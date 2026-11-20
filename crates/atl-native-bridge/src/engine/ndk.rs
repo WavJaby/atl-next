@@ -7,7 +7,7 @@
 //!
 //! The other arguments are host values already: object references are the host's, and on an LP64 guest an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes fit six int and eight fp registers (build.rs refuses the rest), so one forwarder shape serves all: the fp lanes keep their bits untouched (a float in the low half of its register), an fp result returns in the fp register.
 
-use super::bindings::{self, LaneMap, MappedRow, RetMap};
+use super::bindings::{self, LaneMap, MappedRow, RetMap, Slots};
 use super::{convert, handles, jni, unsupported};
 
 /// The forwarded host function: six int lanes (SysV's integer registers) and eight fp lanes (its vector registers); a shorter prototype ignores the rest. One int result (a void one's is never read).
@@ -59,22 +59,41 @@ pub(super) fn call_mapped(
     });
     // ILP32 handles first: an unknown one refuses the whole call before any temporary or host side effect
     let mut released: Option<usize> = None;
+    // handle slots: (lane, the guest array, its type and direction, the host array)
+    let mut slots: Vec<(usize, usize, &'static str, Slots, Vec<usize>)> = Vec::new();
     for &(i, map) in maps {
-        if let LaneMap::Handle(_, release) = map {
-            let Some(host) = handles::to_host(lanes[i]) else {
-                return refuse_handle(symbol, i, lanes[i]);
-            };
-            if release {
-                released = Some(lanes[i]);
+        match map {
+            LaneMap::Handle(_, release) => {
+                let Some(host) = handles::to_host(lanes[i]) else {
+                    return refuse_handle(symbol, i, lanes[i]);
+                };
+                if release {
+                    released = Some(lanes[i]);
+                }
+                lanes[i] = host;
             }
-            lanes[i] = host;
+            LaneMap::Handles(ty, dir, len) if lanes[i] != 0 => {
+                let n = len.map_or(1, |l| lanes[l] as u32 as usize);
+                if n > MAX_HANDLE_SLOTS {
+                    return refuse_handle(symbol, i, n);
+                }
+                // SAFETY: lane `i` is the guest's non-NULL pointer to `n` handle slots (build.rs ILP32_HANDLE_SLOTS: the header's count parameter), readable for In/InOut.
+                let Some(host) = (unsafe { slots_in(dir, lanes[i], n) }) else {
+                    return refuse_handle(symbol, i, lanes[i]);
+                };
+                slots.push((i, lanes[i], ty, dir, host));
+            }
+            _ => {}
         }
+    }
+    for (i, _, _, _, host) in &mut slots {
+        lanes[*i] = host.as_mut_ptr() as usize;
     }
     // ILP32 temporaries: (lane, the guest pointer, its map, the host copy), written back after the call
     let mut temps: Vec<(usize, usize, LaneMap, convert::Temp)> = Vec::new();
     for &(i, map) in maps {
         match map {
-            LaneMap::Handle(..) => {}
+            LaneMap::Handle(..) | LaneMap::Handles(..) => {}
             LaneMap::Record(c, _) if lanes[i] != 0 => {
                 // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
                 let mut t = unsafe { convert::record_in(c, lanes[i]) };
@@ -131,6 +150,15 @@ pub(super) fn call_mapped(
             );
         }
     }
+    for (i, guest, ty, dir, host) in slots {
+        // SAFETY: `guest` is the guest's pointer to these slots read above, writable for Out/InOut (a non-const `T**`).
+        if !unsafe { slots_out(ty, dir, guest, &host) } {
+            super::dispatch::report_refused(
+                super::dispatch::REFUSED_HANDLE,
+                &format!("{symbol} parameter {i}: handle table full"),
+            );
+        }
+    }
     if let Some(h) = released {
         handles::release(h);
     }
@@ -157,6 +185,49 @@ pub(super) fn call_mapped(
     }
 }
 
+/// Most handle slots one call converts: a count above it is refused, not allocated (the host array is 8 bytes a slot; a million bounds it at 8 MiB). Real counts are small: EGL configs number in tens, surfaces in ones.
+const MAX_HANDLE_SLOTS: usize = 1 << 20;
+
+/// The host array for `n` guest handle slots at `guest`: Out zeroed (the guest's slots are uninitialised), In/InOut each guest handle's host object. `None` when a slot read in holds a handle the table does not hold.
+///
+/// # Safety
+/// For In/InOut, `guest` points to `n` readable 4-byte slots.
+unsafe fn slots_in(dir: Slots, guest: usize, n: usize) -> Option<Vec<usize>> {
+    if dir == Slots::Out {
+        return Some(vec![0; n]);
+    }
+    (0..n)
+        .map(|k| {
+            // SAFETY: slot `k` of the caller's `n` readable slots (unaligned: the guest's array may be packed in a record).
+            let h = unsafe { (guest as *const u32).add(k).read_unaligned() };
+            handles::to_host(h as usize)
+        })
+        .collect()
+}
+
+/// Writes the host array's objects back to the guest's slots as handles (Out, InOut; In writes nothing). A one-slot lane writes its slot always (NULL included: the host's failure answer); an array only the slots the host filled (non-NULL), leaving the rest as the guest had them. `false` when a handle could not be issued (that slot written NULL).
+///
+/// # Safety
+/// For Out/InOut, `guest` points to `host.len()` writable 4-byte slots.
+unsafe fn slots_out(ty: &'static str, dir: Slots, guest: usize, host: &[usize]) -> bool {
+    if dir == Slots::In {
+        return true;
+    }
+    let mut ok = true;
+    for (k, &v) in host.iter().enumerate() {
+        if v == 0 && host.len() > 1 {
+            continue;
+        }
+        let h = handles::to_guest(ty, v).unwrap_or_else(|| {
+            ok = false;
+            0
+        });
+        // SAFETY: slot `k` of the caller's writable slots.
+        unsafe { (guest as *mut u32).add(k).write_unaligned(h) };
+    }
+    ok
+}
+
 /// A guest handle the table does not hold (never issued, freed, a raw address): the host function is not called, the answer is 0 (NULL / false / `EGL_FALSE`, the NDK's usual error value), counted and reported with the row and lane.
 fn refuse_handle(symbol: &str, i: usize, value: usize) -> usize {
     super::dispatch::ILP32_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -165,4 +236,53 @@ fn refuse_handle(symbol: &str, i: usize, value: usize) -> usize {
         &format!("{symbol} parameter {i} = {value:#x}"),
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Handle slots by the headers' contracts: an out slot gets a handle naming the host object (a raw host address never reaches the guest: break `ilp32_raw_handles` fails here); an array (egl.h eglChooseConfig: `num_config` of `config_size` slots written) writes only the filled slots; an iterator cursor (NdkMediaCodecStore.h: keep the last value) crosses back in; a slot holding an unissued value refuses.
+    #[test]
+    fn handle_slots_issue_handles_and_refuse_forged_ones() {
+        // host objects above 4 GiB, as a 64-bit host heap holds them
+        let (a, b) = (0x7f00_0000_3000usize, 0x7f00_0000_4000usize);
+        // one Out slot, guest garbage before the call
+        let mut one = [0xdead_beefu32];
+        // SAFETY: here and below, each array holds as many 4-byte slots as passed, readable and writable.
+        let host = unsafe { slots_in(Slots::Out, one.as_ptr() as usize, 1) }.unwrap();
+        assert_eq!(host, [0]);
+        // SAFETY: as above.
+        assert!(unsafe { slots_out("S", Slots::Out, one.as_mut_ptr() as usize, &[a]) });
+        assert_ne!(
+            one[0] as usize,
+            a & 0xffff_ffff,
+            "a handle, not the truncated address"
+        );
+        assert_eq!(handles::to_host(one[0] as usize), Some(a));
+        // InOut: the cursor crosses back in as the host object
+        // SAFETY: as above.
+        let back = unsafe { slots_in(Slots::InOut, one.as_ptr() as usize, 1) }.unwrap();
+        assert_eq!(back, [a]);
+        // array of 3, host filled 2: the third keeps the guest's value
+        let mut arr = [0u32, 0, 7];
+        // SAFETY: as above.
+        assert!(unsafe { slots_out("S", Slots::Out, arr.as_mut_ptr() as usize, &[a, b, 0]) });
+        assert_eq!(arr[0], one[0], "one handle per live address");
+        assert_eq!(handles::to_host(arr[1] as usize), Some(b));
+        assert_eq!(arr[2], 7);
+        // In: a forged slot refuses; In writes nothing back
+        let forged = [arr[0], 0x1234u32];
+        // SAFETY: as above.
+        assert!(unsafe { slots_in(Slots::In, forged.as_ptr() as usize, 2) }.is_none());
+        let good = [arr[0], arr[1]];
+        assert_eq!(
+            // SAFETY: as above.
+            unsafe { slots_in(Slots::In, good.as_ptr() as usize, 2) }.unwrap(),
+            [a, b]
+        );
+        for h in [arr[0], arr[1]] {
+            handles::release(h as usize);
+        }
+    }
 }

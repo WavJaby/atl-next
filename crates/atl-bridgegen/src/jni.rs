@@ -186,6 +186,23 @@ pub enum LaneMap {
     OutWord(crate::ilp32::Word),
     /// ILP32: a guest handle of type `ty` -> the host object it names (`ilp32::Kind::Opaque`); `release`: the call ends the object's life, its handle is freed after it
     Handle { ty: String, release: bool },
+    /// ILP32: a guest pointer to handle slots of type `ty` (`ilp32::Kind::OutHandle`) -> a host array of host objects; `len`: the parameter holding the element count (None: one slot)
+    Handles {
+        ty: String,
+        slots: Slots,
+        len: Option<usize>,
+    },
+}
+
+/// Which way the handles of a [`LaneMap::Handles`] lane cross.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slots {
+    /// the host writes them (the guest's slots are uninitialised): handles out after the call
+    Out,
+    /// the guest's handle in (NULL or issued), the host's object back out (an iterator's cursor)
+    InOut,
+    /// the guest's handles in, nothing back
+    In,
 }
 
 /// What a lane-mapped row's host side does to its result.

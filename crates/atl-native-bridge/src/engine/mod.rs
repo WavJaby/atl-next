@@ -32,6 +32,7 @@ pub mod sles;
 pub mod thread;
 mod va_list;
 pub mod vdso;
+mod window;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

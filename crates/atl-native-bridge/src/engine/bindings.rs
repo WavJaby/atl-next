@@ -131,6 +131,19 @@ pub enum LaneMap {
     OutWord(Word),
     /// ILP32: a guest handle of this type -> the host object (handles.rs); `true`: the call ends the object, the handle is freed after it. 0 stays NULL; an unknown handle refuses the call (counted, answers 0).
     Handle(&'static str, bool),
+    /// ILP32: a guest pointer to handle slots of this type -> a host array of host objects (ndk.rs `Slots`); the parameter holding the element count (None: one slot). NULL stays NULL; an unknown handle read in refuses the call.
+    Handles(&'static str, Slots, Option<usize>),
+}
+
+/// Which way a [`LaneMap::Handles`] lane's handles cross (atl_bridgegen `jni::Slots`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slots {
+    /// host-written (guest slots uninitialised): handles out after the call
+    Out,
+    /// the guest's handle in, the host's object back out (an iterator cursor)
+    InOut,
+    /// the guest's handles in only
+    In,
 }
 
 /// The table of the process's engine.
@@ -277,7 +290,7 @@ fn trapped((lib, name, why): (&str, &str, &str)) {
     ))
 }
 
-/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `SIGNAL_SHIMS` and `PROXY_SHIMS` (test `every_shim_has_an_arm`).
+/// The hand-written host side of `Entry::Shim` stub `name`: the one match over build.rs `SHIMS`, `SIGNAL_SHIMS`, `PROXY_SHIMS` and `ILP32_PROXY_SHIMS` (test `every_shim_has_an_arm`).
 fn shim(name: &str) -> Option<usize> {
     Some(match name {
         "pthread_create" => super::intercepts::pthread_create as *const () as usize,
@@ -305,6 +318,9 @@ fn shim(name: &str) -> Option<usize> {
         "android_getaddrinfofornetwork" => {
             super::netdb::getaddrinfo_for_network as *const () as usize
         }
+        // ILP32 only, build.rs `ILP32_PROXY_SHIMS`: the locked buffer through a guest-addressable window copy
+        "ANativeWindow_lock" => super::window::lock as *const () as usize,
+        "ANativeWindow_unlockAndPost" => super::window::unlock_and_post as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         #[cfg(atl_nb_identity)]

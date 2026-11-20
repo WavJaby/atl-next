@@ -240,8 +240,12 @@ const PROXY_SHIMS: &[&str] = &[
     "eglGetProcAddress",
     "android_getaddrinfofornetwork",
 ];
-/// [`PROXY_SHIMS`] that convert an ILP32 guest's row themselves, bound with the guest view's lane classes: `android_getaddrinfofornetwork` (engine/netdb.rs builds the list in the guest's view).
-const ILP32_PROXY_SHIMS: &[&str] = &["android_getaddrinfofornetwork"];
+/// Proxy rows whose ILP32 host side is hand-written, bound `Entry::Shim` with the guest view's lane classes on the ILP32 table only (equal-model tables bind them as before): `android_getaddrinfofornetwork` (a [`PROXY_SHIMS`] row; engine/netdb.rs builds the list in the guest's view); `ANativeWindow_lock` / `ANativeWindow_unlockAndPost` (engine/window.rs: the locked buffer through a guest-addressable window copy; a record converter would hand the guest the host's `bits` above 4 GiB).
+const ILP32_PROXY_SHIMS: &[&str] = &[
+    "android_getaddrinfofornetwork",
+    "ANativeWindow_lock",
+    "ANativeWindow_unlockAndPost",
+];
 /// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
 /// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging).
 const CALLBACKS: &[&str] = &[
@@ -1258,6 +1262,291 @@ const ILP32_ARRAY_PARAMS: &[(&str, usize, &str)] = &[
     ("glCreateShaderProgramvEXT", 2, "count strings"),
 ];
 
+/// Handle-slot parameters (`T**` of a handle type, `Kind::OutHandle`): function, parameter, direction, the parameter holding the element count (None: one slot), the header's words. The views cannot tell one out slot from an iterator cursor or an input array; the header's prose does. Every out-handle position of the ILP32 table is here or in [`ILP32_HANDLE_SLOTS_TRAPPED`] (build fails otherwise), and each row here must be one (stale check).
+const ILP32_HANDLE_SLOTS: &[(&str, usize, atl_bridgegen::jni::Slots, Option<usize>, &str)] = {
+    use atl_bridgegen::jni::Slots::{In, InOut, Out};
+    &[
+        (
+            "eglChooseConfig",
+            2,
+            Out,
+            Some(3),
+            "egl.h: up to config_size configs written to configs (NULL: count only)",
+        ),
+        (
+            "eglGetConfigs",
+            1,
+            Out,
+            Some(2),
+            "egl.h: up to config_size configs written to configs (NULL: count only)",
+        ),
+        (
+            "AAudioStreamBuilder_openStream",
+            1,
+            Out,
+            None,
+            "AAudio.h: pointer to a variable to receive the new stream reference",
+        ),
+        (
+            "AAudio_createStreamBuilder",
+            0,
+            Out,
+            None,
+            "AAudio.h: pointer to a variable to receive the new builder",
+        ),
+        (
+            "ADisplayLuts_setEntries",
+            1,
+            In,
+            Some(2),
+            "display_luts.h: entries, numEntries",
+        ),
+        (
+            "AHardwareBuffer_allocate",
+            1,
+            Out,
+            None,
+            "hardware_buffer.h: outBuffer, the allocated buffer",
+        ),
+        (
+            "AHardwareBuffer_recvHandleFromUnixSocket",
+            1,
+            Out,
+            None,
+            "hardware_buffer.h: outBuffer",
+        ),
+        (
+            "AInputQueue_getEvent",
+            1,
+            Out,
+            None,
+            "input.h: outEvent, the next available event",
+        ),
+        (
+            "APerformanceHint_createSessionUsingConfig",
+            2,
+            Out,
+            None,
+            "performance_hint.h: sessionOut",
+        ),
+        (
+            "APerformanceHint_setNativeSurfaces",
+            1,
+            In,
+            Some(2),
+            "performance_hint.h: nativeWindows, nativeWindowsSize",
+        ),
+        (
+            "APerformanceHint_setNativeSurfaces",
+            3,
+            In,
+            Some(4),
+            "performance_hint.h: surfaceControls, surfaceControlsSize",
+        ),
+        (
+            "ASessionCreationConfig_setNativeSurfaces",
+            1,
+            In,
+            Some(2),
+            "performance_hint.h: nativeWindows, nativeWindowsSize",
+        ),
+        (
+            "ASessionCreationConfig_setNativeSurfaces",
+            3,
+            In,
+            Some(4),
+            "performance_hint.h: surfaceControls, surfaceControlsSize",
+        ),
+        (
+            "AImageDecoder_createFromAAsset",
+            1,
+            Out,
+            None,
+            "imagedecoder.h: outDecoder",
+        ),
+        (
+            "AImageDecoder_createFromBuffer",
+            2,
+            Out,
+            None,
+            "imagedecoder.h: outDecoder",
+        ),
+        (
+            "AImageDecoder_createFromFd",
+            1,
+            Out,
+            None,
+            "imagedecoder.h: outDecoder",
+        ),
+        (
+            "AndroidBitmap_getHardwareBuffer",
+            2,
+            Out,
+            None,
+            "bitmap.h: outBuffer (the row waits on its jni lane)",
+        ),
+        (
+            "ACodecVideoCapabilities_getNextSupportedPerformancePoint",
+            1,
+            InOut,
+            None,
+            "NdkMediaCodecInfo.h: on successive calls, keep the last pointer value",
+        ),
+        (
+            "AImageReader_acquireLatestImage",
+            1,
+            Out,
+            None,
+            "NdkImageReader.h: image",
+        ),
+        (
+            "AImageReader_acquireLatestImageAsync",
+            1,
+            Out,
+            None,
+            "NdkImageReader.h: image",
+        ),
+        (
+            "AImageReader_acquireNextImage",
+            1,
+            Out,
+            None,
+            "NdkImageReader.h: image",
+        ),
+        (
+            "AImageReader_acquireNextImageAsync",
+            1,
+            Out,
+            None,
+            "NdkImageReader.h: image",
+        ),
+        (
+            "AImageReader_getWindow",
+            1,
+            Out,
+            None,
+            "NdkImageReader.h: window",
+        ),
+        ("AImageReader_new", 4, Out, None, "NdkImageReader.h: reader"),
+        (
+            "AImageReader_newWithDataSpace",
+            6,
+            Out,
+            None,
+            "NdkImageReader.h: reader",
+        ),
+        (
+            "AImageReader_newWithUsage",
+            5,
+            Out,
+            None,
+            "NdkImageReader.h: reader",
+        ),
+        (
+            "AImage_getHardwareBuffer",
+            1,
+            Out,
+            None,
+            "NdkImage.h: buffer",
+        ),
+        (
+            "AMediaCodecInfo_getAudioCapabilities",
+            1,
+            Out,
+            None,
+            "NdkMediaCodecInfo.h: outAudioCaps",
+        ),
+        (
+            "AMediaCodecInfo_getEncoderCapabilities",
+            1,
+            Out,
+            None,
+            "NdkMediaCodecInfo.h: outEncoderCaps",
+        ),
+        (
+            "AMediaCodecInfo_getVideoCapabilities",
+            1,
+            Out,
+            None,
+            "NdkMediaCodecInfo.h: outVideoCaps",
+        ),
+        (
+            "AMediaCodecStore_findNextDecoderForFormat",
+            1,
+            InOut,
+            None,
+            "NdkMediaCodecStore.h: outCodecInfo, NON NULL continues an iteration",
+        ),
+        (
+            "AMediaCodecStore_findNextEncoderForFormat",
+            1,
+            InOut,
+            None,
+            "NdkMediaCodecStore.h: outCodecInfo, NON NULL continues an iteration",
+        ),
+        (
+            "AMediaCodecStore_getCodecInfo",
+            1,
+            Out,
+            None,
+            "NdkMediaCodecStore.h: outCodecInfo",
+        ),
+        (
+            "AMediaCodec_createInputSurface",
+            1,
+            Out,
+            None,
+            "NdkMediaCodec.h: surface",
+        ),
+        (
+            "AMediaCodec_createPersistentInputSurface",
+            0,
+            Out,
+            None,
+            "NdkMediaCodec.h: surface",
+        ),
+    ]
+};
+
+/// Handle-slot parameters that stay trapped (function, parameter, why): their slots are host-owned arrays the guest keeps reading after the call, or another lane blocks the row first.
+const ILP32_HANDLE_SLOTS_TRAPPED: &[(&str, usize, &str)] = &[
+    (
+        "ASensorManager_getSensorList",
+        1,
+        "sensor.h: ASensorList, the manager's own array of sensors: a window copy of handles living as long as the manager (P5)",
+    ),
+    (
+        "ASensorManager_getDynamicSensorList",
+        1,
+        "sensor.h: ASensorList, the manager's own array: as above (P5)",
+    ),
+    (
+        "ASurfaceTransactionStats_getASurfaceControls",
+        1,
+        "surface_control.h: a host-allocated array the guest frees with releaseASurfaceControls: a window copy paired with that release (P5)",
+    ),
+    (
+        "ASurfaceTransactionStats_releaseASurfaceControls",
+        0,
+        "surface_control.h: frees the array getASurfaceControls returned (P5, with it)",
+    ),
+    (
+        "AMediaCodecStore_getSupportedMediaTypes",
+        0,
+        "NdkMediaCodecStore.h: a host-owned array of records holding text (P5)",
+    ),
+    (
+        "slCreateEngine",
+        0,
+        "OpenSLES.h: SLObjectItf, an interface of function pointers (P6)",
+    ),
+    (
+        "android_getaddrinfofornetwork",
+        4,
+        "multinetwork.h: an addrinfo list, the libc converter's",
+    ),
+];
+
 /// An ILP32 converted row's lane maps and its lanes literal ([`ilp32_maps`]).
 type Ilp32Maps = (Vec<(usize, LaneMap)>, RetMap, bool, String);
 /// The fp lanes the mapped forwarder takes (generated `mapped`): SysV's eight vector argument registers; an fp argument keeps its bits in its register (a float in the low half), which the forwarder passes on untouched.
@@ -1318,6 +1607,19 @@ fn ilp32_maps(
                 },
             )),
             (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
+            (Kind::OutHandle(ty), Some(p)) => ILP32_HANDLE_SLOTS
+                .iter()
+                .find(|(f, at, ..)| *f == name && *at == p)
+                .map(|&(_, _, slots, len, _)| {
+                    (
+                        p,
+                        LaneMap::Handles {
+                            ty: ty.clone(),
+                            slots,
+                            len,
+                        },
+                    )
+                }),
             (Kind::Record(name), Some(p)) if shallow(name) => match sig.params[p].resolved() {
                 atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
                     p,
@@ -1722,7 +2024,7 @@ fn bindings_table(
     let mut mapped_rows: Vec<MappedRow> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     // ILP32_PROXY_SHIMS rows bound as their own converters on this table (stale-row check below)
-    let mut proxy_shims_bound: Vec<&str> = Vec::new();
+    let mut ilp32_shims_bound: Vec<&str> = Vec::new();
     // ILP32_TEXT_VARIABLES rows bound (stale-row check below)
     let mut text_variables = vec![0usize; ILP32_TEXT_VARIABLES.len()];
     for (soname, names) in &lists {
@@ -1759,72 +2061,83 @@ fn bindings_table(
                 ilp32_rows.push(((*soname).to_owned(), name.clone(), row.describe(), waits));
             }
             // ILP32: a row with a position its lane class cannot convert binds lane-mapped when every such position has a generated converter ([`ilp32_maps`]), else traps naming the conversion it waits for (p4b s3-s4), before any route: no truncated value passes
-            let entry = if ilp32.is_some() && ILP32_PROXY_SHIMS.contains(&name.as_str()) {
-                if let Some(last) = ilp32_rows.last_mut() {
-                    last.3 = "shim";
-                }
-                proxy_shims_bound.push(name.as_str());
-                let sig = &guest_view.functions[name.as_str()];
-                let ret = atl_bridgegen::jni::result_class(&sig.ret)?;
-                let params = atl_bridgegen::jni::param_classes(sig)?;
-                format!("Entry::Shim({})", sig_literal(ret, &params))
-            } else if let Some(row) = ilp32.filter(|r| !r.carried()) {
-                let sig = &guest_view.functions[name.as_str()];
-                match ilp32_maps(name, sig, row, &route, qemu, &views, &mut convs) {
-                    Ok((maps, ret, fp, lanes)) => {
-                        if let Some(last) = ilp32_rows.last_mut() {
-                            last.3 = "converted";
+            let entry =
+                if ilp32.is_some() && !equal_model && ILP32_PROXY_SHIMS.contains(&name.as_str()) {
+                    if let Some(last) = ilp32_rows.last_mut() {
+                        last.3 = "shim";
+                    }
+                    ilp32_shims_bound.push(name.as_str());
+                    // a shim converts its records with the generated converters (engine/window.rs `C_ANativeWindow_Buffer`)
+                    for k in &ilp32.map_or(&[][..], |r| &r.kinds[..]).to_vec() {
+                        if let atl_bridgegen::ilp32::Kind::Record(r) = k {
+                            convs.entry(r.clone()).or_insert_with(|| {
+                                atl_bridgegen::ilp32::converters(r, &views)
+                                    .map_err(|e| format!("{e:#}"))
+                            });
                         }
-                        mapped_rows.push(((*soname).to_owned(), name.clone(), maps, ret, fp));
-                        format!("Entry::Mapped({}, {lanes})", mapped_rows.len() - 1)
                     }
-                    Err(why) => trap(why),
-                }
-            } else if let Route::Mapped(maps) = route {
-                mapped_rows.push((
-                    (*soname).to_owned(),
-                    name.clone(),
-                    maps,
-                    RetMap::Plain,
-                    false,
-                ));
-                format!("Entry::Mapped({}, Sig::INT)", mapped_rows.len() - 1)
-            } else if let Route::Pending(why) = route {
-                trap(why)
-            } else {
-                match (guest_view.functions.get(name), host_ir.functions.get(name)) {
-                    (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
-                        "Entry::Shim(Sig::INT)".to_owned()
-                    }
-                    (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
-                        trap("pending: annotated, GS2.2")
-                    }
-                    // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
-                    (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => {
-                        trap("pending: fn-return, GS2.2")
-                    }
-                    (Some(sig), Some(_)) => {
-                        // a record by value (NDK imagedecoder.h `ARect AImageDecoderFrameInfo_getFrameRect`) has no lane class: trapped by name, both engines (the identity table's Generic rows carry a class too)
-                        match (
-                            atl_bridgegen::jni::result_class(&sig.ret),
-                            atl_bridgegen::jni::param_classes(sig),
-                        ) {
-                            (Ok(ret), Ok(params)) => {
-                                // QEMU crosses by the lane image (dispatch.rs `call_host`): a prototype it cannot carry traps by name here, at bind time (R-1, Q7-4); identity passes the call through natively
-                                match atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu) {
-                                    Some(why) => trap(why),
-                                    None => format!(
-                                        "Entry::Generic(Host::System, {name:?}, {})",
-                                        sig_literal(ret, &params)
-                                    ),
-                                }
+                    let sig = &guest_view.functions[name.as_str()];
+                    let ret = atl_bridgegen::jni::result_class(&sig.ret)?;
+                    let params = atl_bridgegen::jni::param_classes(sig)?;
+                    format!("Entry::Shim({})", sig_literal(ret, &params))
+                } else if let Some(row) = ilp32.filter(|r| !r.carried()) {
+                    let sig = &guest_view.functions[name.as_str()];
+                    match ilp32_maps(name, sig, row, &route, qemu, &views, &mut convs) {
+                        Ok((maps, ret, fp, lanes)) => {
+                            if let Some(last) = ilp32_rows.last_mut() {
+                                last.3 = "converted";
                             }
-                            _ => trap("pending: a record by value has no lane class"),
+                            mapped_rows.push(((*soname).to_owned(), name.clone(), maps, ret, fp));
+                            format!("Entry::Mapped({}, {lanes})", mapped_rows.len() - 1)
                         }
+                        Err(why) => trap(why),
                     }
-                    _ => trap(missing_prototype(soname)),
-                }
-            };
+                } else if let Route::Mapped(maps) = route {
+                    mapped_rows.push((
+                        (*soname).to_owned(),
+                        name.clone(),
+                        maps,
+                        RetMap::Plain,
+                        false,
+                    ));
+                    format!("Entry::Mapped({}, Sig::INT)", mapped_rows.len() - 1)
+                } else if let Route::Pending(why) = route {
+                    trap(why)
+                } else {
+                    match (guest_view.functions.get(name), host_ir.functions.get(name)) {
+                        (Some(_), Some(_)) if PROXY_SHIMS.contains(&name.as_str()) => {
+                            "Entry::Shim(Sig::INT)".to_owned()
+                        }
+                        (Some(_), Some(_)) if ANNOTATED.contains(&name.as_str()) => {
+                            trap("pending: annotated, GS2.2")
+                        }
+                        // fn-return rows that are not shims (PROXY_SHIMS, eglGetProcAddress): a host function pointer must never reach the guest as a result
+                        (Some(sig), Some(_)) if is_fn_ptr(&sig.ret) => {
+                            trap("pending: fn-return, GS2.2")
+                        }
+                        (Some(sig), Some(_)) => {
+                            // a record by value (NDK imagedecoder.h `ARect AImageDecoderFrameInfo_getFrameRect`) has no lane class: trapped by name, both engines (the identity table's Generic rows carry a class too)
+                            match (
+                                atl_bridgegen::jni::result_class(&sig.ret),
+                                atl_bridgegen::jni::param_classes(sig),
+                            ) {
+                                (Ok(ret), Ok(params)) => {
+                                    // QEMU crosses by the lane image (dispatch.rs `call_host`): a prototype it cannot carry traps by name here, at bind time (R-1, Q7-4); identity passes the call through natively
+                                    match atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu)
+                                    {
+                                        Some(why) => trap(why),
+                                        None => format!(
+                                            "Entry::Generic(Host::System, {name:?}, {})",
+                                            sig_literal(ret, &params)
+                                        ),
+                                    }
+                                }
+                                _ => trap("pending: a record by value has no lane class"),
+                            }
+                        }
+                        _ => trap(missing_prototype(soname)),
+                    }
+                };
             let prototyped =
                 guest_view.functions.contains_key(name) && host_ir.functions.contains_key(name);
             ensure!(
@@ -1895,11 +2208,11 @@ fn bindings_table(
             "{t}: in CALLBACKS but no proxy row with a prototype in the set takes it"
         );
     }
-    // stale-row check of ILP32_PROXY_SHIMS: each a PROXY_SHIMS name that bound as its own converter on the ILP32 table
+    // stale-row check of ILP32_PROXY_SHIMS: each bound as its own converter on the ILP32 table
     for n in ILP32_PROXY_SHIMS.iter().filter(|_| !equal_model) {
         ensure!(
-            PROXY_SHIMS.contains(n) && proxy_shims_bound.contains(n),
-            "{n}: in ILP32_PROXY_SHIMS but not a PROXY_SHIMS row bound on the {} table (stale row)",
+            ilp32_shims_bound.contains(n),
+            "{n}: in ILP32_PROXY_SHIMS but no row bound it on the {} table (stale row)",
             guest.row.arch
         );
     }
@@ -1913,6 +2226,37 @@ fn bindings_table(
             "{f} parameter {p}: in ILP32_ARRAY_PARAMS but not an out-word position of the {} table",
             guest.row.arch
         );
+    }
+    // ILP32_HANDLE_SLOTS / _TRAPPED: each row an out-handle position (stale), each out-handle position in one of them (missing)
+    if !equal_model {
+        let is_slot = |f: &str, p: usize| {
+            classes
+                .get(f)
+                .and_then(|r| r.kinds.get(p + 1))
+                .is_some_and(|k| matches!(k, atl_bridgegen::ilp32::Kind::OutHandle(_)))
+        };
+        let listed = ILP32_HANDLE_SLOTS
+            .iter()
+            .map(|&(f, p, ..)| (f, p))
+            .chain(ILP32_HANDLE_SLOTS_TRAPPED.iter().map(|&(f, p, _)| (f, p)));
+        for (f, p) in listed.clone() {
+            ensure!(
+                is_slot(f, p),
+                "{f} parameter {p}: in ILP32_HANDLE_SLOTS(_TRAPPED) but not an out-handle position of the {} table",
+                guest.row.arch
+            );
+        }
+        for (f, r) in &classes {
+            for (at, k) in r.kinds.iter().enumerate().skip(1) {
+                if matches!(k, atl_bridgegen::ilp32::Kind::OutHandle(_)) {
+                    ensure!(
+                        listed.clone().any(|(lf, lp)| lf == *f && lp == at - 1),
+                        "{f} parameter {}: an out-handle position in neither ILP32_HANDLE_SLOTS nor ILP32_HANDLE_SLOTS_TRAPPED (the header says one slot, an array with its length, or why it waits)",
+                        at - 1
+                    );
+                }
+            }
+        }
     }
     // stale-row checks of HANDLE_RELEASES (a handle parameter) and GUEST_VALUE_HANDLES (a handle type some row uses), on the ILP32 table
     for (f, p, _) in HANDLE_RELEASES.iter().filter(|_| !equal_model) {
@@ -2055,6 +2399,12 @@ fn bindings_table(
         "the mapped forwarder below takes 6 lanes, atl_bridgegen::jni::MAPPED_LANES is {}",
         atl_bridgegen::jni::MAPPED_LANES
     );
+    if mapped_rows.iter().any(|r| {
+        r.2.iter()
+            .any(|(_, m)| matches!(m, LaneMap::Handles { .. }))
+    }) {
+        code.push_str("use super::Slots;\n\n");
+    }
     code.push_str("/// Per `Entry::Mapped(i)`: library, symbol, the (parameter, map) pairs.\npub const MAPPED_ROWS: &[MappedRow] = &[\n");
     for (lib, name, maps, ret, _) in &mapped_rows {
         let maps: Vec<String> = maps
@@ -2063,6 +2413,9 @@ fn bindings_table(
                 LaneMap::Env => format!("({i}, LaneMap::Env)"),
                 LaneMap::Handle { ty, release } => {
                     format!("({i}, LaneMap::Handle({ty:?}, {release}))")
+                }
+                LaneMap::Handles { ty, slots, len } => {
+                    format!("({i}, LaneMap::Handles({ty:?}, Slots::{slots:?}, {len:?}))")
                 }
                 LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
                 LaneMap::Record { name, out } => {
