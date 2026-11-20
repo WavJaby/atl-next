@@ -509,6 +509,11 @@ impl Compositor {
         self.queues.values().map(VecDeque::len).sum()
     }
 
+    /// Whether the transaction with libgui id `id` (`Transaction::mId`, unique per process: pid << 32 | counter) is still queued, not yet applied.
+    pub fn is_queued(&self, id: u64) -> bool {
+        self.queues.values().flatten().any(|t| t.id == id)
+    }
+
     /// The descriptor numbers the core still refers to: the buffers layers show and the client cache keeps, the layers' release channels and acquire fences, and everything in the transactions still queued.
     /// The core never owns a descriptor; the front-end that took them from the parcels closes the ones missing here (the fd ownership rule: a descriptor lives while the core names it).
     pub fn referenced_fds(&self) -> BTreeSet<i32> {

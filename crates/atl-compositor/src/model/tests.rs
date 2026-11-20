@@ -690,6 +690,59 @@ fn backpressure_latches_one_buffer_per_tick() {
     );
 }
 
+/// `is_queued` follows one transaction, not the queue: a window-surface buffer (own apply token) is applied at the tick while a backpressured SurfaceView layer keeps its second buffer queued.
+/// The composer's same-thread mark is cleared by this answer; "queue empty" never became true here and kept the mark set.
+#[test]
+fn is_queued_names_one_transaction_while_another_layer_keeps_the_queue_busy() {
+    let (surface_view, window, listener) = (local(1), local(2), local(3));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(surface_view, 7, None)).unwrap();
+    c.create_layer(spec(window, 8, None)).unwrap();
+    c.queue_transaction(tx(vec![flags_state(
+        &surface_view,
+        layer_flags::ENABLE_BACKPRESSURE,
+        layer_flags::ENABLE_BACKPRESSURE,
+    )]));
+    let with_id = |mut t: TransactionState, id: u64, token: StrongBinder| {
+        t.id = id;
+        t.apply_token = token;
+        t
+    };
+    for (id, buffer, frame, callback) in [(11, 301, 1, 1), (12, 302, 2, 2)] {
+        c.queue_transaction(with_id(
+            tx(vec![buffer_state(
+                &surface_view,
+                &listener,
+                buffer,
+                frame,
+                8,
+                8,
+                false,
+                callback,
+            )]),
+            id,
+            StrongBinder::NULL,
+        ));
+    }
+    c.queue_transaction(with_id(
+        tx(vec![buffer_state(
+            &window, &listener, 401, 1, 8, 8, false, 1,
+        )]),
+        21,
+        local(4),
+    ));
+    assert!(c.is_queued(21) && c.is_queued(12));
+    c.on_frame(10);
+    assert_eq!(
+        c.pending_transactions(),
+        1,
+        "the SurfaceView's second buffer waits"
+    );
+    assert!(c.is_queued(12));
+    assert!(!c.is_queued(21), "the window's buffer was applied");
+    assert!(!c.is_queued(11));
+}
+
 /// Without backpressure the later buffer replaces the earlier one within the tick, and the replaced buffer is still released.
 #[test]
 fn without_backpressure_the_replaced_buffer_is_released_in_the_same_tick() {
