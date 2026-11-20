@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
@@ -56,6 +56,102 @@ const KIND_VSYNC: u32 = 0x1;
 pub struct Presented {
     pub vsync: AtomicU64,
     pub other: AtomicU64,
+}
+
+/// [`Proxy::throttle_frames`]: the window's frame callbacks answered no faster than `period_ns` (0 = off), and what the throttle did, over the window's connection.
+#[derive(Debug, Default)]
+pub struct Throttle {
+    period_ns: AtomicU64,
+    /// `done` events the throttle delayed.
+    pub held: AtomicU64,
+    /// `done` events written to the client while the throttle was on, delayed or not.
+    pub released: AtomicU64,
+}
+
+impl Throttle {
+    /// (held, released) now.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.held.load(Ordering::Relaxed),
+            self.released.load(Ordering::Relaxed),
+        )
+    }
+
+    fn period(&self) -> Option<Duration> {
+        match self.period_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+}
+
+/// Window frame-callback events the throttle holds back: each `done` with its release time, and the callback's `delete_id` once it arrives (it must not reach the client before its `done`).
+#[derive(Default)]
+struct Held {
+    items: std::collections::VecDeque<(Instant, u32, Vec<u8>)>,
+    /// The earliest the next `done` may go out.
+    next: Option<Instant>,
+}
+
+impl Held {
+    /// A window `done` for `callback` arriving `now`: the bytes to write now, or none when it is queued.
+    fn done(
+        &mut self,
+        now: Instant,
+        period: Duration,
+        callback: u32,
+        bytes: Vec<u8>,
+        t: &Throttle,
+    ) -> Option<Vec<u8>> {
+        let due = self.next.filter(|n| *n > now || !self.items.is_empty());
+        match due {
+            None => {
+                self.next = Some(now + period);
+                t.released.fetch_add(1, Ordering::Relaxed);
+                Some(bytes)
+            }
+            Some(at) => {
+                let at = self
+                    .items
+                    .back()
+                    .map_or(at, |(last, _, _)| (*last + period).max(at));
+                self.next = Some(at + period);
+                self.items.push_back((at, callback, bytes));
+                t.held.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Appends `bytes` (a `delete_id`) behind the held `done` of `callback`; false when that callback is not held.
+    fn delete_id(&mut self, callback: u32, bytes: &[u8]) -> bool {
+        match self.items.iter_mut().find(|(_, c, _)| *c == callback) {
+            Some((_, _, held)) => {
+                held.extend_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The held bytes due by `now`, in order.
+    fn due(&mut self, now: Instant, t: &Throttle) -> Vec<u8> {
+        let mut out = Vec::new();
+        while self.items.front().is_some_and(|(at, _, _)| *at <= now) {
+            if let Some((_, _, bytes)) = self.items.pop_front() {
+                out.extend(bytes);
+                t.released.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    /// How long until the next held item is due.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        self.items
+            .front()
+            .map(|(at, _, _)| at.saturating_duration_since(now))
+    }
 }
 
 impl Presented {
@@ -88,6 +184,9 @@ const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
 const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
 /// `wl_surface.commit` request 6 (wayland.xml).
 const WL_SURFACE_COMMIT: u16 = 6;
+/// `wl_surface.frame(callback new_id)` request 3; `wl_callback.done(data)` event 0, a destructor (wayland.xml).
+const WL_SURFACE_FRAME: u16 = 3;
+const WL_CALLBACK_DONE: u16 = 0;
 /// The `configure` events of xdg_toplevel and xdg_surface are both opcode 0 (their requests are other opcodes).
 const XDG_TOPLEVEL_CONFIGURE: u16 = 0;
 /// `xdg_toplevel.close` event, opcode 1 (xdg-shell.xml event order: configure 0, close 1, configure_bounds 2, wm_capabilities 3): the desktop closed the window.
@@ -215,6 +314,10 @@ struct Ids {
     injected: Vec<u32>,
     /// The proxy-wide [`Presented`] count this connection's feedback adds to.
     presented: Arc<Presented>,
+    /// The window surface's pending `wl_surface.frame` callbacks (the throttle's subject).
+    frame_callbacks: Vec<u32>,
+    /// The proxy-wide [`Throttle`].
+    throttle: Arc<Throttle>,
 }
 
 impl Ids {
@@ -323,6 +426,10 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         let toplevel = word(body, 0)?;
         ids.interfaces.insert(toplevel, XDG_TOPLEVEL.to_owned());
         ids.toplevel.get_or_insert(toplevel);
+        return None;
+    }
+    if Some(object) == ids.surface && opcode == WL_SURFACE_FRAME {
+        ids.frame_callbacks.extend(word(body, 0));
         return None;
     }
     if Some(object) == ids.surface && opcode == WL_SURFACE_COMMIT {
@@ -475,6 +582,7 @@ pub struct Proxy {
     /// `run-apk --break-input`: pointer, touch and key injections are dropped (configures, pings and closes still go).
     drop_input: AtomicBool,
     presented: Arc<Presented>,
+    throttle: Arc<Throttle>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -502,9 +610,11 @@ impl Proxy {
         let window: Shared<Option<usize>> = Arc::default();
         let presented: Arc<Presented> = Arc::default();
         let seen = Arc::clone(&presented);
+        let throttle: Arc<Throttle> = Arc::default();
+        let slow = Arc::clone(&throttle);
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
-                match serve(client, &up, &tx, &inj, &wk, &window, &seen) {
+                match serve(client, &up, &tx, &inj, &wk, &window, &seen, &slow) {
                     Ok(()) => {}
                     Err(e) => eprintln!("wayland proxy: connection setup failed: {e:#}"),
                 }
@@ -517,7 +627,21 @@ impl Proxy {
             wakes,
             drop_input: AtomicBool::new(false),
             presented,
+            throttle,
         })
+    }
+
+    /// The throttle's counts so far ([`Throttle`]); the handle stays valid after the proxy moves.
+    pub fn throttle(&self) -> Arc<Throttle> {
+        Arc::clone(&self.throttle)
+    }
+
+    /// A slow display (stage slow-display): from now on the window surface's `wl_callback.done` events reach the client no faster than one per `period`; the others wait in the proxy, in order. Takes effect at the next `done`.
+    pub fn throttle_frames(&self, period: Duration) {
+        self.throttle
+            .period_ns
+            .store(period.as_nanos() as u64, Ordering::Relaxed);
+        // a connection blocked in poll with nothing held sees the period at its next server message; nothing is due before that
     }
 
     /// The `presented` events seen so far ([`Presented`]); the handle stays valid after the proxy moves.
@@ -623,11 +747,13 @@ fn serve(
     wakes: &Shared<Vec<OwnedFd>>,
     window: &Shared<Option<usize>>,
     presented: &Arc<Presented>,
+    throttle: &Arc<Throttle>,
 ) -> Result<()> {
     let server = UnixStream::connect(upstream)
         .with_context(|| format!("connecting to {}", upstream.display()))?;
     let ids: Shared<Ids> = Arc::new(Mutex::new(Ids {
         presented: Arc::clone(presented),
+        throttle: Arc::clone(throttle),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
@@ -724,23 +850,32 @@ fn server_to_client(
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
 ) -> Result<()> {
-    let presented = Arc::clone(
-        &ids.lock()
-            .map_err(|_| anyhow::anyhow!("ids poisoned"))?
-            .presented,
-    );
+    let (presented, throttle) = {
+        let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
+        (Arc::clone(&ids.presented), Arc::clone(&ids.throttle))
+    };
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
+    let mut held = Held::default();
     loop {
         let mut watch = [
             PollFd::new(server, PollFlags::IN),
             PollFd::new(wake, PollFlags::IN),
         ];
-        poll(&mut watch, None)?;
+        let timeout = held.wait(Instant::now()).map(|d| rustix::time::Timespec {
+            tv_sec: d.as_secs() as _,
+            tv_nsec: d.subsec_nanos() as _,
+        });
+        poll(&mut watch, timeout.as_ref())?;
         let (server_ready, woken) = (
             !watch[0].revents().is_empty(),
             !watch[1].revents().is_empty(),
         );
+        // held frame callbacks go out before anything newer from the server
+        let due = held.due(Instant::now(), &throttle);
+        if !due.is_empty() {
+            forward(client.as_fd(), &due, &mut Vec::new())?;
+        }
         if server_ready {
             let (data, received) = receive(server.as_fd())?;
             if data.is_empty() && received.is_empty() {
@@ -748,7 +883,7 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let (wm_base, seats, touch, feedbacks) = {
+            let (wm_base, seats, touch, feedbacks, callbacks) = {
                 let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
                 let of = |interface: &str| -> Vec<u32> {
                     ids.interfaces
@@ -761,15 +896,42 @@ fn server_to_client(
                     of(WL_SEAT),
                     ids.touch,
                     of(WP_PRESENTATION_FEEDBACK),
+                    ids.frame_callbacks.clone(),
                 )
             };
             // feedback objects the compositor destroyed (presented / discarded): their ids are free for reuse
             let mut ended: Vec<u32> = Vec::new();
+            // window frame callbacks answered (done destroys the callback)
+            let mut fired: Vec<u32> = Vec::new();
+            let period = throttle.period();
+            let now = Instant::now();
             // the seat claims touch, so the client asks for the proxy's wl_touch; the sync that took that id answers on it and deletes it: both are the proxy's to drop
             let mut out = Vec::with_capacity(pending.len());
             let complete = scan(&pending, |object, opcode, body| {
                 if feedbacks.contains(&object) && note_feedback(&presented, opcode, body) {
                     ended.push(object);
+                }
+                if callbacks.contains(&object) && opcode == WL_CALLBACK_DONE {
+                    fired.push(object);
+                    if let Some(period) = period {
+                        if let Some(now_bytes) = held.done(
+                            now,
+                            period,
+                            object,
+                            self::event(object, opcode, body),
+                            &throttle,
+                        ) {
+                            out.extend(now_bytes);
+                        }
+                        return;
+                    }
+                }
+                if object == WL_DISPLAY_ID
+                    && opcode == WL_DISPLAY_DELETE_ID
+                    && let Some(id) = word(body, 0)
+                    && held.delete_id(id, &self::event(object, opcode, body))
+                {
+                    return;
                 }
                 let id_of_touch = |v: Option<u32>| v.is_some() && v == touch;
                 if id_of_touch(Some(object))
@@ -804,11 +966,12 @@ fn server_to_client(
                     ));
                 }
             });
-            if !ended.is_empty() {
+            if !ended.is_empty() || !fired.is_empty() {
                 let mut ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
                 for id in ended {
                     ids.interfaces.remove(&id);
                 }
+                ids.frame_callbacks.retain(|c| !fired.contains(c));
             }
             if complete > 0 {
                 forward(client.as_fd(), &out, &mut fds)?;
@@ -1126,6 +1289,30 @@ fn pointer_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Period 10 ms: the first done goes out at once; one 1 ms later waits until 10 ms with its delete_id behind it; a third queues one period after the second; nothing is due early.
+    #[test]
+    fn throttle_spaces_dones_and_keeps_delete_id_behind() {
+        let (t, p, t0) = (
+            Throttle::default(),
+            Duration::from_millis(10),
+            Instant::now(),
+        );
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut h = Held::default();
+        assert_eq!(h.done(t0, p, 5, vec![1], &t), Some(vec![1]));
+        assert_eq!(h.done(ms(1), p, 6, vec![2], &t), None);
+        assert!(h.delete_id(6, &[3]));
+        assert!(!h.delete_id(5, &[9]));
+        assert_eq!(h.done(ms(2), p, 7, vec![4], &t), None);
+        assert_eq!(h.wait(ms(2)), Some(Duration::from_millis(8)));
+        assert!(h.due(ms(9), &t).is_empty());
+        assert_eq!(h.due(ms(10), &t), vec![2, 3]);
+        assert_eq!(h.due(ms(20), &t), vec![4]);
+        assert_eq!(t.counts(), (2, 3));
+        // idle past the next slot: the next done goes out at once
+        assert_eq!(h.done(ms(45), p, 8, vec![5], &t), Some(vec![5]));
+    }
 
     fn msg(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
         let size = (HEADER_BYTES + body.len()) as u32;

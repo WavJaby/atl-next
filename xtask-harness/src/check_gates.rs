@@ -78,6 +78,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["sles-bridge"], false, true),
     Row::new(&["window", "--stage", "surface-view"], true, true),
     Row::new(&["window", "--stage", "ime"], true, true),
+    Row::new(&["window", "--stage", "slow-display"], true, true),
 ];
 
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line.

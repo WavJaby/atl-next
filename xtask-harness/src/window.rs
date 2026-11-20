@@ -41,6 +41,7 @@ mod gles1;
 mod gles2;
 mod ime;
 mod move_output;
+mod slow_display;
 mod splash;
 mod surface_view;
 mod suspended;
@@ -99,7 +100,7 @@ pub struct Args {
     /// Deliberate break (any UI stage that replaces buffers): the composer ignores the window's hold set and releases a shown buffer at the latch that replaces it, before the window's paint, so the release check must fail.
     #[arg(long)]
     break_ignore_hold: bool,
-    /// Deliberate break (stage ui-block): the composer latches every tick whether the window took the last scene or not (atl-composer feature `break-no-backpressure`), so the held and replaced checks must fail.
+    /// Deliberate break (stage slow-display): the composer latches every tick whether the window took the last scene or not (atl-composer feature `break-no-backpressure`), so the held and replaced checks must fail.
     #[arg(long)]
     break_no_backpressure: bool,
     /// Deliberate break (stages widgets, ui-block): the composer reads every presentation sample as not vsync (atl-composer feature `break-ignore-vsync-flag`), so on a hardware-vsync host the
@@ -220,6 +221,9 @@ enum Stage {
     WebViewOverlay,
     /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask-harness/src/window/ui_block.rs; composer threading S2).
     UiBlock,
+    /// UI mode, the ui-block fixture: the proxy answers the window's frame callbacks at 1/4 of the output rate; the SurfaceView producer must be held to that slow display, none of its frames replaced
+    /// unseen (xtask-harness/src/window/slow_display.rs; display-thread S4).
+    SlowDisplay,
     /// The gtk stage on window-hwui (hardware accelerated): onDraw gets hwui's RecordingCanvas, and the frame hwui's RenderThread draws through EGL reaches the window's picture as the quadrants.
     Hwui,
     /// UI mode: a dimming dialog with surfaceInsets and a popup near the bottom over a software window; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/dialog.rs).
@@ -261,6 +265,7 @@ impl Stage {
             Stage::WebView => "webview",
             Stage::WebViewOverlay => "webview-overlay",
             Stage::UiBlock => "ui-block",
+            Stage::SlowDisplay => "slow-display",
             Stage::Hwui => "hwui",
             Stage::Dialog => "dialog",
             Stage::Gles2 => "gles2",
@@ -290,6 +295,7 @@ impl Stage {
             | Stage::Title
             | Stage::Splash => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
+            Stage::SlowDisplay => slow_display::WINDOW_MS,
             Stage::Capture => capture::CAPTURE_WINDOW_MS,
             // the webview stage's picture, then four inputs each waiting for the page's answer
             Stage::Widgets | Stage::Ime | Stage::MouseTouch | Stage::WebView => WIDGETS_WINDOW_MS,
@@ -464,6 +470,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::StartFinish
         | Stage::Move
         | Stage::UiBlock
+        | Stage::SlowDisplay
         | Stage::Suspended
         | Stage::MouseTouch => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
@@ -2087,6 +2094,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::WebView
         | Stage::WebViewOverlay
         | Stage::UiBlock
+        | Stage::SlowDisplay
         | Stage::Dialog
         | Stage::Gles2
         | Stage::Gles1
@@ -2439,6 +2447,8 @@ struct LiveOut {
     pressure: Samples,
     /// The proxy's count of the compositor's `presented` feedback (vsync-flagged, other); None: the stage ran without a proxy (no Wayland connection the harness sees).
     presented: Option<(u64, u64)>,
+    /// The proxy's frame-callback throttle (held, released); (0, 0) unless the stage throttled (slow-display).
+    throttle: (u64, u64),
 }
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
@@ -2478,6 +2488,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     });
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
+    let throttle = proxy.as_ref().map(Proxy::throttle);
     let probe = proxy.map(|p| {
         let log = run.log(package);
         let services_log = run.log("services");
@@ -2517,6 +2528,10 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
             },
             (Stage::WebViewOverlay, _, _) => webview_overlay::drive(p, &log),
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
+            // local only: the nested compositor's output is the gate output, whose rate the checks judge against too
+            (Stage::SlowDisplay, _, _) => {
+                slow_display::drive(p, &log, GATE_OUTPUT.refresh_mhz as f32 / 1000.0)
+            }
             (Stage::MouseTouch, _, _) => widgets::drive_mouse_touch(p, &log),
             (Stage::Dialog, _, _) => match &capture_probe {
                 Some(capture_probe) => dialog::drive(p, &log, capture_probe),
@@ -2603,6 +2618,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         stopped,
         pressure: sampler.stop(),
         presented: presented.map(|p| p.counts()),
+        throttle: throttle.map_or((0, 0), |t| t.counts()),
     })
 }
 
@@ -2645,6 +2661,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         stopped,
         pressure,
         presented,
+        throttle,
     } = out;
     let read = atl_diag::logfiles::read;
     let app_log = run.log(package);
@@ -2704,6 +2721,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         ),
         (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz),
+        (Stage::SlowDisplay, Some(_)) => slow_display::checks(&app, display.refresh_hz, throttle),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
@@ -2938,6 +2956,7 @@ fn fixture(stage: Stage) -> &'static str {
         Stage::WebView => webview::FIXTURE,
         Stage::WebViewOverlay => webview_overlay::FIXTURE,
         Stage::UiBlock => ui_block::FIXTURE,
+        Stage::SlowDisplay => slow_display::FIXTURE,
         Stage::Hwui => HWUI_FIXTURE,
         Stage::Dialog => dialog::FIXTURE,
         Stage::Gles2 => gles2_fixture::FIXTURE,
@@ -3287,6 +3306,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         stopped: record.stopped.then_some(status),
         pressure: record.pressure,
         presented: record.presented,
+        // remote stages do not throttle (slow-display is local)
+        throttle: (0, 0),
     };
     judge(
         &Judged {
