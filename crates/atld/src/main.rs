@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use atl_android_paths::valid_package_name;
 use atl_android_paths::{
-    DATA, DATA_APP, DATA_USER, DATA_USER_DE, PROC_CPUINFO, PRODUCT, PROPERTY_AREA,
+    DATA, DATA_APP, DATA_USER, DATA_USER_DE, KEYSTORE_DB, PROC_CPUINFO, PRODUCT, PROPERTY_AREA,
     PROPERTY_AREA_ENV, SDCARD, SHARED_STORAGE, SYSTEM, SYSTEM_EXT, SYSTEM_FONTS, SYSTEM_FRAMEWORK,
     VENDOR,
 };
@@ -307,8 +307,6 @@ const AID_SYSTEM: u32 = 1000;
 const AID_KEYSTORE: u32 = 1017;
 const AID_SHELL: u32 = 2000;
 const AID_NOBODY: u32 = 9999;
-/// Where keystore2 finds its database (keystore2.rc: `/system/bin/keystore2 /data/misc/keystore`).
-const KEYSTORE_DB: &str = "/data/misc/keystore";
 /// The run's control socket, below the root (serve_run_control).
 const CONTROL_SOCKET: &str = "control.sock";
 /// How often the run checks that the services still run while it waits for its end: a dead services process is noticed within this.

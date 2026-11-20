@@ -97,6 +97,8 @@ pub const DATA_APP: &str = "/data/app";
 pub const DATA_USER: &str = "/data/user";
 /// Device-encrypted user data (`Environment.getDataUserDeDirectory`): `<DATA_USER_DE>/<user>/<package>`.
 pub const DATA_USER_DE: &str = "/data/user_de";
+/// keystore2's database dir (keystore2.rc: `/system/bin/keystore2 /data/misc/keystore`), its argv[1].
+pub const KEYSTORE_DB: &str = "/data/misc/keystore";
 /// bionic's default property area path (`__system_properties_init` without `$ATL_PROP_AREA`): the sandbox's `/dev` is the broker's own, so the area is mounted there and no variable is needed.
 pub const PROPERTY_AREA: &str = "/dev/__properties__";
 /// The variable naming the property area file a process maps instead of `PROPERTY_AREA` (`ATL_PROP_AREA`): whoever starts the process sets it until the sandbox mounts the area there. The one definition: atl-bionic reads it, the launcher names it, atl-property-service prints it.
