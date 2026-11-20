@@ -159,7 +159,7 @@ pub fn pool_rows(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
             backing_row(&Backing {
                 file,
                 // the filesystem's own size, as btrfs_space reads it (block devices may be larger after a vhdx resize)
-                fs_size: fs.f_blocks.saturating_mul(fs.f_bsize),
+                fs_size: fs_size(&fs),
                 backed: len,
                 host_free: host.f_bavail * host.f_frsize,
                 margin_gib: cfg.disk.pool_backing_margin.value,
@@ -167,6 +167,11 @@ pub fn pool_rows(ws: &Path, cfg: &WsConfig) -> Result<Vec<(String, bool)>> {
         }
     });
     Ok(rows)
+}
+
+/// Filesystem size in bytes: POSIX `statvfs` counts `f_blocks` in `f_frsize` units, not `f_bsize` (the preferred I/O size).
+fn fs_size(vfs: &rustix::fs::StatVfs) -> u64 {
+    vfs.f_blocks.saturating_mul(vfs.f_frsize)
 }
 
 /// The pool's filesystem lives in a growing file (`[disk] pool_backing`, a dynamic vhdx) on a host drive the guest's statfs cannot see.
@@ -236,6 +241,25 @@ fn gib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 10 blocks of f_frsize 1024 = 10240 bytes; f_bsize 4096 would claim 40960.
+    #[test]
+    fn fs_size_counts_fragment_units() {
+        let vfs = rustix::fs::StatVfs {
+            f_bsize: 4096,
+            f_frsize: 1024,
+            f_blocks: 10,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_favail: 0,
+            f_fsid: 0,
+            f_flag: rustix::fs::StatVfsMountFlags::empty(),
+            f_namemax: 255,
+        };
+        assert_eq!(fs_size(&vfs), 10240);
+    }
 
     /// Same device: one disk, floors summed, holds joined; another device stays apart.
     #[test]
