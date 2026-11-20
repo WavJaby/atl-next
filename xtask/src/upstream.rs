@@ -58,18 +58,12 @@ pub const RECIPES: &[Recipe] = &[Recipe {
             "build/rust/bssl-sys/librust_wrapper.a",
         ),
     ],
-    crates: &[
-        RecipeCrate {
-            module: "libbssl_sys",
-            dir: "rust/bssl-sys",
-            bindings: true,
-        },
-        RecipeCrate {
-            module: "libbssl_crypto",
-            dir: "rust/bssl-crypto",
-            bindings: false,
-        },
-    ],
+    // only bssl-sys: AOSP's bssl-crypto (ISC, external/boringssl/src/rust) builds as-is over this bssl-sys
+    crates: &[RecipeCrate {
+        module: "libbssl_sys",
+        dir: "rust/bssl-sys",
+        bindings: true,
+    }],
     // shared: dependents link libcrypto.so / libssl.so as AOSP's device build does; tests are not ours to build
     cache: &[("BUILD_SHARED_LIBS", "ON"), ("BUILD_TESTING", "OFF")],
     shared_defines: &[("BORINGSSL_PREFIX", BORINGSSL_SYMBOL_PREFIX)],

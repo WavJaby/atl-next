@@ -132,7 +132,7 @@ reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0. Lin
 provider = "upstream:boringssl"
 reason = "AOSP's copy is OpenSSL-licensed; upstream BoringSSL is Apache-2.0"
 
-# BoringSSL's Rust bindings: upstream's own crates over its CMake RUST_BINDINGS output (bindgen wrapper + static-inline wrappers); the tree modules keep their crate names, features and deps
+# BoringSSL's Rust bindings: upstream's own bssl-sys over its CMake RUST_BINDINGS output (bindgen wrapper + static-inline wrappers); the tree module keeps its crate name, features and deps. AOSP's bssl-crypto (ISC) builds as-is over it
 ["libbssl_sys"]
 provider = "upstream:boringssl"
 reason = "AOSP's crate binds its OpenSSL-licensed headers (libbssl_sys_raw bindgen); upstream's bssl-sys binds the Apache-2.0 upstream we link"
@@ -140,10 +140,6 @@ reason = "AOSP's crate binds its OpenSSL-licensed headers (libbssl_sys_raw bindg
 ["libbssl_sys_raw_staticfns"]
 provider = "upstream:boringssl"
 reason = "bindgen's static-inline wrappers; AOSP compiles them against its OpenSSL-licensed headers, upstream's CMake (rust_wrapper) against the upstream we link"
-
-["libbssl_crypto"]
-provider = "upstream:boringssl"
-reason = "AOSP's copy is OpenSSL-licensed; upstream's bssl-crypto is Apache-2.0 and matches the upstream bssl-sys"
 
 # Rust crates whose Android code is hidden on glibc (owner decision B, 2026-11-01): built as Android userspace, see `rust_os` above
 ["librustutils"]
