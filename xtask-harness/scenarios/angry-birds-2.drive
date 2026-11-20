@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # angry-birds-2 (Google Play, Unity, arm64 only -> native bridge). Positions read at 1440x900 content.
 # Fresh root: Rovio logo -> red "2" splash -> "FIRST THINGS FIRST!" Terms of Service consent (free, no personal data) -> forced tutorial level: an animated hand shows the slingshot drag.
-# Online only: offline, a fresh root stops at "YOU ARE OFFLINE - please go online to complete the update" (Retry) over the "Starting up..." bar; the tutorial scene never loads (scenario-offline probe ab-p2).
 size 1440 900
 network online
 needs arm64
 control break-input
+unreachable offline start: a fresh root stops at "YOU ARE OFFLINE - please go online to complete the update" (Retry) over the "Starting up..." bar; the tutorial scene never loads (scenario-offline probe ab-p2)
 unreachable account panel: network content, drawn in a WebView (WebView defect 3)
 unreachable Facebook sign-in: needs credentials
 unreachable purchases: cost money
