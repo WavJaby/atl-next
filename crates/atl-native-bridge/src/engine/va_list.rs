@@ -189,19 +189,13 @@ mod tests {
         // an int then a long long: the pair skips word 1
         let pad = [3u64, j];
         // SAFETY: two 8-aligned u64: int 3 at 0, j at 8.
-        assert_eq!(
-            unsafe { jvalues32(pad.as_ptr() as usize, b"IJ") }.unwrap(),
-            [3, j]
-        );
+        let v = unsafe { jvalues32(pad.as_ptr() as usize, b"IJ") };
+        assert_eq!(v.unwrap(), [3, j]);
         // SAFETY: as above, a byte promoted to int.
-        assert_eq!(
-            unsafe { jvalues32(aligned.as_ptr() as usize, b"Z") }.unwrap(),
-            [7]
-        );
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"Z") };
+        assert_eq!(v.unwrap(), [7]);
         // SAFETY: an unknown shorty character is refused before any read.
-        assert_eq!(
-            unsafe { jvalues32(aligned.as_ptr() as usize, b"Q") },
-            Err(b'Q')
-        );
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"Q") };
+        assert_eq!(v, Err(b'Q'));
     }
 }
