@@ -23,6 +23,8 @@ struct Slot {
     host: usize,
     ty: &'static str,
     generation: u32,
+    /// a window copy of the object's read-only data (address, length), given back when the handle is freed ([`attach`])
+    window: Option<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -72,6 +74,7 @@ pub(super) fn to_guest(ty: &'static str, host: usize) -> Option<u32> {
                     host: 0,
                     ty,
                     generation: 0,
+                    window: None,
                 });
                 t.slots.len() - 1
             }
@@ -99,13 +102,36 @@ pub(super) fn to_host(h: usize) -> Option<usize> {
 /// Frees handle `h` after the call that ended its object; an unknown handle is ignored (the call was refused before).
 pub(super) fn release(h: usize) {
     let Ok(h) = u32::try_from(h) else { return };
-    with(|t| {
-        if let Some(i) = t.index(h) {
-            let host = std::mem::take(&mut t.slots[i].host);
-            t.by_host.remove(&host);
-            t.free.push(i);
-        }
+    let window = with(|t| {
+        let i = t.index(h)?;
+        let host = std::mem::take(&mut t.slots[i].host);
+        t.by_host.remove(&host);
+        t.free.push(i);
+        t.slots[i].window.take()
     });
+    if let Some((at, len)) = window {
+        super::active().release(at, len);
+    }
+}
+
+/// The window copy attached to handle `h` ([`attach`]), if any.
+pub(super) fn window(h: usize) -> Option<usize> {
+    let h = u32::try_from(h).ok()?;
+    with(|t| t.index(h).and_then(|i| t.slots[i].window).map(|(at, _)| at))
+}
+
+/// Attaches window copy `(at, len)` to live handle `h`: it lives until the handle is freed (the call ending the object, `HANDLE_RELEASES`). `false` (the window is the caller's to give back) when `h` is not live or already has one.
+pub(super) fn attach(h: usize, at: usize, len: usize) -> bool {
+    let Ok(h) = u32::try_from(h) else {
+        return false;
+    };
+    with(|t| match t.index(h) {
+        Some(i) if t.slots[i].window.is_none() => {
+            t.slots[i].window = Some((at, len));
+            true
+        }
+        _ => false,
+    })
 }
 
 /// Live handles per type, the leak counter: a type whose count only grows over a run leaks host objects (or its release is not in build.rs `HANDLE_RELEASES`).

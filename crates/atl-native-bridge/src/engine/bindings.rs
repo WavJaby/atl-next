@@ -321,6 +321,9 @@ fn shim(name: &str) -> Option<usize> {
         // ILP32 only, build.rs `ILP32_PROXY_SHIMS`: the locked buffer through a guest-addressable window copy
         "ANativeWindow_lock" => super::window::lock as *const () as usize,
         "ANativeWindow_unlockAndPost" => super::window::unlock_and_post as *const () as usize,
+        // ILP32 only: read-only host data as a window copy living with the handle
+        "AAsset_getBuffer" => super::buffers::asset_get_buffer as *const () as usize,
+        "ADisplayLutsEntry_getBuffer" => super::buffers::lut_get_buffer as *const () as usize,
         "__system_property_foreach" => super::provider::foreach as *const () as usize,
         "__system_property_read_callback" => super::provider::read_callback as *const () as usize,
         #[cfg(atl_nb_identity)]

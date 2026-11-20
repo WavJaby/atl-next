@@ -240,11 +240,13 @@ const PROXY_SHIMS: &[&str] = &[
     "eglGetProcAddress",
     "android_getaddrinfofornetwork",
 ];
-/// Proxy rows whose ILP32 host side is hand-written, bound `Entry::Shim` with the guest view's lane classes on the ILP32 table only (equal-model tables bind them as before): `android_getaddrinfofornetwork` (a [`PROXY_SHIMS`] row; engine/netdb.rs builds the list in the guest's view); `ANativeWindow_lock` / `ANativeWindow_unlockAndPost` (engine/window.rs: the locked buffer through a guest-addressable window copy; a record converter would hand the guest the host's `bits` above 4 GiB).
+/// Proxy rows whose ILP32 host side is hand-written, bound `Entry::Shim` with the guest view's lane classes on the ILP32 table only (equal-model tables bind them as before): `android_getaddrinfofornetwork` (a [`PROXY_SHIMS`] row; engine/netdb.rs builds the list in the guest's view); `ANativeWindow_lock` / `ANativeWindow_unlockAndPost` (engine/window.rs: the locked buffer through a guest-addressable window copy; a record converter would hand the guest the host's `bits` above 4 GiB); `AAsset_getBuffer` / `ADisplayLutsEntry_getBuffer` (engine/buffers.rs: read-only host data as a window copy living with the handle).
 const ILP32_PROXY_SHIMS: &[&str] = &[
     "android_getaddrinfofornetwork",
     "ANativeWindow_lock",
     "ANativeWindow_unlockAndPost",
+    "AAsset_getBuffer",
+    "ADisplayLutsEntry_getBuffer",
 ];
 /// Callback typedefs whose guest function pointer a lane-mapped row hands the host as a down shell (`Entry::Mapped`, engine/ndk.rs `call_mapped`; GS2.2 callback-param, tr-first blocker 5). Reviewed: every argument the host passes the callback is a value, the guest's own user data, or a host buffer the guest only loads from or stores to (QEMU's page table holds no host heap, so a host buffer must never reach a guest syscall or be fetched as code). A function-pointer parameter of another type traps `pending` (`atl_bridgegen::jni::route`); a name here no row uses is stale.
 /// Not here, with why: `AMediaDataSourceReadAt` (its buffer is host memory the guest writes: needs the G2 copy arena), `GLDEBUGPROC*` (its message is host memory: G2 staging).
