@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-platform-ui-api on GTK4 (M3 slice 6): the toolkit session and main loop ([`GtkUi`]), the window with its frame clock and pointer input ([`GtkWindow`]).
 //! A presented `Scene` becomes one GSK render node tree with a `GdkDmabufTexture` per buffer quad (`scene`, `dmabuf`), drawn by the window's one widget (`view`); GSK's GL or Vulkan renderer imports the dma-bufs (no CPU copy, owner decision O3).
-//! No `unsafe` here except the GLib mirror (`mirror`: the raw `g_main_context_*` calls glib-rs leaves unwrapped), the dmabuf texture builder (`dmabuf`: GDK borrows the fds) and the PCM output (`audio`: pipewire-rs's unsafe thread-loop constructor, `sched_getscheduler`).
+//! No `unsafe` here except the GLib mirror (`mirror`: the raw `g_main_context_*` calls glib-rs leaves unwrapped), the ping hold (`ping`: the exported `wl_proxy_add_listener` and GDK's saved listener), the dmabuf texture builder (`dmabuf`: GDK borrows the fds) and the PCM output (`audio`: pipewire-rs's unsafe thread-loop constructor, `sched_getscheduler`).
 //! `audio` is the PCM output on PipeWire (plan A0): [`PipeWireHost`] and [`PipeWireOutput`] implement the `atl-platform-ui-api` audio traits.
 //! Built only as the cdylib the facade loads `RTLD_LOCAL`; `module` exports every type here through the `abi` vtable, the one route in.
 #![deny(unsafe_code)]
@@ -19,6 +19,8 @@ pub(crate) mod mirror;
 mod module;
 mod outputs;
 mod paint_stats;
+#[allow(unsafe_code)]
+mod ping;
 mod presentation;
 mod scene;
 mod sideband;

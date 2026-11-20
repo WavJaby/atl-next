@@ -27,6 +27,8 @@ atl-gralloc-dmabuf = { path = "../atl-gralloc-dmabuf" }
 atl-gralloc-service = { path = "../atl-gralloc-service" }
 clap.workspace = true
 rustix.workspace = true
+# the gate example prints the module's records (the ping hold's) on stderr
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

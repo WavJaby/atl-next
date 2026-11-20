@@ -1249,6 +1249,15 @@ fn await_event(
     }
 }
 
+/// Stage `gtk`: the real launcher's module armed its ping hold (atl-platform-ui-linux ping.rs `report`; display-thread plan D3): libgtk's `wl_proxy_add_listener` bound to the module and GDK's xdg_wm_base listener was kept. Its line is logged once, at attach; not armed names its reason.
+fn ping_hold_check(app: &str) -> Result<String, String> {
+    match app.lines().find(|l| l.contains("display: ping hold")) {
+        Some(l) if l.contains("display: ping hold armed") => Ok("ping hold armed".to_owned()),
+        Some(l) => Err(l.trim().to_owned()),
+        None => Err("no ping hold line in the app log".to_owned()),
+    }
+}
+
 /// Stage `gtk` sub-gate (c): the probe's verdict. The ping is answered, no pong comes while the UI thread sleeps, and the pong follows the sleep.
 fn pong_check(liveness: &Result<Liveness, String>) -> Result<String, String> {
     let l = liveness.as_ref().map_err(Clone::clone)?;
@@ -2807,6 +2816,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 }),
             ),
             ("pong", pong_check(&liveness)),
+            ("ping-hold", ping_hold_check(&app)),
         ],
         _ => Vec::new(),
     };

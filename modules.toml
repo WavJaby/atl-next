@@ -48,10 +48,16 @@ uses = ["binder", "broker", "diag", "gralloc", "launch", "platform-host", "platf
 crates = ["atl-launch"]
 exports = ["atl-launch"]
 
-# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types); native-bridge: the executables' `sigaction` interposer, whose hook the bridge registers (atl-sigaction-hook)
+# the app process's entry: JNI invocation of the converter's ART, liblog's logger, bionic's property and target-SDK API, all resolved at run time by name in libatl_bionic.so (no link to atl-bionic: one copy of its state); the process's SurfaceFlinger (composer), started in app mode; UI mode's GTK session (platform-ui), attached before Java; the installer's output frames (services-types); native-bridge: the executables' `sigaction` interposer, whose hook the bridge registers (atl-sigaction-hook); looper: the main thread's Looper and the platform's liveness poster on it
 [launcher]
 crates = ["atl-app-launcher"]
-uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types", "native-bridge", "launch"]
+uses = ["generators", "android-paths", "composer", "gralloc", "platform-ui", "service-view", "audioflinger", "codec-store", "resource-manager", "media-player", "media-extractors", "services-types", "native-bridge", "launch", "looper"]
+
+# libandroid's ALooper API for the process's own code and the one `post` executor over it (display-thread plan D2): closures from any thread run on one Looper's thread inside its poll; the launcher's main Looper now, the WebView's Looper next (display-thread S2)
+[looper]
+crates = ["atl-looper"]
+exports = ["atl-looper"]
+uses = ["generators"]
 
 # the process's own view of servicemanager: names the app process serves itself (its SurfaceFlinger, the Codec2 store, the media resource manager, the media extractor service, media.player) answered in-process, the rest forwarded; libbinder reached through cxx adapters (wrap/view.cpp)
 [service-view]

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-looper"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# libandroid's ALooper API (NDK looper.h) for the process's own code, and the one `post` executor over it (display-thread plan D2): closures from any thread run on one Looper's thread inside its poll.
+# Users: the launcher (the main thread's Looper, UI mode's liveness token) and the WebView JNI library (display-thread S2). libandroid is dlopened RTLD_LOCAL and resolved by name: it is the converter's output, not an input of a cargo build. build.rs generates the fn types and constants from looper.h with atl-bridgegen.
+
+[dependencies]
+libc.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+atl-bridgegen = { path = "../atl-bridgegen" }
+
+[lints]
+workspace = true

@@ -53,6 +53,8 @@ atl-media-player = { path = "../atl-media-player" }
 atl-media-extractors = { path = "../atl-media-extractors" }
 # UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
 atl-platform-ui = { path = "../atl-platform-ui" }
+# UI mode: the main thread's Looper (libandroid) and its post executor, the platform's liveness poster (looper.rs)
+atl-looper = { path = "../atl-looper" }
 # the app's desktop identity `atl.<package>` its audio stream carries (lib.rs serve_media_services), the one its window and desktop file carry
 atl-launch = { path = "../atl-launch" }
 # the run's gralloc node (property) -> its device number, what the UI's presented buffers must carry (lib.rs start_ui)

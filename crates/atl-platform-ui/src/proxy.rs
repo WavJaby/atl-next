@@ -7,7 +7,7 @@ use std::path::Path;
 
 use atl_platform_ui_api::abi::{
     self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
-    PaintedView, PcmHandle, QuadView, RequesterHandle, SceneView, SendCallback, Str,
+    PaintedView, PcmHandle, PosterAbi, QuadView, RequesterHandle, SceneView, SendCallback, Str,
     StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
     WindowAttributesView, WindowHandle,
 };
@@ -16,9 +16,9 @@ use atl_platform_ui_api::audio::{
 };
 use atl_platform_ui_api::{
     Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester,
-    FrameTick, InputEvent, InputSource, Looper, Monitor, Painted, PhysRect, PhysSize, PresentError,
-    PresentTiming, Scale, Scene, Surrounding, TextInput, TextInputEvent, Ui, UiError, UiInvoker,
-    Window, WindowAttributes,
+    FrameTick, InputEvent, InputSource, Looper, LooperPoster, Monitor, Painted, PhysRect, PhysSize,
+    PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput, TextInputEvent, Ui, UiError,
+    UiInvoker, Window, WindowAttributes,
 };
 
 use crate::module::module;
@@ -34,14 +34,16 @@ impl Ui for PlatformUi {
 
     fn attach(
         looper: Box<dyn Looper>,
+        liveness: Box<dyn LooperPoster>,
         buffer_device: Option<DeviceNumber>,
     ) -> Result<Self, UiError> {
         let vt = module().map_err(UiError::Unavailable)?;
         let mut h = std::ptr::null_mut();
-        // SAFETY: the vtable's contract: an owned Looper, an out-parameter and an error sink for this call.
+        // SAFETY: the vtable's contract: an owned Looper and poster, an out-parameter and an error sink for this call.
         let (status, err) = BytesOut::collect(|err| unsafe {
             (vt.ui_attach)(
                 LooperAbi::new(looper),
+                PosterAbi::new(liveness),
                 buffer_device.map_or(0, |d| d.0),
                 buffer_device.is_some(),
                 &mut h,

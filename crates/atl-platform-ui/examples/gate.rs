@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The client of `xtask test platform-ui` (M3 slice 6): a window through the `atl-platform-ui` facade, driven only by its frame clock and its Looper's poll, as the launcher's UI thread drives it. [`TestLooper`] is this program's Looper: the platform's `Looper` seam, polled by [`TestLooper::poll`].
+//! Two threads (display-thread plan D3): the toolkit stays on the main thread with its `TestLooper`; [`AppThread`] is the app's UI thread, a second thread with its own `TestLooper` that drains the liveness poster ([`TestPoster`]), so the ping hold is seen apart from the toolkit's loop. The launcher's poster targets the main Looper, the toolkit's own thread today.
+//! The module's log records go to stderr (`display: ping hold armed`, the `pings_held` / `pings_answered` counts), where the harness reads them.
 //! The harness reads this program's stdout (one `KEY value...` line per event) and the raw RGBA captures it writes to `--out`; it checks them against its own implementation of the pattern below, not against this program.
 //!
 //! Phases, in order:
@@ -10,15 +12,16 @@
 //!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
 //! 3. refusals + release: a handle whose pitch is shorter than a row and one with a fourcc the table does not have are refused (never a CPU fallback); a scene that replaces the frame buffer releases it at the next paint, with a read fence (`RELEASES`).
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
-//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the UI thread that long (the harness's ping probe); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
+//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the app's UI thread ([`AppThread`]) that long, printing `BLOCKING` when it starts (the harness's ping probe; the toolkit thread keeps running); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,9 +34,9 @@ use atl_gralloc_dmabuf::{Mapping, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::Backend;
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
-    ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, PhysRect, PhysSize, PlatformUi,
-    PlatformWindow, PresentError, PresentTiming, Surrounding, TextInput, TextInputEvent, Ui,
-    UiError, Window, WindowAttributes,
+    ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, LooperPoster, PhysRect, PhysSize,
+    PlatformUi, PlatformWindow, PresentError, PresentTiming, Surrounding, TextInput,
+    TextInputEvent, Ui, UiError, Window, WindowAttributes,
 };
 
 /// What `ime-focus` declares the field to be; the harness checks the input method sees it (as text-input v3 `content_type`).
@@ -462,6 +465,94 @@ fn events_of(revents: PollFlags) -> FdEvents {
     }
 }
 
+/// One posted closure.
+type Posted = Box<dyn FnOnce() + Send>;
+
+/// The app thread's post queue: a FIFO and an eventfd its [`TestLooper`] watches (the shape of atl-looper's `Poster` over a `poll(2)` loop).
+struct PostQueue {
+    tasks: Mutex<VecDeque<Posted>>,
+    wake: OwnedFd,
+}
+
+impl PostQueue {
+    /// Runs every closure queued so far, in post order (on the app thread, inside its poll).
+    fn drain(&self) {
+        let mut counter = [0u8; 8];
+        let _ = read(&self.wake, &mut counter);
+        loop {
+            let task = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front();
+            match task {
+                Some(task) => task(),
+                None => break,
+            }
+        }
+    }
+}
+
+/// The liveness poster the toolkit gets: posts to [`AppThread`]'s Looper.
+#[derive(Clone)]
+struct TestPoster(Arc<PostQueue>);
+
+impl LooperPoster for TestPoster {
+    fn post(&self, f: Box<dyn FnOnce() + Send>) {
+        self.0
+            .tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(f);
+        let _ = write(&self.0.wake, &1u64.to_ne_bytes());
+    }
+}
+
+/// The app's UI thread: its own [`TestLooper`], polled until [`stop`](AppThread::stop), running what is posted to it.
+struct AppThread {
+    poster: TestPoster,
+    quit: Arc<AtomicBool>,
+    handle: thread::JoinHandle<Result<()>>,
+}
+
+impl AppThread {
+    fn spawn() -> Result<Self> {
+        let queue = Arc::new(PostQueue {
+            tasks: Mutex::new(VecDeque::new()),
+            wake: eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?,
+        });
+        let quit = Arc::new(AtomicBool::new(false));
+        let (q, stop) = (Arc::clone(&queue), Arc::clone(&quit));
+        let handle =
+            thread::Builder::new()
+                .name("app-ui".to_owned())
+                .spawn(move || -> Result<()> {
+                    let looper = TestLooper::default();
+                    let drain = Arc::clone(&q);
+                    let _watch = looper.watch(q.wake.as_fd(), move || drain.drain());
+                    while !stop.load(Ordering::Relaxed) {
+                        looper.poll(PASS)?;
+                    }
+                    Ok(())
+                })?;
+        Ok(AppThread {
+            poster: TestPoster(queue),
+            quit,
+            handle,
+        })
+    }
+
+    /// Ends the thread after what was posted before this call has run.
+    fn stop(self) -> Result<()> {
+        let quit = Arc::clone(&self.quit);
+        self.poster
+            .post(Box::new(move || quit.store(true, Ordering::Relaxed)));
+        self.handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("app thread panicked"))?
+    }
+}
+
 /// Polls `looper` until `done` is true or `deadline` passes.
 fn spin(looper: &TestLooper, deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
     while !done() {
@@ -473,11 +564,22 @@ fn spin(looper: &TestLooper, deadline: Instant, what: &str, done: impl Fn() -> b
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // the module's records (the ping hold's line and counts) on stderr, which the harness keeps in a file
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+        .init();
     std::fs::create_dir_all(&args.out)?;
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
     let looper = TestLooper::default();
+    let app = AppThread::spawn()?;
     // the window imports what this gate's own GBM backend allocates
-    let ui = PlatformUi::attach(Box::new(looper.clone()), Some(backend()?.device()))?;
+    let ui = PlatformUi::attach(
+        Box::new(looper.clone()),
+        Box::new(app.poster.clone()),
+        Some(backend()?.device()),
+    )?;
     let window = Rc::new(PlatformWindow::create(
         &ui,
         &WindowAttributes {
@@ -734,6 +836,7 @@ fn main() -> Result<()> {
     let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
     let _stdin_watch = {
         let (quit, pending, window) = (Rc::clone(&quit), Rc::clone(&pending), Rc::clone(&window));
+        let app_poster = app.poster.clone();
         looper.watch(rustix::stdio::stdin(), move || {
             let mut chunk = [0u8; 256];
             let n = read(rustix::stdio::stdin(), &mut chunk).unwrap_or(0);
@@ -749,9 +852,12 @@ fn main() -> Result<()> {
                 match line.split_whitespace().collect::<Vec<_>>().as_slice() {
                     ["block", ms] => {
                         let ms: u64 = ms.parse().unwrap_or(0);
-                        emit(format_args!("BLOCKING {ms}"));
-                        thread::sleep(Duration::from_millis(ms));
-                        emit(format_args!("UNBLOCKED"));
+                        // the app's UI thread only: the toolkit thread keeps running
+                        app_poster.post(Box::new(move || {
+                            emit(format_args!("BLOCKING {ms}"));
+                            thread::sleep(Duration::from_millis(ms));
+                            emit(format_args!("UNBLOCKED"));
+                        }));
                     }
                     ["ime-focus", text, cursor] => {
                         let cursor_byte = cursor.parse().unwrap_or(0);
@@ -776,6 +882,7 @@ fn main() -> Result<()> {
     while !quit.get() {
         looper.poll(PASS)?;
     }
+    app.stop()?;
     // `xtask test platform-ui` checks these: the monitor's rate (0 = none reported), then every presentation sample in order, with the monotonic time its report arrived
     emit(format_args!(
         "MONITOR refresh_hz={}",

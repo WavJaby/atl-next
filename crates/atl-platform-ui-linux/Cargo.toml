@@ -8,13 +8,17 @@ license.workspace = true
 publish.workspace = true
 
 # The Linux implementation of atl-platform-ui-api on GTK4 (M3 slice 6): the only crate allowed to depend on GTK (deny.toml `wrappers`), and with the `cfg(target_os)` that selects it living in the facade.
-# One thread: GLib's default main context is mirrored into the Android Looper of the thread that attached (`mirror.rs`; the Looper polls it), so a blocked UI thread answers no `xdg_wm_base.ping`.
-# `unsafe` only in `mirror` (raw g_main_context calls), `dmabuf` (GDK borrows the dmabuf texture's fds: gtk4-rs marks the builder unsafe) and `audio` (PipeWire: the thread-loop constructor pipewire-rs marks unsafe, `sched_getscheduler`); the read-fence ioctl is atl-gralloc-dmabuf's.
+# One thread: GLib's default main context is mirrored into the Android Looper of the thread that attached (`mirror.rs`; the Looper polls it). A blocked main thread answers no `xdg_wm_base.ping`: GDK's ping is held until the main Looper ran a liveness token (`ping.rs`, which exports libwayland-client's `wl_proxy_add_listener` so libgtk's call binds here).
+# `unsafe` only in `mirror` (raw g_main_context calls), `ping` (the exported listener registration, GDK's saved listener), `dmabuf` (GDK borrows the dmabuf texture's fds: gtk4-rs marks the builder unsafe) and `audio` (PipeWire: the thread-loop constructor pipewire-rs marks unsafe, `sched_getscheduler`); the read-fence ioctl is atl-gralloc-dmabuf's.
 # PipeWire (plan A0, `audio`): the PCM output's safe bindings, the only crate allowed to depend on them (deny.toml `wrappers`).
 # Only a cdylib, `libatl_platform_ui_linux.so` (launcher-ui-module plan S2/M3, `module`): the atl-platform-ui facade loads it with dlopen(RTLD_NOW | RTLD_LOCAL) and calls it through atl-platform-ui-api's `abi` vtable, so GTK, GLib, PipeWire and their closure stay out of the process's global symbol scope. No rlib: no crate links it, so there is no second (static) route to GTK. atl-platform-ui-api's `abi::set_log` forwards the module's own `tracing` copy to the process's log sink.
 
 [lib]
 crate-type = ["cdylib"]
+
+# Deliberate breaks, enabled only on the harness's command line (env-reads check): `break-ping-hold` registers GDK's xdg_wm_base listener unwrapped, so GDK pongs at once (`xtask test platform-ui --break-ping-hold`: gate 4's blocked check must fail).
+[features]
+break-ping-hold = []
 
 [dependencies]
 atl-compositor = { path = "../atl-compositor" }

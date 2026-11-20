@@ -87,9 +87,12 @@ pub trait Ui: Sized {
     type Invoker: UiInvoker;
 
     /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
+    /// `looper` is the temporary seam display-thread S5 deletes, when the toolkit gets its own thread and loop.
+    /// `liveness`: the app's main Looper, where the toolkit posts its liveness token: a compositor ping is answered only after that Looper ran the token (display-thread plan D3), so a blocked main thread answers none and the desktop shows its own "not responding" dialog.
     /// `buffer_device`: the run's gralloc node (st_rdev); every presented buffer must have been allocated there, others are refused by name. None (no gralloc in this process): every buffer is refused.
     fn attach(
         looper: Box<dyn Looper>,
+        liveness: Box<dyn LooperPoster>,
         buffer_device: Option<DeviceNumber>,
     ) -> Result<Self, UiError>;
 
@@ -163,6 +166,12 @@ pub trait Looper {
 
     /// Unregisters `fd`. The Looper may still report it once from the batch it is polling: the sink must ignore an fd it no longer waits on.
     fn remove_fd(&self, fd: RawFd) -> Result<(), UiError>;
+}
+
+/// Runs closures on one Looper's thread, posted from any thread: the toolkit -> Looper form of the display seam (display-thread plan D2 `post`). The process implements it over its Looper (atl-looper `Poster`); the toolkit only posts.
+pub trait LooperPoster: Send + Sync {
+    /// Queues `f` to run on the Looper's thread inside its poll, after every earlier post. Once that Looper's thread has ended, `f` is dropped unrun (the implementation counts it).
+    fn post(&self, f: Box<dyn FnOnce() + Send>);
 }
 
 /// Readiness of a registered fd: `input` and `output` are what the registration asks for; `error` and `hangup` are reported on every poll.

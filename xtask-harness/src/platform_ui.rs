@@ -5,8 +5,9 @@
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
-//! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the UI thread is blocked (`block`) for the ping timeout plus a margin: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
-//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (one UI thread, no GTK thread, answers pings only from its Looper poll); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
+//! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the app's UI thread is blocked (`block`) for the ping timeout plus a margin while the toolkit keeps running on its own thread: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
+//!    The ping hold (display-thread plan D3) makes that so: after the client exits, its module log must hold `display: ping hold armed`, `pings_held` at least the probe's pings and `pings_answered` equal to it. `--break-ping-hold` builds the module with its listener unwrapped: GDK pongs at once, so the blocked check and the hold checks fail.
+//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (the toolkit on one thread answers pings only after the app thread's Looper ran a token); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //! 5. **text input**: a fake input method (`nested_wayland::Ime`, input-method v2 on labwc's seat) is bound, then the client focuses its window's `TextInput` with a content type and surrounding text. Checks: the IME is activated; it receives the content type and surrounding text as text-input v3 numbers them; its preedit, commit and delete_surrounding_text (protocol units: UTF-8 bytes) reach the client as `TextInputEvent`s (GTK units: chars). Expected values are worked out from the encodings in the constants below. `--break-ime-commit` skips the commit_string, so the commit check must fail.
 //!    Evidence tier: isolated runtime, real compositor relay (wlroots) and GTK's own Wayland IM module; a desktop IME (fcitx5) and the candidate popup at the cursor rect stay laptop checks.
 //!
@@ -58,6 +59,9 @@ pub struct Args {
     /// The fake input method skips its commit_string (deliberate break): the ime commit check must fail.
     #[arg(long)]
     break_ime_commit: bool,
+    /// The platform module built with `break-ping-hold` (GDK's ping listener registered unwrapped, deliberate break): GDK pongs at once, so gate 4's blocked check and the hold checks must fail.
+    #[arg(long)]
+    break_ping_hold: bool,
 }
 
 /// The ime gate's texts: multi-byte UTF-8, so a byte/char mix-up shows. Surrounding "xかy" with the cursor after か: x is 1 byte, か 3 (U+304B, UTF-8 E3 81 8B), so the cursor is at byte 4.
@@ -395,6 +399,11 @@ pub struct Built {
 
 /// Builds atl-platform-ui's `example` with the platform module (atl-platform-ui-linux's cdylib).
 pub fn build_client(root: &Path, example: &str) -> Result<Built> {
+    build_client_with(root, example, &[])
+}
+
+/// [`build_client`] with cargo `features` on (a gate's deliberate breaks, `atl-platform-ui-linux/break-<name>`). The next plain build rebuilds the module without them (another unit hash), so a faulted module never outlives its run.
+fn build_client_with(root: &Path, example: &str, features: &[&str]) -> Result<Built> {
     let mut cmd = crate::cargo_command();
     cmd.current_dir(root).args([
         "build",
@@ -407,6 +416,9 @@ pub fn build_client(root: &Path, example: &str) -> Result<Built> {
         "atl-platform-ui-linux",
         "--lib",
     ]);
+    if !features.is_empty() {
+        cmd.args(["--features", &features.join(",")]);
+    }
     let run = unit_use::run(&mut cmd, Units::Recorded, Echo::Both)?;
     ensure!(
         run.status.success(),
@@ -468,13 +480,30 @@ impl Report {
     }
 }
 
+/// The module's line when its ping hold is armed (atl-platform-ui-linux ping.rs `report`).
+const HOLD_ARMED: &str = "display: ping hold armed";
+
+/// The last value the module logged for counter `key` (`atl-platform-ui: count <key> <n>`, count.rs).
+fn last_count(log: &str, key: &str) -> Option<u64> {
+    let marker = format!("atl-platform-ui: count {key} ");
+    log.lines()
+        .rev()
+        .find_map(|l| l.split_once(&marker).map(|(_, n)| n.trim().parse().ok()))
+        .flatten()
+}
+
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
-    let built = build_client(root, "gate")?;
+    let breaks: &[&str] = if args.break_ping_hold {
+        &["atl-platform-ui-linux/break-ping-hold"]
+    } else {
+        &[]
+    };
+    let built = build_client_with(root, "gate", breaks)?;
     let out_dir = match &args.keep {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
@@ -847,6 +876,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }),
     );
     let s3 = next_serial();
+    // every serial handed out above was injected once
+    let probe_pings = serial - PROBE_SERIAL_BASE;
     let sent = probe.ping(s3)?;
     let again = probe.pong(s3, sent + RESPONSIVE_LIMIT);
     report.check(
@@ -962,6 +993,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "client exited cleanly",
         &format!("{status}"),
     );
+    // the ping hold (display-thread plan D3), from the module's records on the client's stderr, complete now that it exited: armed at attach, every probe ping held (each reached GDK's xdg_wm_base, so each passed the hold), and nothing left held at exit
+    let module_log = std::fs::read_to_string(&stderr_file).unwrap_or_default();
+    report.check(
+        module_log.contains(HOLD_ARMED),
+        "the ping hold armed at attach (the module's wl_proxy_add_listener saw GDK's xdg_wm_base listener)",
+        module_log
+            .lines()
+            .find(|l| l.contains("display: ping hold"))
+            .unwrap_or("no ping hold line"),
+    );
+    let held = last_count(&module_log, "pings_held");
+    let answered = last_count(&module_log, "pings_answered");
+    report.check(
+        held.is_some_and(|n| n >= u64::from(probe_pings)) && answered == held,
+        "every probe ping was held, and every held ping answered by exit",
+        &format!("pings_held {held:?} (probe pings {probe_pings}), pings_answered {answered:?}"),
+    );
     if args.keep.is_none() {
         let _ = std::fs::remove_dir_all(&out_dir);
     }
@@ -1038,5 +1086,17 @@ mod tests {
     fn field_lookup() {
         assert_eq!(field("FRAME 3 time_ns=77 a", "time_ns"), Some("77"));
         assert_eq!(field("FRAME 3", "time_ns"), None);
+    }
+
+    /// The last logged value wins (the module logs each hit), other keys and prefixes of the key are ignored.
+    #[test]
+    fn last_count_takes_the_final_value() {
+        let log = "x INFO atl_platform_ui_linux: atl-platform-ui: count pings_held 1\n\
+                   x INFO atl_platform_ui_linux: atl-platform-ui: count pings_held_extra 9\n\
+                   x INFO atl_platform_ui_linux: atl-platform-ui: count pings_answered 1\n\
+                   x INFO atl_platform_ui_linux: atl-platform-ui: count pings_held 2\n";
+        assert_eq!(last_count(log, "pings_held"), Some(2));
+        assert_eq!(last_count(log, "pings_answered"), Some(1));
+        assert_eq!(last_count(log, "pings_lost"), None);
     }
 }

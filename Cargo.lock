@@ -122,6 +122,7 @@ dependencies = [
  "atl-composer",
  "atl-gralloc",
  "atl-launch",
+ "atl-looper",
  "atl-media-extractors",
  "atl-media-player",
  "atl-platform-ui",
@@ -477,6 +478,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-looper"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-bridgegen",
+ "libc",
+ "rustix",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "atl-media-extractors"
 version = "0.0.0"
 dependencies = [
@@ -577,6 +590,7 @@ dependencies = [
  "libc",
  "rustix",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

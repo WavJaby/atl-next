@@ -83,9 +83,6 @@ mod generated {
     pub mod binder_process {
         include!(concat!(env!("OUT_DIR"), "/binder_process.rs"));
     }
-    pub mod looper {
-        include!(concat!(env!("OUT_DIR"), "/looper.rs"));
-    }
 }
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -240,20 +237,24 @@ fn serve_media_services(_launch: &args::Launch) -> Result<()> {
 }
 
 /// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
-/// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper and a blocked one answers no ping.
+/// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper. The liveness poster targets the same Looper: the toolkit answers a compositor ping only after a main Looper pass (display-thread plan D3), so a blocked main thread answers none.
 /// `gralloc_node`: the run's node (`ro.atl.gpu.render_node`), whose device number every presented buffer must carry; unset: no gralloc, the window refuses every buffer.
 /// Returns the Looper too, which step 1d polls before Java exists.
 #[cfg_attr(not(feature = "converter"), allow(dead_code))]
-fn start_ui(gralloc_node: Option<String>) -> Result<(atl_platform_ui::PlatformUi, ffi::Looper)> {
+fn start_ui(
+    gralloc_node: Option<String>,
+) -> Result<(atl_platform_ui::PlatformUi, atl_looper::Looper)> {
     let device = gralloc_node
         .map(|n| {
             atl_gralloc::node::device_number(std::path::Path::new(&n))
                 .with_context(|| format!("gralloc node {n}"))
         })
         .transpose()?;
-    let thread_looper = ffi::LooperApi::load()?.prepare_looper()?;
+    let thread_looper = atl_looper::LooperApi::load()?.prepare_looper()?;
+    let liveness = atl_looper::Poster::attach(&thread_looper)?;
     let ui = atl_platform_ui::PlatformUi::attach(
         Box::new(looper::AndroidLooper::new(thread_looper)),
+        Box::new(looper::MainPoster(liveness)),
         device,
     )
     .map_err(|e| anyhow!("{e}"))?;

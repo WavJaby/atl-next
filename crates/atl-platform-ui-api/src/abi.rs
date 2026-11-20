@@ -2,7 +2,7 @@
 //! The C ABI between a process and the platform module it loads with `dlopen(RTLD_NOW | RTLD_LOCAL)` (launcher-ui-module plan S2, slices M1 + M3): the module's toolkit and host libraries (GTK, GLib, PipeWire and their closure) stay out of the process's global symbol scope, so an app `.so` that needs `libvulkan.so` or `libz.so` binds AOSP's copy, not the host's.
 //! Shape: the module exports one symbol, [`ENTRY_SYMBOL`] (an [`Entry`]), which returns its static [`UiVtable`]: one `extern "C"` fn per trait method of this crate over opaque handles. The facade (`atl-platform-ui`) wraps the vtable in proxies implementing the traits; the module wraps its implementation in the exports. Both sides compile these definitions, so no layout is copied by hand.
 //! Identity, not versioning: [`UiVtable::abi`] is [`ABI_ID`], a hash of this crate's sources, atl-platform-types' and the rustc version (build.rs). The loader reads it before any other field and refuses a module of another build by name.
-//! Ownership: a callback ([`Callback`], [`FillCallback`], [`Task`], [`LooperAbi`]) is made by `new` on the side whose closure it carries, and its `drop` runs that side's code: nothing is freed by the other artifact's std. Views ([`Str`], [`SceneView`], [`PaintedView`], ...) borrow for one call; the fences of a [`PaintedView`] pass to the receiver.
+//! Ownership: a callback ([`Callback`], [`FillCallback`], [`Task`], [`LooperAbi`], [`PosterAbi`]) is made by `new` on the side whose closure it carries, and its `drop` runs that side's code: nothing is freed by the other artifact's std. Views ([`Str`], [`SceneView`], [`PaintedView`], ...) borrow for one call; the fences of a [`PaintedView`] pass to the receiver.
 //! No unwind crosses: an `extern "C"` fn aborts on panic. Strings cross as views because `String`'s layout is Rust's, unspecified between two artifacts.
 
 use std::borrow::Cow;
@@ -17,8 +17,8 @@ use atl_libgui_parcel::state::FloatRect;
 use crate::audio::AudioError;
 use crate::webview::{CookiePolicy, WebSetting};
 use crate::{
-    FdEvents, Looper, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent,
-    UiError,
+    FdEvents, Looper, LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale,
+    TextInputEvent, UiError,
 };
 
 /// The module's file name, found by the dynamic loader's search path (the runtime library dir the process's `LD_LIBRARY_PATH` names, as for the GL driver).
@@ -519,6 +519,52 @@ fn looper_result(rc: c_int, msg: Vec<u8>) -> Result<(), UiError> {
 }
 
 impl Drop for LooperAbi {
+    fn drop(&mut self) {
+        // SAFETY: paired by `new`; Drop runs once.
+        unsafe { (self.drop)(self.data) }
+    }
+}
+
+/// The process's [`LooperPoster`] as the module holds it: owned by the module from `ui_attach` on; callable from any thread (the toolkit's).
+#[repr(C)]
+pub struct PosterAbi {
+    data: *mut c_void,
+    post: unsafe extern "C" fn(*mut c_void, Task),
+    drop: unsafe extern "C" fn(*mut c_void),
+}
+
+// SAFETY: `new` takes only a Send + Sync poster, and `post` is callable from any thread.
+unsafe impl Send for PosterAbi {}
+// SAFETY: as Send.
+unsafe impl Sync for PosterAbi {}
+
+type BoxPoster = Box<dyn LooperPoster>;
+
+unsafe extern "C" fn poster_post(data: *mut c_void, task: Task) {
+    // SAFETY: `data` is the Box<BoxPoster> `PosterAbi::new` leaked, alive until `drop`; the poster is Sync.
+    let poster = unsafe { &*data.cast::<BoxPoster>() };
+    poster.post(Box::new(move || task.run()));
+}
+
+impl PosterAbi {
+    /// Carries `poster` (the process side).
+    pub fn new(poster: Box<dyn LooperPoster>) -> Self {
+        Self {
+            data: Box::into_raw(Box::new(poster)).cast(),
+            post: poster_post,
+            drop: drop_box::<BoxPoster>,
+        }
+    }
+}
+
+impl LooperPoster for PosterAbi {
+    fn post(&self, f: Box<dyn FnOnce() + Send>) {
+        // SAFETY: paired by `new`; the task's ownership passes to the process's poster, which runs or drops it with this side's code.
+        unsafe { (self.post)(self.data, Task::new(f)) }
+    }
+}
+
+impl Drop for PosterAbi {
     fn drop(&mut self) {
         // SAFETY: paired by `new`; Drop runs once.
         unsafe { (self.drop)(self.data) }
@@ -1050,6 +1096,7 @@ pub struct UiVtable {
     /// `Ui::attach`; `device` counts when `has_device`.
     pub ui_attach: unsafe extern "C" fn(
         looper: LooperAbi,
+        liveness: PosterAbi,
         device: u32,
         has_device: bool,
         out: *mut *mut UiHandle,

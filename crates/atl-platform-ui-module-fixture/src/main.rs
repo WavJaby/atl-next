@@ -20,8 +20,8 @@ use atl_compositor::scene::{Content, Quad};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::audio::AudioHost;
 use atl_platform_ui::{
-    FdEvents, FrameClock, Looper, PhysSize, PlatformAudioHost, PlatformUi, PlatformWindow, Scene,
-    Ui, UiError, Window, WindowAttributes, abi,
+    FdEvents, FrameClock, Looper, LooperPoster, PhysSize, PlatformAudioHost, PlatformUi,
+    PlatformWindow, Scene, Ui, UiError, Window, WindowAttributes, abi,
 };
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -84,6 +84,15 @@ struct LoopState {
 /// This thread's Looper: registered fds polled by [`PollLooper::poll_once`], readiness handed to the sink.
 #[derive(Clone, Default)]
 struct PollLooper(Rc<RefCell<LoopState>>);
+
+/// The liveness poster: runs each post at once. This program has no app thread apart from the toolkit's, so a ping is answered as soon as it arrives; what it gates is module loading, not liveness (`xtask test platform-ui` gate 4 is that).
+struct InlinePoster;
+
+impl LooperPoster for InlinePoster {
+    fn post(&self, f: Box<dyn FnOnce() + Send>) {
+        f();
+    }
+}
 
 impl Looper for PollLooper {
     fn set_sink(&self, sink: Sink) {
@@ -296,7 +305,7 @@ fn main() -> Result<()> {
     }
     let looper = PollLooper::default();
     let mut session = None;
-    match PlatformUi::attach(Box::new(looper.clone()), None) {
+    match PlatformUi::attach(Box::new(looper.clone()), Box::new(InlinePoster), None) {
         Ok(ui) => {
             let (window, painted) =
                 paint_window(&ui, &looper, Duration::from_millis(args.timeout_ms))?;

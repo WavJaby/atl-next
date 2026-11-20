@@ -93,6 +93,12 @@ symbols = ["sigaction", "signal", "bsd_signal", "sigset", "sysv_signal"]
 reason = "intended: the executable's sigaction interposer (atl-sigaction-hook) must bind every library's call so the native bridge wraps each new kernel action; forwards to libsigchain"
 
 [[reverse]]
+to = "libatl_platform_ui_linux.so"
+max_bindings = 1
+symbols = ["wl_proxy_add_listener"]
+reason = "intended: the platform module's ping hold (atl-platform-ui-linux ping.rs) exports libwayland-client's wl_proxy_add_listener; libgtk's call must bind it so GDK's xdg_wm_base ping waits for the main Looper's liveness token (display-thread plan D3). This row occurring is the proof the interposer binds in the real process"
+
+[[reverse]]
 to = "libz.so"
 max_bindings = 116
 reason = "global through libsigchain's android variant (libunwindstack NEEDs it): host zlib users (png16, freetype, glib) resolve inflate / deflate to AOSP zlib; X3 removes it"
