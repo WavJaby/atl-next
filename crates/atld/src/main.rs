@@ -293,7 +293,7 @@ struct Args {
     /// C4 `prop_diag.summary_rows`: rows of the `atld: prop-summary` block (the full list stays in each process's log).
     #[arg(long, default_value_t = PROP_SUMMARY_ROWS)]
     prop_diag_summary_rows: usize,
-    /// App log capture (atld applog, journald's `RateLimitIntervalSec=`): the window, ms, of `--log-rate-burst`.
+    /// App log capture (atld applog, journald's `RateLimitIntervalSec=`; also each liblog daemon's logdw log: keystore2, the KeyMint HAL): the window, ms, of `--log-rate-burst`.
     #[arg(long, default_value_t = applog::RATE_INTERVAL_MS_DEFAULT)]
     log_rate_interval_ms: u64,
     /// App log capture (journald's `RateLimitBurst=`): lines an app process may log per window; the rest is dropped and counted. 0: no rate limit.
@@ -440,18 +440,64 @@ fn kernel_log_to_log(spawn: &mut Spawn, log: &Path) -> Result<()> {
 
 /// The logd write socket of a daemon that logs through liblog (keystore2, the KeyMint HAL: android_logger): on Android logd listens at /dev/socket/logdw; here atld binds one per daemon at `sock`
 /// (atl-services-types `serve_logdw`, the app launcher's receiver), bound at that path in the daemon's sandbox, and appends each record to `log` as a logcat line. Environment only, no daemon change.
-fn logdw_to_log(spawn: &mut Spawn, sock: &Path, log: &Path) -> Result<()> {
-    let out = OpenOptions::new().append(true).open(log)?;
+/// Written through the app log's bound ([`bounded_copier`]: rate window, byte budget, drops counted), as an app can make these daemons log at will (keystore2 logs every error it answers but
+/// KEY_NOT_FOUND, error.rs `into_logged_binder`). The copier runs as long as atld: the socket never closes.
+fn logdw_to_log(
+    mounts: &mut Vec<Mount>,
+    sock: &Path,
+    name: &str,
+    log: &Path,
+    limits: applog::Limits,
+) -> Result<()> {
+    let (out, _copier) = bounded_copier(name, log, limits)?;
     atl_services_types::logcat::serve_logdw(sock, move |line| {
         let _ = (&out).write_all(line.as_bytes());
     })?;
-    spawn.mounts.push(Mount {
+    mounts.push(Mount {
         host: sock.to_owned(),
         at: atl_services_types::logcat::LOGDW.into(),
         // connect(2) on a socket file needs write access to it
         writable: true,
     });
     Ok(())
+}
+
+/// A pipe whose read end a thread copies into `log` + its tail ring (appended) under `limits` ([`applog`]); a drop also gives one atld line, `log <name>: suppressed ...`, when the pipe ends.
+fn bounded_copier(
+    name: &str,
+    path: &Path,
+    limits: applog::Limits,
+) -> Result<(std::io::PipeWriter, std::thread::JoinHandle<()>)> {
+    let (reader, writer) = std::io::pipe().context("log pipe")?;
+    let mut out = applog::Files::open(path)?;
+    let name = name.to_owned();
+    let copier = std::thread::Builder::new()
+        .name("app-log".into())
+        .spawn(move || {
+            match applog::copy_bounded(BufReader::new(reader), &mut out, limits, Instant::now) {
+                Ok(d) if d.lines > 0 => log(format_args!(
+                    "log {name}: suppressed {} lines ({} bytes)",
+                    d.lines, d.bytes
+                )),
+                Ok(_) => {}
+                Err(e) => log(format_args!("log {name}: {e}")),
+            }
+        })
+        .context("log copier thread")?;
+    Ok((writer, copier))
+}
+
+/// The log bounds of `--log-rate-*` / `--log-max-bytes` ([`applog::Limits`]).
+fn log_limits(a: &Args) -> applog::Limits {
+    applog::Limits {
+        rate: (a.log_rate_burst > 0).then(|| {
+            (
+                Duration::from_millis(a.log_rate_interval_ms),
+                a.log_rate_burst,
+            )
+        }),
+        size: (a.log_max_bytes > 0).then(|| applog::Size::of_budget(a.log_max_bytes)),
+    }
 }
 
 /// stderr's fd number, the `ANDROID_FILE__dev_kmsg` value of [`kernel_log_to_log`].
@@ -1285,23 +1331,7 @@ impl Host {
     /// stdout + stderr of an app process: one pipe atld copies into `log/<name>.log` + its tail ring (appended) under [`Host::log_limits`] ([`applog`]); a drop also gives one atld line when the
     /// pipe ends.
     fn bounded_log(&self, name: &str) -> Result<(std::process::Stdio, std::process::Stdio)> {
-        let (reader, writer) = std::io::pipe().context("app log pipe")?;
-        let mut out = applog::Files::open(&self.root.log(name))?;
-        let limits = self.log_limits;
-        let name = name.to_owned();
-        let copier = std::thread::Builder::new()
-            .name("app-log".into())
-            .spawn(move || {
-                match applog::copy_bounded(BufReader::new(reader), &mut out, limits, Instant::now) {
-                    Ok(d) if d.lines > 0 => log(format_args!(
-                        "log {name}: suppressed {} lines ({} bytes)",
-                        d.lines, d.bytes
-                    )),
-                    Ok(_) => {}
-                    Err(e) => log(format_args!("log {name}: {e}")),
-                }
-            })
-            .context("app log thread")?;
+        let (writer, copier) = bounded_copier(name, &self.root.log(name), self.log_limits)?;
         self.app_logs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2176,10 +2206,17 @@ fn run(a: &Args) -> Result<ExitCode> {
     let mut daemons = Vec::new();
     let sockets = r.root.join("logdw");
     std::fs::create_dir_all(&sockets)?;
+    let limits = log_limits(&a);
     // the health HAL (its .rc: `user system`), the battery services' source: the host's power-supply sysfs read-only, nothing else of /sys (atl_broker::power_supply_sysfs)
     if let Some(health) = &a.health {
         let mut hal = system_spawn("health", health, vec![], false, None)?;
-        logdw_to_log(&mut hal, &sockets.join("health"), &r.log("health"))?;
+        logdw_to_log(
+            &mut hal.mounts,
+            &sockets.join("health"),
+            "health",
+            &r.log("health"),
+            limits,
+        )?;
         let (mounts, links) =
             atl_broker::power_supply_sysfs().context("the host's power-supply sysfs")?;
         hal.mounts.extend(mounts);
@@ -2193,7 +2230,13 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let (Some(keystore2), Some(keymint)) = (&a.keystore2, &a.keymint) {
         let mut hal = system_spawn("keymint", keymint, vec![], false, None)?;
         hal.uid = AID_NOBODY;
-        logdw_to_log(&mut hal, &sockets.join("keymint"), &r.log("keymint"))?;
+        logdw_to_log(
+            &mut hal.mounts,
+            &sockets.join("keymint"),
+            "keymint",
+            &r.log("keymint"),
+            limits,
+        )?;
         daemons.push((
             "keymint",
             broker.spawn(hal).context("starting the KeyMint HAL")?,
@@ -2209,7 +2252,13 @@ fn run(a: &Args) -> Result<ExitCode> {
             None,
         )?;
         ks.uid = AID_KEYSTORE;
-        logdw_to_log(&mut ks, &sockets.join("keystore2"), &r.log("keystore2"))?;
+        logdw_to_log(
+            &mut ks.mounts,
+            &sockets.join("keystore2"),
+            "keystore2",
+            &r.log("keystore2"),
+            limits,
+        )?;
         ks.mounts.push(Mount {
             host: db,
             at: KEYSTORE_DB.into(),
@@ -2637,15 +2686,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         wayland: a.ui.is_some().then(Wayland::probe).transpose()?,
         pipewire: atl_platform_host::app_access::pipewire_socket(),
         first_app_ms: OnceLock::new(),
-        log_limits: applog::Limits {
-            rate: (a.log_rate_burst > 0).then(|| {
-                (
-                    Duration::from_millis(a.log_rate_interval_ms),
-                    a.log_rate_burst,
-                )
-            }),
-            size: (a.log_max_bytes > 0).then(|| applog::Size::of_budget(a.log_max_bytes)),
-        },
+        log_limits: log_limits(&a),
         app_logs: Mutex::new(Vec::new()),
         notifications: {
             let n = PlatformNotifications::connect();
@@ -3096,6 +3137,65 @@ mod tests {
             host_pid,
             pidfd,
         }
+    }
+
+    /// R7-8: a daemon's logdw records go through the app log's rate bound. Burst 3 per 300 ms window: of 10 records sent at once the log keeps the first 3 (the rule: `burst` lines per window,
+    /// journald's RateLimitBurst), and the first record of the next window brings the window's note counting the other 7.
+    #[test]
+    fn logdw_log_is_rate_bounded() {
+        let dir = std::env::temp_dir().join(format!("atld-logdw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (sock, log_path) = (dir.join("ks"), dir.join("keystore2.log"));
+        let window = Duration::from_millis(300);
+        let limits = applog::Limits {
+            rate: Some((window, 3)),
+            size: None,
+        };
+        let mut mounts = Vec::new();
+        logdw_to_log(&mut mounts, &sock, "keystore2", &log_path, limits).expect("logdw");
+        assert_eq!(mounts.len(), 1);
+        // a datagram as liblog's logd_writer.cpp builds it: log id, tid u16, sec u32, nsec u32, then priority (6 = ANDROID_LOG_ERROR) + tag NUL + message NUL
+        let entry = |msg: &str| {
+            let mut d = vec![0u8];
+            d.extend_from_slice(&7u16.to_le_bytes());
+            d.extend_from_slice(&1_762_000_000u32.to_le_bytes());
+            d.extend_from_slice(&0u32.to_le_bytes());
+            d.push(6);
+            d.extend_from_slice(b"keystore2\0");
+            d.extend_from_slice(msg.as_bytes());
+            d.push(0);
+            d
+        };
+        let sender = std::os::unix::net::UnixDatagram::unbound().expect("socket");
+        let records = |text: &str| {
+            text.lines()
+                .filter(|l| l.contains("liblog/keystore2: e"))
+                .count()
+        };
+        let read_until = |want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if records(&text) >= want || Instant::now() > deadline {
+                    return text;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        for n in 0..10 {
+            sender
+                .send_to(&entry(&format!("e{n}")), &sock)
+                .expect("send");
+        }
+        let text = read_until(3);
+        std::thread::sleep(window * 2);
+        sender.send_to(&entry("e10"), &sock).expect("send");
+        let after = read_until(4);
+        assert_eq!(records(&text), 3, "{text}");
+        assert!(after.contains("atld-log: suppressed 7 lines"), "{after}");
+        assert!(after.contains("liblog/keystore2: e10"), "{after}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// R7-7: a daemon that exits after the run's last poll gets its verdict from the end-of-run pass, once, with its status (3: the `exit 3` it ran); a live one gets none; the end's stop of the
