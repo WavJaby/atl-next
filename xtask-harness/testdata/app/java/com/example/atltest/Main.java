@@ -698,6 +698,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "notification: " + channels());
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "uimode: " + uiMode());
+        Log.i("AtlTest", "locale: " + locales());
         Log.i("AtlTest", "keyguard: " + keyguard());
         Log.i("AtlTest", "user: " + userProfile());
         Log.i("AtlTest", "zen: " + zen());
@@ -1360,6 +1361,34 @@ public class Main extends Activity {
             return "type=" + um.getCurrentModeType() + " night=" + um.getNightMode() + " config=" + getResources().getConfiguration().uiMode;
         } catch (Throwable t) {
             return "threw " + t;
+        }
+    }
+
+    /**
+     * LocaleManager: the fixture's own app locales (none set: the empty list, printed "[]"); the system locales, "config" when they equal the app Configuration's (one source), else their tags;
+     * another package's app locales without READ_APP_SPECIFIC_LOCALES ("android") and an unknown package's, each what it threw. "absent" when getSystemService returns null; else what it threw.
+     */
+    private String locales() {
+        try {
+            android.app.LocaleManager lm = getSystemService(android.app.LocaleManager.class);
+            if (lm == null) {
+                return "absent";
+            }
+            String app = "[" + lm.getApplicationLocales().toLanguageTags() + "]";
+            String system = lm.getSystemLocales().toLanguageTags();
+            String config = getResources().getConfiguration().getLocales().toLanguageTags();
+            return "app=" + app + " system=" + (system.equals(config) ? "config" : system) + " other=" + localesOf(lm, "android") + " unknown=" + localesOf(lm, "com.example.absent");
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** getApplicationLocales(package): "[tags]", else the simple name of what it threw. */
+    private static String localesOf(android.app.LocaleManager lm, String pkg) {
+        try {
+            return "[" + lm.getApplicationLocales(pkg).toLanguageTags() + "]";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName();
         }
     }
 

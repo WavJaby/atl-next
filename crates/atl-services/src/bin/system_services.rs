@@ -93,7 +93,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `locale`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -150,6 +150,8 @@ const THERMAL: &str = "thermalservice";
 /// Context.SYSTEM_CONFIG_SERVICE (SystemConfigManager looks ISystemConfig up by it).
 const SYSTEM_CONFIG: &str = "system_config";
 const UI_MODE: &str = "uimode";
+/// Context.LOCALE_SERVICE (LocaleManager's constructor looks ILocaleManager up by it).
+const LOCALE: &str = "locale";
 /// Context.TRUST_SERVICE (KeyguardManager's and TrustManager's constructors look ITrustManager up by it).
 const TRUST: &str = "trust";
 /// Context.TELEPHONY_REGISTRY_SERVICE (TelephonyRegistryManager's registry; SystemServer adds it on every device).
@@ -410,6 +412,17 @@ fn main() -> Result<()> {
             atl_services::uimode::new_binder(Arc::clone(&permissions)),
         )
         .context("addService uimode")?;
+    }
+    if !a.omit_service.iter().any(|s| s == LOCALE) {
+        binder::add_service(
+            LOCALE,
+            atl_services::locale::new_binder(
+                Arc::clone(&packages),
+                Arc::clone(&permissions),
+                Arc::clone(&tasks),
+            ),
+        )
+        .context("addService locale")?;
     }
     binder::add_service(
         TRUST,

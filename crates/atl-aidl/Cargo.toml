@@ -89,6 +89,7 @@ types = [
     "com.android.internal.app.IAppOpsService",
     # the uimode service (uimode.rs)
     "android.app.IUiModeManager",
+    "android.app.ILocaleManager", # the locale service (locale.rs)
     # the trust service (trust.rs): KeyguardManager's and TrustManager's constructors look ITrustManager up by Context.TRUST_SERVICE
     "android.app.trust.ITrustManager",
     # the telephony.registry service (telephony_registry.rs): TelephonyManager.registerTelephonyCallback and SubscriptionManager's listeners reach it through TelephonyRegistryManager

@@ -71,6 +71,7 @@ pub mod android {
     }
     pub mod os {
         pub mod Bundle;
+        pub mod LocaleList;
         pub mod Message;
         pub mod Messenger;
         pub mod storage {

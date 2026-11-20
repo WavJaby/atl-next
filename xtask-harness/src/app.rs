@@ -203,6 +203,9 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// power: Main.power: a desktop session is interactive with battery saver off; PARTIAL is a supported level; a PARTIAL wake lock is held after acquire and not after release
 /// (WAKE_LOCK is requested + NORMAL -> granted; a refused acquire or release throws SecurityException and the line reads `threw ...`).
 /// uimode: Main.uiMode: UI_MODE_TYPE_NORMAL (1), MODE_NIGHT_NO (1), and the Configuration's uiMode TYPE_NORMAL | NIGHT_NO = 0x11 = 17 (UiModeManagerService's default for a normal device).
+/// locale: Main.locales: no per-app locale is stored, so the fixture's own are LocaleManagerService.getApplicationLocales' empty list (:450-460, "[]"); getSystemLocales (:534-554) is the global
+/// configuration's list, the same the app's Configuration holds (`config`); `android` is not the caller's package and the fixture lacks READ_APP_SPECIFIC_LOCALES -> SecurityException; an unknown package
+/// fails isPackageOwnedByCaller (:363) -> IllegalArgumentException.
 /// trust: Main.keyguard: KeyguardManager's constructor needs `trust` (getServiceOrThrow) and the window service's keyguard calls; with no lock-screen credential the manager is non-null and isDeviceLocked, isKeyguardLocked, isDeviceSecure, isKeyguardSecure are all false.
 /// jobscheduler: Main.jobs: each enqueue answers RESULT_SUCCESS (1); the second, of an equal JobInfo, joins the first job (JobSchedulerService.scheduleAsPackage), so one job is pending; cancel removes it;
 /// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
@@ -224,7 +227,7 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// getSimStateForSlotIndex:19217); getPhoneType PHONE_TYPE_NONE (0; no ITelephony and no ro.telephony.default_network, getPhoneTypeFromNetworkType:2841); getNetworkOperator "" (operator_numeric
 /// unset); getDataState DATA_DISCONNECTED (0; null ITelephony). registerTelephonyCallback reaches the registry, which delivers nothing (validatePhoneId: the service sees no modem) -> calls=0.
 /// Without the registry the register NPEs. A Wi-Fi tablet's SIM_STATE_ABSENT needs the device declared modem-less (zero modems) first: not modelled.
-const SERVICE_LINES: [(&str, &str, Option<&str>); 15] = [
+const SERVICE_LINES: [(&str, &str, Option<&str>); 16] = [
     (
         "audio",
         "AtlTest: audiodevices: ",
@@ -278,6 +281,11 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 15] = [
         "uimode",
         "AtlTest: uimode: ",
         Some("type=1 night=1 config=17"),
+    ),
+    (
+        "locale",
+        "AtlTest: locale: ",
+        Some("app=[] system=config other=SecurityException unknown=IllegalArgumentException"),
     ),
     (
         "trust",
@@ -341,8 +349,13 @@ const NOTIFY_ATLD_LINES: [&str; 3] = [
 /// appops: Main.appOps' first noted COARSE_LOCATION (runtime permission -> notes collected) reports its stack trace, AppOpsManager's sConfig starting expired.
 /// user: Main.userProfile's isProfile; a missing method reads back as null = "not a profile" too, so only this count tells them apart (and UserManager then caches the answer instead of asking again).
 /// notification (zen): a missing getZenMode reads back as 0 = ZEN_MODE_OFF too; only the count tells them apart.
-const SERVICE_CALLS: [(&str, &str); 12] = [
+/// locale: Main.locales' own getApplicationLocales: the empty list is also what a reply without a LocaleList would make of an app that sets none, so the count shows the service answered.
+const SERVICE_CALLS: [(&str, &str); 13] = [
     ("user", "IUserManager.getProfileType"),
+    (
+        "locale",
+        "ILocaleManager.getApplicationLocales (no override: empty)",
+    ),
     ("notification", "INotificationManager.getZenMode"),
     (
         "telephony.registry",

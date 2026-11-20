@@ -375,6 +375,10 @@ public class ParcelTruth {
         check("OverlayProperties", OverlayProperties.getDefault(), OverlayProperties.CREATOR);
         // the mount service's volume as StorageService builds it (StorageVolume.Builder: internal path = path; owner = user 0)
         check("StorageVolume", new StorageVolume.Builder("emulated", new File("/storage/emulated/0"), "Internal shared storage", UserHandle.SYSTEM, "mounted").setPrimary(true).setEmulated(true).build(), StorageVolume.CREATOR);
+        // the locale service's replies (atl-services locale.rs): getSystemLocales (several tags, one tag) and getApplicationLocales with no per-app locales (the empty list)
+        check("LocaleList", LocaleList.forLanguageTags("zh-TW,en-US"), LocaleList.CREATOR);
+        check("LocaleList:one", LocaleList.forLanguageTags("en-US"), LocaleList.CREATOR);
+        check("LocaleList:empty", LocaleList.getEmptyLocaleList(), LocaleList.CREATOR);
         checkInputChannel("InputChannel");
         check("PointerIcon", systemIcon(PointerIcon.TYPE_ARROW), PointerIcon.CREATOR);
         // TYPE_CUSTOM as AOSP writes it into a Parcel: in place (768 B), ashmem (16 KB > 12 KB), with a gainmap, and a nested gainmap (refused)

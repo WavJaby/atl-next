@@ -44,6 +44,7 @@ use atl_parcelables::android::media::{
     AudioAttributes, AudioDeviceAttributes, PlayerBase_PlayerIdCard, VolumeInfo,
 };
 use atl_parcelables::android::os::Bundle;
+use atl_parcelables::android::os::LocaleList;
 use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::inputmethod::{
@@ -380,6 +381,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_as::<InputMethodInfoSafeList>(input, mode)
         }
         "android.os.storage.StorageVolume" => round_trip_as::<StorageVolume>(input, mode),
+        "android.os.LocaleList" => round_trip_as::<LocaleList>(input, mode),
         "android.view.WindowManager$LayoutParams" => {
             round_trip_as::<WindowManager_LayoutParams>(input, mode)
         }

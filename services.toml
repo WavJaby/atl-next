@@ -372,6 +372,18 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/UiModeManagerService.java#getForceInvertState",
 ]
 
+[locale]
+src = ["crates/atl-services/src/locale.rs", "crates/atl-parcelables/src/codecs/android/os/LocaleList.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/locales/LocaleManagerService.java#getApplicationLocales",
+    "frameworks/base/services/core/java/com/android/server/locales/LocaleManagerService.java#getSystemLocales",
+    "frameworks/base/services/core/java/com/android/server/locales/LocaleManagerService.java#getOverrideLocaleConfig",
+    "frameworks/base/services/core/java/com/android/server/locales/LocaleManagerService.java#isPackageOwnedByCaller",
+    "frameworks/base/services/core/java/com/android/server/locales/LocaleManagerService.java#isCallerInstaller",
+    "frameworks/base/services/core/java/com/android/server/am/UserController.java#handleIncomingUser",
+    "frameworks/base/core/java/android/os/LocaleList.java#writeToParcel",
+]
+
 [trust]
 src = ["crates/atl-services/src/trust.rs"]
 mirrors = [
