@@ -312,7 +312,13 @@ fn position(
             },
             Ty::Pointer { pointee: hp, .. } | Ty::Reference { pointee: hp, .. },
         ) => pointee(gp, hp, result, *is_const, views),
-        // a pointer in bionic, an integer in glibc (eglplatform.h `EGLNativePixmapType`): the guest passes a pointer
+        // a pointer in bionic, an integer in glibc, to an incomplete record (eglplatform.h `EGLNativeWindowType` = `struct ANativeWindow*`): the guest holds a handle that some row issued, the host gets the object's address as its integer
+        (Ty::Pointer { pointee: gp, .. }, Ty::Int { .. })
+            if untyped(gp, views.guest) && !matches!(gp.resolved(), Ty::Void) =>
+        {
+            Ok(Kind::Opaque(type_name(gp).unwrap_or_default()))
+        }
+        // a pointer in bionic, an integer in glibc, to data: the guest passes a pointer
         (Ty::Pointer { pointee: gp, .. }, Ty::Int { .. })
             if !matches!(gp.resolved(), Ty::Function(_)) =>
         {
@@ -337,7 +343,8 @@ fn pointee(gp: &Ty, hp: &Ty, result: bool, konst: bool, views: &Views) -> Result
         {
             Kind::Opaque(type_name(gp).or(type_name(hp)).unwrap_or_default())
         }
-        (Ty::Int { bits: 8, .. }, Ty::Int { bits: 8, .. }) if result => Kind::String,
+        // text only by C type: a const 8-bit pointee (`const char*`, gl2.h `const GLubyte*`); a non-const one is a writable byte buffer (NdkMediaCodec.h `uint8_t* AMediaCodec_getInputBuffer`), never a NUL-cut copy
+        (Ty::Int { bits: 8, .. }, Ty::Int { bits: 8, .. }) if result && konst => Kind::String,
         _ if same(gp, views.guest, hp, views.host, false) => data,
         _ if both_records(gp, hp, views).is_some() => {
             Kind::Record(both_records(gp, hp, views).unwrap_or_default())
@@ -822,6 +829,7 @@ mod tests {
 
     /// bionic arm32 / glibc x86_64 declarations in miniature, each transcribed from its header with the field order kept; the expected sizes in the tests come from the AAPCS32 data model and those headers, not from the classifier.
     /// `off_t`, `size_t`, `time_t`: `long` / `unsigned long` in bionic (`__kernel_off_t`, `__kernel_size_t`, `__kernel_time_t`, uapi asm-generic/posix_types.h). `pthread_attr_t`: bionic libc/include/bits/pthread_types.h. `ANativeWindow_Buffer`: nativewindow native_window.h. `ARect`: arect rect.h. `EGLAttrib`: EGL/egl.h `intptr_t`. `EGLDisplay`: `void*`.
+    /// `AMediaCodec_getInputBuffer`: media NdkMediaCodec.h `uint8_t* (AMediaCodec*, size_t idx, size_t* out_size)`. `glGetString`: GLES2/gl2.h `const GLubyte* (GLenum)`, `GLubyte` = `khronos_uint8_t`. `eglQueryString`: EGL/egl.h `const char* (EGLDisplay, EGLint)`. `eglCreateWindowSurface`: egl.h `(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*)`; `EGLNativeWindowType`: Android eglplatform.h `struct ANativeWindow*` under `__ANDROID__`, the X11 branch `Window` = `unsigned long` on a glibc host.
     const HEADER: &str = "typedef long off_t;\ntypedef long long off64_t;\ntypedef unsigned long size_t;\ntypedef long time_t;\ntypedef long intptr_t;\n\
 struct timespec { time_t tv_sec; long tv_nsec; };\n\
 typedef struct { unsigned int flags; void* stack_base; size_t stack_size; size_t guard_size; int sched_policy; int sched_priority; } pthread_attr_t;\n\
@@ -851,7 +859,14 @@ int use_object(jobject o);\n\
 int va_fn(const char* fmt, __builtin_va_list ap);\n\
 int out_display(EGLDisplay* out);\n\
 int out_asset(AAsset** out);\n\
-struct _JNIEnv { const void* functions; };\nint env_user(struct _JNIEnv* env);\n";
+struct _JNIEnv { const void* functions; };\nint env_user(struct _JNIEnv* env);\n\
+typedef unsigned char uint8_t;\ntypedef unsigned char GLubyte;\ntypedef unsigned int GLenum;\ntypedef void *EGLConfig;\ntypedef void *EGLSurface;\ntypedef int EGLint;\n\
+typedef struct AMediaCodec AMediaCodec;\n\
+#if defined(__ANDROID__)\ntypedef struct ANativeWindow* EGLNativeWindowType;\n#else\ntypedef unsigned long EGLNativeWindowType;\n#endif\n\
+uint8_t* AMediaCodec_getInputBuffer(AMediaCodec* mData, size_t idx, size_t* out_size);\n\
+const GLubyte* glGetString(GLenum name);\n\
+const char* eglQueryString(EGLDisplay dpy, EGLint name);\n\
+EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint* attrib_list);\n";
 
     /// Defined outside the interface (`Ty::Opaque` + `ArchView::foreign`). `union sigval`: bionic uapi asm-generic/siginfo.h `{ int sival_int; void* sival_ptr; }`. `struct sockaddr`: bionic linux/socket.h `{ sa_family_t sa_family; char sa_data[14]; }`, 16 bytes on both. `socklen_t`: bionic sys/types.h `__kernel_socklen_t` = int; glibc bits/types.h `__socklen_t` = unsigned int.
     const OTHER: &str = "union sigval { int sival_int; void* sival_ptr; };\n\
@@ -860,7 +875,14 @@ struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n\
 struct _jobject {};\ntypedef struct _jobject* jobject;\n\
 #if defined(__arm__)\ntypedef int socklen_t;\n#else\ntypedef unsigned int socklen_t;\n#endif\n";
 
-    const HANDLES: &[&str] = &["EGLDisplay", "EGLImage", "EGLContext", "EGLClientBuffer"];
+    const HANDLES: &[&str] = &[
+        "EGLDisplay",
+        "EGLImage",
+        "EGLContext",
+        "EGLClientBuffer",
+        "EGLConfig",
+        "EGLSurface",
+    ];
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
@@ -1034,6 +1056,28 @@ struct _jobject {};\ntypedef struct _jobject* jobject;\n\
         assert!(row(&i, "sum").same());
         assert!(!row(&i, "ANativeWindow_lock").carried());
         assert!(row(&i, "ALooper_pollOnce").heaviest() == &Kind::OutWord(Word::Ptr));
+    }
+
+    /// Text vs bytes by C type: only a const 8-bit pointee result is a NUL-terminated string (gl2.h `const GLubyte*`, egl.h `const char*`); NdkMediaCodec.h's `uint8_t*` is a writable codec buffer of `*out_size` bytes, valid until the buffer is queued/released.
+    #[test]
+    fn eight_bit_result_text_only_when_const() {
+        let i = views("text", ARM);
+        assert_eq!(
+            row(&i, "AMediaCodec_getInputBuffer").kinds[0],
+            Kind::PtrResult
+        );
+        assert_eq!(row(&i, "glGetString").kinds[0], Kind::String);
+        assert_eq!(row(&i, "eglQueryString").kinds[0], Kind::String);
+    }
+
+    /// A pointer in bionic, an integer in glibc, pointing to an incomplete record: the guest holds a handle to that record (eglplatform.h `EGLNativeWindowType` = `struct ANativeWindow*`, an `ANativeWindow` the guest got from `ANativeWindow_fromSurface`), never a raw address. egl.h 1.5 s3.5.1: `win` must be a valid native window.
+    #[test]
+    fn native_window_typedef_is_a_handle() {
+        let i = views("window", ARM);
+        assert_eq!(
+            row(&i, "eglCreateWindowSurface").kinds[3],
+            op("ANativeWindow")
+        );
     }
 
     /// The brief's gate numbers: `ANativeWindow_Buffer` guest offsets {0,4,8,12,16,20} size 44 (four int32, a 4-byte pointer, uint32[6]: AAPCS32 natural alignment) vs host {0,4,8,12,16,24} size 48 (the pointer 8-aligned and 8 wide); `bits` crosses as a pointer, the rest as copies.

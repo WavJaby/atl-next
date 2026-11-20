@@ -1125,6 +1125,14 @@ const ILP32_TEXT_VARIABLES: &[(&str, &str, &str)] = &[
 ];
 /// Rows of an ILP32 table whose kinds the headers fix (function, position: 0 = result, the kind's `describe`): a classifier change that moves one fails the build.
 const ILP32_EXPECTED: &[(&str, usize, &str)] = &[
+    // NdkMediaCodec.h `uint8_t* AMediaCodec_getInputBuffer(AMediaCodec*, size_t idx, size_t* out_size)`: a writable codec buffer, not text
+    ("AMediaCodec_getInputBuffer", 0, "ptr-result"),
+    // NdkMediaCodec.h `uint8_t* AMediaCodec_getOutputBuffer(AMediaCodec*, size_t idx, size_t* out_size)`
+    ("AMediaCodec_getOutputBuffer", 0, "ptr-result"),
+    // GLES2/gl2.h `const GLubyte* glGetString(GLenum name)`: NUL-terminated text
+    ("glGetString", 0, "string"),
+    // egl.h `eglCreateWindowSurface(EGLDisplay, EGLConfig, EGLNativeWindowType win, const EGLint*)`; Android eglplatform.h `typedef struct ANativeWindow* EGLNativeWindowType`: the guest's ANativeWindow handle
+    ("eglCreateWindowSurface", 3, "opaque"),
     // asset_manager.h `off_t AAsset_getLength(AAsset*)`: bionic arm off_t = long
     ("AAsset_getLength", 0, "widen:s"),
     ("AAsset_getLength", 1, "opaque"),
