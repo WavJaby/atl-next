@@ -199,9 +199,9 @@ fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Ans
     guest_answer(guest, sig.ret, ilp32_narrow(guest, sig.ret, target, answer))
 }
 
-/// Host pointers a 32-bit guest was refused (a result, [`ilp32_narrow`]; a down-call argument, [`place`]; a record field or out word, convert.rs): the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0.
+/// Host pointers and handles a 32-bit guest was refused, every `REFUSED_*` key together: the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0. Moved only by [`report_refused`], so it equals the sum of the atl-diag refused counts under those keys.
 pub static ILP32_REFUSED: AtomicUsize = AtomicUsize::new(0);
-/// Serialises every test that moves [`ILP32_REFUSED`] (the test threads share it): one that reads it before and after, and one that only causes a refusal (convert.rs `window_buffer_round_trip`), which otherwise lands between another's two reads.
+/// Serialises every test that moves [`ILP32_REFUSED`] (the test threads share it): a refusal from another test would land between one test's two reads.
 #[cfg(test)]
 pub(in crate::engine) static REFUSED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -212,8 +212,9 @@ pub(in crate::engine) const REFUSED_OUT: &str = "native-bridge.ilp32-out";
 /// A guest handle the table does not hold (handles.rs), or no slot left for a host object.
 pub(in crate::engine) const REFUSED_HANDLE: &str = "native-bridge.ilp32-handle";
 
-/// Reports one host pointer refused to a 32-bit guest under `key` (`REFUSED_*`), `cause` naming the function and position; [`ILP32_REFUSED`] is counted by the caller.
+/// Reports one host pointer refused to a 32-bit guest under `key` (`REFUSED_*`), `cause` naming the function and position, and counts it in [`ILP32_REFUSED`] (the one place that moves it).
 pub(in crate::engine) fn report_refused(key: &str, cause: &str) {
+    ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
     atl_diag::count(atl_diag::REFUSED, key, Some(cause));
 }
 
@@ -222,7 +223,6 @@ fn ilp32_narrow(guest: HostRules, ret: Class, target: usize, answer: Answer) -> 
     if guest.word_bits != 32 || ret != Class::Ptr || answer.x0 <= WORD {
         return answer;
     }
-    ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
     report_refused(
         REFUSED_RESULT,
         &format!("{} answered {:#x}", symbol_name(target), answer.x0),
@@ -687,7 +687,6 @@ fn place(
             Slot::Stack(i, n) => read(&from.stack, i, n),
         };
         let value = if class == Class::Ptr && to_rules.word_bits == 32 && value > WORD {
-            ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
             report_refused(REFUSED_ARG, &format!("argument {k} = {value:#x}"));
             0
         } else {
@@ -1266,6 +1265,17 @@ mod aapcs32_tests {
     }
 
     use super::REFUSED_LOCK;
+
+    /// Every refusal key moves the gate's counter by exactly one per report -- including the handle-table and no-window refusals no pointer check sees (ndk.rs, buffers.rs, window.rs); 4 keys x 1 report each = 4.
+    #[test]
+    fn every_reported_refusal_moves_the_gate_counter_once() {
+        let _serial = REFUSED_LOCK.lock();
+        let before = ILP32_REFUSED.load(Ordering::Relaxed);
+        for key in [REFUSED_RESULT, REFUSED_ARG, REFUSED_OUT, REFUSED_HANDLE] {
+            report_refused(key, "test: handle table full");
+        }
+        assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 4);
+    }
 
     /// A host pointer argument of a down call into a 32-bit guest: 2^32 - 1 passes whole, 2^32 (the first a 32-bit word cannot hold) is passed null and counted; an aarch64 guest gets it whole.
     #[test]

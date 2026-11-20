@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! ILP32 record and word converters (phase4-32bit P4b s3): one interpreter over the field tables bridgegen derives from the guest and host views (`atl_bridgegen::ilp32::converters`, emitted per ILP32 table as `C_<record>` consts, each const-asserted [`Conv::ordered`] on both sides). No offset is written by hand: a table is the upstream header's layout as clang computed it per target.
-//! Guest memory is host-addressable at the guest's own addresses (QEMU user mode, guest base 0; a 32-bit guest lives below 4 GiB), so a guest pointer zero-extended is a host pointer; a host pointer at or above 4 GiB cannot reach a 32-bit guest and is refused (written as NULL, counted in dispatch.rs `ILP32_REFUSED`).
-
-use std::sync::atomic::Ordering;
+//! Guest memory is host-addressable at the guest's own addresses (QEMU user mode, guest base 0; a 32-bit guest lives below 4 GiB), so a guest pointer zero-extended is a host pointer; a host pointer at or above 4 GiB cannot reach a 32-bit guest and is refused (written as NULL; `false` back, so the caller reports and counts it with its row and lane, ndk.rs `call_mapped`).
 
 /// How one field crosses (atl_bridgegen `ilp32::Op`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,9 +235,6 @@ unsafe fn op_to_guest(op: &Op, h: *const u8, g: *mut u8) -> bool {
                 let v = load(h, host);
                 let fits = guest >= 8 || v >> (8 * guest) == 0;
                 store(g, guest, if fits { v } else { 0 });
-                if !fits {
-                    super::dispatch::ILP32_REFUSED.fetch_add(1, Ordering::Relaxed);
-                }
                 fits
             }
             Op::Record(c) => to_guest(c, h, g),
@@ -383,8 +378,6 @@ mod tests {
     /// Guest bytes -> host -> guest: values survive; the pointer is zero-extended; a host pointer above 4 GiB comes back NULL and refused.
     #[test]
     fn window_buffer_round_trip() {
-        // its >= 4 GiB `bits` refusal moves ILP32_REFUSED
-        let _serial = super::super::dispatch::REFUSED_LOCK.lock();
         let mut g = [0u8; 44];
         for (k, v) in [64u32, 32, 80, 1, 0x1234_5678].iter().enumerate() {
             g[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());

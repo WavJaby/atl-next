@@ -64,7 +64,6 @@ fn host(name: &str) -> usize {
 }
 
 fn refuse(what: &str) -> i32 {
-    super::dispatch::ILP32_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     super::dispatch::report_refused(super::dispatch::REFUSED_HANDLE, what);
     -libc::EINVAL
 }

@@ -239,7 +239,6 @@ unsafe fn slots_out(ty: &'static str, dir: Slots, guest: usize, host: &[usize]) 
 
 /// A guest handle the table does not hold (never issued, freed, a raw address): the host function is not called, the answer is 0 (NULL / false / `EGL_FALSE`, the NDK's usual error value), counted and reported with the row and lane.
 fn refuse_handle(symbol: &str, i: usize, value: usize) -> usize {
-    super::dispatch::ILP32_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     super::dispatch::report_refused(
         super::dispatch::REFUSED_HANDLE,
         &format!("{symbol} parameter {i} = {value:#x}"),

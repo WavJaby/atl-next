@@ -17,7 +17,6 @@ fn copy_for(
     len: impl Fn(usize) -> Option<usize>,
 ) -> usize {
     let Some(obj) = handles::to_host(h).filter(|&o| o != 0) else {
-        super::dispatch::ILP32_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         super::dispatch::report_refused(
             super::dispatch::REFUSED_HANDLE,
             &format!("{symbol} parameter 0 = {h:#x}"),

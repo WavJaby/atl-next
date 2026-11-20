@@ -379,7 +379,7 @@ pub(crate) fn system_wrap(stage: &Path) -> Result<Vec<OsString>> {
     Ok(wrap)
 }
 
-/// atl-diag api prefix of a host pointer refused to a 32-bit guest (native-bridge dispatch.rs `REFUSED_*`, each hit also counted in `ILP32_REFUSED`).
+/// atl-diag api prefix of a host pointer refused to a 32-bit guest (native-bridge dispatch.rs `REFUSED_*`): `report_refused` counts each report once in `ILP32_REFUSED` too, so (r) and this line's sum read the same quantity.
 const ILP32_REFUSED_PREFIX: &str = "native-bridge.ilp32-";
 
 /// The plain runs of the harnesses that read `ILP32_REFUSED` (qemu_main, qemu_dlopen), whose logs carry their exact `diag: total` lines.
