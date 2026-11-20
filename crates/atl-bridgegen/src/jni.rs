@@ -192,22 +192,40 @@ pub enum LaneMap {
     OutWord(crate::ilp32::Word),
     /// ILP32: a guest handle of type `ty` -> the host object it names (`ilp32::Kind::Opaque`); `release`: the call ends the object's life, its handle is freed after it
     Handle { ty: String, release: bool },
-    /// ILP32: a guest pointer to handle slots of type `ty` (`ilp32::Kind::OutHandle`) -> a host array of host objects; `len`: the parameter holding the element count (None: one slot)
-    Handles {
-        ty: String,
-        slots: Slots,
-        len: Option<usize>,
-    },
+    /// ILP32: a guest pointer to an array of 4-byte guest words (`ilp32::Kind::OutHandle`, or `Kind::Array` / a listed `Kind::OutWord`) -> a host array of host words for the call: each element converted by `elem`, `len` elements, crossing as `slots` says
+    Words { elem: Elem, slots: Slots, len: Len },
 }
 
-/// Which way the handles of a [`LaneMap::Handles`] lane cross.
+/// How one guest word of a [`LaneMap::Words`] array becomes a host word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Elem {
+    /// a handle of this type -> the host object it names (an unknown one refuses the call); written back as handles for Out/InOut
+    Handle(String),
+    /// a guest pointer -> the same address zero-extended (the guest's addresses are the host's, guest base 0)
+    Ptr,
+    /// an `EGLAttrib` (egl.h: `intptr_t`) -> sign-extended
+    Attrib,
+}
+
+/// How many elements a [`LaneMap::Words`] array holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Len {
+    /// one slot
+    One,
+    /// the parameter at this index times the factor (NdkMediaDataSource.h `key_values`: 2 x `numheaders`)
+    Param(usize, usize),
+    /// key/value pairs ending at the key slot holding this value, the terminator included (egl.h `EGL_NONE`)
+    Terminated(u32),
+}
+
+/// Which way the words of a [`LaneMap::Words`] lane cross.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slots {
     /// the host writes them (the guest's slots are uninitialised): handles out after the call
     Out,
     /// the guest's handle in (NULL or issued), the host's object back out (an iterator's cursor)
     InOut,
-    /// the guest's handles in, nothing back
+    /// the guest's words in, nothing back
     In,
 }
 

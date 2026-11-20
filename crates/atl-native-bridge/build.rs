@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use atl_bridgegen::buildscript::{self, Upstreams};
 use atl_bridgegen::ir::Ty;
-use atl_bridgegen::jni::{LaneMap, RetMap, Route};
+use atl_bridgegen::jni::{Elem, LaneMap, RetMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
@@ -1315,260 +1315,426 @@ type Convs = std::collections::BTreeMap<String, Result<Vec<atl_bridgegen::ilp32:
 /// The break cfg that swaps two guest offsets of the first generated converter (atl_bridgegen `ilp32::converters_rs`): its const assert fails the build.
 const CONV_SWAP_CFG: &str = "atl_nb_conv_swap";
 
-/// Non-const pointer-to-pointer parameters that are input arrays, not one out word (function, parameter index, the header's words): the views type them as an out word (`Kind::OutWord`), and only the header's prose gives the length. Reviewed over every arm row that would otherwise convert (`ilp32_rows.txt` `converted`); each must name an out-word position of some arm row (build fails otherwise).
-const ILP32_ARRAY_PARAMS: &[(&str, usize, &str)] = &[
-    // gl2ext.h EXT_separate_shader_objects: `GLuint glCreateShaderProgramvEXT(GLenum type, GLsizei count, const GLchar **strings)` -- `count` strings (GLES3's core glCreateShaderProgramv spells it `const GLchar *const*`, an array by its constness)
-    ("glCreateShaderProgramvEXT", 2, "count strings"),
-];
+/// How a [`ILP32_WORD_ARRAYS`] row's guest words convert (atl_bridgegen `jni::Elem`; a `Handle` row takes its type from the position's `Kind::OutHandle`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordElem {
+    Handle,
+    Ptr,
+    Attrib,
+}
 
-/// Handle-slot parameters (`T**` of a handle type, `Kind::OutHandle`): function, parameter, direction, the parameter holding the element count (None: one slot), the header's words. The views cannot tell one out slot from an iterator cursor or an input array; the header's prose does. Every out-handle position of the ILP32 table is here or in [`ILP32_HANDLE_SLOTS_TRAPPED`] (build fails otherwise), and each row here must be one (stale check).
-const ILP32_HANDLE_SLOTS: &[(&str, usize, atl_bridgegen::jni::Slots, Option<usize>, &str)] = {
+/// Parameters that are arrays of 4-byte guest words (`LaneMap::Words`): function, parameter, element, direction, length, the header's words. The views type them `Kind::OutHandle` (handle slots), `Kind::Array` (a const pointer-to-pointer or intptr_t array) or `Kind::OutWord` (a non-const `T**` the header calls an input array); only the header's prose gives direction and length. `Ptr`/`Attrib` rows are In only. Every out-handle or array position of the ILP32 table is here or in [`ILP32_WORD_ARRAYS_TRAPPED`] (build fails otherwise), and each row here must be one (stale check).
+const ILP32_WORD_ARRAYS: &[(
+    &str,
+    usize,
+    WordElem,
+    atl_bridgegen::jni::Slots,
+    atl_bridgegen::jni::Len,
+    &str,
+)] = {
+    use WordElem::{Attrib, Handle, Ptr};
+    use atl_bridgegen::jni::Len::{One, Param, Terminated};
     use atl_bridgegen::jni::Slots::{In, InOut, Out};
+    /// egl.h `#define EGL_NONE 0x3038`: the key ending an EGL attribute list
+    const EGL_NONE: u32 = 0x3038;
     &[
+        // pointer elements: AAPCS32 4-byte guest pointers, In, the call's lifetime (GLES 3.2 7.1: ShaderSource copies the strings; the others read them during the call)
+        (
+            "glShaderSource",
+            2,
+            Ptr,
+            In,
+            Param(1, 1),
+            "gl2.h `const GLchar *const*string`; GLES 3.2 7.1: count strings (the GLint length array p3 is plain data)",
+        ),
+        (
+            "glGetUniformIndices",
+            2,
+            Ptr,
+            In,
+            Param(1, 1),
+            "gl3.h `const GLchar *const*uniformNames`; GLES 3.2 7.6.2: uniformCount names",
+        ),
+        (
+            "glTransformFeedbackVaryings",
+            2,
+            Ptr,
+            In,
+            Param(1, 1),
+            "gl3.h `const GLchar *const*varyings`; GLES 3.2 11.1.2.1: count names",
+        ),
+        (
+            "glCreateShaderProgramv",
+            2,
+            Ptr,
+            In,
+            Param(1, 1),
+            "gl31.h `const GLchar *const*strings`; GLES 3.2 7.3: count strings",
+        ),
+        (
+            "glCreateShaderProgramvEXT",
+            2,
+            Ptr,
+            In,
+            Param(1, 1),
+            "gl2ext.h EXT_separate_shader_objects `const GLchar **strings` (an input array despite the missing const): count strings",
+        ),
+        (
+            "glMultiDrawElementsEXT",
+            3,
+            Ptr,
+            In,
+            Param(4, 1),
+            "gl2ext.h EXT_multi_draw_arrays `const void *const*indices`: primcount pointers or buffer offsets",
+        ),
+        (
+            "glMultiDrawElementsBaseVertexEXT",
+            3,
+            Ptr,
+            In,
+            Param(4, 1),
+            "gl2ext.h EXT_draw_elements_base_vertex `const void *const*indices`: primcount pointers or buffer offsets",
+        ),
+        (
+            "AMediaDataSource_newUri",
+            2,
+            Ptr,
+            In,
+            Param(1, 2),
+            "NdkMediaDataSource.h: key_values, 2 * numheaders strings (key, value pairs)",
+        ),
+        // EGLAttrib lists: egl.h `typedef intptr_t EGLAttrib`, sign-extended; key/value pairs ending at EGL_NONE; NULL = empty list (EGL 1.5)
+        (
+            "eglCreateImage",
+            4,
+            Attrib,
+            In,
+            Terminated(EGL_NONE),
+            "egl.h `const EGLAttrib *attrib_list`; EGL 1.5 3.9.1",
+        ),
+        (
+            "eglCreateSync",
+            2,
+            Attrib,
+            In,
+            Terminated(EGL_NONE),
+            "egl.h `const EGLAttrib *attrib_list`; EGL 1.5 3.8.1",
+        ),
+        (
+            "eglGetPlatformDisplay",
+            2,
+            Attrib,
+            In,
+            Terminated(EGL_NONE),
+            "egl.h `const EGLAttrib *attrib_list`; EGL 1.5 3.2",
+        ),
+        (
+            "eglCreatePlatformWindowSurface",
+            3,
+            Attrib,
+            In,
+            Terminated(EGL_NONE),
+            "egl.h `const EGLAttrib *attrib_list`; EGL 1.5 3.5.1",
+        ),
+        (
+            "eglCreatePlatformPixmapSurface",
+            3,
+            Attrib,
+            In,
+            Terminated(EGL_NONE),
+            "egl.h `const EGLAttrib *attrib_list`; EGL 1.5 3.5.4",
+        ),
+        // handle elements (Kind::OutHandle): the views cannot tell one out slot from an iterator cursor or an input array; the header's prose does
         (
             "eglChooseConfig",
             2,
+            Handle,
             Out,
-            Some(3),
+            Param(3, 1),
             "egl.h: up to config_size configs written to configs (NULL: count only)",
         ),
         (
             "eglGetConfigs",
             1,
+            Handle,
             Out,
-            Some(2),
+            Param(2, 1),
             "egl.h: up to config_size configs written to configs (NULL: count only)",
         ),
         (
             "AAudioStreamBuilder_openStream",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "AAudio.h: pointer to a variable to receive the new stream reference",
         ),
         (
             "AAudio_createStreamBuilder",
             0,
+            Handle,
             Out,
-            None,
+            One,
             "AAudio.h: pointer to a variable to receive the new builder",
         ),
         (
             "ADisplayLuts_setEntries",
             1,
+            Handle,
             In,
-            Some(2),
+            Param(2, 1),
             "display_luts.h: entries, numEntries",
         ),
         (
             "AHardwareBuffer_allocate",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "hardware_buffer.h: outBuffer, the allocated buffer",
         ),
         (
             "AHardwareBuffer_recvHandleFromUnixSocket",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "hardware_buffer.h: outBuffer",
         ),
         (
             "AInputQueue_getEvent",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "input.h: outEvent, the next available event",
         ),
         (
             "APerformanceHint_createSessionUsingConfig",
             2,
+            Handle,
             Out,
-            None,
+            One,
             "performance_hint.h: sessionOut",
         ),
         (
             "APerformanceHint_setNativeSurfaces",
             1,
+            Handle,
             In,
-            Some(2),
+            Param(2, 1),
             "performance_hint.h: nativeWindows, nativeWindowsSize",
         ),
         (
             "APerformanceHint_setNativeSurfaces",
             3,
+            Handle,
             In,
-            Some(4),
+            Param(4, 1),
             "performance_hint.h: surfaceControls, surfaceControlsSize",
         ),
         (
             "ASessionCreationConfig_setNativeSurfaces",
             1,
+            Handle,
             In,
-            Some(2),
+            Param(2, 1),
             "performance_hint.h: nativeWindows, nativeWindowsSize",
         ),
         (
             "ASessionCreationConfig_setNativeSurfaces",
             3,
+            Handle,
             In,
-            Some(4),
+            Param(4, 1),
             "performance_hint.h: surfaceControls, surfaceControlsSize",
         ),
         (
             "AImageDecoder_createFromAAsset",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "imagedecoder.h: outDecoder",
         ),
         (
             "AImageDecoder_createFromBuffer",
             2,
+            Handle,
             Out,
-            None,
+            One,
             "imagedecoder.h: outDecoder",
         ),
         (
             "AImageDecoder_createFromFd",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "imagedecoder.h: outDecoder",
         ),
         (
             "AndroidBitmap_getHardwareBuffer",
             2,
+            Handle,
             Out,
-            None,
+            One,
             "bitmap.h: outBuffer (the row waits on its jni lane)",
         ),
         (
             "ACodecVideoCapabilities_getNextSupportedPerformancePoint",
             1,
+            Handle,
             InOut,
-            None,
+            One,
             "NdkMediaCodecInfo.h: on successive calls, keep the last pointer value",
         ),
         (
             "AImageReader_acquireLatestImage",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: image",
         ),
         (
             "AImageReader_acquireLatestImageAsync",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: image",
         ),
         (
             "AImageReader_acquireNextImage",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: image",
         ),
         (
             "AImageReader_acquireNextImageAsync",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: image",
         ),
         (
             "AImageReader_getWindow",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: window",
         ),
-        ("AImageReader_new", 4, Out, None, "NdkImageReader.h: reader"),
+        (
+            "AImageReader_new",
+            4,
+            Handle,
+            Out,
+            One,
+            "NdkImageReader.h: reader",
+        ),
         (
             "AImageReader_newWithDataSpace",
             6,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: reader",
         ),
         (
             "AImageReader_newWithUsage",
             5,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImageReader.h: reader",
         ),
         (
             "AImage_getHardwareBuffer",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkImage.h: buffer",
         ),
         (
             "AMediaCodecInfo_getAudioCapabilities",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodecInfo.h: outAudioCaps",
         ),
         (
             "AMediaCodecInfo_getEncoderCapabilities",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodecInfo.h: outEncoderCaps",
         ),
         (
             "AMediaCodecInfo_getVideoCapabilities",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodecInfo.h: outVideoCaps",
         ),
         (
             "AMediaCodecStore_findNextDecoderForFormat",
             1,
+            Handle,
             InOut,
-            None,
+            One,
             "NdkMediaCodecStore.h: outCodecInfo, NON NULL continues an iteration",
         ),
         (
             "AMediaCodecStore_findNextEncoderForFormat",
             1,
+            Handle,
             InOut,
-            None,
+            One,
             "NdkMediaCodecStore.h: outCodecInfo, NON NULL continues an iteration",
         ),
         (
             "AMediaCodecStore_getCodecInfo",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodecStore.h: outCodecInfo",
         ),
         (
             "AMediaCodec_createInputSurface",
             1,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodec.h: surface",
         ),
         (
             "AMediaCodec_createPersistentInputSurface",
             0,
+            Handle,
             Out,
-            None,
+            One,
             "NdkMediaCodec.h: surface",
         ),
     ]
 };
 
-/// Handle-slot parameters that stay trapped (function, parameter, why): their slots are host-owned arrays the guest keeps reading after the call, or another lane blocks the row first.
-const ILP32_HANDLE_SLOTS_TRAPPED: &[(&str, usize, &str)] = &[
+/// Word-array parameters (out-handle or array positions) that stay trapped (function, parameter, why): their slots are host-owned arrays the guest keeps reading after the call, or another lane blocks the row first.
+const ILP32_WORD_ARRAYS_TRAPPED: &[(&str, usize, &str)] = &[
+    (
+        "slCreateEngine",
+        4,
+        "OpenSLES.h: pInterfaceIds, a Ptr array of SLInterfaceID; waits with the row's SLObjectItf out slot (P6, L6)",
+    ),
     (
         "ASensorManager_getSensorList",
         1,
@@ -1632,18 +1798,24 @@ fn ilp32_maps(
     let mut maps = Vec::new();
     let mut ret = RetMap::Plain;
     let array = Kind::Array;
-    let mut blocking: Option<&Kind> = None;
+    // the heaviest kind no map takes: (weight, trap reason)
+    let mut blocking: Option<(u8, &'static str)> = None;
     // a record with a deep pointer field (a list) converts only in a hand shim
     let shallow = |name: &str| matches!(convs.get(name), Some(Ok(list)) if list.last().is_some_and(|c| !c.deep(list)));
     for (at, k) in row.kinds.iter().enumerate() {
         let param = at.checked_sub(1);
-        let listed_array = ILP32_ARRAY_PARAMS
+        let words = ILP32_WORD_ARRAYS
             .iter()
-            .any(|(f, p, _)| *f == name && Some(*p) == param);
-        let k = if listed_array && matches!(k, Kind::OutWord(_)) {
-            &array
-        } else {
-            k
+            .find(|(f, p, ..)| *f == name && Some(*p) == param);
+        let handle_param = ILP32_HANDLE_PARAMS
+            .iter()
+            .find(|(f, p, ..)| *f == name && Some(*p) == param)
+            .map(|&(_, _, ty, _)| Kind::Opaque(ty.to_owned()));
+        // a listed non-const `T**` input array (Kind::OutWord by type) is an array; a listed `void*` handle a handle
+        let k = match (&handle_param, k) {
+            (Some(h), Kind::Ptr) => h,
+            (_, Kind::OutWord(_)) if words.is_some() => &array,
+            _ => k,
         };
         let map = match (k, param) {
             _ if k.carried() => continue,
@@ -1690,19 +1862,18 @@ fn ilp32_maps(
                 _ => None,
             },
             (Kind::OutWord(w), Some(p)) => Some((p, LaneMap::OutWord(*w))),
-            (Kind::OutHandle(ty), Some(p)) => ILP32_HANDLE_SLOTS
-                .iter()
-                .find(|(f, at, ..)| *f == name && *at == p)
-                .map(|&(_, _, slots, len, _)| {
-                    (
-                        p,
-                        LaneMap::Handles {
-                            ty: ty.clone(),
-                            slots,
-                            len,
-                        },
-                    )
-                }),
+            (Kind::OutHandle(_) | Kind::Array, Some(p)) => {
+                words.and_then(|&(_, _, elem, slots, len, _)| {
+                    let elem = match (elem, k) {
+                        (WordElem::Handle, Kind::OutHandle(ty)) => Elem::Handle(ty.clone()),
+                        (WordElem::Ptr, Kind::Array) => Elem::Ptr,
+                        (WordElem::Attrib, Kind::Array) => Elem::Attrib,
+                        // a row whose element disagrees with the position's kind: the stale check names it
+                        _ => return None,
+                    };
+                    Some((p, LaneMap::Words { elem, slots, len }))
+                })
+            }
             (Kind::Record(name), Some(p)) if shallow(name) => match sig.params[p].resolved() {
                 atl_bridgegen::ir::Ty::Pointer { is_const, .. } => Some((
                     p,
@@ -1718,14 +1889,14 @@ fn ilp32_maps(
         match map {
             Some(m) => maps.push(m),
             None => {
-                if blocking.is_none_or(|b| k.weight() > b.weight()) {
-                    blocking = Some(k);
+                if blocking.is_none_or(|(w, _)| k.weight() > w) {
+                    blocking = Some((k.weight(), k.trap_reason()));
                 }
             }
         }
     }
-    if let Some(k) = blocking {
-        return Err(k.trap_reason());
+    if let Some((_, why)) = blocking {
+        return Err(why);
     }
     // the route's down shells are the ones mapped above; a JNIEnv lane or an unreviewed callback still traps
     let routed = match route {
@@ -1756,6 +1927,22 @@ fn ilp32_maps(
     }
     Ok((maps, ret, class.is_fp(), sig_literal(class, &params)))
 }
+
+/// `void*` parameters (`Kind::Ptr` by type) that are handles by the header's prose: function, parameter, the handle type (the one the native-typedef rows of the same object use, e.g. `eglCreateWindowSurface`'s `EGLNativeWindowType`), the header's words. Each must name a `Kind::Ptr` position of the ILP32 table (build fails otherwise).
+const ILP32_HANDLE_PARAMS: &[(&str, usize, &str, &str)] = &[
+    (
+        "eglCreatePlatformWindowSurface",
+        2,
+        "ANativeWindow",
+        "EGL_KHR_platform_android: native_window is an ANativeWindow* (egl.h spells void*)",
+    ),
+    (
+        "eglCreatePlatformPixmapSurface",
+        2,
+        "egl_native_pixmap_t",
+        "egl.h void* native_pixmap: Android's EGLNativePixmapType (eglplatform.h egl_native_pixmap_t*), as eglCreatePixmapSurface: a guest value no row issued is refused, counted",
+    ),
+];
 
 /// Handle typedefs that carry a guest value, not a host object (zero-extended like a pointer, never looked up): the host hands them back unchanged or interprets them itself. An `EGLClientBuffer` the host made (`eglGetNativeClientBufferANDROID`, an AHardwareBuffer) answers above 4 GiB and is refused by the result narrowing, counted (P6).
 const GUEST_VALUE_HANDLES: &[(&str, &str)] = &[(
@@ -2325,46 +2512,59 @@ fn bindings_table(
             guest.row.arch
         );
     }
-    // stale-row check of ILP32_ARRAY_PARAMS: on the ILP32 table, where they apply
-    for (f, p, _) in ILP32_ARRAY_PARAMS.iter().filter(|_| !equal_model) {
-        ensure!(
-            classes
-                .get(f)
-                .and_then(|r| r.kinds.get(p + 1))
-                .is_some_and(|k| matches!(k, atl_bridgegen::ilp32::Kind::OutWord(_))),
-            "{f} parameter {p}: in ILP32_ARRAY_PARAMS but not an out-word position of the {} table",
-            guest.row.arch
-        );
-    }
-    // ILP32_HANDLE_SLOTS / _TRAPPED: each row an out-handle position (stale), each out-handle position in one of them (missing)
+    // ILP32_WORD_ARRAYS / _TRAPPED: each row a position of its element's kind (stale), each out-handle or array position in one of them (missing); ILP32_HANDLE_PARAMS: each a `void*` position
     if !equal_model {
-        let is_slot = |f: &str, p: usize| {
-            classes
-                .get(f)
-                .and_then(|r| r.kinds.get(p + 1))
-                .is_some_and(|k| matches!(k, atl_bridgegen::ilp32::Kind::OutHandle(_)))
-        };
-        let listed = ILP32_HANDLE_SLOTS
+        use atl_bridgegen::ilp32::Kind;
+        let kind = |f: &str, p: usize| classes.get(f).and_then(|r| r.kinds.get(p + 1));
+        for &(f, p, elem, slots, ..) in ILP32_WORD_ARRAYS {
+            let fits = match (elem, kind(f, p)) {
+                (WordElem::Handle, Some(Kind::OutHandle(_))) => true,
+                // a non-const `T**` the header calls an input array (gl2ext.h glCreateShaderProgramvEXT)
+                (
+                    WordElem::Ptr,
+                    Some(Kind::Array | Kind::OutWord(atl_bridgegen::ilp32::Word::Ptr)),
+                ) => true,
+                (WordElem::Attrib, Some(Kind::Array)) => true,
+                _ => false,
+            };
+            ensure!(
+                fits,
+                "{f} parameter {p}: in ILP32_WORD_ARRAYS but not a position of its element's kind on the {} table",
+                guest.row.arch
+            );
+            ensure!(
+                elem == WordElem::Handle || slots == atl_bridgegen::jni::Slots::In,
+                "{f} parameter {p}: a Ptr/Attrib word array crosses In only (a host pointer written back would need a checked narrowing)"
+            );
+        }
+        let listed = ILP32_WORD_ARRAYS
             .iter()
             .map(|&(f, p, ..)| (f, p))
-            .chain(ILP32_HANDLE_SLOTS_TRAPPED.iter().map(|&(f, p, _)| (f, p)));
-        for (f, p) in listed.clone() {
+            .chain(ILP32_WORD_ARRAYS_TRAPPED.iter().map(|&(f, p, _)| (f, p)));
+        for &(f, p, _) in ILP32_WORD_ARRAYS_TRAPPED {
             ensure!(
-                is_slot(f, p),
-                "{f} parameter {p}: in ILP32_HANDLE_SLOTS(_TRAPPED) but not an out-handle position of the {} table",
+                matches!(kind(f, p), Some(Kind::OutHandle(_) | Kind::Array)),
+                "{f} parameter {p}: in ILP32_WORD_ARRAYS_TRAPPED but not an out-handle or array position of the {} table",
                 guest.row.arch
             );
         }
         for (f, r) in &classes {
             for (at, k) in r.kinds.iter().enumerate().skip(1) {
-                if matches!(k, atl_bridgegen::ilp32::Kind::OutHandle(_)) {
+                if matches!(k, Kind::OutHandle(_) | Kind::Array) {
                     ensure!(
                         listed.clone().any(|(lf, lp)| lf == *f && lp == at - 1),
-                        "{f} parameter {}: an out-handle position in neither ILP32_HANDLE_SLOTS nor ILP32_HANDLE_SLOTS_TRAPPED (the header says one slot, an array with its length, or why it waits)",
+                        "{f} parameter {}: an out-handle or array position in neither ILP32_WORD_ARRAYS nor ILP32_WORD_ARRAYS_TRAPPED (the header says one slot, an array with its length, or why it waits)",
                         at - 1
                     );
                 }
             }
+        }
+        for &(f, p, ..) in ILP32_HANDLE_PARAMS {
+            ensure!(
+                matches!(kind(f, p), Some(Kind::Ptr)),
+                "{f} parameter {p}: in ILP32_HANDLE_PARAMS but not a pointer position of the {} table",
+                guest.row.arch
+            );
         }
     }
     // stale-row checks of HANDLE_RELEASES (a handle parameter) and GUEST_VALUE_HANDLES (a handle type some row uses), on the ILP32 table
@@ -2508,11 +2708,11 @@ fn bindings_table(
         "the mapped forwarder below takes 6 lanes, atl_bridgegen::jni::MAPPED_LANES is {}",
         atl_bridgegen::jni::MAPPED_LANES
     );
-    if mapped_rows.iter().any(|r| {
-        r.2.iter()
-            .any(|(_, m)| matches!(m, LaneMap::Handles { .. }))
-    }) {
-        code.push_str("use super::Slots;\n\n");
+    if mapped_rows
+        .iter()
+        .any(|r| r.2.iter().any(|(_, m)| matches!(m, LaneMap::Words { .. })))
+    {
+        code.push_str("use super::{Elem, Len, Slots};\n\n");
     }
     code.push_str("/// Per `Entry::Mapped(i)`: library, symbol, the (parameter, map) pairs.\npub const MAPPED_ROWS: &[MappedRow] = &[\n");
     for (lib, name, maps, ret, _) in &mapped_rows {
@@ -2523,8 +2723,18 @@ fn bindings_table(
                 LaneMap::Handle { ty, release } => {
                     format!("({i}, LaneMap::Handle({ty:?}, {release}))")
                 }
-                LaneMap::Handles { ty, slots, len } => {
-                    format!("({i}, LaneMap::Handles({ty:?}, Slots::{slots:?}, {len:?}))")
+                LaneMap::Words { elem, slots, len } => {
+                    let elem = match elem {
+                        Elem::Handle(ty) => format!("Elem::Handle({ty:?})"),
+                        Elem::Ptr => "Elem::Ptr".to_owned(),
+                        Elem::Attrib => "Elem::Attrib".to_owned(),
+                    };
+                    let len = match len {
+                        atl_bridgegen::jni::Len::One => "Len::One".to_owned(),
+                        atl_bridgegen::jni::Len::Param(l, f) => format!("Len::Param({l}, {f})"),
+                        atl_bridgegen::jni::Len::Terminated(t) => format!("Len::Terminated({t:#x})"),
+                    };
+                    format!("({i}, LaneMap::Words({elem}, Slots::{slots:?}, {len}))")
                 }
                 LaneMap::Down { shorty, .. } => format!("({i}, LaneMap::Down(b{shorty:?}))"),
                 LaneMap::DownHandle { shorty, handle, .. } => {

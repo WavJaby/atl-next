@@ -133,11 +133,33 @@ pub enum LaneMap {
     OutWord(Word),
     /// ILP32: a guest handle of this type -> the host object (handles.rs); `true`: the call ends the object, the handle is freed after it. 0 stays NULL; an unknown handle refuses the call (counted, answers 0).
     Handle(&'static str, bool),
-    /// ILP32: a guest pointer to handle slots of this type -> a host array of host objects (ndk.rs `Slots`); the parameter holding the element count (None: one slot). NULL stays NULL; an unknown handle read in refuses the call.
-    Handles(&'static str, Slots, Option<usize>),
+    /// ILP32: a guest pointer to an array of 4-byte guest words -> a host array of host words living for the call (ndk.rs `words_in`), each element converted by [`Elem`], [`Len`] elements, crossing as [`Slots`] says. NULL stays NULL; an unknown handle read in, a length past the bound or an unterminated list refuses the call.
+    Words(Elem, Slots, Len),
 }
 
-/// Which way a [`LaneMap::Handles`] lane's handles cross (atl_bridgegen `jni::Slots`).
+/// How one guest word of a [`LaneMap::Words`] array becomes a host word (atl_bridgegen `jni::Elem`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    /// a handle of this type -> its host object (handles.rs); written back as handles for Out/InOut
+    Handle(&'static str),
+    /// a guest pointer, zero-extended (guest base 0: a guest address is the host address)
+    Ptr,
+    /// an `EGLAttrib` (egl.h `intptr_t`), sign-extended
+    Attrib,
+}
+
+/// How many elements a [`LaneMap::Words`] array holds (atl_bridgegen `jni::Len`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Len {
+    /// one slot
+    One,
+    /// the lane at this index (a C `int`-width count) times the factor; a negative count is 0 elements (the host answers its own error for it)
+    Param(usize, usize),
+    /// key/value pairs ending at the key slot holding this value, the terminator included
+    Terminated(u32),
+}
+
+/// Which way a [`LaneMap::Words`] lane's words cross (atl_bridgegen `jni::Slots`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slots {
     /// host-written (guest slots uninitialised): handles out after the call

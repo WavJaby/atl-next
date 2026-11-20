@@ -7,7 +7,7 @@
 //!
 //! The other arguments are host values already: object references are the host's, and on an LP64 guest an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes fit six int and eight fp registers (build.rs refuses the rest), so one forwarder shape serves all: the fp lanes keep their bits untouched (a float in the low half of its register), an fp result returns in the fp register.
 
-use super::bindings::{self, LaneMap, MappedRow, RetMap, Slots};
+use super::bindings::{self, Elem, LaneMap, Len, MappedRow, RetMap, Slots};
 use super::{convert, handles, jni, unsupported};
 
 /// The forwarded host function: six int lanes (SysV's integer registers) and eight fp lanes (its vector registers); a shorter prototype ignores the rest. One int result (a void one's is never read).
@@ -59,8 +59,8 @@ pub(super) fn call_mapped(
     });
     // ILP32 handles first: an unknown one refuses the whole call before any temporary or host side effect
     let mut released: Option<usize> = None;
-    // handle slots: (lane, the guest array, its type and direction, the host array)
-    let mut slots: Vec<(usize, usize, &'static str, Slots, Vec<usize>)> = Vec::new();
+    // word arrays: (lane, the guest array, its element and direction, the host array); the host arrays live until the call returns
+    let mut slots: Vec<(usize, usize, Elem, Slots, Vec<usize>)> = Vec::new();
     for &(i, map) in maps {
         match map {
             LaneMap::Handle(_, release) => {
@@ -72,16 +72,19 @@ pub(super) fn call_mapped(
                 }
                 lanes[i] = host;
             }
-            LaneMap::Handles(ty, dir, len) if lanes[i] != 0 => {
-                let n = len.map_or(1, |l| lanes[l] as u32 as usize);
-                if n > MAX_HANDLE_SLOTS {
-                    return refuse_handle(symbol, i, n);
+            LaneMap::Words(elem, dir, len) if lanes[i] != 0 => {
+                // SAFETY: lane `i` is the guest's non-NULL pointer to a word array of this length rule (build.rs ILP32_WORD_ARRAYS: the header's count parameter or terminator), readable for In/InOut.
+                match unsafe { words_in(elem, dir, lanes[i], len, &lanes) } {
+                    Ok(host) => slots.push((i, lanes[i], elem, dir, host)),
+                    Err(Refusal::Handle(h)) => return refuse_handle(symbol, i, h),
+                    Err(why) => {
+                        super::dispatch::report_refused(
+                            super::dispatch::REFUSED_ARG,
+                            &format!("{symbol} parameter {i}: {why:?} (bound {MAX_WORDS} words)"),
+                        );
+                        return 0;
+                    }
                 }
-                // SAFETY: lane `i` is the guest's non-NULL pointer to `n` handle slots (build.rs ILP32_HANDLE_SLOTS: the header's count parameter), readable for In/InOut.
-                let Some(host) = (unsafe { slots_in(dir, lanes[i], n) }) else {
-                    return refuse_handle(symbol, i, lanes[i]);
-                };
-                slots.push((i, lanes[i], ty, dir, host));
             }
             _ => {}
         }
@@ -93,7 +96,7 @@ pub(super) fn call_mapped(
     let mut temps: Vec<(usize, usize, LaneMap, convert::Temp)> = Vec::new();
     for &(i, map) in maps {
         match map {
-            LaneMap::Handle(..) | LaneMap::Handles(..) => {}
+            LaneMap::Handle(..) | LaneMap::Words(..) => {}
             LaneMap::Record(c, _) if lanes[i] != 0 => {
                 // SAFETY: lane `i` is the guest's non-NULL pointer to this record in its own layout (build.rs from the ILP32 classifier's kind of this parameter).
                 let mut t = unsafe { convert::record_in(c, lanes[i]) };
@@ -159,9 +162,9 @@ pub(super) fn call_mapped(
             );
         }
     }
-    for (i, guest, ty, dir, host) in slots {
+    for (i, guest, elem, dir, host) in slots {
         // SAFETY: `guest` is the guest's pointer to these slots read above, writable for Out/InOut (a non-const `T**`).
-        if !unsafe { slots_out(ty, dir, guest, &host) } {
+        if !unsafe { words_out(elem, dir, guest, &host) } {
             super::dispatch::report_refused(
                 super::dispatch::REFUSED_HANDLE,
                 &format!("{symbol} parameter {i}: handle table full"),
@@ -194,31 +197,84 @@ pub(super) fn call_mapped(
     }
 }
 
-/// Most handle slots one call converts: a count above it is refused, not allocated (the host array is 8 bytes a slot; a million bounds it at 8 MiB). Real counts are small: EGL configs number in tens, surfaces in ones.
-const MAX_HANDLE_SLOTS: usize = 1 << 20;
+/// Host bytes one call's word array may take: a per-call memory budget, not a spec limit (no GL ES / EGL / NDK header bounds these counts). Real counts are small: EGL configs in tens, shader strings and attribute pairs in ones to hundreds.
+const MAX_ARRAY_BYTES: usize = 8 << 20;
+/// Most words one array converts (= [`MAX_ARRAY_BYTES`] / host word): a longer count, or an attribute list with no terminator within it, is refused and counted, never allocated or read past.
+const MAX_WORDS: usize = MAX_ARRAY_BYTES / size_of::<usize>();
 
-/// The host array for `n` guest handle slots at `guest`: Out zeroed (the guest's slots are uninitialised), In/InOut each guest handle's host object. `None` when a slot read in holds a handle the table does not hold.
+/// Why [`words_in`] refused an array.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// a slot read in holds this value, a handle the table does not hold
+    Handle(usize),
+    /// the count (elements) is past [`MAX_WORDS`]
+    Bound(usize),
+    /// no terminator key within [`MAX_WORDS`]
+    Unterminated,
+}
+
+/// The element count of a word array: `Param` reads its count lane as the guest's 32-bit word, unsigned (a negative `int`/`GLsizei` count reads past the bound and is refused, so a host reading `size_t` never sees more than the array holds); `Terminated` scans key slots (even indices) of the guest list for the terminator, values unread.
 ///
 /// # Safety
-/// For In/InOut, `guest` points to `n` readable 4-byte slots.
-unsafe fn slots_in(dir: Slots, guest: usize, n: usize) -> Option<Vec<usize>> {
+/// For `Terminated`, `guest` points to a readable list of 4-byte words in key/value pairs.
+unsafe fn word_count(len: Len, guest: usize, lanes: &[usize; 6]) -> Result<usize, Refusal> {
+    let n = match len {
+        Len::One => 1,
+        Len::Param(l, factor) => (lanes[l] as u32 as usize).saturating_mul(factor),
+        Len::Terminated(end) => {
+            return (0..MAX_WORDS)
+                .step_by(2)
+                // SAFETY: key slot `k`, reached only past the pairs before it, none of them the terminator (the caller's list).
+                .find(|&k| unsafe { (guest as *const u32).add(k).read_unaligned() } == end)
+                .map(|k| k + 1)
+                .ok_or(Refusal::Unterminated);
+        }
+    };
+    if n > MAX_WORDS {
+        return Err(Refusal::Bound(n));
+    }
+    Ok(n)
+}
+
+/// The host array for the guest word array at `guest` (its length by `len`, count lanes in `lanes`): Out zeroed (the guest's slots are uninitialised), In/InOut each guest word converted by `elem`. Lives as long as the caller keeps it: the call.
+///
+/// # Safety
+/// `guest` points to the array `len` describes, readable for In/InOut (and for `Terminated`, whatever the direction).
+unsafe fn words_in(
+    elem: Elem,
+    dir: Slots,
+    guest: usize,
+    len: Len,
+    lanes: &[usize; 6],
+) -> Result<Vec<usize>, Refusal> {
+    // SAFETY: the caller's array.
+    let n = unsafe { word_count(len, guest, lanes) }?;
     if dir == Slots::Out {
-        return Some(vec![0; n]);
+        return Ok(vec![0; n]);
     }
     (0..n)
         .map(|k| {
             // SAFETY: slot `k` of the caller's `n` readable slots (unaligned: the guest's array may be packed in a record).
-            let h = unsafe { (guest as *const u32).add(k).read_unaligned() };
-            handles::to_host(h as usize)
+            let w = unsafe { (guest as *const u32).add(k).read_unaligned() };
+            match elem {
+                Elem::Handle(_) => handles::to_host(w as usize).ok_or(Refusal::Handle(w as usize)),
+                // AAPCS32: a 4-byte data pointer; guest base 0, so the address as an unsigned number is the host's
+                Elem::Ptr => Ok(w as usize),
+                // egl.h `typedef intptr_t EGLAttrib`: a signed 4-byte word on ILP32, 8 on LP64
+                Elem::Attrib => Ok(w as i32 as isize as usize),
+            }
         })
         .collect()
 }
 
-/// Writes the host array's objects back to the guest's slots as handles (Out, InOut; In writes nothing). A one-slot lane writes its slot always (NULL included: the host's failure answer); an array only the slots the host filled (non-NULL), leaving the rest as the guest had them. `false` when a handle could not be issued (that slot written NULL).
+/// Writes the host array's objects back to the guest's slots as handles (a `Handle` array, Out or InOut; In writes nothing, and `Ptr`/`Attrib` arrays are In only: build.rs refuses another direction). A one-slot lane writes its slot always (NULL included: the host's failure answer); an array only the slots the host filled (non-NULL), leaving the rest as the guest had them. `false` when a handle could not be issued (that slot written NULL).
 ///
 /// # Safety
 /// For Out/InOut, `guest` points to `host.len()` writable 4-byte slots.
-unsafe fn slots_out(ty: &'static str, dir: Slots, guest: usize, host: &[usize]) -> bool {
+unsafe fn words_out(elem: Elem, dir: Slots, guest: usize, host: &[usize]) -> bool {
+    let Elem::Handle(ty) = elem else {
+        return true;
+    };
     if dir == Slots::In {
         return true;
     }
@@ -250,6 +306,94 @@ fn refuse_handle(symbol: &str, i: usize, value: usize) -> usize {
 mod tests {
     use super::*;
 
+    const H: Elem = Elem::Handle("S");
+    const NO_LANES: [usize; 6] = [0; 6];
+
+    /// `n` slots at `p` by a count lane (lane 0 = `n`).
+    unsafe fn slots_in(elem: Elem, dir: Slots, p: usize, n: usize) -> Result<Vec<usize>, Refusal> {
+        // SAFETY: the caller's `n` slots.
+        unsafe { words_in(elem, dir, p, Len::Param(0, 1), &[n, 0, 0, 0, 0, 0]) }
+    }
+
+    /// `Ptr` elements: AAPCS32 data pointers are 4 bytes, and guest base 0 makes a guest address the host's, so 0x8000_0000 (a valid guest address below 4 GiB) zero-extends, never to -2^31; NULL stays 0.
+    #[test]
+    fn ptr_words_zero_extend() {
+        let g = [0x0001_0000u32, 0x8000_0000, 0];
+        // SAFETY: three readable slots.
+        let host = unsafe { slots_in(Elem::Ptr, Slots::In, g.as_ptr() as usize, 3) };
+        assert_eq!(host, Ok(vec![0x1_0000, 0x8000_0000, 0]));
+    }
+
+    /// `Attrib` elements: egl.h `typedef intptr_t EGLAttrib` (signed, 4 bytes on ILP32); `EGL_WIDTH` 0x3057, value -1, `EGL_NONE` 0x3038 (egl.h): the list ends at the key slot holding `EGL_NONE`, which is copied; -1 sign-extends.
+    #[test]
+    fn attrib_lists_sign_extend_and_end_at_egl_none() {
+        let g = [0x3057u32, 0xFFFF_FFFF, 0x3038, 0x1234];
+        // SAFETY: a terminated list.
+        let host = unsafe {
+            words_in(
+                Elem::Attrib,
+                Slots::In,
+                g.as_ptr() as usize,
+                Len::Terminated(0x3038),
+                &NO_LANES,
+            )
+        };
+        assert_eq!(host, Ok(vec![0x3057, 0xFFFF_FFFF_FFFF_FFFF, 0x3038]));
+        // a value slot holding 0x3038 is not the end: only key slots are inspected
+        let v = [0x3057u32, 0x3038, 0x3038];
+        // SAFETY: as above.
+        let host = unsafe {
+            words_in(
+                Elem::Attrib,
+                Slots::In,
+                v.as_ptr() as usize,
+                Len::Terminated(0x3038),
+                &NO_LANES,
+            )
+        };
+        assert_eq!(host.map(|h| h.len()), Ok(3));
+    }
+
+    /// An attribute list with no terminator within the bound (bound + 1 pairs, every key `EGL_WIDTH`) is refused, never read past the bound.
+    #[test]
+    fn unterminated_attrib_list_is_refused() {
+        let g = vec![0x3057u32; 2 * (MAX_WORDS + 1)];
+        // SAFETY: bound + 1 readable pairs.
+        let host = unsafe {
+            words_in(
+                Elem::Attrib,
+                Slots::In,
+                g.as_ptr() as usize,
+                Len::Terminated(0x3038),
+                &NO_LANES,
+            )
+        };
+        assert_eq!(host, Err(Refusal::Unterminated));
+    }
+
+    /// A count times a factor: NdkMediaDataSource.h `AMediaDataSource_newUri(uri, numheaders, key_values)`, `key_values` holding 2 x `numheaders` strings: `numheaders` 2 reads 4 words; a count past the bound refuses before any allocation or read.
+    #[test]
+    fn scaled_count_and_bound() {
+        let g = [1u32, 2, 3, 4, 5];
+        let lanes = [0, 2, 0, 0, 0, 0];
+        // SAFETY: five readable slots, four read.
+        let host = unsafe {
+            words_in(
+                Elem::Ptr,
+                Slots::In,
+                g.as_ptr() as usize,
+                Len::Param(1, 2),
+                &lanes,
+            )
+        };
+        assert_eq!(host, Ok(vec![1, 2, 3, 4]));
+        // a negative GLsizei (-1 as the guest's word) reads as 2^32 - 1, past the bound: refused, nothing read
+        let lanes = [0xFFFF_FFFF, 0, 0, 0, 0, 0];
+        // SAFETY: never dereferenced (refused first).
+        let host = unsafe { words_in(Elem::Ptr, Slots::In, 8, Len::Param(0, 1), &lanes) };
+        assert_eq!(host, Err(Refusal::Bound(0xFFFF_FFFF)));
+    }
+
     /// Handle slots by the headers' contracts: an out slot gets a handle naming the host object (a raw host address never reaches the guest: break `ilp32_raw_handles` fails here); an array (egl.h eglChooseConfig: `num_config` of `config_size` slots written) writes only the filled slots; an iterator cursor (NdkMediaCodecStore.h: keep the last value) crosses back in; a slot holding an unissued value refuses.
     #[test]
     fn handle_slots_issue_handles_and_refuse_forged_ones() {
@@ -258,10 +402,10 @@ mod tests {
         // one Out slot, guest garbage before the call
         let mut one = [0xdead_beefu32];
         // SAFETY: here and below, each array holds as many 4-byte slots as passed, readable and writable.
-        let host = unsafe { slots_in(Slots::Out, one.as_ptr() as usize, 1) }.unwrap();
+        let host = unsafe { slots_in(H, Slots::Out, one.as_ptr() as usize, 1) }.unwrap();
         assert_eq!(host, [0]);
         // SAFETY: as above.
-        assert!(unsafe { slots_out("S", Slots::Out, one.as_mut_ptr() as usize, &[a]) });
+        assert!(unsafe { words_out(H, Slots::Out, one.as_mut_ptr() as usize, &[a]) });
         assert_ne!(
             one[0] as usize,
             a & 0xffff_ffff,
@@ -270,23 +414,23 @@ mod tests {
         assert_eq!(handles::to_host(one[0] as usize), Some(a));
         // InOut: the cursor crosses back in as the host object
         // SAFETY: as above.
-        let back = unsafe { slots_in(Slots::InOut, one.as_ptr() as usize, 1) }.unwrap();
+        let back = unsafe { slots_in(H, Slots::InOut, one.as_ptr() as usize, 1) }.unwrap();
         assert_eq!(back, [a]);
         // array of 3, host filled 2: the third keeps the guest's value
         let mut arr = [0u32, 0, 7];
         // SAFETY: as above.
-        assert!(unsafe { slots_out("S", Slots::Out, arr.as_mut_ptr() as usize, &[a, b, 0]) });
+        assert!(unsafe { words_out(H, Slots::Out, arr.as_mut_ptr() as usize, &[a, b, 0]) });
         assert_eq!(arr[0], one[0], "one handle per live address");
         assert_eq!(handles::to_host(arr[1] as usize), Some(b));
         assert_eq!(arr[2], 7);
         // In: a forged slot refuses; In writes nothing back
         let forged = [arr[0], 0x1234u32];
         // SAFETY: as above.
-        assert!(unsafe { slots_in(Slots::In, forged.as_ptr() as usize, 2) }.is_none());
+        assert!(unsafe { slots_in(H, Slots::In, forged.as_ptr() as usize, 2) }.is_err());
         let good = [arr[0], arr[1]];
         assert_eq!(
             // SAFETY: as above.
-            unsafe { slots_in(Slots::In, good.as_ptr() as usize, 2) }.unwrap(),
+            unsafe { slots_in(H, Slots::In, good.as_ptr() as usize, 2) }.unwrap(),
             [a, b]
         );
         for h in [arr[0], arr[1]] {
