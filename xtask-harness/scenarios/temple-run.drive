@@ -75,7 +75,7 @@ touch-swipe 480 600 200 600 120
 wait-frames 3
 touch-swipe 480 600 200 600 120
 wait-log app "LEFT: turn element was null" 5000
-# floor = half the lowest of 3 means over this window, WSL x86_64 readback, job s4-tr-b4: 25.7 / 26.2 / 33.3
-expect-fps 12.8 tier=readback over 4000
+# floor = half the lowest of 3 means over this window, WSL x86_64 readback, offline, load 3.8-7.7, job sof-fps3b: 59.2 / 60.6 / 59.5
+expect-fps 29.6 tier=readback over 4000
 expect-audio 5000
 expect-no-log services "refused IActivityTaskManager"
