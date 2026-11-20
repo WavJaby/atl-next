@@ -798,6 +798,15 @@ reason = "generated configure output (%define lines), no notice; libvpx LICENSE 
 licence = "BSD-3-Clause"
 reason = "generated version header, no notice; libvpx LICENSE (WebM Project, BSD-3-Clause)"
 
+# the health HAL (android.hardware.health-service.example): its charger UI (libminui) links libdrm; BatteryMonitor includes the battery constants header
+[upstream.aosp.paths."external/libdrm/generated_static_table_fourcc.h"]
+licence = "MIT"
+reason = "gen_table_fourcc.py output, no notice; generated from include/drm/drm_fourcc.h, whose notice is MIT (Intel)"
+
+[upstream.aosp.paths."frameworks/native/services/batteryservice/include/batteryservice/BatteryServiceConstants.h"]
+licence = "Apache-2.0"
+reason = "enum header with no notice; its Android.bp names default_applicable_licenses frameworks_native_license, which lists SPDX-license-identifier-Apache-2.0 for this package"
+
 [upstream.qemu]
 # QEMU's LICENSE: "Source files with no licensing information are released under the GNU General
 # Public License, version 2 or (at your option) any later version."

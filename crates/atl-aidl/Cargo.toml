@@ -10,9 +10,9 @@ publish.workspace = true
 # The stubs: the converter's AIDL crate `atl_aidl_stubs` (xtask packages.rs `aidl`, bp2ninja aidlcrates.go) against libbinder_rs (AOSP's Rust binder: libbinder_ndk -> libbinder), which the probe also names.
 # Only `xtask native` builds them: it builds this package after the converter with feature `converter` (atl-bridgegen converter.rs).
 # Plain workspace builds and tests take the empty library and skip the probe.
-# `android.hardware.graphics.allocator-V2-rust` is AOSP's own Rust backend of the stable HAL interface (stability vintf, frozen at V2 = its current sources): an unstable crate cannot compile @VintfStability types (aidl.cpp), so it is not one of the crate's `types`.
+# `android.hardware.graphics.allocator-V2-rust` is AOSP's own Rust backend of the stable HAL interface (stability vintf, frozen at V2 = its current sources): an unstable crate cannot compile @VintfStability types (aidl.cpp), so it is not one of the crate's `types`. Same for `android.hardware.health-V4-rust` (the health HAL the battery service calls, battery.rs).
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcelables", "device/android.hardware.graphics.allocator-V2-rust"]
+converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcelables", "device/android.hardware.graphics.allocator-V2-rust", "device/android.hardware.health-V4-rust"]
 
 # types: IServiceManager (libbinder's own AIDL), the M2 framework interfaces, and the M3 window path (IWindowManager, IWindowSession, IWindow, IDisplayManager; libgui's `android.gui` ISurfaceComposer and its client / display-event interfaces), IInputMethodManager (the input method service, input_method.rs), IInputMethod / IInputMethodSession / IInputMethodSessionCallback (the in-app input method atl-ime serves and IMMS-lite binds, ime_bind.rs), IAndroidFuture (the getSurroundingText result atl-ime receives), IInputManager (the input service, input.rs), IStorageManager (the mount service, storage.rs; its IVoldTaskListener import is in system/vold/binder), IClipboard (the clipboard service, clipboard.rs), compiled with their import closure.
 # A type another aidl_interface owns is imported at its latest frozen version, not compiled (bp2ninja aidlcrates.go): android.hardware.graphics.common (DisplayDecorationSupport, ...) is `android.hardware.graphics.common-V6-rust`. The interfaces owning a requested type are stood in for: `android.gui` brings its rust backend's `libgui_aidl_types_rs` (BitTube, LayerMetadata, VsyncEventData, ... as `todo!()` stubs).
@@ -49,6 +49,8 @@ include_dirs = [
     "packages/modules/Bluetooth/framework/aidl-export",
     "packages/modules/Connectivity/framework/aidl-export",
     "packages/modules/Connectivity/framework/src",
+    # framework-connectivity-t's AIDL (packages/modules/Connectivity/framework-t/Android.bp: its srcs root; aidl.include_dirs = framework/aidl-export, above): INetworkStatsService
+    "packages/modules/Connectivity/framework-t/src",
     # IPermissionManager imports the structured AttributionSourceState
     "frameworks/native/libs/permission/aidl",
     "system/hardware/interfaces/media/aidl",
@@ -114,6 +116,11 @@ types = [
     "android.app.INotificationManager",
     "android.app.ITransientNotification",
     "android.hardware.input.IInputManager",
+    # the batterystats and batteryproperties services (battery.rs): BatteryManager needs both
+    "com.android.internal.app.IBatteryStats",
+    "android.os.IBatteryPropertiesRegistrar",
+    # the netstats service (netstats.rs): TrafficStats.init in every app process
+    "android.net.INetworkStatsService",
     # test only (atl-aidl-probe --enforce): the smallest framework interface with @EnforcePermission methods
     "android.hardware.ISerialManager",
 ]

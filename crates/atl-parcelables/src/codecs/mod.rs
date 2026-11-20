@@ -70,6 +70,7 @@ pub mod android {
         pub mod Uri;
     }
     pub mod os {
+        pub mod BatteryProperty;
         pub mod Bundle;
         pub mod LocaleList;
         pub mod Message;

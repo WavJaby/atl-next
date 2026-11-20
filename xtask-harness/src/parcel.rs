@@ -255,6 +255,8 @@ const CASES: [&str; 122] = [
     "AudioDeviceAttributes:short",
     "VolumeInfo",
     "VolumeInfo:unset",
+    "BatteryProperty",
+    "BatteryProperty:null-string",
     "self-test:corrupt",
     "self-test:wrong-codec",
     "self-test:refusal",

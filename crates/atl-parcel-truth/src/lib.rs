@@ -43,8 +43,8 @@ use atl_parcelables::android::hardware::OverlayProperties;
 use atl_parcelables::android::media::{
     AudioAttributes, AudioDeviceAttributes, PlayerBase_PlayerIdCard, VolumeInfo,
 };
-use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::os::LocaleList;
+use atl_parcelables::android::os::{BatteryProperty, Bundle};
 use atl_parcelables::android::os::storage::StorageVolume;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::inputmethod::{
@@ -361,6 +361,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
             round_trip_as::<AudioDeviceAttributes>(input, mode)
         }
         "android.media.VolumeInfo" => round_trip_as::<VolumeInfo>(input, mode),
+        "android.os.BatteryProperty" => round_trip_as::<BatteryProperty>(input, mode),
         "android.media.PlayerBase$PlayerIdCard" => {
             round_trip_as::<PlayerBase_PlayerIdCard>(input, mode)
         }

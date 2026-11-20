@@ -400,6 +400,15 @@ mirrors = [
     "frameworks/base/core/java/com/android/internal/widget/LockPatternUtils.java#isSecure",
 ]
 
+["netstats"]
+src = ["crates/atl-services/src/netstats.rs"]
+mirrors = [
+    "packages/modules/Connectivity/service-t/src/com/android/server/net/NetworkStatsService.java#getUidStats",
+    "packages/modules/Connectivity/service-t/src/com/android/server/net/NetworkStatsService.java#getIfaceStats",
+    "packages/modules/Connectivity/service-t/src/com/android/server/net/NetworkStatsService.java#getTotalStats",
+    "packages/modules/Connectivity/service-t/src/com/android/server/net/NetworkStatsService.java#getRateLimitCacheConfig",
+]
+
 ["telephony.registry"]
 src = ["crates/atl-services/src/telephony_registry.rs"]
 mirrors = [

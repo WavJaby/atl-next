@@ -6,7 +6,8 @@ Subject: [PATCH] aidl: Rust backend: optional Java nullability
 --rust_java_nullability makes every object type nullable, as the Java
 backend treats it: String, arrays, lists, parcelables (Java-only ones
 included), IBinder and interfaces. Primitives, enums and
-ParcelableHolder stay non-null. Implemented as
+ParcelableHolder stay non-null, and so do interface
+constants (a const String is &str). Implemented as
 AidlTypeSpecifier::IsNullable, which every backend query and check of
 a type already goes through.
 
@@ -16,10 +17,10 @@ Patch-Reason: Java AIDL passes and returns null for any object (ActivityManagerS
 SPDX-License-Identifier: Apache-2.0
  aidl_language.cpp |  8 ++++++++
  aidl_language.h   |  3 +++
- aidl_to_rust.cpp  |  5 ++++-
+ aidl_to_rust.cpp  |  8 ++++++--
  options.cpp       | 11 +++++++++++
  options.h         |  3 +++
- 5 files changed, 29 insertions(+), 1 deletion(-)
+ 5 files changed, 31 insertions(+), 2 deletions(-)
 
 diff --git a/aidl_language.cpp b/aidl_language.cpp
 index b72f88092e0c9f931d6ae20d37ba776a428f560a..3fd1189f0b51def6ace504b7fab83d6ff7f5229e 100644
@@ -55,10 +56,20 @@ index 5a724c575102c90b0405598b10713fbb3f739fb8..a8ed2b9e726146f31a07cd2dedbd9d21
    bool IsDynamicArray() const {
      return array_.has_value() && std::get_if<DynamicArray>(&*array_) != nullptr;
 diff --git a/aidl_to_rust.cpp b/aidl_to_rust.cpp
-index 471a498808767498c1b81e819f33c03e2292aa22..413e289a134b3aa93d96fcac7619e0f8b113f7c3 100644
+index 471a498808767498c1b81e819f33c03e2292aa22..b7fab135d92cc4e8d92812e0d7dbe2ee9ea8f992 100644
 --- a/aidl_to_rust.cpp
 +++ b/aidl_to_rust.cpp
-@@ -327,7 +327,10 @@ StorageMode ArgumentStorageMode(const AidlArgument& arg, const AidlTypenames& ty
+@@ -95,7 +95,8 @@ std::string ConstantValueDecoratorInternal(
+     value = value + ".into()";
+   }
+ 
+-  if (type.IsNullable()) {
++  // by_ref = an interface constant (`pub const X: &str`), never an Option: a constant is non-null even where every object type is nullable
++  if (type.IsNullable() && !by_ref) {
+     value = "Some(" + value + ")";
+   }
+ 
+@@ -327,7 +328,10 @@ StorageMode ArgumentStorageMode(const AidlArgument& arg, const AidlTypenames& ty
  
    const bool isEnum = definedType && definedType->AsEnumDeclaration() != nullptr;
    const bool isPrimitive = AidlTypenames::IsPrimitiveTypename(typeName);

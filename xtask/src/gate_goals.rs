@@ -162,6 +162,9 @@ pub fn runtime() -> Goals {
         APK_SIGNER,
         // org.apache.http.legacy: the platform library every run registers (external/apache-http java_sdk_library; its jar and permission file, platform_rows)
         "org.apache.http.legacy.impl",
+        // AOSP's default health HAL (hardware/interfaces/health/aidl/default) atld starts in every run, and its Rust backend the battery service calls (atl-services battery.rs)
+        "android.hardware.health-service.example",
+        "android.hardware.health-V4-rust",
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))

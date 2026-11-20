@@ -422,6 +422,9 @@ public class ParcelTruth {
         check("AudioDeviceAttributes:short", new AudioDeviceAttributes(AudioDeviceAttributes.ROLE_OUTPUT, AudioDeviceInfo.TYPE_BUILTIN_SPEAKER, ""), AudioDeviceAttributes.CREATOR);
         check("VolumeInfo", new VolumeInfo.Builder(AudioManager.STREAM_MUSIC).setMuted(true).setVolumeIndex(9).setMinVolumeIndex(0).setMaxVolumeIndex(15).build(), VolumeInfo.CREATOR);
         check("VolumeInfo:unset", new VolumeInfo.Builder(AudioManager.STREAM_MUSIC).build(), VolumeInfo.CREATOR);
+        // IBatteryPropertiesRegistrar.getProperty's out value (atl-services battery.rs): both fields set, and the string left null as every numeric property leaves it
+        check("BatteryProperty", batteryProperty(42L, "x"), android.os.BatteryProperty.CREATOR);
+        check("BatteryProperty:null-string", batteryProperty(-7L, null), android.os.BatteryProperty.CREATOR);
 
         selfTests(config, intent, entries);
         System.out.println("pt summary " + failures + " failed");
@@ -457,6 +460,13 @@ public class ParcelTruth {
     /// ImeOnBackInvokedDispatcher carries its ResultReceiver's binder: Java Parcel -> codec -> Java Parcel with its objects (roundTripParcel); every byte consumed, Java reads it back,
     /// and the binder Java re-writes from the read value is the original one.
     /// ImeTracker.Token carries a binder, so it goes through the parcel-copy path: the binder must come back the same object, the tag equal.
+    static android.os.BatteryProperty batteryProperty(long v, String s) {
+        android.os.BatteryProperty p = new android.os.BatteryProperty();
+        p.setLong(v);
+        p.setString(s);
+        return p;
+    }
+
     static void checkImeToken(String name) {
         Binder binder = new Binder();
         ImeTracker.Token t = new ImeTracker.Token(binder, "atl:parcel-truth");

@@ -93,7 +93,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `locale`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`appops`, `connectivity`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -156,6 +156,8 @@ const LOCALE: &str = "locale";
 const TRUST: &str = "trust";
 /// Context.TELEPHONY_REGISTRY_SERVICE (TelephonyRegistryManager's registry; SystemServer adds it on every device).
 const TELEPHONY_REGISTRY: &str = "telephony.registry";
+/// Context.NETWORK_STATS_SERVICE (NetworkStatsManager; TrafficStats.init in every app process).
+const NETSTATS: &str = "netstats";
 /// Context.APP_OPS_SERVICE.
 const APP_OPS: &str = "appops";
 /// WebViewFactory.WEBVIEW_UPDATE_SERVICE_NAME.
@@ -438,6 +440,10 @@ fn main() -> Result<()> {
             ),
         )
         .context("addService telephony.registry")?;
+    }
+    if !a.omit_service.iter().any(|s| s == NETSTATS) {
+        binder::add_service(NETSTATS, atl_services::netstats::new_binder())
+            .context("addService netstats")?;
     }
     if !a.omit_service.iter().any(|s| s == APP_OPS) {
         binder::add_service(
