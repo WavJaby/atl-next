@@ -575,11 +575,51 @@ pub fn drm_sysfs(devices: &[PathBuf]) -> io::Result<(Vec<Mount>, Vec<Link>)> {
 /// The power-supply class dir AOSP's BatteryMonitor (healthd) scans: each entry is a link into its supply's device dir, whose `type`, `online`, `capacity`, `status` ... it reads.
 pub const POWER_SUPPLY_SYSFS: &str = "/sys/class/power_supply";
 
-/// The power-supply sysfs the health HAL reads, and no more of /sys: each `/sys/class/power_supply/<name>` link recreated as the host has it, and the supply's own device dir (the link's target)
-/// read-only at its path. A host without supplies gives nothing (BatteryMonitor's no-battery answer). Given to the health HAL's sandbox only (atld `--health`).
+/// Every per-supply attribute AOSP's BatteryMonitor reads (system/core healthd/BatteryMonitor.cpp, each `"%s/%s/<attr>"`; pin 7c348c9): the health HAL's whole view of a supply.
+/// Not here, on purpose: `serial_number` (a stable hardware identifier no app may get; BatteryMonitor::getSerialNumber answers none anyway), `uevent` (repeats every attribute,
+/// POWER_SUPPLY_SERIAL_NUMBER included), `manufacturer`, `model_name` and the rest -- unread by the HAL, so absent changes no answer.
+pub const BATTERY_MONITOR_ATTRS: [&str; 28] = [
+    "capacity",
+    "capacity_level",
+    "charge_counter",
+    "charge_full",
+    "charge_full_design",
+    "charging_policy",
+    "charging_state",
+    "current_avg",
+    "current_max",
+    "current_now",
+    "cycle_count",
+    "first_usage_date",
+    "health",
+    "health_index",
+    "health_status",
+    "is_dock",
+    "manufacturing_date",
+    "online",
+    "present",
+    "scope",
+    "state_of_health",
+    "status",
+    "technology",
+    "temp",
+    "time_to_full_now",
+    "type",
+    "voltage_max",
+    "voltage_now",
+];
+
+/// The power-supply sysfs the health HAL reads, and no more of /sys: each `/sys/class/power_supply/<name>` link recreated as the host has it, and of the supply's device dir (the link's target)
+/// only the [`BATTERY_MONITOR_ATTRS`] files it has, each read-only at its own path -- never the whole dir (its `serial_number` and `uevent` carry the battery's serial).
+/// A host without supplies gives nothing (BatteryMonitor's no-battery answer). Given to the health HAL's sandbox only (atld `--health`).
 pub fn power_supply_sysfs() -> io::Result<(Vec<Mount>, Vec<Link>)> {
+    power_supply_view(Path::new(POWER_SUPPLY_SYSFS))
+}
+
+/// [`power_supply_sysfs`] of the class dir `class`.
+fn power_supply_view(class: &Path) -> io::Result<(Vec<Mount>, Vec<Link>)> {
     let (mut mounts, mut links) = (Vec::new(), Vec::new());
-    let entries = match std::fs::read_dir(POWER_SUPPLY_SYSFS) {
+    let entries = match std::fs::read_dir(class) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((mounts, links)),
         Err(e) => return Err(e),
@@ -590,11 +630,16 @@ pub fn power_supply_sysfs() -> io::Result<(Vec<Mount>, Vec<Link>)> {
             continue;
         };
         let dir = std::fs::canonicalize(&at)?;
-        mounts.push(Mount {
-            host: dir.clone(),
-            at: dir,
-            writable: false,
-        });
+        for attr in BATTERY_MONITOR_ATTRS {
+            let file = dir.join(attr);
+            if file.is_file() {
+                mounts.push(Mount {
+                    host: file.clone(),
+                    at: file,
+                    writable: false,
+                });
+            }
+        }
         links.push(Link { target, at });
     }
     Ok((mounts, links))
@@ -1577,6 +1622,65 @@ mod tests {
             s(&binderd_args(&files, 9, 8)).join(" "),
             "--unshare-all --unshare-user --uid 65534 --gid 65534 --die-with-parent --new-session --cap-drop ALL --info-fd 9 --seccomp 8 --tmpfs / --ro-bind /b/atl-binderd /b/atl-binderd --ro-bind /lib64/ld.so /lib64/ld.so --"
         );
+    }
+
+    /// R7-4: a synthetic supply carrying a known serial in `serial_number` and `uevent` (as a host battery does): the HAL's view holds the link and only BatteryMonitor's attributes,
+    /// file by file; no mounted path is a dir, none is the serial's file, no mounted content contains the serial.
+    #[test]
+    fn power_supply_view_withholds_the_serial() {
+        const SERIAL: &str = "ATLSERIAL0123456";
+        let dir = std::env::temp_dir().join(format!("atl-broker-psy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dev = dir.join("devices/BAT0/power_supply/BAT0");
+        fs::create_dir_all(&dev).expect("device dir");
+        fs::create_dir_all(dir.join("class")).expect("class dir");
+        let dir = fs::canonicalize(&dir).expect("canonical test dir");
+        let dev = dir.join("devices/BAT0/power_supply/BAT0");
+        for (f, v) in [
+            ("type", "Battery\n".to_owned()),
+            ("capacity", "87\n".to_owned()),
+            ("status", "Discharging\n".to_owned()),
+            ("manufacturer", "ACME\n".to_owned()),
+            ("model_name", "B1\n".to_owned()),
+            ("serial_number", format!("{SERIAL}\n")),
+            (
+                "uevent",
+                format!("POWER_SUPPLY_NAME=BAT0\nPOWER_SUPPLY_SERIAL_NUMBER={SERIAL}\n"),
+            ),
+        ] {
+            fs::write(dev.join(f), v).expect("attr");
+        }
+        std::os::unix::fs::symlink("../devices/BAT0/power_supply/BAT0", dir.join("class/BAT0"))
+            .expect("link");
+        let (mounts, links) = power_supply_view(&dir.join("class")).expect("view");
+        assert_eq!(
+            links,
+            [Link {
+                target: "../devices/BAT0/power_supply/BAT0".into(),
+                at: dir.join("class/BAT0")
+            }]
+        );
+        let mut got: Vec<_> = mounts
+            .iter()
+            .map(|m| {
+                m.at.strip_prefix(&dev)
+                    .expect("under the device dir")
+                    .to_owned()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [PathBuf::from("capacity"), "status".into(), "type".into()]
+        );
+        for m in &mounts {
+            assert!(!m.writable && m.host == m.at && m.host.is_file(), "{m:?}");
+            assert!(
+                !fs::read_to_string(&m.host).expect("read").contains(SERIAL),
+                "{m:?} carries the serial"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Golden argv of Profile::Installer, written from its spec: the installer's uid, every namespace and a network namespace of its own (loopback only), its own session, the seccomp program;

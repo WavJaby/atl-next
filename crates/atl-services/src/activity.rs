@@ -3143,6 +3143,40 @@ mod tests {
 
     use super::*;
 
+    /// R7-3 must not get worse: the system sender identity (`broadcast_as_system`, SYSTEM_UID) is no binder method, and its only caller is atl-system-services' battery sender.
+    /// Every app reaches broadcasts through broadcastIntentWithFeature, which passes the binder caller's uid. A new call site (an AIDL handler routing through it) fails here.
+    #[test]
+    fn system_broadcast_entry_has_only_the_battery_caller() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("src dir") {
+                let p = e.expect("entry").path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let mut calls = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).expect("source");
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(".broadcast_as_system(") {
+                    calls.push(format!(
+                        "{}:{}",
+                        f.strip_prefix(&src).expect("under src").display(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].starts_with("bin/system_services.rs:"), "{calls:?}");
+    }
+
     /// The global configuration's locale: the host's UI language tag as given, else AOSP's en-US (LocaleList needs one; ActivityThread.handleBindApplication).
     #[test]
     fn global_configuration_locale_is_the_host_tag_or_the_default() {
