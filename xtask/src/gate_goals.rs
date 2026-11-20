@@ -348,7 +348,7 @@ pub const GATES: &[(&str, GoalsOf)] = &[
             "libjavacrypto",
         ]))
     }),
-    ("run-apk", app),
+    ("run-apk", || app().with(keystore_daemons())),
     // a riscv64 host's libz (its V-tier TU) and libunwindstack (vlenb in a ucontext unwind), run under qemu-user (rv_qemu.rs)
     ("rv-qemu", || Goals::host(&["libz", "libunwindstack"])),
     ("sandbox", Goals::default),

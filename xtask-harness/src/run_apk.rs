@@ -983,7 +983,11 @@ pub(crate) fn configure(
     rt: Runtime,
     foreign: Option<&SupportedAbi>,
 ) -> Result<Runtime> {
-    let rt = rt.with_gralloc(root)?.with_gl_driver(root)?;
+    // keystore2 + KeyMint as on a device: apps get AndroidKeyStore at start (the launcher installs the provider) and fail without the service (LINE: "Could not connect to Keystore service")
+    let rt = rt
+        .with_gralloc(root)?
+        .with_gl_driver(root)?
+        .with_keystore(root)?;
     // the host ISA's guest exists only where its identity engine does, as app.rs; elsewhere the guest is foreign (below)
     let rt = if crate::arches::identity(root, &args.host)? {
         rt.with_native_bridge_guest(&args.host)?
