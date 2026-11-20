@@ -152,8 +152,9 @@ pub fn build(
     let mut env = Vec::new();
     // bindgen parses the headers as the C compiler compiles them: upstream's CMake gives it only -I and --target, so a cross host's
     // --sysroot comes through bindgen's own BINDGEN_EXTRA_CLANG_ARGS (else it reads the build machine's glibc headers: other layouts)
-    let bindgen_args = tc.flags.compile.join(" ");
+    let bindgen_args = shell_join(&tc.flags.compile);
     if !recipe.crates.is_empty() {
+        bindgen_stamp(&build, tc.rust_triple, &bindgen_args)?;
         cache.push(("RUST_BINDINGS", tc.rust_triple.to_owned()));
         env.push(("LIBCLANG_PATH", tc.libclang.as_os_str()));
         env.push((
@@ -242,6 +243,44 @@ fn crate_edition(manifest: &Path) -> Result<String> {
 /// Compiler entries whose change makes cmake delete its cache and re-run configure without the other `-D`s: CMAKE_INSTALL_PREFIX then falls back to the project's default
 /// (BoringSSL's `${CMAKE_SOURCE_DIR}/install`, its CMakeLists.txt), and install writes into the source tree.
 const COMPILER_ENTRIES: [&str; 2] = ["CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER"];
+
+/// POSIX shell words, single-quoted where needed: bindgen splits `BINDGEN_EXTRA_CLANG_ARGS` with `shlex::split`, so a plain space join breaks a path holding a space.
+fn shell_join(args: &[String]) -> String {
+    let word = |a: &String| {
+        let plain = !a.is_empty()
+            && a.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_=+/.,:@%".contains(&b));
+        if plain {
+            a.clone()
+        } else {
+            format!("'{}'", a.replace('\'', r"'\''"))
+        }
+    };
+    args.iter().map(word).collect::<Vec<_>>().join(" ")
+}
+
+/// The bindgen custom command (upstream bssl-sys CMakeLists) reads `BINDGEN_EXTRA_CLANG_ARGS` from the environment, which ninja does not see: Soong puts bindgen's clang args on the command line
+/// (rust/bindgen.go `$cflags`), so a change reruns it. The equivalent without patching upstream's command: the value is stamped in the build dir, and a different value deletes the wrapper
+/// `wrapper_<triple>.rs` (+ its depfile) so ninja regenerates it, as `drop_stale_cache` does for cache entries. Returns whether it deleted.
+fn bindgen_stamp(build: &Path, triple: &str, args: &str) -> Result<bool> {
+    let dir = build.join("rust").join("bssl-sys");
+    let stamp = dir.join("atl-bindgen-args");
+    if std::fs::read_to_string(&stamp).is_ok_and(|old| old == args) {
+        return Ok(false);
+    }
+    let wrapper = dir.join(format!("wrapper_{triple}.rs"));
+    let mut deleted = false;
+    for f in [wrapper.clone(), wrapper.with_extension("rs.d")] {
+        match std::fs::remove_file(&f) {
+            Ok(()) => deleted = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", f.display())),
+        }
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::write(&stamp, args).with_context(|| format!("writing {}", stamp.display()))?;
+    Ok(deleted)
+}
 
 /// Deletes `build`'s CMakeCache.txt + CMakeFiles when cmake cannot reuse it with `-D` entries `wanted`: the cache names another source dir (`CMAKE_HOME_DIRECTORY`, e.g. a removed task copy: cmake refuses it),
 /// or another compiler (COMPILER_ENTRIES: cmake's own reset would drop the other entries). Returns why when it deleted.
@@ -352,6 +391,43 @@ pub fn cmake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R5-5: the same args keep the generated wrapper, changed args delete it and its depfile (ninja then regenerates it: its own command and depfile do not name the env args).
+    #[test]
+    fn a_bindgen_args_change_deletes_the_wrapper() {
+        let build =
+            std::env::temp_dir().join(format!("xtask-bindgen-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&build);
+        let dir = build.join("rust/bssl-sys");
+        let t = "x86_64-unknown-linux-gnu";
+        let wrapper = dir.join(format!("wrapper_{t}.rs"));
+        let depfile = dir.join(format!("wrapper_{t}.rs.d"));
+        let make = || {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&wrapper, "w").unwrap();
+            std::fs::write(&depfile, "d").unwrap();
+        };
+        assert!(
+            !bindgen_stamp(&build, t, "--sysroot=/a").unwrap(),
+            "first stamp: nothing to delete"
+        );
+        make();
+        assert!(!bindgen_stamp(&build, t, "--sysroot=/a").unwrap());
+        assert!(wrapper.is_file() && depfile.is_file());
+        assert!(bindgen_stamp(&build, t, "--sysroot=/a -march=rv64gc").unwrap());
+        assert!(!wrapper.exists() && !depfile.exists());
+        let _ = std::fs::remove_dir_all(&build);
+    }
+
+    /// shlex::split (POSIX words) of the joined value gives the args back: a space or quote inside one stays inside it.
+    #[test]
+    fn bindgen_args_are_shell_words() {
+        let args = ["--sysroot=/opt/my sdk", "-DX='1'", "-O2", ""].map(String::from);
+        assert_eq!(
+            shell_join(&args),
+            r#"'--sysroot=/opt/my sdk' '-DX='\''1'\''' -O2 ''"#
+        );
+    }
 
     #[test]
     fn a_cache_from_another_source_dir_is_dropped() {
