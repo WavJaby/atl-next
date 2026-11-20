@@ -1727,7 +1727,9 @@ impl Runtime {
             inputs.files.extend(remote::lib_files(mapper_dir)?);
         }
         if let Some(k) = &self.keystore {
-            inputs.files.extend([k.keystore2.clone(), k.keymint.clone()]);
+            inputs
+                .files
+                .extend([k.keystore2.clone(), k.keymint.clone()]);
             inputs
                 .files
                 .extend(k.fragments.iter().map(|(_, f)| f.clone()));

@@ -2100,11 +2100,20 @@ fn run(a: &Args) -> Result<ExitCode> {
         let mut hal = system_spawn("keymint", keymint, vec![], false, None)?;
         hal.uid = AID_NOBODY;
         logdw_to_log(&mut hal, &sockets.join("keymint"), &r.log("keymint"))?;
-        keystore.push(("keymint", broker.spawn(hal).context("starting the KeyMint HAL")?));
+        keystore.push((
+            "keymint",
+            broker.spawn(hal).context("starting the KeyMint HAL")?,
+        ));
         let db = host_layout::keystore_data(&r.data_root);
         std::fs::create_dir_all(&db)?;
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700))?;
-        let mut ks = system_spawn("keystore2", keystore2, vec![KEYSTORE_DB.into()], false, None)?;
+        let mut ks = system_spawn(
+            "keystore2",
+            keystore2,
+            vec![KEYSTORE_DB.into()],
+            false,
+            None,
+        )?;
         ks.uid = AID_KEYSTORE;
         logdw_to_log(&mut ks, &sockets.join("keystore2"), &r.log("keystore2"))?;
         ks.mounts.push(Mount {

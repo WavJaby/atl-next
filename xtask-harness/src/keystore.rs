@@ -60,7 +60,10 @@ fn checks() -> [(&'static str, String); 6] {
             "an EC key generated through keystore2: ORIGIN authorization SOFTWARE",
             format!("AtlKeystore: origin-level {SOFTWARE}"),
         ),
-        ("the generated key deletes", "AtlKeystore: delete-key ok".to_owned()),
+        (
+            "the generated key deletes",
+            "AtlKeystore: delete-key ok".to_owned(),
+        ),
         (
             "keystore2's database is outside the app sandbox",
             "AtlKeystore: keystore-dir absent".to_owned(),
