@@ -319,8 +319,9 @@ impl Stage {
 
 /// The stages whose run ends when their probe is done, not at the watch's end: the ime probe kills the app and relaunches it, a cold start (8-20 s under load, 2026-11-21) the 12 s watch
 /// cut short, so the stop landed anywhere in the relaunch (its bind missing, the death counted from the exit summary, the relaunched process's half-started counters judged). LIMIT still bounds it.
+/// webview-overlay: its probe waits for every answer it judges (the last Esc's back line), so the rest of its 30 s watch was idle time (rows 49-55 s, 2026-11-21).
 fn probe_ends_run(stage: Stage) -> bool {
-    matches!(stage, Stage::Ime)
+    matches!(stage, Stage::Ime | Stage::WebViewOverlay)
 }
 
 /// The stages whose probe takes pictures of the window through [`capture::Probe`] (the harness route, not the composer's log).
