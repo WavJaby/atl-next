@@ -40,8 +40,9 @@ const SWEEP_LIMIT: Duration = Duration::from_secs(300);
 const MANAGER: &str = "manager";
 /// A name nothing registers, shaped as an AIDL HAL instance (`<package>.<Interface>/<instance>`) so servicemanager's miss path consults the VINTF manifests (ServiceManager.cpp `isVintfDeclared` via `NativeName::fill` / AIDL instance names): without them it logs `NULL VINTF MANIFEST`.
 const ABSENT: &str = "android.hardware.atltest.IAbsent/default";
-/// How long servicemanager may take to answer its first `service check` (a cold start reads VINTF and starts its Looper: well under a second measured; 10 s leaves room for a loaded machine).
-const STARTUP: Duration = Duration::from_secs(10);
+/// How long servicemanager may take to answer its first `service check` (a cold start reads VINTF and starts its Looper: well under a second measured on a quiet host). The bound only bites
+/// when it never comes up; 10 s, with each check killed at RUN_LIMIT, failed gates compositor and gralloc at load 10-22 (2026-11-20, `killed after 5s`); 60 s is generous on purpose.
+const STARTUP: Duration = Duration::from_secs(60);
 /// binderd counter lines this workload must produce (atl-binderd main.rs prints them; any nonzero count): servicemanager's nodes carry TXN_SECURITY_CTX (`becomeContextManager`, and `setRequestingSid` on its services), and libbinder sends BINDER_ENABLE_ONEWAY_SPAM_DETECTION at open (ProcessState.cpp `open_driver`). Measured 2026-11-02: 3 and 4.
 /// 0x40046210 = _IOW('b', 16, __u32) = BINDER_ENABLE_ONEWAY_SPAM_DETECTION (uapi binder.h), once per process open (9 in this workload, 2026-11-06). Left unsupported on purpose:
 /// EINVAL is what a kernel without the feature answers, libbinder tolerates it (logs only when binderfs advertises `features/oneway_spam_detection`), and accepting it
@@ -198,14 +199,26 @@ fn service(
     args: &[&str],
     log: &Path,
 ) -> Result<(bool, String)> {
+    service_limited(b, service, env, args, log, RUN_LIMIT)
+}
+
+/// [`service`] killed after `limit`.
+fn service_limited(
+    b: &Broker,
+    service: &Path,
+    env: &[(String, String)],
+    args: &[&str],
+    log: &Path,
+    limit: Duration,
+) -> Result<(bool, String)> {
     let mut cmd = Command::new(service);
     cmd.args(args).envs(env.iter().cloned());
     let mut p = spawn_logged(b, &cmd, AID_SHELL, log)?;
-    let status = wait_limited(&mut p.child, RUN_LIMIT)?;
+    let status = wait_limited(&mut p.child, limit)?;
     let text = std::fs::read_to_string(log)?;
     Ok(match status {
         Some(s) => (s.success(), text),
-        None => (false, format!("{text}(killed after {RUN_LIMIT:?})")),
+        None => (false, format!("{text}(killed after {limit:?})")),
     })
 }
 
@@ -289,7 +302,9 @@ pub(crate) fn start_servicemanager(
     let start = Instant::now();
     let log = |n: &str| test_root.join(format!("service-{n}.log"));
     let found = loop {
-        let r = self::service(b, service, env, &["check", MANAGER], &log("check"))?;
+        // a check started before servicemanager is the context manager waits for it inside libbinder, so during the start-up one check may take all of STARTUP, not RUN_LIMIT
+        let left = STARTUP.saturating_sub(start.elapsed()).max(RUN_LIMIT);
+        let r = self::service_limited(b, service, env, &["check", MANAGER], &log("check"), left)?;
         if r.0 && r.1.contains("found") && !r.1.contains("not found") || start.elapsed() > STARTUP {
             break r;
         }
