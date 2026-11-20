@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The web engine behind `android.webkit.WebView` (webview plan S4.1, M68): shaped by its first implementation, WebKitGTK (atl-webview-linux), and by what the provider needs so far (W1 default UA; W2 views: load, JS, script dialogs, load events).
 //! Threads: [`WebView`] and [`WebEngine::create_view`] run on the UI thread (= the GTK main thread, plan README Q6), as Android's WebView methods do; events arrive there too. [`PromptReply`] and [`NavigationReply`] alone are Send.
+//! No method answers with engine state: what the provider's synchronous getters need comes with the events ([`WebEvent::Location`], `Title`, `Progress`), so a later display thread never has to answer one.
 
 /// The process's web engine, reached through its module.
 pub trait WebEngine {
@@ -69,22 +70,12 @@ pub trait WebView {
     fn stop_loading(&self);
     /// Reloads the current page.
     fn reload(&self);
-    /// Whether session history has an entry `steps` away from the current one (negative = back).
-    fn can_go_back_or_forward(&self, steps: i32) -> bool;
     /// Goes to the session-history entry `steps` away; none there = nothing happens.
     fn go_back_or_forward(&self, steps: i32);
     /// Runs `script` in the main frame; `done` gets the result as JSON (`null` for undefined, a function or a non-serialisable value), or the exception's text.
     fn evaluate_javascript(&self, script: &str, done: Box<dyn FnOnce(Result<String, String>)>);
     /// Replaces the scripts injected at document start into every frame of every later load (an already loaded document keeps what it got).
     fn set_user_scripts(&self, sources: &[String]);
-    /// The current URL, if any.
-    fn uri(&self) -> Option<String>;
-    /// The URL the current history entry was first requested as (before redirects), if any.
-    fn original_uri(&self) -> Option<String>;
-    /// The current title, if any.
-    fn title(&self) -> Option<String>;
-    /// The estimated progress of the current load, 0..=100.
-    fn progress(&self) -> i32;
     /// Applies one engine-backed setting to the view; `value` has the kind of `which` ([`WebSetting::kind`]). The core stores every WebSettings value and calls this only for the ones WebKit has.
     fn set_setting(&self, which: WebSetting, value: &SettingValue);
     /// The view's background colour, an Android colour int (ARGB). WebView.setBackgroundColor hands it to the provider only (WebView.java:3072), so the page's background is the only one.
@@ -156,6 +147,18 @@ pub enum WebEvent {
     Title(String),
     /// The estimated load progress changed, 0..=100.
     Progress(i32),
+    /// The view's location changed: its URL, its session history around the current entry. Reported before the load event it belongs to, so a receiver keeping the last one answers the
+    /// synchronous getters (getUrl, getOriginalUrl, canGoBackOrForward) as of the events it has seen (display-thread plan D5: no getter waits for the engine's thread).
+    Location {
+        /// The current URL, if any.
+        uri: Option<String>,
+        /// The URL the current history entry was first requested as (before redirects); the current URL for a page with no history entry.
+        original_uri: Option<String>,
+        /// Session-history entries behind the current one.
+        back: u32,
+        /// Session-history entries ahead of the current one.
+        forward: u32,
+    },
     /// A page called `prompt(message, default)`; JavaScript blocks until `reply` finishes (from any thread). Dropping `reply` unfinished answers `null`.
     Prompt {
         /// prompt's first argument.

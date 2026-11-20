@@ -33,7 +33,13 @@ fn main() -> Result<()> {
         };
         let iface = atl_bridgegen::interface("jni", JNI_H, &src, std::slice::from_ref(&target))
             .context(JNI_H)?;
-        atl_bridgegen::rust::import_module(&iface, &host.arch, &[], &["JNINativeInterface"])
+        // JavaVMAttachArgs: the JavaBridge thread attaches under its own name (jni `bridge_thread`)
+        atl_bridgegen::rust::import_module(
+            &iface,
+            &host.arch,
+            &[],
+            &["JNINativeInterface", "JavaVMAttachArgs"],
+        )
     };
     let code = generate()?;
     ensure!(

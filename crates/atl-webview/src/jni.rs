@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! The JNI exports: `JNI_OnLoad` and one `Java_*` per native method of the forwarders, each converting at once to safe values and calling safe code.
 //! Symbol names are JNI's short form (class + method; no native overloads in these classes). Provider natives run on the UI thread (WebView's own thread check), which is the GTK main thread
-//! where the engine's events arrive too; `Statics.getDefaultUserAgent` runs on whatever thread called; bridge calls run on the "JavaBridge" thread ([`bridge_thread`]).
+//! where the engine's events arrive too; `Statics.getDefaultUserAgent` runs on whatever thread called; bridge calls run on the "JavaBridge" thread ([`bridge_thread`]), which finds their objects
+//! itself. No provider native asks the engine for state: the getters read the [`Mirror`] the events keep (display-thread plan D5).
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use atl_platform_ui::webview::{
     InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue, WebEngine as _, WebEvent,
@@ -407,8 +408,6 @@ struct Native {
     /// (Surface::dispatchSetSidebandStream, `NativeHandle::create(h, false)`) that may outlive this provider; 20 bytes per WebView.
     sideband: &'static [i32],
     shared: Rc<Shared>,
-    /// `addJavascriptInterface` objects: name, global ref, the `@JavascriptInterface` method names.
-    interfaces: RefCell<Vec<(String, usize, Vec<String>)>>,
     /// The WebSettings values (settings.rs table): stored here, the engine's own pushed on set.
     settings: RefCell<Settings>,
     /// CookieManager.setAcceptThirdPartyCookies(this view) (= WebSettings.setAcceptThirdPartyCookies); counted in [`crate::cookies::third_party`] while on.
@@ -460,9 +459,50 @@ impl Native {
     }
 }
 
+/// `addJavascriptInterface` objects: name, global ref, the `@JavascriptInterface` method names. Shared with the JavaBridge thread, which looks a call's object up itself (WTC R5: a bridge call
+/// never waits for the WebView's thread); a global ref is deleted only under the lock, so a lookup's NewLocalRef under it never sees a deleted one.
+type Interfaces = Arc<Mutex<Vec<(String, usize, Vec<String>)>>>;
+
+fn interfaces(i: &Interfaces) -> MutexGuard<'_, Vec<(String, usize, Vec<String>)>> {
+    i.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// What the synchronous getters answer (display-thread plan D5, WTC R3): the engine's state as of the last event delivered here, set before that event's callback runs. Chromium's provider answers
+/// them from its browser-side state on the WebView's thread, so a getter inside a callback agrees with the callbacks seen so far. The provider's own loads seed `uri` (read-after-write).
+#[derive(Default)]
+struct Mirror {
+    uri: Option<String>,
+    original_uri: Option<String>,
+    back: u32,
+    forward: u32,
+    title: Option<String>,
+    progress: i32,
+}
+
+impl Mirror {
+    /// Whether session history has an entry `steps` away from the current one (negative = back); 0 = false, as the engine's history lookup answered before the mirror.
+    fn can_go(&self, steps: i32) -> bool {
+        match steps.cmp(&0) {
+            std::cmp::Ordering::Less => self.back >= steps.unsigned_abs(),
+            std::cmp::Ordering::Greater => self.forward >= steps.unsigned_abs(),
+            std::cmp::Ordering::Equal => false,
+        }
+    }
+
+    /// The provider asked the engine to load `uri`: the getters name it until the engine's own location arrives.
+    fn seed(&mut self, uri: &str) {
+        self.uri = Some(uri.to_owned());
+        self.original_uri = Some(uri.to_owned());
+    }
+}
+
 /// What the event sink needs: the provider (a weak global ref, so the app's WebView stays collectable).
 struct Shared {
     provider: Cell<usize>,
+    /// [`Interfaces`].
+    interfaces: Interfaces,
+    /// [`Mirror`].
+    mirror: RefCell<Mirror>,
     /// The view's sideband key (stream ints `[tag, key]`): names the view in `webview[<key>]:` log lines, so an app with several WebViews shows which one loads what and which one is on screen.
     id: Cell<i32>,
     /// Copies of the keys the page was given (dispatchKeyEvent's claim), oldest first: (stamp ns, global ref to the KeyEvent copy, action, keycode). An unhandled report names one by its stamp.
@@ -568,6 +608,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     }
     let shared = Rc::new(Shared {
         provider: Cell::new(0),
+        interfaces: Interfaces::default(),
+        mirror: RefCell::default(),
         id: Cell::new(-1),
         keys: RefCell::default(),
         unhandled_presses: RefCell::default(),
@@ -608,7 +650,6 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         view,
         sideband: Box::leak(handle.into_boxed_slice()),
         shared: shared.clone(),
-        interfaces: RefCell::default(),
         settings: RefCell::new(settings),
         third_party: Cell::new(false),
         paused: Cell::new(false),
@@ -660,10 +701,25 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
 
 /// One engine event on the UI thread, to the app's clients in the engine's order (onPageStarted first; title/progress as they come).
 fn on_event(shared: &Shared, ev: WebEvent) {
-    let Some(env) = env_now() else { return };
-    if let WebEvent::Prompt { message, reply, .. } = ev {
-        return on_prompt(env, shared, &message, reply);
+    match ev {
+        WebEvent::Location {
+            uri,
+            original_uri,
+            back,
+            forward,
+        } => {
+            let mut m = shared.mirror.borrow_mut();
+            (m.uri, m.original_uri, m.back, m.forward) = (uri, original_uri, back, forward);
+            return;
+        }
+        WebEvent::Prompt { message, reply, .. } => {
+            return on_prompt(&shared.interfaces, &message, reply);
+        }
+        WebEvent::Title(ref t) => shared.mirror.borrow_mut().title = Some(t.clone()),
+        WebEvent::Progress(p) => shared.mirror.borrow_mut().progress = p,
+        _ => {}
     }
+    let Some(env) = env_now() else { return };
     if let WebEvent::UnhandledKey(t) = ev {
         return on_unhandled_key(env, shared, t);
     }
@@ -987,31 +1043,15 @@ fn on_download(env: Env, provider: Obj, [url, disposition, mime]: &[&str; 3], le
     }
 }
 
-/// A page's `prompt`: a bridge call goes to the JavaBridge thread with its object; any other prompt answers null (WebChromeClient.onJsPrompt dispatch is a later slice, counted).
-fn on_prompt(env: Env, shared: &Shared, message: &str, reply: Box<dyn PromptReply>) {
+/// A page's `prompt`, on any thread and without JNI: a bridge call goes to the JavaBridge thread with the view's interfaces; any other prompt answers null (WebChromeClient.onJsPrompt dispatch is
+/// a later slice, counted).
+fn on_prompt(interfaces: &Interfaces, message: &str, reply: Box<dyn PromptReply>) {
     let Some(call) = bridge::parse(message) else {
         crate::refuse("WebChromeClient.onJsPrompt");
         return reply.finish(None);
     };
-    let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
-    let object = (!provider.is_null())
-        .then(|| native(env, provider))
-        .flatten()
-        .and_then(|n| {
-            n.interfaces
-                .borrow()
-                .iter()
-                .find(|(name, ..)| *name == call.object)
-                .map(|(_, g, _)| *g as Obj)
-        })
-        .map(|g| jni_call!(env, NewGlobalRef, g) as usize);
-    delete_local(env, provider);
-    let Some(object) = object else {
-        // removed since the page was loaded: Chromium answers as for a missing method
-        return reply.finish(Some(bridge::reply_error(bridge::JAVA_EXCEPTION)));
-    };
     let job = Job {
-        object,
+        interfaces: interfaces.clone(),
         call,
         reply,
     };
@@ -1021,11 +1061,20 @@ fn on_prompt(env: Env, shared: &Shared, message: &str, reply: Box<dyn PromptRepl
     }
 }
 
-/// One bridge call for the JavaBridge thread; `object` is a global ref it deletes.
+/// One bridge call for the JavaBridge thread, which finds `call.object` in `interfaces` itself.
 struct Job {
-    object: usize,
+    interfaces: Interfaces,
     call: bridge::Call,
     reply: Box<dyn PromptReply>,
+}
+
+/// The call's object as a local ref on the bridge thread, None when the page names one not (or no longer) added: Chromium answers that as a missing method.
+fn bridge_object(env: Env, job: &Job) -> Option<Obj> {
+    let list = interfaces(&job.interfaces);
+    let (_, global, _) = list.iter().find(|(name, ..)| *name == job.call.object)?;
+    // under the lock: the owner deletes a global ref only while holding it
+    let local = jni_call!(env, NewLocalRef, *global as Obj);
+    (!local.is_null()).then_some(local)
 }
 
 /// The JavaBridge thread (Chromium runs injected-object methods on such a background thread, not the UI thread), started on first use.
@@ -1038,17 +1087,29 @@ fn bridge_thread() -> &'static mpsc::Sender<Job> {
             .spawn(move || {
                 let vm = vm();
                 let mut env: *mut *const JNINativeInterface = std::ptr::null_mut();
-                // SAFETY: ART's JavaVM; a daemon attach so the bridge never holds the process open.
+                // the Java thread's name (Thread.getName), which an attach without one makes "Thread-<n>"; the OS name above is the native one
+                let mut args = generated::JavaVMAttachArgs {
+                    version: JNI_VERSION_1_6,
+                    name: c"JavaBridge".as_ptr().cast_mut(),
+                    group: NULL,
+                };
+                // SAFETY: ART's JavaVM; a daemon attach so the bridge never holds the process open; `args` outlives the call.
                 let attached = unsafe { (**vm).AttachCurrentThreadAsDaemon }.is_some_and(
-                    |attach| unsafe { attach(vm, &mut env, std::ptr::null_mut()) } == 0,
+                    |attach| unsafe { attach(vm, &mut env, (&raw mut args).cast()) } == 0,
                 );
                 if !attached {
                     tracing::error!("webview: JavaBridge thread cannot attach to the VM");
                     return;
                 }
                 for job in rx {
-                    let answer = invoke(env, job.object as Obj, &job.call);
-                    jni_call!(env, DeleteGlobalRef, job.object as Obj);
+                    let answer = match bridge_object(env, &job) {
+                        Some(object) => {
+                            let a = invoke(env, object, &job.call);
+                            delete_local(env, object);
+                            a
+                        }
+                        None => bridge::reply_error(bridge::JAVA_EXCEPTION),
+                    };
                     job.reply.finish(Some(answer));
                 }
             });
@@ -1246,9 +1307,7 @@ fn box_arg(env: Env, a: bridge::Arg) -> Obj {
 
 /// Rebuilds the document-start scripts from the interfaces (takes effect on the next load, as Android documents for addJavascriptInterface).
 fn refresh_scripts(n: &Native) {
-    let scripts: Vec<String> = n
-        .interfaces
-        .borrow()
+    let scripts: Vec<String> = interfaces(&n.shared.interfaces)
         .iter()
         .map(|(name, _, ms)| bridge::script(name, ms))
         .collect();
@@ -1258,7 +1317,7 @@ fn refresh_scripts(n: &Native) {
 fn add_interface(env: Env, n: &Native, object: Obj, name: &str) {
     let methods = interface_methods(env, object);
     let global = jni_call!(env, NewGlobalRef, object) as usize;
-    let mut list = n.interfaces.borrow_mut();
+    let mut list = interfaces(&n.shared.interfaces);
     if let Some(i) = list.iter().position(|(nm, ..)| nm == name) {
         let (_, old, _) = list.remove(i);
         jni_call!(env, DeleteGlobalRef, old as Obj);
@@ -1498,7 +1557,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_destroy(
     let n = unsafe { Box::from_raw(p) };
     tracing::info!("webview[{}]: destroyed", n.shared.id.get());
     n.set_third_party(false);
-    for (_, g, _) in n.interfaces.borrow_mut().drain(..) {
+    // under the lock ([`Interfaces`])
+    for (_, g, _) in interfaces(&n.shared.interfaces).drain(..) {
         jni_call!(env, DeleteGlobalRef, g as Obj);
     }
     if n.carrier.get() != 0 {
@@ -1523,7 +1583,10 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
             // (AB2's settings WebView, `load failed ... Cancelled`). A string result replacing the document (Chromium, targetSdk >= K) is not modelled.
             match bridge::javascript_source(&u) {
                 Some(script) => n.view.evaluate_javascript(&script, Box::new(|_| {})),
-                None => n.view.load_uri(&u),
+                None => {
+                    n.shared.mirror.borrow_mut().seed(&u);
+                    n.view.load_uri(&u)
+                }
             }
         }
         None => tracing::warn!("webview: loadUrl(null) ignored"),
@@ -1532,7 +1595,9 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadData, (env, n, data: Obj, mime: Obj, encoding: Obj) -> () = (), {
     let data = string(env, data).unwrap_or_default();
-    n.view.load_uri(&bridge::data_url(&data, string(env, mime).as_deref(), string(env, encoding).as_deref()));
+    let url = bridge::data_url(&data, string(env, mime).as_deref(), string(env, encoding).as_deref());
+    n.shared.mirror.borrow_mut().seed(&url);
+    n.view.load_uri(&url);
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataWithBaseURL, (env, n, base: Obj, data: Obj, mime: Obj, encoding: Obj, history: Obj) -> () = (), {
@@ -1546,14 +1611,22 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataW
     }
     match base {
         // a data: base makes it loadData (Chromium's AwContents.loadDataWithBaseURL)
-        Some(b) if b.starts_with("data:") => n.view.load_uri(&bridge::data_url(&data, mime.as_deref(), encoding.as_deref())),
-        b => n.view.load_bytes(
-            data.as_bytes(),
-            mime.as_deref().filter(|m| !m.is_empty()).unwrap_or("text/html"),
-            // the Java String is UTF-16; it crosses as UTF-8 whatever charset the caller named
-            "UTF-8",
-            b.as_deref().unwrap_or("about:blank"),
-        ),
+        Some(b) if b.starts_with("data:") => {
+            let url = bridge::data_url(&data, mime.as_deref(), encoding.as_deref());
+            n.shared.mirror.borrow_mut().seed(&url);
+            n.view.load_uri(&url);
+        }
+        b => {
+            let base = b.as_deref().unwrap_or("about:blank");
+            n.shared.mirror.borrow_mut().seed(base);
+            n.view.load_bytes(
+                data.as_bytes(),
+                mime.as_deref().filter(|m| !m.is_empty()).unwrap_or("text/html"),
+                // the Java String is UTF-16; it crosses as UTF-8 whatever charset the caller named
+                "UTF-8",
+                base,
+            );
+        }
     }
 });
 
@@ -1584,7 +1657,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_reload, (
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_canGoBackOrForward, (env, n, steps: i32) -> u8 = 0, {
     let _ = env;
-    u8::from(n.view.can_go_back_or_forward(steps))
+    u8::from(n.shared.mirror.borrow().can_go(steps))
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_goBackOrForward, (env, n, steps: i32) -> () = (), {
@@ -1592,21 +1665,22 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_goBackOrF
     n.view.go_back_or_forward(steps);
 });
 
+// the getters read the Mirror (Shared::mirror): the engine's state as of the last event delivered
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getUrl, (env, n) -> Obj = NULL, {
-    n.view.uri().map_or(NULL, |u| new_string(env, &u))
+    n.shared.mirror.borrow().uri.as_deref().map_or(NULL, |u| new_string(env, u))
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getTitle, (env, n) -> Obj = NULL, {
-    n.view.title().map_or(NULL, |t| new_string(env, &t))
+    n.shared.mirror.borrow().title.as_deref().map_or(NULL, |t| new_string(env, t))
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getProgress, (env, n) -> i32 = 0, {
     let _ = env;
-    n.view.progress()
+    n.shared.mirror.borrow().progress
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_getOriginalUrl, (env, n) -> Obj = NULL, {
-    n.view.original_uri().map_or(NULL, |u| new_string(env, &u))
+    n.shared.mirror.borrow().original_uri.as_deref().map_or(NULL, |u| new_string(env, u))
 });
 
 // WebView.onPause: "best-effort ... animations and geolocation", JavaScript not paused. WebKitGTK has no per-view pause (hiding the widget would hide a page Android still shows): isPaused answers, the engine runs on, counted
@@ -2198,11 +2272,15 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_addJavasc
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_removeJavascriptInterface, (env, n, name: Obj) -> () = (), {
     let Some(name) = string(env, name) else { return };
     let removed = {
-        let mut list = n.interfaces.borrow_mut();
-        list.iter().position(|(nm, ..)| *nm == name).map(|i| list.remove(i))
+        let mut list = interfaces(&n.shared.interfaces);
+        let removed = list.iter().position(|(nm, ..)| *nm == name).map(|i| list.remove(i));
+        // under the lock ([`Interfaces`])
+        if let Some((_, g, _)) = &removed {
+            jni_call!(env, DeleteGlobalRef, *g as Obj);
+        }
+        removed.is_some()
     };
-    if let Some((_, g, _)) = removed {
-        jni_call!(env, DeleteGlobalRef, g as Obj);
+    if removed {
         refresh_scripts(n);
     }
 });
@@ -2553,3 +2631,29 @@ text_get!(
     Java_com_android_webview_chromium_WebSettingsImpl_getUserAgentString,
     UserAgentString
 );
+
+#[cfg(test)]
+mod tests {
+    use super::Mirror;
+
+    /// WebView.canGoBackOrForward(steps): "whether the page can go back or forward in the history by the given number of steps" -- an entry exists that far (negative = back).
+    #[test]
+    fn can_go_counts_entries_each_way() {
+        let m = Mirror {
+            back: 2,
+            forward: 1,
+            ..Mirror::default()
+        };
+        assert!(m.can_go(-1) && m.can_go(-2) && m.can_go(1));
+        assert!(!m.can_go(-3) && !m.can_go(2));
+        assert!(!Mirror::default().can_go(-1));
+    }
+
+    /// The provider's own load names its URL at once, before the engine reports it.
+    #[test]
+    fn seed_names_the_requested_url() {
+        let mut m = Mirror::default();
+        m.seed("data:text/html;base64,cA==");
+        assert_eq!(m.uri.as_deref(), Some("data:text/html;base64,cA=="));
+    }
+}

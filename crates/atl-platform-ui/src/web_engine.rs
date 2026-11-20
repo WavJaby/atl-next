@@ -107,6 +107,13 @@ impl WebEngine for PlatformWebEngine {
                         std::ptr::read(&e.reply)
                     })) as Box<dyn NavigationReply>,
                 },
+                web_event::LOCATION => WebEvent::Location {
+                    uri: (e.flags & web_event::FLAG_HAS_URI != 0).then_some(text),
+                    original_uri: (e.flags & web_event::FLAG_HAS_ORIGINAL_URI != 0)
+                        .then_some(detail),
+                    back: e.back,
+                    forward: e.forward,
+                },
                 web_event::TITLE => WebEvent::Title(text),
                 web_event::PROGRESS => WebEvent::Progress(e.progress),
                 web_event::PROMPT => WebEvent::Prompt {
@@ -215,17 +222,6 @@ pub struct PlatformWebView {
     key: i32,
 }
 
-impl PlatformWebView {
-    fn text(
-        &self,
-        f: unsafe extern "C" fn(*mut WebViewHandle, *mut BytesOut) -> bool,
-    ) -> Option<String> {
-        // SAFETY: a live handle on the UI thread; the sink lives for the call.
-        let (some, bytes) = BytesOut::collect(|out| unsafe { f(self.h, out) });
-        some.then(|| String::from_utf8_lossy(&bytes).into_owned())
-    }
-}
-
 // Every method: a live handle (dropped only in Drop) on the UI thread (trait contract); borrowed strings live for the call.
 impl WebView for PlatformWebView {
     fn load_uri(&self, uri: &str) {
@@ -257,11 +253,6 @@ impl WebView for PlatformWebView {
         unsafe { (self.m.view_reload)(self.h) }
     }
 
-    fn can_go_back_or_forward(&self, steps: i32) -> bool {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_can_go)(self.h, steps) }
-    }
-
     fn go_back_or_forward(&self, steps: i32) {
         // SAFETY: see the impl comment.
         unsafe { (self.m.view_go)(self.h, steps) }
@@ -284,23 +275,6 @@ impl WebView for PlatformWebView {
         let views: Vec<Str> = sources.iter().map(|s| Str::of(s)).collect();
         // SAFETY: see the impl comment; `views` borrows `sources` for the call.
         unsafe { (self.m.view_set_user_scripts)(self.h, views.as_ptr(), views.len()) }
-    }
-
-    fn uri(&self) -> Option<String> {
-        self.text(self.m.view_uri)
-    }
-
-    fn original_uri(&self) -> Option<String> {
-        self.text(self.m.view_original_uri)
-    }
-
-    fn title(&self) -> Option<String> {
-        self.text(self.m.view_title)
-    }
-
-    fn progress(&self) -> i32 {
-        // SAFETY: see the impl comment.
-        unsafe { (self.m.view_progress)(self.h) }
     }
 
     fn set_setting(&self, which: WebSetting, value: &SettingValue) {

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! The WebView module's exports (`atl_platform_ui_api::abi::WebViewVtable`): WebKitGTK behind the facade's `PlatformWebEngine`.
-//! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default, made once on the GTK main thread and cached. WebKit binds its main thread to the first thread that
-//! touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView on the UI thread SIGSEGV/abort in instance init (AB2, Temple Run; test app row
-//! webview-ua runs on a worker for this). So WebKit is touched on the UI thread only; a worker's call hops there and waits.
-//! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it); shown by the UI module, which parents it into the window whose scene has its sideband quad (`view_widget`). Every `view_*` runs on the GTK main thread (the Android UI thread); signals arrive there.
+//! The display thread: the thread that owns GLib's default context and runs GTK (today the Android UI thread, which the UI module's mirror makes the context's owner; display-thread plan D2: its own
+//! thread later). WebKit binds its main thread to the first thread that touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView SIGSEGV/abort in
+//! instance init (AB2, Temple Run; test app row webview-ua runs on a worker for this). So WebKit is touched on the display thread only, found as the default context's owner; another thread's call hops there.
+//! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default, made once on the display thread and cached.
+//! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it); shown by the UI module, which parents it into the window whose scene has its sideband quad (`view_widget`). Every `view_*` runs on the display thread; signals arrive there.
 
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
@@ -27,14 +28,9 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_load_bytes,
     view_stop,
     view_reload,
-    view_can_go,
     view_go,
     view_evaluate,
     view_set_user_scripts,
-    view_uri,
-    view_original_uri,
-    view_title,
-    view_progress,
     view_set_bool,
     view_set_int,
     view_set_str,
@@ -68,35 +64,35 @@ unsafe extern "C" fn default_user_agent(out: *mut BytesOut) -> bool {
     ok
 }
 
-/// The engine's default UA, made once on the UI thread ([`ui_user_agent`]).
+/// The engine's default UA, made once on the display thread ([`display_user_agent`]).
 static USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// [`USER_AGENT`] from any thread. The UI thread owns GLib's default context for the process's life (the UI module's mirror acquires it at attach), so: owner -> run here; a context nobody
-/// owns -> no UI thread in this process, refuse (invoking would run WebKit right here, on the caller); else invoke on the UI thread and wait.
-/// Deadlock: a worker waits here while the UI thread runs its Looper; if the app blocks its UI thread on this worker (join, Future.get) both wait -- as Chromium's provider, whose statics start
-/// the engine on the UI thread and block a background caller until it ran. No fallback: answering on the worker is exactly the off-thread WebKit touch this avoids.
+/// [`USER_AGENT`] from any thread: the display plan's `call` form (an app thread waits on the display thread, which never waits on an app thread). The display thread owns GLib's default context for
+/// the process's life, so: owner -> run here; a context nobody owns -> no display thread in this process, refuse (invoking would run WebKit right here, on the caller); else invoke there and wait.
+/// While the display thread is the UI thread (until display-thread S5): if the app blocks its UI thread on this worker (join, Future.get) both wait, as Chromium's provider blocks a background
+/// caller until its UI thread started the engine. No fallback: answering on the worker is exactly the off-thread WebKit touch this avoids.
 fn user_agent() -> Result<String, &'static [u8]> {
     if let Some(ua) = USER_AGENT.get() {
         return Ok(ua.clone());
     }
     let ctx = glib::MainContext::default();
     if ctx.is_owner() {
-        return ui_user_agent();
+        return display_user_agent();
     }
     if ctx.acquire().is_ok() {
         return Err(NO_DISPLAY);
     }
     let (tx, rx) = std::sync::mpsc::channel();
     ctx.invoke(move || {
-        let _ = tx.send(ui_user_agent());
+        let _ = tx.send(display_user_agent());
     });
     rx.recv().unwrap_or(Err(
-        b"web engine: the UI thread dropped the user agent call",
+        b"web engine: the display thread dropped the user agent call",
     ))
 }
 
-/// On the UI thread only. WebKitSettings' constructor reads the default GDK display's GL support and dereferences a missing display (SIGSEGV, measured in the no-UI app run): no display -> refusal.
-fn ui_user_agent() -> Result<String, &'static [u8]> {
+/// On the display thread only. WebKitSettings' constructor reads the default GDK display's GL support and dereferences a missing display (SIGSEGV, measured in the no-UI app run): no display -> refusal.
+fn display_user_agent() -> Result<String, &'static [u8]> {
     if webkit6::gdk::Display::default().is_none() {
         return Err(NO_DISPLAY);
     }
@@ -126,11 +122,12 @@ impl View {
 }
 
 fn view<'a>(h: *mut WebViewHandle) -> &'a View {
-    // SAFETY: every handle is a Box<View> `view_create` leaked, alive until `view_drop`; the caller's contract (UI thread, live handle).
+    // SAFETY: every handle is a Box<View> `view_create` leaked, alive until `view_drop`; the caller's contract (display thread, live handle).
     unsafe { &*h.cast::<View>() }
 }
 
 /// One event not yet delivered.
+#[derive(Default)]
 struct Pending {
     kind: u32,
     text: String,
@@ -141,6 +138,29 @@ struct Pending {
     extra: String,
     length: i64,
     flags: u32,
+    back: u32,
+    forward: u32,
+}
+
+/// What a LOCATION event reports: URL, original URL, entries back, entries forward.
+type Location = (Option<String>, Option<String>, u32, u32);
+
+/// `w`'s location now. Original URL: the current back-forward item's (WebKitBackForwardListItem: the URI first requested, before redirects); a page without an item (load_bytes makes none) -> its
+/// URI, which nothing redirected.
+fn location(w: &webkit6::WebView) -> Location {
+    let uri = w.uri().map(|u| u.to_string());
+    let list = w.back_forward_list();
+    let original = list
+        .as_ref()
+        .and_then(|l| l.current_item())
+        .and_then(|i| i.original_uri())
+        .map(|u| u.to_string())
+        .or_else(|| uri.clone());
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let (back, forward) = list.map_or((0, 0), |l| {
+        (count(l.back_list().len()), count(l.forward_list().len()))
+    });
+    (uri, original, back, forward)
 }
 
 /// The sink plus a queue: a callback may call back into the view (loadUrl from onPageFinished) and WebKit may signal synchronously inside it; such a nested event waits until the running one returns, so order is kept and nothing is dropped.
@@ -159,9 +179,38 @@ struct Events {
     navigating: RefCell<Option<String>>,
     /// The current main-frame load's URL for its LOAD_FINISHED: the started one, then the view's from redirect / commit on; a load that failed before commit keeps the URL it was started for.
     load_uri: RefCell<String>,
+    /// The location last reported ([`Self::location_changed`]).
+    location: RefCell<Option<Location>>,
 }
 
 impl Events {
+    /// Reports `w`'s location if it differs from the last one reported. Called on every change WebKit notifies (uri, back-forward list) and before each load event, so the receiver's copy is current
+    /// when that event's callback runs.
+    fn location_changed(&self, w: &webkit6::WebView) {
+        let now = location(w);
+        if self.location.borrow().as_ref() == Some(&now) {
+            return;
+        }
+        self.location.replace(Some(now.clone()));
+        let (uri, original, back, forward) = now;
+        let mut flags = 0;
+        if uri.is_some() {
+            flags |= web_event::FLAG_HAS_URI;
+        }
+        if original.is_some() {
+            flags |= web_event::FLAG_HAS_ORIGINAL_URI;
+        }
+        self.push(Pending {
+            kind: web_event::LOCATION,
+            text: uri.unwrap_or_default(),
+            detail: original.unwrap_or_default(),
+            flags,
+            back,
+            forward,
+            ..Pending::default()
+        });
+    }
+
     /// Reports `w`'s title if it differs from the last one reported for this load.
     fn title_changed(&self, w: &webkit6::WebView) {
         let Some(t) = w.title().map(|t| t.to_string()) else {
@@ -190,9 +239,7 @@ impl Events {
             error,
             progress,
             reply,
-            extra: String::new(),
-            length: 0,
-            flags: 0,
+            ..Pending::default()
         });
     }
 
@@ -215,6 +262,8 @@ impl Events {
                 extra: Str::of(&p.extra),
                 length: p.length,
                 flags: p.flags,
+                back: p.back,
+                forward: p.forward,
                 // the receiver takes `reply` only for PROMPT and NAVIGATION; any other event carries a placeholder this side drops
                 reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| ReplyAbi::new(|_| {}))),
             };
@@ -344,12 +393,9 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
         kind: web_event::NAVIGATION,
         text: uri,
         detail: method,
-        error: 0,
-        progress: 0,
         reply: Some(reply),
-        extra: String::new(),
-        length: 0,
         flags,
+        ..Pending::default()
     });
     true
 }
@@ -396,9 +442,24 @@ unsafe extern "C" fn view_create(
         main_loading: std::cell::Cell::new(false),
         navigating: RefCell::default(),
         load_uri: RefCell::default(),
+        location: RefCell::default(),
     });
     let ev = events.clone();
+    web.connect_uri_notify(move |w| ev.location_changed(w));
+    if let Some(list) = web.back_forward_list() {
+        let ev = events.clone();
+        let weak = web.downgrade();
+        // the bindings carry no typed `changed` (its removed-items argument is a GList): connected by name, arguments unread
+        list.connect_local("changed", false, move |_| {
+            if let Some(w) = weak.upgrade() {
+                ev.location_changed(&w);
+            }
+            None
+        });
+    }
+    let ev = events.clone();
     web.connect_load_changed(move |w, e| {
+        ev.location_changed(w);
         let uri = w.uri().map(|u| u.to_string()).unwrap_or_default();
         match e {
             webkit6::LoadEvent::Started => {
@@ -481,13 +542,10 @@ unsafe extern "C" fn view_create(
             kind: web_event::DOWNLOAD,
             text: r.uri().map(|u| u.to_string()).unwrap_or_default(),
             detail: disposition,
-            error: 0,
-            progress: 0,
-            reply: None,
             extra: r.mime_type().map(|m| m.to_string()).unwrap_or_default(),
             // WebKit reports 0 for an unknown length (no Content-Length) -> -1, the API's "unknown"
             length: if length == 0 { -1 } else { length as i64 },
-            flags: 0,
+            ..Pending::default()
         });
         true
     });
@@ -575,10 +633,6 @@ fn history_item(h: *mut WebViewHandle, steps: i32) -> Option<webkit6::BackForwar
     view(h).web.back_forward_list()?.nth_item(steps)
 }
 
-unsafe extern "C" fn view_can_go(h: *mut WebViewHandle, steps: i32) -> bool {
-    history_item(h, steps).is_some()
-}
-
 unsafe extern "C" fn view_go(h: *mut WebViewHandle, steps: i32) {
     if let Some(item) = history_item(h, steps) {
         view(h).web.go_to_back_forward_list_item(&item);
@@ -636,42 +690,6 @@ unsafe extern "C" fn view_set_user_scripts(h: *mut WebViewHandle, sources: *cons
             &[],
         ));
     }
-}
-
-unsafe extern "C" fn view_uri(h: *mut WebViewHandle, out: *mut BytesOut) -> bool {
-    view(h).web.uri().is_some_and(|u| {
-        // SAFETY: the sink the caller lent.
-        unsafe { BytesOut::put_to(out, u.as_bytes()) };
-        true
-    })
-}
-
-/// The current back-forward item's original URI (WebKitBackForwardListItem: the URI first requested, before redirects); a page without an item (load_bytes makes none) -> its URI, which nothing redirected.
-unsafe extern "C" fn view_original_uri(h: *mut WebViewHandle, out: *mut BytesOut) -> bool {
-    let item = view(h)
-        .web
-        .back_forward_list()
-        .and_then(|l| l.current_item());
-    let uri = item
-        .and_then(|i| i.original_uri())
-        .or_else(|| view(h).web.uri());
-    uri.is_some_and(|u| {
-        // SAFETY: the sink the caller lent.
-        unsafe { BytesOut::put_to(out, u.as_bytes()) };
-        true
-    })
-}
-
-unsafe extern "C" fn view_title(h: *mut WebViewHandle, out: *mut BytesOut) -> bool {
-    view(h).web.title().is_some_and(|u| {
-        // SAFETY: the sink the caller lent.
-        unsafe { BytesOut::put_to(out, u.as_bytes()) };
-        true
-    })
-}
-
-unsafe extern "C" fn view_progress(h: *mut WebViewHandle) -> i32 {
-    (view(h).web.estimated_load_progress() * 100.0).round() as i32
 }
 
 fn settings(h: *mut WebViewHandle) -> webkit6::Settings {
@@ -749,8 +767,8 @@ unsafe extern "C" fn view_set_initial_scale(h: *mut WebViewHandle, percent: i32)
     web.set_zoom_level(zoom);
 }
 
-/// Runs `f` on the UI thread (the owner of GLib's default context, as [`user_agent`]): now when this is it, else queued; false = no UI thread (nobody owns the context), `f` dropped.
-fn on_ui(f: impl FnOnce() + Send + 'static) -> bool {
+/// Runs `f` on the display thread (the owner of GLib's default context, as [`user_agent`]): now when this is it, else queued; false = no display thread (nobody owns the context), `f` dropped.
+fn on_display(f: impl FnOnce() + Send + 'static) -> bool {
     let ctx = glib::MainContext::default();
     if ctx.is_owner() {
         f();
@@ -763,7 +781,7 @@ fn on_ui(f: impl FnOnce() + Send + 'static) -> bool {
     true
 }
 
-/// The default network session's cookie store (every view uses that session: `WebView::new`). UI thread.
+/// The default network session's cookie store (every view uses that session: `WebView::new`). Display thread.
 fn cookie_manager() -> Option<webkit6::CookieManager> {
     webkit6::NetworkSession::default()?.cookie_manager()
 }
@@ -797,7 +815,7 @@ fn from_soup(mut s: webkit6::soup::Cookie) -> Cookie {
 /// The one watcher ([`cookies_watch`]); a second watch replaces it, the `changed` handler is connected once.
 static WATCHER: std::sync::Mutex<Option<SendCallback<CookieList>>> = std::sync::Mutex::new(None);
 
-/// Fetches the whole store and hands it to the watcher. UI thread.
+/// Fetches the whole store and hands it to the watcher. Display thread.
 fn deliver_cookies(cm: &webkit6::CookieManager) {
     cm.all_cookies(None::<&webkit6::gio::Cancellable>, |r| {
         let list: Vec<Cookie> = match r {
@@ -818,7 +836,7 @@ fn deliver_cookies(cm: &webkit6::CookieManager) {
 }
 
 unsafe extern "C" fn cookies_watch(changed: SendCallback<CookieList>) -> bool {
-    on_ui(move || {
+    on_display(move || {
         let Some(cm) = cookie_manager() else {
             tracing::warn!("webview: no cookie manager");
             return;
@@ -842,7 +860,7 @@ fn finish(mut done: SendCallback<bool>, ok: bool) {
 unsafe extern "C" fn cookies_add(cookie: *const CookieView, done: SendCallback<bool>) -> bool {
     // SAFETY: the caller lends the cookie and its strings for this call; copied here.
     let c = unsafe { (*cookie).get() };
-    on_ui(move || {
+    on_display(move || {
         let Some(cm) = cookie_manager() else {
             return finish(done, false);
         };
@@ -861,7 +879,7 @@ unsafe extern "C" fn cookies_replace(cookies: CookieList, done: SendCallback<boo
         // SAFETY: as above.
         .map(|v| unsafe { v.get() })
         .collect();
-    on_ui(move || {
+    on_display(move || {
         let Some(cm) = cookie_manager() else {
             return finish(done, false);
         };
@@ -885,7 +903,7 @@ unsafe extern "C" fn cookies_replace(cookies: CookieList, done: SendCallback<boo
 }
 
 unsafe extern "C" fn cookies_policy(policy: CookiePolicy) -> bool {
-    on_ui(move || {
+    on_display(move || {
         let Some(cm) = cookie_manager() else { return };
         cm.set_accept_policy(match policy {
             CookiePolicy::Always => webkit6::CookieAcceptPolicy::Always,

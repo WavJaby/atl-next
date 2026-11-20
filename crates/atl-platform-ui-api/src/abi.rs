@@ -1349,6 +1349,12 @@ pub mod web_event {
     pub const DOWNLOAD: u32 = 8;
     /// `Navigation { request: { uri = text, method = detail, main_frame / redirect / gesture = flags }, reply }`.
     pub const NAVIGATION: u32 = 9;
+    /// `Location { uri = text if FLAG_HAS_URI, original_uri = detail if FLAG_HAS_ORIGINAL_URI, back, forward }`.
+    pub const LOCATION: u32 = 10;
+    /// `LOCATION` flag bits.
+    pub const FLAG_HAS_URI: u32 = 1;
+    /// See [`FLAG_HAS_URI`].
+    pub const FLAG_HAS_ORIGINAL_URI: u32 = 2;
     /// `NAVIGATION` flag bits.
     pub const FLAG_MAIN_FRAME: u32 = 1;
     /// See [`FLAG_MAIN_FRAME`].
@@ -1438,8 +1444,12 @@ pub struct WebEventView {
     pub extra: Str,
     /// `DOWNLOAD`: the content length, -1 unknown.
     pub length: i64,
-    /// `NAVIGATION`: [`web_event`] `FLAG_*` bits.
+    /// `NAVIGATION`, `LOCATION`: [`web_event`] `FLAG_*` bits of that kind.
     pub flags: u32,
+    /// `LOCATION`: session-history entries behind the current one.
+    pub back: u32,
+    /// `LOCATION`: session-history entries ahead of the current one.
+    pub forward: u32,
     /// `PROMPT`, `NAVIGATION`: the reply, owned by the receiver.
     pub reply: ManuallyDrop<ReplyAbi>,
 }
@@ -1487,8 +1497,6 @@ pub struct WebViewVtable {
     pub view_stop: unsafe extern "C" fn(view: *mut WebViewHandle),
     /// `WebView::reload`.
     pub view_reload: unsafe extern "C" fn(view: *mut WebViewHandle),
-    /// `WebView::can_go_back_or_forward`.
-    pub view_can_go: unsafe extern "C" fn(view: *mut WebViewHandle, steps: i32) -> bool,
     /// `WebView::go_back_or_forward`.
     pub view_go: unsafe extern "C" fn(view: *mut WebViewHandle, steps: i32),
     /// `WebView::evaluate_javascript`; `done` is called once.
@@ -1497,15 +1505,6 @@ pub struct WebViewVtable {
     /// `WebView::set_user_scripts`.
     pub view_set_user_scripts:
         unsafe extern "C" fn(view: *mut WebViewHandle, sources: *const Str, len: usize),
-    /// `WebView::uri` into `out`; false = none.
-    pub view_uri: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
-    /// `WebView::original_uri` into `out`; false = none.
-    pub view_original_uri:
-        unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
-    /// `WebView::title` into `out`; false = none.
-    pub view_title: unsafe extern "C" fn(view: *mut WebViewHandle, out: *mut BytesOut) -> bool,
-    /// `WebView::progress`.
-    pub view_progress: unsafe extern "C" fn(view: *mut WebViewHandle) -> i32,
     /// `WebView::set_setting` for a boolean setting.
     pub view_set_bool: unsafe extern "C" fn(view: *mut WebViewHandle, which: WebSetting, on: bool),
     /// `WebView::set_setting` for an int setting.
