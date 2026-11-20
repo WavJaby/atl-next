@@ -287,25 +287,6 @@ fn outbox_check(app: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(test)]
-mod outbox_tests {
-    use super::*;
-
-    /// The line shape is field.rs `post`'s; a call on the window's thread (the break) or a line without a thread fails.
-    #[test]
-    fn every_sent_line_must_name_the_outbox() {
-        let good = "I atl-ime: sent Commit(\"x\") thread=atl-outbox\nI atl-ime: sent getSurroundingText thread=atl-outbox\n";
-        assert_eq!(
-            outbox_check(good),
-            Ok("2 connection calls, all on atl-outbox".to_owned())
-        );
-        let bad = format!("{good}I atl-ime: sent PreeditEnd thread=main\n");
-        assert!(outbox_check(&bad).is_err());
-        assert!(outbox_check("I atl-ime: sent PreeditEnd\n").is_err());
-        assert!(outbox_check("").is_err());
-    }
-}
-
 /// After the death line: the relaunched process added a fresh client (addClient 2) and was bound again (onBindMethod 2), in that order.
 fn relaunch_check(services: &str) -> Result<String, String> {
     let at = |needle: &str| services.find(needle);
@@ -363,5 +344,24 @@ fn surrounding_check() -> Result<String, String> {
             "`{text}` cursor {cursor} anchor {anchor}, want `{want}` at byte {end}"
         )),
         None => Err("the IME never received a surrounding text".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+
+    /// The line shape is field.rs `post`'s; a call on the window's thread (the break) or a line without a thread fails.
+    #[test]
+    fn every_sent_line_must_name_the_outbox() {
+        let good = "I atl-ime: sent Commit(\"x\") thread=atl-outbox\nI atl-ime: sent getSurroundingText thread=atl-outbox\n";
+        assert_eq!(
+            outbox_check(good),
+            Ok("2 connection calls, all on atl-outbox".to_owned())
+        );
+        let bad = format!("{good}I atl-ime: sent PreeditEnd thread=main\n");
+        assert!(outbox_check(&bad).is_err());
+        assert!(outbox_check("I atl-ime: sent PreeditEnd\n").is_err());
+        assert!(outbox_check("").is_err());
     }
 }
