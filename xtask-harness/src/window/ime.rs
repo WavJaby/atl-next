@@ -10,6 +10,8 @@
 //! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
 //! the link (`--no-ime-death-link`): the death sub-gate must fail. Then relaunch: the probe starts the fixture again through atld's control `start` (startActivity with no caller app,
 //! a process started anew); the relaunch sub-gate wants a fresh addClient and bind after the death.
+//! The run ends when this probe is done (window.rs `probe_ends_run`), and the composer sub-checks judge the first process's part of the shared app log ([`first_process`]): the relaunched one
+//! is stopped wherever its start has got to.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -31,17 +33,67 @@ const COMMIT: &str = "仮名";
 const TEXT_LINE: &str = "AtlWindow: text input=";
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
+/// How long the first process's composer may take, before the kill, to log what the post-draw and release sub-checks judge (a paint that released a retired shown buffer). Paints took up to
+/// ~1.3 s with the GPU held by another job (2026-11-20, against 3-9 ms idle); the bound only runs out when that paint never comes (`--break-ignore-hold`), and the check then judges what was logged.
+const SETTLE_WAIT: Duration = Duration::from_secs(30);
+/// How long the services may take to tell the SIGKILL as the client's binder death. Generous: it bounds only a lost death (`--break-ime-death`); a death told after the relaunch's addClient is
+/// dropped by the pid check and would read as a lost one.
+const DEATH_WAIT: Duration = Duration::from_secs(30);
+/// How long the relaunch may take to bind again: a cold start, bounded as the first one ([`super::LIMIT`]). Under 5-9 builders addClient alone came 8 s after `start` (2026-11-21).
+const RELAUNCH_WAIT: Duration = super::LIMIT;
 
 /// The services' client-death counter (atl_diag::answered: `diag: first|count answered <interface>.<name> <n> at=...`) and removal line (input_method.rs State::client_died).
 const DEATH_COUNTER: &str = "answered IInputMethodManager.client died";
 const DEATH_LINE: &str = "services: input_method client uid=";
 const NONE_LEFT: &str = "entry removed, 0 clients left";
+/// atl_diag's exit summary line prefix (`diag: total <outcome> <api> <n> first=<stamp>`).
+const DIAG_TOTAL: &str = "diag: total ";
 /// The relaunched process's client: the second addClient, then the second onBindMethod (atl-diag power-of-two lines).
 const READDED_LINE: &str = "answered IInputMethodManager.addClient 2 ";
 const REBOUND_LINE: &str = "sent IInputMethodManager.IInputMethodClient.onBindMethod 2 ";
 
 /// The surrounding text (text, cursor byte, anchor byte) the fake IME held after the commit: the probe thread's, for `checks` (Liveness is shared by every stage).
 static SURROUNDING: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
+/// The app log's length once the first process was dead (its death told, or the wait over), before the relaunch: its lines end there. The probe thread's, for [`first_process`].
+static FIRST_END: Mutex<Option<usize>> = Mutex::new(None);
+
+/// The first process's part of the app log: the relaunched process writes the same log, and the run stops it wherever its start has got to, so the composer sub-checks (post-draw, release,
+/// dmabuf) judge the process the stage drove. The whole log when the probe never got to the kill.
+pub fn first_process(app: &str) -> &str {
+    first_part(app, *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `app` up to its last whole line inside `end` bytes; all of it for `None`.
+fn first_part(app: &str, end: Option<usize>) -> &str {
+    match end {
+        Some(end) => app.as_bytes()[..end.min(app.len())]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or("", |at| &app[..=at]),
+        None => app,
+    }
+}
+
+/// The composer has logged what the post-draw and release sub-checks judge: a post-draw received, and a shown buffer retired for a paint whose release went out with its read fence (or a fence
+/// that rode no release: red, and final). Read on the counters line, which the composer logs at most once a second after the work.
+fn composer_settled(app: &str) -> bool {
+    let Some(line) = crate::composer::last_counters(app) else {
+        return false;
+    };
+    let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
+    n("post_draw_received") > 0
+        && n("releases_held") > 0
+        && (n("releases_fenced") > 0 || n("releases_fenced_unmatched") > 0)
+}
+
+fn wait_settled(app_log: &Path) {
+    let deadline = Instant::now() + SETTLE_WAIT;
+    while Instant::now() < deadline
+        && !composer_settled(&std::fs::read_to_string(app_log).unwrap_or_default())
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// The deliberate breaks.
 #[derive(Clone, Copy, Default)]
@@ -180,6 +232,8 @@ pub fn drive(
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_delete());
+    // the composer sub-checks judge this process's last counters: let its paints catch up first
+    wait_settled(app_log);
     // mid-session, input bound: SIGKILL the app (no Java-side teardown, so only the binder death can tell the services), then give the death notification time to arrive
     let apps = super::app_pids(atld);
     if apps.is_empty() {
@@ -190,7 +244,10 @@ pub fn drive(
             .args(["-KILL", &pid.to_string()])
             .status();
     }
-    wait_for_line(services_log, DEATH_LINE, IME_WAIT);
+    wait_for_line(services_log, DEATH_LINE, DEATH_WAIT);
+    *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = std::fs::metadata(app_log)
+        .ok()
+        .and_then(|m| usize::try_from(m.len()).ok());
     // then the relaunch, as a launcher tap: startActivity with no caller app (atld `start` -> atl-am), whose process is started anew; its window's focus binds again (fresh addClient)
     let (root, component) = relaunch;
     let reply = crate::atld_run::control_at(&root, &format!("start {component}"))
@@ -198,7 +255,7 @@ pub fn drive(
     if !reply.starts_with("ok") {
         return Err(format!("relaunch refused: {reply}"));
     }
-    wait_for_line(services_log, REBOUND_LINE, IME_WAIT);
+    wait_for_line(services_log, REBOUND_LINE, RELAUNCH_WAIT);
     Ok(Liveness {
         answered: true,
         silent: true,
@@ -255,7 +312,8 @@ pub fn checks(
         ),
         ("death", death_check(services, app_uid)),
         ("relaunch", relaunch_check(services)),
-        ("outbox", outbox_check(app)),
+        // the relaunch reports too; judge the process the stage drove, as the composer sub-checks do
+        ("outbox", outbox_check(first_process(app))),
     ]
 }
 
@@ -306,9 +364,10 @@ fn death_check(services: &str, app_uid: u32) -> Result<String, String> {
     let before = services
         .find(READDED_LINE)
         .map_or(services, |at| &services[..at]);
+    // the counter's own lines, not the exit summary (`diag: total ...`), which the services write at the stop and which lands here when no relaunch added a client
     let counted: Vec<&str> = before
         .lines()
-        .filter(|l| l.contains(DEATH_COUNTER))
+        .filter(|l| l.contains(DEATH_COUNTER) && !l.starts_with(DIAG_TOTAL))
         .collect();
     let removed: Vec<&str> = before.lines().filter(|l| l.contains(DEATH_LINE)).collect();
     let want = format!("{DEATH_LINE}{app_uid} ");
@@ -363,5 +422,76 @@ mod outbox_tests {
         assert!(outbox_check(&bad).is_err());
         assert!(outbox_check("INFO atl-composer: task reports: sent 1\n").is_err());
         assert!(outbox_check("").is_err());
+    }
+
+    /// The run goes on through the relaunch, whose reports also land in the app log: the gate counts the first process's part only, so a red there stays red and the relaunch's lines are not counted.
+    #[test]
+    fn the_outbox_judges_the_first_process() {
+        let first = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nservices: died\n";
+        let relaunch = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=?\n";
+        let app = format!("{first}{relaunch}");
+        assert_eq!(
+            outbox_check(first_part(&app, Some(first.len()))),
+            Ok("1 task reports, all on atl-outbox".to_owned())
+        );
+        let red = "INFO atl-composer: task reports: sent 2 thread=?\n";
+        let broken = format!("{red}{relaunch}");
+        assert!(outbox_check(first_part(&broken, Some(red.len()))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEATH: &str = "diag: first answered IInputMethodManager.client died 1 at=100.000\n\
+                         services: input_method client uid=10002 pid=7 died; entry removed, 0 clients left\n";
+
+    /// A run stopped before the relaunch added a client: the services' exit summary (`diag: total`, atl_diag's format) follows, and is not a second death.
+    #[test]
+    fn the_exit_summary_is_not_a_death() {
+        let services = format!(
+            "{DEATH}diag: total answered IInputMethodManager.client died 1 first=100.000\n"
+        );
+        assert!(death_check(&services, 10002).is_ok());
+    }
+
+    /// Two deaths told before the relaunch's client stay red.
+    #[test]
+    fn two_deaths_are_red() {
+        let services = format!(
+            "{DEATH}diag: count answered IInputMethodManager.client died 2 at=101.000\n\
+             services: input_method client uid=10002 pid=8 died; entry removed, 0 clients left\n"
+        );
+        assert!(death_check(&services, 10002).is_err());
+    }
+
+    /// The first process's part ends at its last whole line before the recorded length; a length inside a multi-byte char still cuts at a line end.
+    #[test]
+    fn the_first_process_ends_at_its_last_whole_line() {
+        let app = "a\nかな\nrelaunched\n";
+        // "a\n" is 2 bytes, "かな\n" 7: a length of 4 falls inside か
+        *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = Some(4);
+        assert_eq!(first_process(app), "a\n");
+        *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = Some(9);
+        assert_eq!(first_process(app), "a\nかな\n");
+        *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(first_process(app), app);
+    }
+
+    /// Settled only once a retired shown buffer's release went out (or a fence rode none), with a post-draw received.
+    #[test]
+    fn settled_waits_for_the_paints_release() {
+        let line = |held: u64, fenced: u64, unmatched: u64, post: u64| {
+            format!(
+                "1.0 INFO composer: counters releases_fenced={fenced} releases_fenced_unmatched={unmatched} releases_held={held} post_draw_received={post}\n"
+            )
+        };
+        assert!(!composer_settled(""));
+        assert!(!composer_settled(&line(2, 0, 0, 1)));
+        assert!(!composer_settled(&line(0, 0, 0, 1)));
+        assert!(!composer_settled(&line(1, 1, 0, 0)));
+        assert!(composer_settled(&line(1, 1, 0, 1)));
+        assert!(composer_settled(&line(1, 0, 1, 1)));
     }
 }

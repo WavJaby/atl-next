@@ -304,6 +304,12 @@ impl Stage {
     }
 }
 
+/// The stages whose run ends when their probe is done, not at the watch's end: the ime probe kills the app and relaunches it, a cold start (8-20 s under load, 2026-11-21) the 12 s watch
+/// cut short, so the stop landed anywhere in the relaunch (its bind missing, the death counted from the exit summary, the relaunched process's half-started counters judged). LIMIT still bounds it.
+fn probe_ends_run(stage: Stage) -> bool {
+    matches!(stage, Stage::Ime)
+}
+
 /// The stages whose probe takes pictures of the window through [`capture::Probe`] (the harness route, not the composer's log).
 fn takes_pictures(stage: Stage) -> bool {
     matches!(
@@ -2551,8 +2557,10 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         if matches!(args.stage, Stage::Splash) {
             splash::take(&mut splash_shot, &app, &app_log, nested, &splash_png);
         }
-        // the window runs from the marker's own stamp, not from when this loop saw the marker
-        if marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
+        // the window runs from the marker's own stamp, not from when this loop saw the marker; a stage whose probe ends the app's session runs until the probe is done too
+        let probe_running =
+            probe_ends_run(args.stage) && probe.as_ref().is_some_and(|h| !h.is_finished());
+        if !probe_running && marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
             break;
         }
         if let Some(s) = atld.try_wait()? {
@@ -2840,9 +2848,15 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 | Stage::Dialog
         )
     {
-        sub.push(("post-draw", post_draw_check(&app, &services)));
-        sub.push(("dmabuf", dmabuf_check(&app)));
-        match release_sub(&app, args.stage) {
+        // the ime stage's log holds two processes: judge the one the stage drove (ime::first_process)
+        let judged = if matches!(args.stage, Stage::Ime) {
+            ime::first_process(&app)
+        } else {
+            &app
+        };
+        sub.push(("post-draw", post_draw_check(judged, &services)));
+        sub.push(("dmabuf", dmabuf_check(judged)));
+        match release_sub(judged, args.stage) {
             Some(r) => sub.push(("release", r)),
             None => {
                 println!(
