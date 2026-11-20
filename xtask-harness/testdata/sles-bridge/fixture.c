@@ -117,3 +117,15 @@ SLresult sles_g_unknown(void) {
     void *itf = NULL;
     return (*sles_engine_obj)->GetInterface(sles_engine_obj, &unknown_iid, &itf);
 }
+
+// (h) interposers, as WeChat's liboboe.so defines SL_IID_*: this library is the dlopen root and DT_NEEDs libOpenSLES.so, so ELF lookup binds the proxy's references to these names here, not to the proxy's own definitions.
+// The proxy's constructor must still fill its own variables and leave these untouched. Names the steps above do not use, so a-g see the proxy's values.
+// Read-only (RELRO after relocation, like liboboe's R segment): a write faults.
+static const struct SLInterfaceID_ h_config_iid = {0x4c0, 1, 2, 3, {7, 7, 7, 7, 7, 7}};
+const SLInterfaceID SL_IID_ANDROIDCONFIGURATION = &h_config_iid;
+// Writable: a write succeeds silently. In .data by asm: OpenSLES_Android.h declares the name `const`, so C cannot define it writable.
+const struct SLInterfaceID_ sles_h_effect_iid = {0x4e0, 1, 2, 3, {8, 8, 8, 8, 8, 8}};
+__asm__(".pushsection .data\n.globl SL_IID_ANDROIDEFFECT\n.type SL_IID_ANDROIDEFFECT, @object\n.size SL_IID_ANDROIDEFFECT, 8\n"
+        ".p2align 3\nSL_IID_ANDROIDEFFECT:\n.quad sles_h_effect_iid\n.popsection");
+const void *sles_h_config_own(void) { return &h_config_iid; }
+const void *sles_h_effect_own(void) { return &sles_h_effect_iid; }

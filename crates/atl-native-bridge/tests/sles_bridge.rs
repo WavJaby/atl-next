@@ -9,6 +9,7 @@
 //! e: `sles_players` players registering one Play callback add exactly 1 down shell;
 //! f: the guest's `SL_IID_PLAY` is the recorder's `SL_IID_PLAY` value;
 //! g: `GetInterface` of the fixture's unknown IID = SL_RESULT_FEATURE_UNSUPPORTED (0x0C) and the refusal counter `sles.GetInterface.<its 16 bytes in hex>` is 1.
+//! h: the fixture defines `SL_IID_ANDROIDCONFIGURATION` read-only and `SL_IID_ANDROIDEFFECT` writable (an app library interposing the proxy, as WeChat's liboboe.so does): the load survives, both fixture words still point at the fixture's own IIDs, and the proxy's own words (guest dlsym on the proxy handle) equal the recorder's. Expected by the ELF rule: the dlopen root precedes its DT_NEEDED proxy in lookup, so the proxy's GOT binds these names to the fixture; only the proxy's own definitions may be written.
 //! Breaks (`ATL_NB_BREAK`): `sles_raw_sink` -> c red; `sles_no_dedup` -> e red; `sles_var_skip` -> f red.
 #![allow(
     clippy::print_stdout,
@@ -25,6 +26,13 @@ use atl_native_bridge::engine::{self, Guest, sles};
 use common::{RTLD_NOW, need};
 
 const LIB: &CStr = c"libsles-fixture.so";
+/// The guest proxy the fixture DT_NEEDs.
+const PROXY: &CStr = c"libOpenSLES.so";
+/// Check h: (interposed name, fixture function returning the fixture's own IID).
+const INTERPOSED: [(&str, &str); 2] = [
+    ("SL_IID_ANDROIDCONFIGURATION", "sles_h_config_own"),
+    ("SL_IID_ANDROIDEFFECT", "sles_h_effect_own"),
+];
 /// OpenSLES.h `SL_RESULT_FEATURE_UNSUPPORTED`.
 const FEATURE_UNSUPPORTED: usize = 0x0C;
 /// fixture.c `unknown_iid` {0x0badc0de, 0x0001, 0x0002, 0x0003, {1..6}} as its little-endian bytes in hex.
@@ -200,6 +208,58 @@ fn run(env: &common::Nb) -> Result<(), String> {
             return Err("check a red; later checks need the engine".into());
         }
     };
+
+    // h: interposed variables keep the fixture's values; the proxy's own hold the recorder's
+    // SAFETY: __loader_dlopen of the already-loaded proxy: its handle, whose dlsym searches the proxy first.
+    let ph = unsafe {
+        fx.g.call(dlopen, PROXY.as_ptr() as usize, RTLD_NOW, fx.g.exe_entry)
+    };
+    let mut h = Vec::new();
+    for (name, own) in INTERPOSED {
+        let (got, want) = (fx.word(name)?, fx.step(own)?);
+        let c = CString::new(name).map_err(|e| e.to_string())?;
+        // SAFETY: the recorder's IID is a pointer-sized static.
+        let rec_v = unsafe { *(rec.sym(&c)? as *const usize) };
+        let proxy_v = if ph == 0 {
+            None
+        } else {
+            let mut px = Fx {
+                g: &mut *fx.g,
+                dlsym,
+                h: ph,
+            };
+            Some(px.word(name)?)
+        };
+        h.push(if got != want {
+            Err(format!(
+                "fixture's {name} = {got:#x}, want its own {want:#x}"
+            ))
+        } else if proxy_v != Some(rec_v) {
+            Err(format!(
+                "proxy's {name} = {proxy_v:x?}, want recorder's {rec_v:#x}"
+            ))
+        } else {
+            Ok(format!(
+                "{name}: fixture keeps {got:#x}, proxy = recorder's {rec_v:#x}"
+            ))
+        });
+    }
+    // every name's verdict, red or not
+    let (ok, bad): (Vec<_>, Vec<_>) = h.into_iter().partition(Result::is_ok);
+    let join = |v: Vec<Result<String, String>>| {
+        v.into_iter()
+            .map(|r| r.unwrap_or_else(|e| e))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    check!(
+        'h',
+        if bad.is_empty() {
+            Ok(join(ok))
+        } else {
+            Err(join(bad))
+        }
+    );
 
     // f: the IID variable row
     let iid = fx.step("sles_f_iid_play")?;

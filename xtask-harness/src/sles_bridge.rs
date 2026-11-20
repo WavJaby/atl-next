@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test sles-bridge`: OpenSL ES through the identity engine (opensl-es plan slice O1). An NDK x86_64 fixture (`xtask-harness/testdata/sles-bridge/fixture.c`, DT_NEEDED libOpenSLES.so -> the guest proxy) drives a host recorder SL library (atl-native-bridge example `sles_recorder`), which the bridge opens as `/system/lib64/libOpenSLES.so` by absolute path: the run sees a bwrap root whose `/system` is `<out>/sles-bridge/root/system` (qemu_linker.rs `system_wrap`), no product change.
-//! Harness: `cargo test -p atl-native-bridge --test sles_bridge` (harness-less; checks a-g in its header), env as `nb-identity` (nb_identity.rs `identity_env`) with the fixture dir as the test library dir.
+//! Harness: `cargo test -p atl-native-bridge --test sles_bridge` (harness-less; checks a-h in its header), env as `nb-identity` (nb_identity.rs `identity_env`) with the fixture dir as the test library dir.
 //! Runs: plain (every check ok, exit 0), then each break (`ATL_NB_BREAK`, atl-native-bridge build.rs `BREAKS`) must turn its named check red and exit nonzero: `sles_raw_sink` -> c, `sles_no_dedup` -> e, `sles_var_skip` -> f.
 //! Output: `<out>/sles-bridge/`, one log per run. Default: mutating (builds the fixture, the recorder and the test; a break run rebuilds the package with its cfg).
 
@@ -23,7 +23,7 @@ const RECORDER: &str = "sles_recorder";
 const TESTDATA: &str = "xtask-harness/testdata/sles-bridge";
 /// The prefix of the test's check lines (`sles-bridge: (<c>) ok`).
 const PREFIX: &str = "sles-bridge";
-const CHECKS: [char; 7] = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+const CHECKS: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 /// (break, the check it must turn red): opensl-es plan O1 break column.
 const BREAKS: [(&str, char); 3] = [
     ("sles_raw_sink", 'c'),

@@ -2,6 +2,7 @@
 //! Host side of NBS `libnative_bridge_vdso.so` (soname `linux-vdso.so.1`), the guest's door to the host: the guest linker takes it as the kernel vdso (auxv AT_SYSINFO_EHDR, bionic linker_main.cpp `add_vdso`), and the guest libc imports `native_bridge_intercept_symbol` from it.
 //! How an entry, a linker hook or a stub reaches its host function is the process engine's (`Active::patch_entry`, `patch_hook`, `patch_site`, `is_stub`): x86_64 rewrites `st_value` and movabs immediates, QEMU writes binding thunks in place. The vdso file stays unpatched.
 //! `native_bridge_intercept_symbol` binds a guest libc stub (NBS `interceptable_functions.h`) by writing the thunk of its binding (bindings.rs, keyed (library, name)) into the stub. A stub the table lacks, or whose host symbol is absent, stays unbound: it jumps to 0 if called.
+//! Invariant: `addr` is the stub library's own symbol, never an app library's interposing definition of the same name (e.g. Oboe's read-only `SL_IID_*`): the NBS INIT macros pass a hidden alias (`name##_nb_own`, NBS patch "Intercept stubs through hidden aliases"), which ELF lookup cannot interpose. No host-side guard: the bridge sees only an address.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
@@ -27,7 +28,7 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
         // the exported entry (`jmp name_stub`) reaches the host through the stub; a stub variable (NBS `DEFINE_INTERCEPTABLE_STUB_VARIABLE`, `uintptr_t name;`) takes the host variable's value (break `sles_var_skip`: left 0)
         if let Some(value) = super::bindings::variable(&lib, &name) {
             #[cfg(not(atl_nb_sles_var_skip))]
-            // SAFETY: NBS INIT_INTERCEPTABLE_STUB_VARIABLE passes `&name`, the guest's own writable `uintptr_t`.
+            // SAFETY: NBS INIT_INTERCEPTABLE_STUB_VARIABLE passes `&name##_nb_own`, the stub library's own writable `uintptr_t` (hidden alias: no app copy).
             unsafe {
                 *(addr as *mut usize) = value;
             }

@@ -53,6 +53,13 @@ static IID_PLAY: IidData = iid(0xef0b_d9c0, 0xddd7, 0x11db, 0xbf49);
 static IID_BUFFERQUEUE: IidData = iid(0x2bc9_9cc0, 0xddd4, 0x11db, 0x8d99);
 static IID_VOLUME: IidData = iid(0x09e8_ede0, 0xddde, 0x11db, 0xb4f6);
 static IID_ANDROIDSIMPLEBUFFERQUEUE: IidData = iid(0x198e_4940, 0xc5d7, 0x11df, 0xa2a6);
+// check h: names the fixture also defines (an app library interposing the guest proxy's variables)
+static IID_ANDROIDCONFIGURATION: IidData = iid(0x89f6_a7e0, 0xbeac, 0x11df, 0x8b5c);
+static IID_ANDROIDEFFECT: IidData = iid(0xae12_da60, 0xc5d7, 0x11df, 0xa456);
+#[unsafe(no_mangle)]
+pub static SL_IID_ANDROIDCONFIGURATION: Iid = Iid(&IID_ANDROIDCONFIGURATION);
+#[unsafe(no_mangle)]
+pub static SL_IID_ANDROIDEFFECT: Iid = Iid(&IID_ANDROIDEFFECT);
 
 #[unsafe(no_mangle)]
 pub static SL_IID_OBJECT: Iid = Iid(&IID_OBJECT);

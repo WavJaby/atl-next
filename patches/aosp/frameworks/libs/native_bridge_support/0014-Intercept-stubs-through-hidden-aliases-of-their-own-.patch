@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 20 Nov 2026 15:43:13 +0800
+Subject: [PATCH] Intercept stubs through hidden aliases of their own symbols
+
+The INIT_INTERCEPTABLE_STUB_* macros passed &name / name to
+native_bridge_intercept_symbol. Both resolve through the GOT, so an
+app library loaded before the stub library that defines the same name
+(Oboe defines SL_IID_* read-only and DT_NEEDs libOpenSLES.so)
+interposes them: the bridge then writes the host value into the app's
+data (SIGSEGV when read-only, silent overwrite otherwise) and records
+the app's function as the stub's exported entry.
+
+Each stub variable and exported function now gets a hidden alias,
+name##_nb_own, and the INIT macros pass it, so the address is the
+stub library's own definition by construction. Exported symbols and
+all other interposition are unchanged.
+
+Upstream-Status: Pending
+Patch-Reason: an app library exporting a stubbed name (liboboe SL_IID_*) interposes the stub's &name, so the constructor writes into the app's read-only data; the bridge receives only an address and cannot tell whose it is
+---
+SPDX-License-Identifier: Apache-2.0
+ .../vdso/interceptable_functions.h            | 20 ++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h b/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
+index bffb1b2595a822960751bb90edf8c37abfff854e..a351ca8335e4eb5056b37c296bd91548445b8363 100644
+--- a/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
++++ b/android_api/vdso/include/native_bridge_support/vdso/interceptable_functions.h
+@@ -107,15 +107,25 @@
+ 
+ #endif
+ 
+-#define DEFINE_INTERCEPTABLE_STUB_VARIABLE(name) uintptr_t name;
++// The INIT macros pass a hidden alias (name##_nb_own), never the exported name itself: an app library
++// loaded before this one may define the same name (e.g. Oboe's SL_IID_*), and ELF interposition
++// would then bind &name to the app's copy, so the bridge would write into the app's (possibly
++// read-only) data. A hidden alias always resolves to this library's own definition. A variable
++// at namespace scope has an unmangled linkage name, so alias(#name) names it.
++
++#define DEFINE_INTERCEPTABLE_STUB_VARIABLE(name) \
++  uintptr_t name;                                \
++  extern uintptr_t name##_nb_own __attribute__((alias(#name), visibility("hidden")))
+ 
+ #define INIT_INTERCEPTABLE_STUB_VARIABLE(library_name, name) \
+-  native_bridge_intercept_symbol(&name, library_name, #name)
++  native_bridge_intercept_symbol(&name##_nb_own, library_name, #name)
+ 
+-#define DEFINE_INTERCEPTABLE_STUB_FUNCTION(name) INTERCEPTABLE_STUB_ASM_FUNCTION(name)
++#define DEFINE_INTERCEPTABLE_STUB_FUNCTION(name) \
++  INTERCEPTABLE_STUB_ASM_FUNCTION(name)          \
++  extern "C" void name##_nb_own() __attribute__((alias(#name), visibility("hidden")))
+ 
+-#define INIT_INTERCEPTABLE_STUB_FUNCTION(library_name, name)                          \
+-  native_bridge_intercept_symbol(reinterpret_cast<void*>(name), library_name, #name); \
++#define INIT_INTERCEPTABLE_STUB_FUNCTION(library_name, name)                                \
++  native_bridge_intercept_symbol(reinterpret_cast<void*>(name##_nb_own), library_name, #name); \
+   native_bridge_intercept_symbol(reinterpret_cast<void*>(name##_stub), library_name, #name)
+ 
+ #endif  // NATIVE_BRIDGE_SUPPORT_VDSO_INTERCEPTABLE_FUNCTIONS_H_
