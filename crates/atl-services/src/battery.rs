@@ -238,7 +238,8 @@ impl State {
     fn update(&mut self, v: Values, now: Instant) -> Vec<(Intent, bool)> {
         let force = self.last.is_none();
         self.plug = v.plug_type();
-        self.charging.set_battery_state(v.on_battery(), v.level, now);
+        self.charging
+            .set_battery_state(v.on_battery(), v.level, now);
         let mut out = Vec::new();
         // :757-771 (charge counter included: rateLimitBatteryChangedBroadcast off; invalid charger always 0)
         let changed = match &self.last {
@@ -253,7 +254,9 @@ impl State {
         let last_level = self.last.as_ref().map(|(l, _)| l.level);
         // :848-867
         if !self.low {
-            if self.plug == PLUGGED_NONE && v.status != STATUS_UNKNOWN && v.level <= LOW_WARNING_LEVEL
+            if self.plug == PLUGGED_NONE
+                && v.status != STATUS_UNKNOWN
+                && v.level <= LOW_WARNING_LEVEL
             {
                 self.low = true;
             }
@@ -319,8 +322,14 @@ impl State {
                 ("max_charging_voltage", Value::Int(v.max_charging_voltage)),
                 ("charge_counter", Value::Int(v.charge_counter)),
                 ("android.os.extra.CYCLE_COUNT", Value::Int(v.cycle_count)),
-                ("android.os.extra.CHARGING_STATUS", Value::Int(v.charging_state)),
-                ("android.os.extra.CAPACITY_LEVEL", Value::Int(v.capacity_level)),
+                (
+                    "android.os.extra.CHARGING_STATUS",
+                    Value::Int(v.charging_state),
+                ),
+                (
+                    "android.os.extra.CAPACITY_LEVEL",
+                    Value::Int(v.capacity_level),
+                ),
             ],
         )
     }
@@ -421,17 +430,27 @@ impl IBatteryPropertiesRegistrar for PropertiesRegistrar {
             Err(code) => code,
         };
         let ret = match id {
-            PROPERTY_CHARGE_COUNTER => long(property(h.getChargeCounterUah())?.map(i64::from), &mut out),
-            PROPERTY_CURRENT_NOW => long(property(h.getCurrentNowMicroamps())?.map(i64::from), &mut out),
-            PROPERTY_CURRENT_AVERAGE => {
-                long(property(h.getCurrentAverageMicroamps())?.map(i64::from), &mut out)
+            PROPERTY_CHARGE_COUNTER => {
+                long(property(h.getChargeCounterUah())?.map(i64::from), &mut out)
             }
+            PROPERTY_CURRENT_NOW => long(
+                property(h.getCurrentNowMicroamps())?.map(i64::from),
+                &mut out,
+            ),
+            PROPERTY_CURRENT_AVERAGE => long(
+                property(h.getCurrentAverageMicroamps())?.map(i64::from),
+                &mut out,
+            ),
             PROPERTY_CAPACITY => long(property(h.getCapacity())?.map(i64::from), &mut out),
-            PROPERTY_STATUS => long(property(h.getChargeStatus())?.map(|s| i64::from(s.0)), &mut out),
+            PROPERTY_STATUS => long(
+                property(h.getChargeStatus())?.map(|s| i64::from(s.0)),
+                &mut out,
+            ),
             PROPERTY_ENERGY_COUNTER => long(property(h.getEnergyCounterNwh())?, &mut out),
-            PROPERTY_CHARGING_POLICY => {
-                long(property(h.getChargingPolicy())?.map(|p| i64::from(p.0)), &mut out)
-            }
+            PROPERTY_CHARGING_POLICY => long(
+                property(h.getChargingPolicy())?.map(|p| i64::from(p.0)),
+                &mut out,
+            ),
             PROPERTY_MANUFACTURING_DATE
             | PROPERTY_FIRST_USAGE_DATE
             | PROPERTY_STATE_OF_HEALTH
@@ -443,11 +462,13 @@ impl IBatteryPropertiesRegistrar for PropertiesRegistrar {
                     (PROPERTY_MANUFACTURING_DATE, Ok(d)) => {
                         long(Ok(d.batteryManufacturingDateSeconds), &mut out)
                     }
-                    (PROPERTY_FIRST_USAGE_DATE, Ok(d)) => long(Ok(d.batteryFirstUsageSeconds), &mut out),
-                    (PROPERTY_STATE_OF_HEALTH, Ok(d)) => {
-                        long(Ok(d.batteryStateOfHealth), &mut out)
+                    (PROPERTY_FIRST_USAGE_DATE, Ok(d)) => {
+                        long(Ok(d.batteryFirstUsageSeconds), &mut out)
                     }
-                    (PROPERTY_PART_STATUS, Ok(d)) => long(Ok(i64::from(d.batteryPartStatus.0)), &mut out),
+                    (PROPERTY_STATE_OF_HEALTH, Ok(d)) => long(Ok(d.batteryStateOfHealth), &mut out),
+                    (PROPERTY_PART_STATUS, Ok(d)) => {
+                        long(Ok(i64::from(d.batteryPartStatus.0)), &mut out)
+                    }
                     (_, Ok(d)) => {
                         out.value_string = d.batterySerialNumber.clone();
                         0
@@ -511,7 +532,10 @@ impl IBatteryStats for BatteryStats {
         if !st.charging.stepped {
             return Ok(-1);
         }
-        atl_diag::answered(STATS, "computeChargeTimeRemaining (step estimate not modelled)");
+        atl_diag::answered(
+            STATS,
+            "computeChargeTimeRemaining (step estimate not modelled)",
+        );
         Err(StatusCode::UNKNOWN_TRANSACTION.into())
     }
 }
@@ -611,7 +635,10 @@ mod tests {
         assert!(!st.charging.is_charging(t));
         assert_eq!(
             actions(&st.update(on_ac(16), t)),
-            [(ACTION_POWER_CONNECTED, false), (ACTION_BATTERY_CHANGED, true)]
+            [
+                (ACTION_POWER_CONNECTED, false),
+                (ACTION_BATTERY_CHANGED, true)
+            ]
         );
         assert!(!st.low, "plugged leaves low mode");
         assert_eq!(
@@ -660,7 +687,12 @@ mod tests {
             changed.flags,
             FLAG_RECEIVER_REGISTERED_ONLY | FLAG_RECEIVER_REPLACE_PENDING
         );
-        let extras = changed.extras.as_ref().expect("extras").entries();
+        let extras = changed
+            .extras
+            .as_ref()
+            .expect("extras")
+            .entries()
+            .expect("entries");
         for want in [
             ("scale", Value::Int(100)),
             ("plugged", Value::Int(1)),
@@ -668,7 +700,10 @@ mod tests {
             ("status", Value::Int(2)),
             ("battery_low", Value::Bool(false)),
         ] {
-            assert!(extras.contains(&(want.0.to_owned(), want.1.clone())), "{want:?}");
+            assert!(
+                extras.contains(&(want.0.to_owned(), want.1.clone())),
+                "{want:?}"
+            );
         }
     }
 }

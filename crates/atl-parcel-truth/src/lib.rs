@@ -44,8 +44,8 @@ use atl_parcelables::android::media::{
     AudioAttributes, AudioDeviceAttributes, PlayerBase_PlayerIdCard, VolumeInfo,
 };
 use atl_parcelables::android::os::LocaleList;
-use atl_parcelables::android::os::{BatteryProperty, Bundle};
 use atl_parcelables::android::os::storage::StorageVolume;
+use atl_parcelables::android::os::{BatteryProperty, Bundle};
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::inputmethod::{
     EditorInfo, ImeTracker_Token, InputBinding, SurroundingText,

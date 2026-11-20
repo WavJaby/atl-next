@@ -872,7 +872,9 @@ fn battery_want() -> String {
             Some("Battery") => {
                 battery = Some((
                     read(&d.join("present")).is_none_or(|p| p == "1"),
-                    read(&d.join("capacity")).and_then(|c| c.parse::<i32>().ok()).unwrap_or(0),
+                    read(&d.join("capacity"))
+                        .and_then(|c| c.parse::<i32>().ok())
+                        .unwrap_or(0),
                     match read(&d.join("status")).as_deref() {
                         Some("Charging") => 2,
                         Some("Discharging") => 3,

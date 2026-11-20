@@ -31,13 +31,19 @@ impl INetworkStatsService for NetworkStatsService {
 
     /// :2245-2256: the interface's counters would be host-wide traffic.
     fn r#getIfaceStats(&self, _iface: Option<&str>) -> binder::Result<Option<StatsResult>> {
-        atl_diag::answered(NETSTATS, "getIfaceStats (null: host-wide counters withheld)");
+        atl_diag::answered(
+            NETSTATS,
+            "getIfaceStats (null: host-wide counters withheld)",
+        );
         Ok(None)
     }
 
     /// :2275-2283: the device total would be host-wide traffic.
     fn r#getTotalStats(&self) -> binder::Result<Option<StatsResult>> {
-        atl_diag::answered(NETSTATS, "getTotalStats (null: host-wide counters withheld)");
+        atl_diag::answered(
+            NETSTATS,
+            "getTotalStats (null: host-wide counters withheld)",
+        );
         Ok(None)
     }
 

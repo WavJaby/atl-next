@@ -2107,7 +2107,10 @@ fn run(a: &Args) -> Result<ExitCode> {
             atl_broker::power_supply_sysfs().context("the host's power-supply sysfs")?;
         hal.mounts.extend(mounts);
         hal.links.extend(links);
-        daemons.push(("health", broker.spawn(hal).context("starting the health HAL")?));
+        daemons.push((
+            "health",
+            broker.spawn(hal).context("starting the health HAL")?,
+        ));
     }
     // the KeyMint HAL, then keystore2 on it (init's order: early_hal before keystore2's class main); keystore2 alone holds its database dir
     if let (Some(keystore2), Some(keymint)) = (&a.keystore2, &a.keymint) {

@@ -74,11 +74,11 @@ pub mod job_scheduler;
 #[cfg(feature = "converter")]
 pub mod locale;
 #[cfg(feature = "converter")]
+pub mod netstats;
+#[cfg(feature = "converter")]
 pub mod notification;
 #[cfg(feature = "converter")]
 pub mod notification_channels;
-#[cfg(feature = "converter")]
-pub mod netstats;
 #[cfg(feature = "converter")]
 mod notification_display;
 #[cfg(feature = "converter")]
