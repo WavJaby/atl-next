@@ -17,13 +17,16 @@ atl-services-types = { path = "../crates/atl-services-types" }
 clap.workspace = true
 object.workspace = true
 roxmltree.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["termios"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 spdx.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["pty", "termios"] }
 
 [lints]
 workspace = true

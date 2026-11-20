@@ -93,19 +93,41 @@ pub fn run(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
     timing::phase("cargo: process", || run_process(cmd, units, echo))
 }
 
+/// Column count of the terminal behind `fd` (`TIOCGWINSZ`); `None` when it is no terminal or reports 0 columns.
+fn terminal_width(fd: impl std::os::fd::AsFd) -> Option<u16> {
+    rustix::termios::tcgetwinsize(fd)
+        .ok()
+        .map(|w| w.ws_col)
+        .filter(|&c| c > 0)
+}
+
+/// Cargo's colour/progress env for a run whose stderr is piped to us. Cargo refuses `PROGRESS_WHEN=always` without `PROGRESS_WIDTH` ("always" progress requires a `width` key), so progress is forced only with a width read from the terminal; without one, cargo's default (no progress on a pipe) stays.
+fn term_env(terminal: bool, width: Option<u16>) -> Vec<(&'static str, String)> {
+    let when = if terminal { "always" } else { "never" };
+    let mut env = vec![("CARGO_TERM_COLOR", when.to_owned())];
+    match (terminal, width) {
+        (true, Some(w)) => {
+            env.push(("CARGO_TERM_PROGRESS_WHEN", "always".to_owned()));
+            env.push(("CARGO_TERM_PROGRESS_WIDTH", w.to_string()));
+        }
+        (true, None) => {}
+        (false, _) => env.push(("CARGO_TERM_PROGRESS_WHEN", "never".to_owned())),
+    }
+    env
+}
+
 fn run_process(cmd: &mut Command, units: Units, echo: Echo) -> Result<Run> {
     let mut child_cmd = with_units(cmd, units)?;
     child_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if echo == Echo::Both {
         // stderr is a pipe here: cargo would drop colour and progress without these
-        let when = if std::io::stderr().is_terminal() {
-            "always"
+        let stderr = std::io::stderr();
+        let width = if stderr.is_terminal() {
+            terminal_width(&stderr)
         } else {
-            "never"
+            None
         };
-        child_cmd
-            .env("CARGO_TERM_COLOR", when)
-            .env("CARGO_TERM_PROGRESS_WHEN", when);
+        child_cmd.envs(term_env(stderr.is_terminal(), width));
     }
     let mut child = child_cmd
         .spawn()
@@ -499,6 +521,88 @@ mod tests {
 
     /// The fixture clock: every record time and message time below is relative to it.
     const NOW: u64 = 1_800_000_000;
+
+    fn has(env: &[(&str, String)], key: &str) -> Option<String> {
+        env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn progress_when_always_comes_only_with_a_width() {
+        let with = term_env(true, Some(97));
+        assert_eq!(
+            has(&with, "CARGO_TERM_PROGRESS_WHEN").as_deref(),
+            Some("always")
+        );
+        assert_eq!(
+            has(&with, "CARGO_TERM_PROGRESS_WIDTH").as_deref(),
+            Some("97")
+        );
+        let without = term_env(true, None);
+        assert_eq!(has(&without, "CARGO_TERM_PROGRESS_WHEN"), None);
+        assert_eq!(has(&without, "CARGO_TERM_PROGRESS_WIDTH"), None);
+        let pipe = term_env(false, Some(97));
+        assert_eq!(
+            has(&pipe, "CARGO_TERM_PROGRESS_WHEN").as_deref(),
+            Some("never")
+        );
+        assert_eq!(has(&pipe, "CARGO_TERM_PROGRESS_WIDTH"), None);
+    }
+
+    /// The width comes from the pty's own winsize: 123 columns set on the pty is read back as 123.
+    #[test]
+    fn terminal_width_reads_the_pty_winsize() {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let name = ptsname(&master, Vec::new()).expect("ptsname");
+        let slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name.to_str().expect("utf-8 pts name"))
+            .expect("open pts");
+        let size = rustix::termios::Winsize {
+            ws_row: 40,
+            ws_col: 123,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        rustix::termios::tcsetwinsize(&slave, size).expect("set winsize");
+        assert_eq!(terminal_width(&slave), Some(123));
+        let not_tty = fs::File::open("/dev/null").expect("/dev/null");
+        assert_eq!(terminal_width(&not_tty), None);
+    }
+
+    /// The real cargo is the gate: the env from a terminal run must be one cargo accepts. Only a build reads the progress config (`metadata`, `fetch`, `tree` ignore it), so this checks an empty scratch crate. The bare `always` pair is checked to fail first, so the probe is shown to respond.
+    #[test]
+    fn cargo_accepts_the_terminal_env() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let root = scratch("term-env");
+        file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+        );
+        file(&root.join("src/lib.rs"), "");
+        let run = |env: Vec<(&'static str, String)>| {
+            Command::new(&cargo)
+                .args(["check", "--offline", "--quiet"])
+                .current_dir(&root)
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .env_remove("CARGO_TERM_PROGRESS_WIDTH")
+                .envs(env)
+                .output()
+                .expect("cargo runs")
+        };
+        let bare = run(vec![("CARGO_TERM_PROGRESS_WHEN", "always".to_owned())]);
+        assert!(!bare.status.success(), "probe: bare always must fail");
+        assert!(String::from_utf8_lossy(&bare.stderr).contains("width"));
+        let ours = run(term_env(true, Some(80)));
+        assert!(
+            ours.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ours.stderr)
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
