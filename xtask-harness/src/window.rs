@@ -1882,22 +1882,47 @@ fn vsync_tier_check(app: &str, host: Option<(u64, u64)>) -> Result<String, Strin
 /// (`releases_held`), at least one release carried its fence. A release sent before the paint (`--break-ignore-hold`) leaves the fence of that paint with no release to ride.
 /// Keyed on shown buffers, not on `buffers_released`: a buffer replaced in a scene the window never took (a same-thread or unpainted latch over an untaken scene) was never read, and goes back at
 /// once with its acquire fence (AOSP's dropped-buffer path), so a run whose only release is such a buffer has `1 released, 0 with a read fence` and nothing wrong.
-fn release_check(app: &str) -> Result<String, String> {
+/// `Ok(None)` = not judged: no shown buffer was retired, so there was nothing to judge; the caller names it apart, never as passed. A counters line without the release fields is an error (a renamed or
+/// dropped field must not read as 0).
+fn release_check(app: &str) -> Result<Option<String>, String> {
     let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
-    let n = |k: &str| crate::composer::field(line, k).unwrap_or(0);
+    let n = |k: &str| {
+        crate::composer::field(line, k)
+            .ok_or_else(|| format!("no `{k}` in the counters line: {}", line.trim_end()))
+    };
     let (released, shown, fenced, unmatched) = (
-        n("buffers_released"),
-        n("releases_held"),
-        n("releases_fenced"),
-        n("releases_fenced_unmatched"),
+        n("buffers_released")?,
+        n("releases_held")?,
+        n("releases_fenced")?,
+        n("releases_fenced_unmatched")?,
     );
     let summary = format!(
         "{released} released, {shown} shown retired for the paint, {fenced} with a read fence, {unmatched} fences unmatched"
     );
-    if unmatched == 0 && (shown == 0 || fenced > 0) {
-        Ok(summary)
-    } else {
+    if unmatched != 0 || (shown > 0 && fenced == 0) {
         Err(format!("release before paint: {summary}"))
+    } else if shown == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(summary))
+    }
+}
+
+/// Stages whose run retires a shown buffer for a paint, so the release check must judge: a not-judged release fails them. Measured from the gate logs (2026-11-20, every widgets / ime /
+/// surface-view run with the `releases_held` field had it > 0; surface-view also proves it in `replaced_check`). gtk, portrait, hwui and dialog draw a static first frame: no log shows them retiring one.
+fn release_must_judge(stage: Stage) -> bool {
+    matches!(stage, Stage::Widgets | Stage::Ime | Stage::SurfaceView)
+}
+
+/// [`release_check`] as a sub-check: `None` when it judged nothing on a stage that may legitimately not ([`release_must_judge`]).
+fn release_sub(app: &str, stage: Stage) -> Option<Result<String, String>> {
+    match release_check(app) {
+        Ok(Some(s)) => Some(Ok(s)),
+        Ok(None) if release_must_judge(stage) => Some(Err(
+            "no shown buffer retired for a paint (releases_held=0): this stage replaces one, the release went unjudged".to_owned(),
+        )),
+        Ok(None) => None,
+        Err(e) => Some(Err(e)),
     }
 }
 
@@ -2786,6 +2811,8 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         _ => Vec::new(),
     };
     let mut sub = sub;
+    // sub-checks that judged nothing: named on the pass line, never counted as passed
+    let mut not_judged: Vec<&str> = Vec::new();
     if !sub.is_empty()
         && matches!(
             args.stage,
@@ -2800,7 +2827,15 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
     {
         sub.push(("post-draw", post_draw_check(&app, &services)));
         sub.push(("dmabuf", dmabuf_check(&app)));
-        sub.push(("release", release_check(&app)));
+        match release_sub(&app, args.stage) {
+            Some(r) => sub.push(("release", r)),
+            None => {
+                println!(
+                    "window: release: not judged (releases_held=0: no shown buffer retired for a paint)"
+                );
+                not_judged.push("release");
+            }
+        }
     }
     // each vsync source tier's gate: local stages run free-running (headless labwc, clock_id=1 without the vsync flag), session displays that mark vsyncs run hardware-vsync
     if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
@@ -2814,8 +2849,13 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         }
     }
     if let (Some(marked), None, None) = (v.marker_ms, &v.fault, &sub_fault) {
+        let skip_note = if not_judged.is_empty() {
+            String::new()
+        } else {
+            format!("; not judged: {}", not_judged.join(", "))
+        };
         println!(
-            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION, death or unserved-service wait in the {window_ms} ms after it)",
+            "window: pass {} (`{marker}` logged {} ms after the start; no FATAL EXCEPTION, death or unserved-service wait in the {window_ms} ms after it{skip_note})",
             args.stage.name(),
             marked.saturating_sub(start_ms)
         );
@@ -3307,20 +3347,40 @@ mod tests {
     }
 
     /// The failure seen in check runs (2026-11-19/20; out/surface-view-release-flake alone-2): the only release was the buffer of a scene a same-thread latch replaced untaken
-    /// (`releases_held=0`, `scenes_dropped=1`), released at once with its acquire fence. Nothing was read, so nothing is wrong: the check passes.
+    /// (`releases_held=0`, `scenes_dropped=1`), released at once with its acquire fence. Nothing was read, so nothing is wrong -- and nothing was judged: not judged, never a pass.
     #[test]
-    fn release_of_a_never_shown_buffer_needs_no_read_fence() {
-        assert!(release_check(&release_log(1, 0, 0, 0)).is_ok());
+    fn release_of_a_never_shown_buffer_is_not_judged() {
+        assert_eq!(release_check(&release_log(1, 0, 0, 0)), Ok(None));
     }
 
-    /// A shown buffer retired for the paint whose release carried no read fence, and a paint's fence with no release to ride (`--break-ignore-hold`), each fail.
+    /// A shown buffer retired for the paint whose release carried no read fence, and a paint's fence with no release to ride (`--break-ignore-hold`), each fail; a counters line without the
+    /// release fields is an error, not zeros.
     #[test]
     fn release_of_a_shown_buffer_needs_its_read_fence() {
-        assert!(release_check(&release_log(1, 1, 1, 0)).is_ok());
+        assert!(matches!(
+            release_check(&release_log(1, 1, 1, 0)),
+            Ok(Some(_))
+        ));
         assert!(release_check(&release_log(1, 1, 0, 0)).is_err());
         assert!(release_check(&release_log(1, 0, 0, 1)).is_err());
-        assert!(release_check("composer: counters ticks=1\n").is_ok());
+        assert!(release_check("composer: counters ticks=1\n").is_err());
         assert!(release_check("no counters\n").is_err());
+    }
+
+    /// A stage that replaces a shown buffer fails when nothing was judged; a static-frame stage names it apart (`None` = not judged).
+    #[test]
+    fn not_judged_fails_only_stages_that_replace_a_shown_buffer() {
+        let idle = release_log(1, 0, 0, 0);
+        assert!(matches!(
+            release_sub(&idle, Stage::SurfaceView),
+            Some(Err(_))
+        ));
+        assert!(matches!(release_sub(&idle, Stage::Widgets), Some(Err(_))));
+        assert_eq!(release_sub(&idle, Stage::Gtk), None);
+        assert!(matches!(
+            release_sub(&release_log(1, 1, 1, 0), Stage::Gtk),
+            Some(Ok(_))
+        ));
     }
 
     /// A run's vsync lines: the platform's clock line, the tier lines (`start` at the clock's start, `switch` at a change), the last counters.
