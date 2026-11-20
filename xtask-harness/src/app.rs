@@ -1953,7 +1953,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let log = dir.join("app.log");
         std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-        let rt = rt.with_site(target.run_site(REMOTE_LIMIT, log.clone(), display));
+        let rt = rt.with_site(target.run_site(REMOTE_LIMIT, log.clone(), display)?);
         let child = rt.start_atld(&run)?;
         if display != crate::remote::Display::Headless {
             let (rc, atld_exited, elapsed) = remote_end(&rt, &run, child)?;

@@ -329,7 +329,7 @@ fn runtime_half(root: &Path, a: &TestArgs, target: &Target, out: &Path) -> Resul
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(format!("{}.log", a.gate));
     std::fs::write(&log, "").with_context(|| format!("writing {}", log.display()))?;
-    let site = target.run_site(gl_probe::LIMIT, log.clone(), Display::Headless);
+    let site = target.run_site(gl_probe::LIMIT, log.clone(), Display::Headless)?;
     let code = gl_probe::run_on(root, arch, out, site)?;
     println!("remote test {}: transcript {}", a.gate, log.display());
     Ok(code == ExitCode::SUCCESS)
@@ -359,6 +359,8 @@ pub struct RemoteRun {
     display: Display,
     /// The window gate's live half, run on the target beside atld ([`Agent`]); boxed: most runs have none.
     agent: Option<Box<Agent>>,
+    /// SHA-256 of the manifest this gate's push staged ([`stale_sh`]).
+    manifest_sha256: String,
 }
 
 /// The window gate's live half on the target (window.rs `agent`, the harness's hidden `window-live`): started before atld, it proxies atld's window to the target's compositor, drives the stage and stops
@@ -638,6 +640,8 @@ struct Plan {
     display: Display,
     /// The window gate's agent ([`Agent`]), bundle paths.
     agent: Option<Agent>,
+    /// SHA-256 of the [`MANIFEST`] this gate staged: the run refuses a dir whose manifest differs ([`stale_sh`]).
+    manifest_sha256: String,
 }
 
 fn out_path(rel: &str) -> String {
@@ -684,6 +688,7 @@ impl Plan {
             sh_quote(base)
         );
         s.push_str(&lock_sh(&format!("remote run {}", self.tag)));
+        s.push_str(&stale_sh(&self.tag, &self.manifest_sha256));
         s.push_str(&format!("rm -rf {}\n", word(&out_path(&self.root))));
         s.push_str(&format!("mkdir -p {}\n", word(&out_path(&self.scratch))));
         for (path, text) in &self.files {
@@ -922,6 +927,7 @@ impl RemoteRun {
                     })
                 })
                 .transpose()?,
+            manifest_sha256: self.manifest_sha256.clone(),
         };
         let script = scratch.join(REMOTE_SCRIPT);
         std::fs::write(&script, plan.script(&self.base))
@@ -1306,9 +1312,14 @@ impl Target {
         Ok(parse_prereq(&self.host.run_script(&script)?))
     }
 
-    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `display`: where its `WAYLAND_DISPLAY` comes from.
-    pub fn run_site(&self, limit: Duration, log: PathBuf, display: Display) -> Site {
-        Site::Remote(RemoteRun {
+    /// A run's site on the target: atld runs from the bundle there, ends at `limit`, and its transcript is appended to `log`. `display`: where its `WAYLAND_DISPLAY` comes from. After [`Target::push`]:
+    /// the run executes only if the target dir still holds the bundle this push staged.
+    pub fn run_site(&self, limit: Duration, log: PathBuf, display: Display) -> Result<Site> {
+        let manifest = self.stage.join(MANIFEST);
+        let bytes = std::fs::read(&manifest)
+            .with_context(|| format!("reading the staged {} (push first)", manifest.display()))?;
+        Ok(Site::Remote(RemoteRun {
+            manifest_sha256: sha256_hex(&bytes),
             host: self.host.clone(),
             base: self.host.base(&self.dir_name),
             lib_dirs: self.lib_dirs.clone(),
@@ -1316,7 +1327,7 @@ impl Target {
             log,
             display,
             agent: None,
-        })
+        }))
     }
 
     /// atld's `--display` value from the target's own display (the harness's hidden `display-probe`, window.rs `display_probe`, under the session's `WAYLAND_DISPLAY`): what a remote UI stage
@@ -1813,10 +1824,7 @@ impl Bundle {
                     }
                     let bytes = std::fs::read(&dst)
                         .with_context(|| format!("reading the staged {}", dst.display()))?;
-                    let hash: String = Sha256::digest(&bytes)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
+                    let hash = sha256_hex(&bytes);
                     manifest.push_str(&format!("{hash}  {}  {}\n", bytes.len(), e.name));
                 }
             }
@@ -1826,6 +1834,14 @@ impl Bundle {
             .with_context(|| format!("writing {}", manifest_path.display()))?;
         Ok(())
     }
+}
+
+/// Lowercase hex SHA-256, as `sha256sum` prints it.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A path the target takes unquoted (the target's directory name, via [`valid_name`]): `[A-Za-z0-9._+/-]`, no `..` component.
@@ -1939,6 +1955,18 @@ const RUN_LOCK: &str = ".run.lock";
 fn lock_sh(what: &str) -> String {
     format!(
         "exec 9>>{RUN_LOCK}\nflock -n 9 || {{ echo \"{what}: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }}\n"
+    )
+}
+
+/// A run's exit when its dir holds another push's bundle ([`stale_sh`]).
+const STALE_EXIT: i32 = 7;
+
+/// The run part that proves the dir holds this gate's bundle: one dir per checkout is shared by every gate (a dir per gate would cost 164-418 MiB per gate on the target), so another gate's push may
+/// have replaced it between this gate's push and its run. Runs under the run lock ([`lock_sh`]), which a push also takes, so the bundle cannot change after the check. Exit [`STALE_EXIT`] otherwise.
+fn stale_sh(tag: &str, manifest_sha256: &str) -> String {
+    format!(
+        "printf '%s  %s\\n' {} {MANIFEST} | sha256sum -c --status - 2>/dev/null || {{ echo \"remote run {tag}: stale: another push replaced the bundle\" >&2; exit {STALE_EXIT}; }}\n",
+        sh_quote(manifest_sha256)
     )
 }
 
@@ -2229,6 +2257,9 @@ fn prune_dirs(
 mod tests {
     use super::*;
 
+    /// A plan's manifest hash where the run's stale check is not under test.
+    const TEST_SHA: &str = "abc123";
+
     fn roots() -> BTreeMap<&'static str, PathBuf> {
         BTreeMap::from([
             ("out", PathBuf::from("/w/out/pool/ws/x9")),
@@ -2455,6 +2486,7 @@ mod tests {
             log: log.clone(),
             display: Display::Headless,
             agent: None,
+            manifest_sha256: TEST_SHA.to_owned(),
         };
         // a wait status: exit code 2 is `2 << 8`
         let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
@@ -2494,6 +2526,7 @@ mod tests {
         assert!(from_session(&["PULSE_SERVER"], &explicit).is_empty());
 
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "run-apk/x".into(),
             root: "run-apk/x/root".into(),
             scratch: "run-apk/x/scratch".into(),
@@ -2608,6 +2641,7 @@ mod tests {
     #[test]
     fn run_script_is_the_plan_in_order() {
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -2634,6 +2668,7 @@ mod tests {
             "BASE=$(pwd)\n",
             "exec 9>>.run.lock\n",
             "flock -n 9 || { echo \"remote run gl/run: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
+            "printf '%s  %s\\n' 'abc123' bundle.manifest | sha256sum -c --status - 2>/dev/null || { echo \"remote run gl/run: stale: another push replaced the bundle\" >&2; exit 7; }\n",
             "rm -rf \"$BASE/out/gl/run/root\"\n",
             "mkdir -p \"$BASE/out/gl/run/scratch\"\n",
             "sed \"s|@BASE@|$BASE|g\" > \"$BASE/out/gl/run/scratch/package-0.json\" <<'ATL_EOF'\n",
@@ -2663,6 +2698,7 @@ mod tests {
     #[test]
     fn session_run_names_the_targets_one_wayland_socket() {
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "run-apk/app".to_owned(),
             root: "run-apk/root".to_owned(),
             scratch: "run-apk/scratch".to_owned(),
@@ -2700,6 +2736,7 @@ mod tests {
     #[test]
     fn nested_run_starts_and_ends_labwc_around_atld() {
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
             scratch: "app/scratch".to_owned(),
@@ -2747,6 +2784,7 @@ mod tests {
     #[test]
     fn agent_run_switches_workspace_and_proxies_atld() {
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "window".to_owned(),
             root: "window/root".to_owned(),
             scratch: "window/scratch".to_owned(),
@@ -2836,6 +2874,7 @@ mod tests {
     #[test]
     fn plain_run_has_no_session_discovery() {
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -3250,6 +3289,7 @@ mod tests {
         assert!(format!("{err:#}").contains("busy"), "{err:#}");
 
         let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -3312,6 +3352,67 @@ mod tests {
         assert!(
             dir.join(RUN_LOCK).is_file(),
             "the lock file is excluded from --delete"
+        );
+    }
+
+    /// Review-4 H4: gate A pushes, gate B pushes another file set into the same dir, then A's run starts: it must refuse (`stale`, exit 7) before touching the dir, not run B's bundle. Once A's bundle
+    /// is back, the same script passes the check and reaches the launcher check (exit 4 here: the fixture has no atld), which shows the check responds both ways.
+    #[test]
+    fn a_run_refuses_a_bundle_another_push_replaced() {
+        let scratch = Scratch::new("replaced");
+        let dir = scratch.0.join("x");
+        let stage = |name: &str, file: &str| {
+            let s = scratch.0.join(name);
+            std::fs::create_dir_all(&s).expect("stage");
+            std::fs::write(s.join(file), name).expect("staged file");
+            let manifest = format!("{file}\n");
+            std::fs::write(s.join(MANIFEST), &manifest).expect("manifest");
+            (s, manifest)
+        };
+        let (a, a_manifest) = stage("a", "a.so");
+        // sizes differ: rsync's quick check (size + mtime) would skip a same-size manifest written in the same second
+        let (b, b_manifest) = stage("b", "bundle-b.so");
+        assert_ne!(a_manifest.len(), b_manifest.len());
+        let host = Host::Local(dir.clone());
+        host.sync(&a, "x").expect("push A");
+        host.sync(&b, "x").expect("push B");
+        let run_root = dir.join("out/gl/run/root");
+        std::fs::create_dir_all(&run_root).expect("run root");
+        std::fs::write(run_root.join("keep"), "k").expect("file");
+        let plan = Plan {
+            tag: "gl/run".to_owned(),
+            root: "gl/run/root".to_owned(),
+            scratch: "gl/run/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: Vec::new(),
+            files: Vec::new(),
+            lib_dirs: Vec::new(),
+            limit: 120,
+            display: Display::Headless,
+            agent: None,
+            manifest_sha256: sha256_hex(a_manifest.as_bytes()),
+        };
+        let script = plan.script(&dir.display().to_string());
+        let err = host
+            .run_script(&script)
+            .expect_err("B's bundle refuses A's run");
+        let text = format!("{err:#}");
+        assert!(text.contains("stale: another push"), "{text}");
+        assert!(
+            run_root.join("keep").is_file(),
+            "a stale run touches nothing: {text}"
+        );
+
+        host.sync(&a, "x").expect("push A again");
+        let err = host
+            .run_script(&script)
+            .expect_err("the fixture has no atld");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("stale: another push") && text.contains("not an executable"),
+            "{text}"
         );
     }
 

@@ -3202,7 +3202,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     };
     let rt = rt.with_display(display.to_arg()).with_site(
         target
-            .run_site(REMOTE_LIMIT, log.clone(), kind)
+            .run_site(REMOTE_LIMIT, log.clone(), kind)?
             .with_agent(agent),
     );
     for f in [LIVE_JSON, AGENT_RC, AGENT_LOG] {
