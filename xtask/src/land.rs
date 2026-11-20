@@ -680,14 +680,34 @@ fn rebase(wt: &Path, branch: &str, onto: &str, head: &str) -> Result<String> {
         ),
     }
     let new = replayed_tip(&String::from_utf8_lossy(&run.stdout), branch, head)?;
-    git(Some(wt), &["reset", "-q", "--keep", &new]).with_context(|| {
+    move_branch(wt, branch, head, &new)?;
+    Ok(new)
+}
+
+/// Moves `branch` (checked out in `wt`) from `head` to `new` by `reset --keep`, refusing if the branch moved since `head` was read: a commit made in `wt` between `git replay` and the reset would otherwise be dropped. Checked before the reset (HEAD) and after it (the reflog's previous value, `@{1}`); a move seen after is undone by resetting back to it, so nothing is lost either way.
+fn move_branch(wt: &Path, branch: &str, head: &str, new: &str) -> Result<()> {
+    let now = git(Some(wt), &["rev-parse", "HEAD"])?;
+    ensure!(
+        now == head,
+        "branch moved during land: {now} (land read {head}); nothing changed"
+    );
+    git(Some(wt), &["reset", "-q", "--keep", new]).with_context(|| {
         format!(
             "moving {branch} and {} to the rebased {}; nothing changed",
             wt.display(),
-            short(&new)
+            short(new)
         )
     })?;
-    Ok(new)
+    let before = git(
+        Some(wt),
+        &["rev-parse", &format!("refs/heads/{branch}@{{1}}")],
+    )?;
+    if before != head {
+        git(Some(wt), &["reset", "-q", "--keep", &before])
+            .with_context(|| format!("moving {branch} back to {before}"))?;
+        bail!("branch moved during land: {before} (land read {head}); {branch} moved back to it");
+    }
+    Ok(())
 }
 
 /// The new tip of `branch` from `git replay`'s `update <ref> <new> <old>` lines; `old` must be `head`, the tip the preflight read.
@@ -1595,6 +1615,28 @@ mod tests {
             std::fs::read_to_string(env.wt.join("change.txt")).unwrap(),
             "task\n"
         );
+    }
+
+    /// A commit made in the task worktree after land read its tip must survive: "a conflict/failure changes nothing" (module doc).
+    #[test]
+    fn a_branch_that_moved_after_the_read_is_not_reset() {
+        let env = behind("moved", "other.txt");
+        let read = branch_tip(&env);
+        git(
+            Some(&env.wt),
+            &["commit", "-q", "--allow-empty", "-m", "late"],
+        )
+        .unwrap();
+        let late = branch_tip(&env);
+        assert_ne!(late, read);
+        let err = move_branch(&env.wt, "task", &read, &env.origin_main())
+            .expect_err("a moved branch must be refused");
+        assert!(
+            format!("{err:#}").contains("branch moved during land"),
+            "{err:#}"
+        );
+        assert_eq!(git(Some(&env.wt), &["rev-parse", "HEAD"]).unwrap(), late);
+        assert_eq!(branch_tip(&env), late);
     }
 
     #[test]
