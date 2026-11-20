@@ -19,7 +19,7 @@ import (
 //   - The aconfig tool is build/make/tools/aconfig's rust_binary_host, built in this graph as Soong builds it: its codegen depends on
 //     the tree (the finalized flags it embeds turn SDK-finalized flags into `SDK_INT >= <level>` checks), so a binary of another tree
 //     generates other code.
-//   - Not supported: rust_aconfig_library (rust.go reports it).
+//   - rust_aconfig_library (codegen/rust_aconfig_library.go): a Rust source provider (rustsrc.go row, rustAconfig here) over the same caches.
 
 // aconfigGraph: the aconfig tool (built once the first declarations need it) and the declarations caches built so far; values come
 // from Graph.release.
@@ -54,6 +54,9 @@ const aconfigRules = `rule aconfig_cache
 rule aconfig_cc
   command = rm -rf $gendir && mkdir -p $gendir && $aconfig create-cpp-lib --mode $mode --cache $in --out $gendir
   description = aconfig cc $out
+rule aconfig_rust
+  command = rm -rf $gendir && mkdir -p $gendir && $aconfig create-rust-lib --mode $mode --cache $in --out $gendir
+  description = aconfig rust $out
 rule aconfig_text
   command = $aconfig dump-cache --dedup --format='{fully_qualified_name}:{permission}={state:bool}' --cache $in --out $out.tmp && (if cmp -s $out.tmp $out; then rm $out.tmp; else mv $out.tmp $out; fi)
   restat = 1
@@ -262,6 +265,34 @@ func (g *Graph) aconfigJavaLib(n *jNode) {
 		}
 	}
 	g.javaLib(n, srcjar)
+}
+
+// rustAconfig: rust_aconfig_library (codegen/rust_aconfig_library.go aconfigDecorator), a Rust source provider.
+//   - aconfig create-rust-lib --mode <mode> --cache <declarations cache> --out <gendir> writes <gendir>/src/lib.rs, the crate root; gendir is emptied first, so it belongs to this module alone.
+//   - SourceProviderDeps: rustlibs libaconfig_storage_read_api, liblazy_static, liblogger, liblog_rust, in every mode.
+type rustAconfig struct{}
+
+var rustAconfigCrates = []string{"libaconfig_storage_read_api", "liblazy_static", "liblogger", "liblog_rust"}
+
+func (rustAconfig) deps(*Node) ([]string, []string) { return rustAconfigCrates, nil }
+
+func (rustAconfig) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
+	decl := g.aconfigDeclarations(n.props.str("aconfig_declarations"), n.mod.Name)
+	if decl == nil {
+		fail("aconfig_declarations %q unusable", n.props.str("aconfig_declarations"))
+		return rustSource{}
+	}
+	mode, ok := g.aconfigMode(n.mod.Name, n.props)
+	if !ok {
+		fail("aconfig mode %q unsupported", n.props.str("mode"))
+		return rustSource{}
+	}
+	dir := g.genDir(n, "aconfig")
+	root := filepath.Join(dir, "src", "lib.rs")
+	n.edges = append(n.edges, genEdge{rule: "aconfig_rust", outs: []string{root}, in: decl.cache, implicit: []string{g.acfg.tool}, vars: [][2]string{
+		{"gendir", esc(dir)}, {"mode", mode},
+	}})
+	return rustSource{outs: []string{root}}
 }
 
 // cc_aconfig_library (codegen/cc_aconfig_library.go, a cc.GeneratedCcLibraryModuleFactory library): one generated source, built like a cc_library.

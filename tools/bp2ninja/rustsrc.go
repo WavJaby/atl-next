@@ -15,8 +15,8 @@ import (
 //     A crate whose srcs names a provider (`srcs: ["lib.rs", ":x_bindgen"]`) takes the source variant alone: a Kind Gen node, no rustc step, its outputs copied into that crate's OUT_DIR (rust.go).
 //     Both nodes write the same edges, emitted once.
 //   - A provider is one rustSourceProviders row: the crates it adds (SourceProviderDeps) and its generation (GenerateSource). Its module's srcs are not read.
-//   - Rows: rust_protobuf[_host] (protobuf.go), rust_bindgen[_host] (bindgen.go), the aidl_interface rust backend (aidl_rust_source_provider.go; a module synthAidl makes, type aidlRustType). What a later one adds:
-//     rust_aconfig_library: `aconfig create-rust-lib` over an aconfig_declarations cache (aconfig.go's graph) and its storage crates as rustlibs.
+//   - Rows: rust_protobuf[_host] (protobuf.go), rust_bindgen[_host] (bindgen.go), the aidl_interface rust backend (aidl_rust_source_provider.go; a module synthAidl makes, type aidlRustType),
+//     rust_aconfig_library (aconfig.go rustAconfig: `aconfig create-rust-lib` over an aconfig_declarations cache, its storage crates as rustlibs).
 
 // rustSource: what a provider generated for its node.
 type rustSource struct {
@@ -37,8 +37,9 @@ type rustSourceProvider interface {
 var rustSourceProviders = map[string]rustSourceProvider{
 	"rust_protobuf": rustProtobuf{}, "rust_protobuf_host": rustProtobuf{},
 	"rust_bindgen": rustBindgen{}, "rust_bindgen_host": rustBindgen{},
-	aidlRustType:        rustAidl{},
-	aidlParcelablesType: rustAidlParcelables{},
+	aidlRustType:           rustAidl{},
+	aidlParcelablesType:    rustAidlParcelables{},
+	"rust_aconfig_library": rustAconfig{},
 }
 
 // rustAidlParcelables: an aidl crate's parcelables.rs (aidlcrates.go), written at conversion time, and the flag dump of each of its aconfig_declarations as `<module>.aconfig.txt`
@@ -168,11 +169,13 @@ func (rustBindgen) deps(*Node) ([]string, []string) { return nil, nil }
 //     header_libs, static_libs, shared_libs and bionicDeps, global includes), so the bindings' layouts are those of the C/C++ this build compiles; -target and -nostdlibinc are not mirrored, as cc does not.
 //     Then the C or C++ -std (getStdVersion: cpp_std or c_std set, else the wrapper's extension .hpp/.hh = C++), `-x c` / `-x c++`, and Soong's two warning suppressions.
 //   - The cc libraries' generated headers are waited on (depGeneratedHeaders); the depfile tracks every header read.
-//   - Not supported, reported: custom_bindgen, handle_static_inline / static_inline_library (no user in the tree's native closure).
+//   - custom_bindgen: that host binary (a rust_binary_host linking libbindgen + libbindgen_cmd) replaces bindgen in the same command (GenerateSource cmd = its HostToolPath).
+//   - Not supported, reported: handle_static_inline / static_inline_library (no user in the tree's native closure).
 func (rustBindgen) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource {
 	p, m := n.props, n.mod
-	if p.str("custom_bindgen") != "" {
-		fail("custom_bindgen is unsupported")
+	tool := rustBindgenTool
+	if c := p.str("custom_bindgen"); c != "" {
+		tool = c
 	}
 	if p.boolean("handle_static_inline", false) || p.str("static_inline_library") != "" {
 		fail("handle_static_inline is unsupported")
@@ -224,7 +227,7 @@ func (rustBindgen) gen(g *Graph, n *Node, fail func(string, ...any)) rustSource 
 	var waits []string
 	genClosure(n, map[*Node]bool{}, &waits)
 	out := filepath.Join(g.genDir(n, ""), stem+".rs")
-	n.edges = append(n.edges, genEdge{rule: "bindgen", outs: []string{out}, in: g.abs(filepath.Join(m.Dir, wrapper)), tools: []edgeTool{{"bindgen", g.buildTool(rustBindgenTool, n)}},
+	n.edges = append(n.edges, genEdge{rule: "bindgen", outs: []string{out}, in: g.abs(filepath.Join(m.Dir, wrapper)), tools: []edgeTool{{"bindgen", g.buildTool(tool, n)}},
 		implicit: flagFiles, order: waits, vars: [][2]string{
 			{"flags", shellQuote(moduleFlags(p, "bindgen_flags"))}, {"flagfiles", shellQuote(flagFiles)}, {"cflags", shellQuote(cflags)},
 		}})

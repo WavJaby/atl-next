@@ -87,6 +87,58 @@ func TestCcAconfigLibrary(t *testing.T) {
 	}
 }
 
+// rust_aconfig_library (codegen/init.go rustRule, codegen/rust_aconfig_library.go GenerateSource + SourceProviderDeps): one edge over the
+// declarations' cache writing <gendir>/src/lib.rs, the crate root; rustlibs libaconfig_storage_read_api, liblazy_static, liblogger, liblog_rust.
+func TestRustAconfigLibrary(t *testing.T) {
+	tree := aconfigTree + `
+rust_library { name: "libaconfig_storage_read_api", crate_name: "aconfig_storage_read_api", srcs: ["a.rs"] }
+rust_library { name: "liblazy_static", crate_name: "lazy_static", srcs: ["z.rs"] }
+rust_library { name: "liblogger", crate_name: "logger", srcs: ["g.rs"] }
+rust_library { name: "liblog_rust", crate_name: "log", srcs: ["r.rs"] }
+rust_aconfig_library { name: "libflags_rust", crate_name: "flags_rust", aconfig_declarations: "decl" }
+rust_aconfig_library { name: "libflags_rust_test", crate_name: "flags_rust", aconfig_declarations: "decl", mode: "test" }
+`
+	g := graphFor(t, map[string]string{"p/Android.bp": tree, "p/f.aconfig": "", "p/v.textproto": ""})
+	g.release = aconfigGraphFor(t).release
+	g.acfg = newAconfigGraph("/aconfig")
+	n := g.node("libflags_rust", Device, Rlib, "t")
+	if n == nil || n.rust == nil {
+		t.Fatalf("problems %v", g.problems)
+	}
+	gd := filepath.Join(g.out, "gen", "device", "libflags_rust", "aconfig")
+	root := gd + "/src/lib.rs"
+	if len(n.edges) != 1 {
+		t.Fatalf("%d edges, problems %v", len(n.edges), g.problems)
+	}
+	e := n.edges[0]
+	cache := filepath.Join(g.out, "aconfig", "decl", "intermediate.pb")
+	if e.rule != "aconfig_rust" || e.in != cache || !reflect.DeepEqual(e.outs, []string{root}) || !slices.Contains(e.implicit, "/aconfig") {
+		t.Errorf("edge %+v", e)
+	}
+	if got := edgeVars(e); !reflect.DeepEqual(got, map[string]string{"gendir": gd, "mode": "production"}) {
+		t.Errorf("vars %v", got)
+	}
+	if !reflect.DeepEqual(n.rust.source.outs, []string{root}) || n.rust.broken != "" {
+		t.Errorf("source %v broken %q", n.rust.source.outs, n.rust.broken)
+	}
+	var crates []string
+	for _, x := range n.rust.externs {
+		crates = append(crates, x.dep.mod.Name)
+	}
+	slices.Sort(crates)
+	if want := []string{"libaconfig_storage_read_api", "liblazy_static", "liblog_rust", "liblogger"}; !reflect.DeepEqual(crates, want) {
+		t.Errorf("crates %v", crates)
+	}
+	if m := g.node("libflags_rust_test", Device, Rlib, "t"); m == nil || len(m.edges) != 1 || edgeVars(m.edges[0])["mode"] != "test" {
+		t.Errorf("test mode: %+v", m)
+	}
+	ninja := g.emit(Tools{})
+	rule, use := strings.Index(ninja, "rule aconfig_rust\n"), strings.Index(ninja, ": aconfig_rust ")
+	if rule < 0 || use < 0 || rule > use {
+		t.Errorf("rule at %d, first use at %d", rule, use)
+	}
+}
+
 func TestAconfigModes(t *testing.T) {
 	g := aconfigGraphFor(t)
 	test := g.node("libflags-test", Device, Shared, "t")

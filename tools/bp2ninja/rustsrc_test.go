@@ -146,6 +146,8 @@ rust_bindgen { name: "libforced_cpp", crate_name: "forced_cpp", wrapper_src: "w.
 rust_library { name: "libsys", crate_name: "sys", srcs: ["src/lib.rs", ":libfoo_bindgen"] }
 rust_library { name: "libuser", crate_name: "user", srcs: ["u.rs"], rustlibs: ["libfoo_bindgen"] }
 rust_bindgen { name: "libnostem", crate_name: "nostem", wrapper_src: "w.h" }
+rust_binary_host { name: "my_bindgen", crate_name: "my_bindgen", srcs: ["b.rs"] }
+rust_bindgen { name: "libcustom", crate_name: "custom", wrapper_src: "w.h", source_stem: "s", custom_bindgen: "my_bindgen" }
 rust_bindgen { name: "libstd", crate_name: "std_flag", wrapper_src: "w.h", source_stem: "s", cflags: ["-std=c11"] }
 rust_bindgen { name: "libinline", crate_name: "inline", wrapper_src: "w.h", source_stem: "s", handle_static_inline: true, static_inline_library: "libx" }
 rust_bindgen { name: "libboth", crate_name: "both", wrapper_src: "w.h", source_stem: "s", c_std: "gnu11", cpp_std: "gnu++17" }
@@ -271,6 +273,19 @@ func TestRustBindgenLanguage(t *testing.T) {
 	n := g.nodes[key{"libcpp_bindgen", Device, Rlib}]
 	if !slices.Contains(strings.Fields(edgeVars(n.edges[0])["cflags"]), "-DCPP=1") || len(n.deps.shared) != 0 {
 		t.Errorf("libcpp_bindgen cflags %q shared %v", edgeVars(n.edges[0])["cflags"], depNames(n.deps.shared))
+	}
+}
+
+// custom_bindgen (bindgen.go GenerateSource): the named host tool replaces bindgen in the same command.
+func TestRustCustomBindgen(t *testing.T) {
+	g := bindgenGraph(t)
+	n := g.node("libcustom", Device, Rlib, "goal")
+	if n == nil || n.rust.broken != "" || len(n.edges) != 1 {
+		t.Fatalf("libcustom %+v %v", n, g.problems)
+	}
+	e := n.edges[0]
+	if e.rule != "bindgen" || len(e.tools) != 1 || e.tools[0].v != "bindgen" || e.tools[0].node == nil || e.tools[0].node != g.nodes[key{"my_bindgen", Host, Binary}] {
+		t.Errorf("tools %+v", e.tools)
 	}
 }
 

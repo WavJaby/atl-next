@@ -33,7 +33,7 @@ import (
 //   - Source providers (rust_protobuf, rust_bindgen, aidl_interface rust backends): rlibs whose crate root a build step generates, rustsrc.go; named in another crate's srcs, their source variant (Kind Gen) generates only.
 //   - Cross host (arches.toml row with isa and rust): its product crates (Device, Host) take the row's target and isa features (HostCross.rustFlags), and its Rust binaries link with its cc link flags; the build machine's crates (tools, proc macros) keep rustc's default target.
 //     The converter reads no Soong Rust codegen flags (rustGlobalFlags is the whole list), so Soong's riscv64 `-C target-feature=+V,+Zba,+Zbb,+Zbs` (rust/config/riscv64_device.go) never reaches rustc.
-//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row (rust_aconfig_library).
+//   - Not supported, reported as problems: dylib / cdylib / staticlib crate variants (rust_ffi in shared_libs), provider types without a rustSourceProviders row.
 
 // rustOSSide: the side whose OS blocks a Rust module takes on side (flatten): rustc compiles for linux_glibc, so Host, but Device for a device variant of a rust_os = "android" row.
 // A native bridge side compiles for android, so it keeps its own blocks.
