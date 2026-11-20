@@ -223,6 +223,19 @@ pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configura
     }
 }
 
+/// `task`'s override as sent to its activities and windows (launch, relayout, resized, configuration change): task_override at `size`, stamped with the Task's configuration seq.
+pub(crate) fn sent_task_override<C: Clone + PartialEq>(
+    tasks: &Tasks<C>,
+    display: &DisplayModel,
+    task: TaskId,
+    size: TaskSize,
+) -> Configuration {
+    Configuration {
+        seq: tasks.config_seq(task),
+        ..task_override(display, size)
+    }
+}
+
 /// The configuration of a Task of `size` on `display`: the global configuration with the Task's override (the fields the override sets replace the global ones).
 pub(crate) fn task_configuration(
     display: &DisplayModel,
@@ -306,11 +319,13 @@ pub(crate) fn resume_item(token: SpIBinder) -> ResumeActivityItem {
 }
 
 /// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): `intent` as the start sent it, the global configuration, the controller every activity names. Built by activity_task when the machine's Launch step is sent.
+/// `task_override` = the activity's merged override configuration (ActivityTaskSupervisor.java:1001 `r.getMergedOverrideConfiguration()`): its freeform Task's, so onCreate lays out at the Task's size, not the display's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_item(
     packages: &Packages,
     display: &DisplayModel,
     locale: Option<&str>,
+    task_override: Configuration,
     controller: &SpIBinder,
     p: &PackageRecord,
     activity: &ActivityInfo,
@@ -323,7 +338,7 @@ pub(crate) fn launch_item(
         activity_token: Some(token),
         ident,
         cur_config: Some(global_configuration(display, locale)),
-        override_config: Some(Configuration::default()),
+        override_config: Some(task_override),
         device_id: DEVICE_ID_DEFAULT,
         proc_state: PROCESS_STATE_TOP,
         is_forward: true,
@@ -990,10 +1005,7 @@ impl Inner {
             return;
         };
         let display = self.tasks.display();
-        let over = Configuration {
-            seq: self.tasks.config_seq(task),
-            ..task_override(&display, size)
-        };
+        let over = sent_task_override(&self.tasks, &display, task, size);
         let new = Config::from(&task_configuration(&display, self.tasks.locale(), size));
         let task_rect = || Rect {
             left: 0,

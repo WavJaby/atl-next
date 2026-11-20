@@ -25,6 +25,7 @@ use binder::{BinderFeatures, FromIBinder, Interface, SpIBinder, Status, Strong, 
 
 use crate::activity::{
     ActivityManager, global_configuration, launch_item, log, resume_item, security,
+    sent_task_override, task_configuration,
 };
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
@@ -272,10 +273,21 @@ impl ActivityTasks {
                     atl_diag::answered(ATM, "launch of a package not installed");
                     return None;
                 };
+                // the token is bound to its Task before the machine sends its launch, and Tasks are never removed: no Task or size is a broken invariant, refused and counted
+                let Some((task, size)) = self
+                    .tasks
+                    .task_of_token(Some(token))
+                    .and_then(|task| Some((task, self.tasks.size(task)?)))
+                else {
+                    atl_diag::refused(ATM, "launch of an activity whose Task has no size");
+                    return None;
+                };
+                let display = self.tasks.display();
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
                     &self.packages,
-                    &self.tasks.display(),
+                    &display,
                     self.tasks.locale(),
+                    sent_task_override(&*self.tasks, &display, task, size),
                     &self.controller,
                     p,
                     &launch.decl,
@@ -374,7 +386,7 @@ impl ActivityTasks {
             package: package.to_owned(),
             affinity: affinity_of(decl, package),
             component: decl.component.item.name.clone().unwrap_or_default(),
-            reported: self.launch_config(),
+            reported: self.launch_config(task),
             declared: self
                 .packages
                 .by_name(package)
@@ -590,7 +602,7 @@ impl ActivityTasks {
             package: calling_package.to_owned(),
             affinity: affinity_of(decl, calling_package),
             component: decl.component.item.name.clone().unwrap_or_default(),
-            reported: self.launch_config(),
+            reported: self.launch_config(task),
             declared: package.map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
             entry: false,
@@ -773,9 +785,17 @@ impl ActivityTasks {
             .collect()
     }
 
-    /// The configuration a launch carries (launch_item: the global configuration, no override): what the record's `reported` starts from.
-    fn launch_config(&self) -> Config {
-        Config::from(&self.global_configuration())
+    /// The configuration a launch into `task` carries (launch_item: global + the Task's override; ActivityTaskSupervisor.java:1002 setLastReportedConfiguration(procConfig, overrideConfig)):
+    /// what the record's `reported` starts from. A Task without a size gets no launch (item refuses it): the global one then.
+    fn launch_config(&self, task: TaskId) -> Config {
+        match self.tasks.size(task) {
+            Some(size) => Config::from(&task_configuration(
+                &self.tasks.display(),
+                self.tasks.locale(),
+                size,
+            )),
+            None => Config::from(&self.global_configuration()),
+        }
     }
 
     /// ActivityTaskManagerService.getGlobalConfigurationForCallingPid: one display, so every caller's is the global one.
@@ -1058,6 +1078,59 @@ mod tests {
             })
             .find(|i| i.component.as_ref().is_some_and(|c| c.class == class))
             .expect("a LaunchActivityItem for the class")
+    }
+
+    /// ActivityTaskSupervisor.java:1001: the launch carries the activity's merged override = its freeform Task's. TaskFragment.computeConfigResourceOverrides: a freeform Task's bounds and
+    /// appBounds are the Task's own (here from the origin); maxBounds is inherited from DisplayContent.computeScreenConfiguration:2488 (the display; ActivityRecord sandboxes it only for
+    /// size-compat); WINDOWING_MODE_FREEFORM = 5 (WindowConfiguration.java:113). Values: a 562x900 Task on a 1920x1200 display.
+    #[test]
+    fn launch_carries_the_task_override() {
+        let mut record = crate::packages::fixture::record(PACKAGE);
+        record.uid = UID;
+        record.info.activities = Some(vec![Some(decl(LAUNCHER))]);
+        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
+        let display = DisplayModel {
+            width: 1920,
+            height: 1200,
+            ..DisplayModel::default()
+        };
+        let atm = ActivityTasks::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Tasks::new(display, None)),
+            token::new(),
+        );
+        let (thread, scheduled) = app_thread();
+        let task = atm.tasks.new_task(
+            UID,
+            PACKAGE,
+            TaskSize {
+                width: 562,
+                height: 900,
+            },
+        );
+        atm.launch_launcher(thread, UID, PACKAGE, &decl(LAUNCHER), task);
+        let over = scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .find_map(|item| match item {
+                ClientTransactionItem::LaunchActivity(launch) => launch.override_config.clone(),
+                _ => None,
+            })
+            .expect("a LaunchActivityItem with an override");
+        let rect = |right, bottom| atl_parcelables::parts::Rect {
+            left: 0,
+            top: 0,
+            right,
+            bottom,
+        };
+        let w = over.window_configuration;
+        assert_eq!(
+            (w.bounds, w.app_bounds, w.max_bounds, w.windowing_mode),
+            (rect(562, 900), Some(rect(562, 900)), rect(1920, 1200), 5)
+        );
     }
 
     /// The start an app's startActivity carries (ZVideoPlayer: setClass + putExtra, no action, no flags) is the intent the fresh launch of its activity delivers: the caller's fields, extras included.

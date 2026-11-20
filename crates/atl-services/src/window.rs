@@ -20,7 +20,6 @@ use atl_aidl::aidl::android::view::IWindowManager::{
 };
 use atl_aidl::aidl::android::view::IWindowSession::{BnWindowSession, IWindowSession};
 use atl_libgui_parcel::transaction::Transaction;
-use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::android::graphics::Rect;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::view::{
@@ -724,10 +723,7 @@ impl IWindowSession for Session {
             frames,
             merged_configuration: MergedConfiguration {
                 global: activity::global_configuration(&display, self.tasks.locale()),
-                override_config: Configuration {
-                    seq: self.tasks.config_seq(task),
-                    ..activity::task_override(&display, size)
-                },
+                override_config: activity::sent_task_override(&self.tasks, &display, task, size),
                 merged: activity::task_configuration(&display, self.tasks.locale(), size),
             },
             surface_control: surface.unwrap_or_default(),
@@ -888,10 +884,7 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     };
     let merged = MergedConfiguration {
         global: activity::global_configuration(&display, tasks.locale()),
-        override_config: Configuration {
-            seq: tasks.config_seq(task),
-            ..activity::task_override(&display, size)
-        },
+        override_config: activity::sent_task_override(tasks, &display, task, size),
         merged: activity::task_configuration(&display, tasks.locale(), size),
     };
     let clients = tasks.windows_of(task);
