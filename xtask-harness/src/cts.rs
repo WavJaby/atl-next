@@ -108,12 +108,24 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// `xtask native` for one row's modules into the Java build directory (this binary again, output in `<work>/build-<row>.log`); None = it built, Some(why) = it did not.
+/// `cargo xtask native` argv for `goals` into `out`. Through cargo's `xtask` alias, not this process's binary: this one is xtask-harness, which has no `native` (every row was BUILD_FAIL that way).
+fn native_argv(host: &str, out: &Path, goals: &[&str]) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = ["xtask", "native", "--host", host, "--out"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    argv.push(out.into());
+    argv.extend(goals.iter().map(Into::into));
+    argv
+}
+
+/// `xtask native` for one row's modules into the Java build directory (output in `<work>/build-<row>.log`); None = it built, Some(why) = it did not.
 /// One invocation per row: a module whose graph ninja cannot even load (a dangling reference in some Android.bp) fails that whole invocation, and the other rows must not share its fate or run an APK of an earlier build.
 /// The exit status is not the verdict (a failed licence gate leaves good APKs), and neither is an APK file's presence (an earlier build's stays when this one fails): ninja's own record of this invocation is. It built when `ninja.log` was written by it (not older than its start: else it stopped before ninja) with no failed step and no `ninja: error:` in `ninja.err`.
 /// `graph.json` lists no Java module, so a failed module cannot be tied to the row by its dependencies: every failed step of the invocation counts (one row's goals plus the workspace's AIDL crates, which do not fail on their own).
 /// (`ninja -n <apk>` after the build is no verdict: measured 2026-11-04, it lists 16 steps of framework-protos and the metalava stubs again after a build that succeeded.)
 fn build_row(
+    root: &Path,
     args: &Args,
     java_out: &Path,
     row: &str,
@@ -124,10 +136,9 @@ fn build_row(
     let file = std::fs::File::create(&log)?;
     println!("cts: {row}: building {goals:?} (log {})", log.display());
     let start = SystemTime::now();
-    let status = Command::new(std::env::current_exe().context("locating xtask")?)
-        .args(["native", "--host", &args.host, "--out"])
-        .arg(java_out)
-        .args(goals)
+    let status = xtask::cargo_command()
+        .args(native_argv(&args.host, java_out, goals))
+        .current_dir(root)
         .stdout(file.try_clone()?)
         .stderr(file)
         .status()
@@ -241,7 +252,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .collect();
         // with --no-build the APKs on disk are taken as they are
         let staged = match (!args.no_build)
-            .then(|| build_row(args, &rt.java_out, module, &goals, &work))
+            .then(|| build_row(root, args, &rt.java_out, module, &goals, &work))
             .transpose()?
             .flatten()
         {
@@ -353,6 +364,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row build's argv minus cargo's alias word is a command line xtask itself accepts (a renamed `native` flag fails here, not as a BUILD_FAIL of every row).
+    #[test]
+    fn native_argv_parses_as_xtask() {
+        use clap::Parser;
+        let argv = native_argv("x86_64", Path::new("/tmp/out"), &["CtsKeystoreTestCases"]);
+        assert_eq!(argv[..2], ["xtask", "native"]);
+        if let Err(e) = xtask::cli::Cli::try_parse_from(&argv) {
+            panic!("{argv:?}: {e}");
+        }
+    }
 
     fn decl(name: &str, target: &str) -> InstrumentationDecl {
         InstrumentationDecl {

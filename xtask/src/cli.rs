@@ -11,7 +11,7 @@ use crate::*;
 
 /// Single build/check driver of the ATL-next repo. Read-only or dry-run by default.
 #[derive(Parser)]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Command,
 }
