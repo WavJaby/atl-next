@@ -83,12 +83,20 @@ const POLL: Duration = Duration::from_millis(100);
 
 /// android.system.keystore2.ResponseCode.KEY_NOT_FOUND (ResponseCode.aidl).
 const KEY_NOT_FOUND: i32 = 7;
+/// android.system.keystore2.ResponseCode.PERMISSION_DENIED (ResponseCode.aidl:38).
+const PERMISSION_DENIED: i32 = 6;
 /// android.hardware.security.keymint.SecurityLevel.SOFTWARE (SecurityLevel.aidl).
 const SOFTWARE: i32 = 0;
 
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 6] {
+fn checks() -> [(&'static str, String); 7] {
     [
+        // service.rs get_key_descriptor_for_lookup: GetInfo on wifi_key denied (app.te:164 grants untrusted_app only keystore:keystore2_key), then KeystorePerm::List denied
+        // (untrusted_app has no keystore2 grant) -> error.rs:240 PERMISSION_DENIED; the generate check after it shows keystore2 still serves
+        (
+            "listEntries(Domain.SELINUX, 102): PERMISSION_DENIED",
+            format!("AtlKeystore: selinux-list error {PERMISSION_DENIED}"),
+        ),
         ("keystore found", "AtlKeystore: keystore found".to_owned()),
         (
             "getSecurityLevel(TRUSTED_ENVIRONMENT) answers a binder",

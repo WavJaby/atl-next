@@ -23,6 +23,10 @@ public final class Probe {
     private static final int TRUSTED_ENVIRONMENT = 1;
     /** keystore2 Domain.APP */
     private static final int DOMAIN_APP = 0;
+    /** keystore2 Domain.SELINUX (Domain.aidl:25) */
+    private static final int DOMAIN_SELINUX = 2;
+    /** system/sepolicy private/keystore2_key_contexts:21: namespace 102 = wifi_key */
+    private static final long WIFI_NAMESPACE = 102;
     /** keymint Tag values (Tag.aidl: TagType << 28 | n): ALGORITHM = ENUM|2, PURPOSE = ENUM_REP|1, EC_CURVE = ENUM|10, DIGEST = ENUM_REP|5, NO_AUTH_REQUIRED = BOOL|503, ORIGIN = ENUM|702. */
     private static final int TAG_ORIGIN = (1 << 28) | 702;
     private static final int TAG_ALGORITHM = (1 << 28) | 2;
@@ -132,6 +136,13 @@ public final class Probe {
                     line("get-key-entry found");
                 } catch (Throwable t) {
                     line("get-key-entry " + outcome(t));
+                }
+                try {
+                    // a SELINUX namespace an app has no grant on (keystore2_key_contexts 102 = wifi_key): denied, and keystore2 keeps serving (the key below is made after it)
+                    Object[] l = (Object[]) ks.getClass().getMethod("listEntries", int.class, long.class).invoke(ks, DOMAIN_SELINUX, WIFI_NAMESPACE);
+                    line("selinux-list " + l.length + " entries");
+                } catch (Throwable t) {
+                    line("selinux-list " + outcome(t));
                 }
                 if (level != null) {
                     generated(ks, level);
