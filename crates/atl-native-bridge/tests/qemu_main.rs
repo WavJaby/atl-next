@@ -71,6 +71,8 @@ fn check(letter: char, result: Result<(), String>) -> bool {
 extern "C" fn at_exit(status: i32, _: *mut c_void) {
     let refused = ILP32_REFUSED.load(Ordering::Relaxed);
     println!("qemu-main: values status {status:#x} ilp32 refused {refused}");
+    // exact `diag: total` lines (refused native-bridge.ilp32-* keys among them) for the gate's ILP32_REFUSED line (qemu_linker.rs `refused_line`)
+    atl_diag::flush_totals();
     let mut ok = CHURN_OK.load(Ordering::Relaxed) && DNS_OK.load(Ordering::Relaxed);
     ok &= check('e', Ok(()));
     ok &= check(

@@ -185,6 +185,8 @@ fn started(r: Result<Guest, String>) -> u64 {
     println!(
         "qemu-dlopen: values handle {handle:#x} ctor {ctor:#x} value {value:#x} malloc {block:#x} stubs bound {bound} unbound {unbound} ilp32 refused {refused}"
     );
+    // exact `diag: total` lines (refused native-bridge.ilp32-* keys among them) for the gate's ILP32_REFUSED line (qemu_linker.rs `refused_line`)
+    atl_diag::flush_totals();
     ok &= check(
         'c',
         if ctor == DEP_VALUE {

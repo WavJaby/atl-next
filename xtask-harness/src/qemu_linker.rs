@@ -240,6 +240,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         failures: fails,
     };
     println!("{}", verdict.line());
+    println!("{}", refused_line(&dir));
     Ok(if verdict.failures.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -375,6 +376,57 @@ pub(crate) fn system_wrap(stage: &Path) -> Result<Vec<OsString>> {
         "bwrap::Args::end did not close with --"
     );
     Ok(wrap)
+}
+
+/// atl-diag api prefix of a host pointer refused to a 32-bit guest (native-bridge dispatch.rs `REFUSED_*`, each hit also counted in `ILP32_REFUSED`).
+const ILP32_REFUSED_PREFIX: &str = "native-bridge.ilp32-";
+
+/// The plain runs of the harnesses that read `ILP32_REFUSED` (qemu_main, qemu_dlopen), whose logs carry their exact `diag: total` lines.
+const REFUSED_RUNS: [&str; 2] = ["qemu_main-plain", "qemu_dlopen-plain"];
+
+/// The host pointers refused to the guest in the plain runs, from their atl-diag counters: `qemu-linker: ilp32-refused <sum> <run>=<n>... [<key> x<n> cause=<last cause>]...`, printed beside the verdict so each run's count is read without opening a log. A run whose log is missing reads `<run>=-`.
+fn refused_line(dir: &Path) -> String {
+    let mut sum = 0;
+    let mut runs = Vec::new();
+    let mut keys = Vec::new();
+    for run in REFUSED_RUNS {
+        let Ok(log) = std::fs::read_to_string(dir.join(format!("{run}.log"))) else {
+            runs.push(format!("{run}=-"));
+            continue;
+        };
+        let events: Vec<_> = atl_diag::summary::events(&log)
+            .into_iter()
+            .filter(|e| {
+                e.counter.outcome == atl_diag::REFUSED
+                    && e.counter.api.starts_with(ILP32_REFUSED_PREFIX)
+            })
+            .collect();
+        let mut n = 0;
+        for c in atl_diag::summary::totals(&events) {
+            n += c.count;
+            let cause = events
+                .iter()
+                .rev()
+                .find_map(|e| {
+                    (e.counter.api == c.api)
+                        .then_some(e.cause.as_deref())
+                        .flatten()
+                })
+                .unwrap_or("-");
+            keys.push(format!(
+                "{run}: {} cause={cause}",
+                atl_diag::summary::show(&c)
+            ));
+        }
+        sum += n;
+        runs.push(format!("{run}={n}"));
+    }
+    let keys = if keys.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", keys.join("; "))
+    };
+    format!("qemu-linker: ilp32-refused {sum} {}{keys}", runs.join(" "))
 }
 
 /// One harness run: plain (every check ok, exit 0) or a break (not every check ok, and a nonzero exit). `dllibs` is the guest library directory of `qemu_dlopen` (ATL_NB_DLLIBS).
