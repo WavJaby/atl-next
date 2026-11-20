@@ -401,7 +401,9 @@ fn off_thread(app: &str) -> Result<String, String> {
     if line == "url=java.lang.IllegalStateException settings=ok" {
         Ok(line.to_owned())
     } else {
-        Err(format!("{line} (want url=java.lang.IllegalStateException settings=ok)"))
+        Err(format!(
+            "{line} (want url=java.lang.IllegalStateException settings=ok)"
+        ))
     }
 }
 
@@ -740,7 +742,9 @@ mod tests {
         assert!(off_thread(ok).is_ok());
         assert!(off_thread("").is_err());
         assert!(off_thread("x AtlWindow: wv offthread url=data:text/html settings=ok\n").is_err());
-        assert!(off_thread(&ok.replace("settings=ok", "settings=java.lang.RuntimeException")).is_err());
+        assert!(
+            off_thread(&ok.replace("settings=ok", "settings=java.lang.RuntimeException")).is_err()
+        );
     }
 
     /// The Esc sub-gates on hand-written logs: handled Esc no back, left Esc one back after it (esc-back on) or none (off); a duplicate key, an early back or a missing back fail.

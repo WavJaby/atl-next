@@ -9,8 +9,8 @@
 
 use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, bound_ms, number, period_ms, result_line};
 use super::{ACK_WAIT, Liveness, Sub, await_event, line_stamp, wait_for_line};
-use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use crate::composer::word;
+use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
 use std::time::Duration;
 
@@ -99,7 +99,11 @@ const PAINT: &str = "atl-platform-ui: paint ";
 
 /// The longest window render (us) among the paint lines stamped inside the steady phase; None without stamped markers or a paint line between them.
 fn steady_render_max_us(app: &str) -> Option<u64> {
-    let stamp = |marker: &str| app.lines().find(|l| l.contains(marker)).and_then(line_stamp);
+    let stamp = |marker: &str| {
+        app.lines()
+            .find(|l| l.contains(marker))
+            .and_then(line_stamp)
+    };
     let (start, end) = (stamp(STEADY_START)?, stamp(STEADY_END)?);
     app.lines()
         .filter(|l| l.contains(PAINT))
@@ -239,7 +243,9 @@ mod tests {
             )
         };
         let paint = |t: &str, max_us: u64| {
-            format!("{t}  INFO atl-platform-ui: paint ms=1000 render_us=5000/{max_us} after_us=1/1\n")
+            format!(
+                "{t}  INFO atl-platform-ui: paint ms=1000 render_us=5000/{max_us} after_us=1/1\n"
+            )
         };
         let log = |on: &str, inside: u64, outside: u64, dropped: u64| {
             format!(

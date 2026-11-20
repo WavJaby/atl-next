@@ -8,8 +8,8 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_void};
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::ThreadId;
 
@@ -447,7 +447,12 @@ impl Native {
 /// Chromium's AwSettings rule for WebSettings ("Methods in this class can be called from any thread, including threads created by the client of WebView", AwSettings.java class doc): one lock
 /// (`mAwSettingsLock`) around every value, a getter reads under it, a setter stores and updates the engine while holding it, so the engine sees the stores in their order. The engine's `view_*` calls
 /// are any-thread (web_engine.rs), so the update runs on the caller's thread instead of AwSettings' blocking hop to the UI thread.
-fn put_setting(settings: &Mutex<Settings>, s: Setting, v: SettingValue, push: impl FnOnce(WebSetting, &SettingValue)) {
+fn put_setting(
+    settings: &Mutex<Settings>,
+    s: Setting,
+    v: SettingValue,
+    push: impl FnOnce(WebSetting, &SettingValue),
+) {
     let mut values = lock_settings(settings);
     if let Some(e) = s.engine() {
         push(e, &v);
@@ -518,7 +523,13 @@ impl Mirror {
 
     /// The engine's location. During a pending step, counts equal to the pre-step ones are the old entry still committed (the engine has not moved yet) and do not undo the step; any other counts
     /// are the engine's move and end it.
-    fn location(&mut self, uri: Option<String>, original_uri: Option<String>, back: u32, forward: u32) {
+    fn location(
+        &mut self,
+        uri: Option<String>,
+        original_uri: Option<String>,
+        back: u32,
+        forward: u32,
+    ) {
         (self.uri, self.original_uri) = (uri, original_uri);
         if self.committed != Some((back, forward)) {
             self.committed = None;
@@ -2828,7 +2839,10 @@ mod tests {
         m.go(-1);
         assert!(!m.can_go(-1) && m.can_go(1));
         m.location(Some("a".into()), None, 1, 0);
-        assert!(!m.can_go(-1) && m.can_go(1), "stale location undid the step");
+        assert!(
+            !m.can_go(-1) && m.can_go(1),
+            "stale location undid the step"
+        );
         assert_eq!(m.uri.as_deref(), Some("a"));
         m.location(Some("b".into()), None, 0, 1);
         m.location(Some("c".into()), None, 1, 0);
@@ -2868,9 +2882,17 @@ mod tests {
                 s.spawn(move || {
                     for i in 0..500 {
                         let on = (i + t) % 2 == 0;
-                        put_setting(settings, Setting::JavaScriptEnabled, SettingValue::Bool(on), |_, v| {
-                            pushed.lock().unwrap().push(matches!(v, SettingValue::Bool(true)))
-                        });
+                        put_setting(
+                            settings,
+                            Setting::JavaScriptEnabled,
+                            SettingValue::Bool(on),
+                            |_, v| {
+                                pushed
+                                    .lock()
+                                    .unwrap()
+                                    .push(matches!(v, SettingValue::Bool(true)))
+                            },
+                        );
                         let _ = lock_settings(settings).flag(Setting::JavaScriptEnabled);
                     }
                 });
@@ -2878,7 +2900,10 @@ mod tests {
         });
         let pushed = pushed.into_inner().unwrap();
         assert_eq!(pushed.len(), 2000);
-        assert_eq!(*pushed.last().unwrap(), lock_settings(&settings).flag(Setting::JavaScriptEnabled));
+        assert_eq!(
+            *pushed.last().unwrap(),
+            lock_settings(&settings).flag(Setting::JavaScriptEnabled)
+        );
     }
 
     /// The provider's own load names its URL at once, before the engine reports it.
