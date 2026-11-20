@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 20 Nov 2026 14:58:00 +0800
+Subject: [PATCH] openssl: BIO_METHOD through accessors on BoringSSL
+
+Backport of rust-openssl 93f30ff3726b ("fixed building on the latest
+boringssl", 2025-05-28, released in 0.10.73): BoringSSL made BIO and
+BIO_METHOD opaque in 8edfd1b30 (2025-04-21), so the struct-literal
+path no longer compiles; BoringSSL exports the BIO_meth_* setters
+under their plain names.
+
+Upstream-Status: Backport [rust-openssl 93f30ff3726b]
+Patch-Reason: ATL links upstream BoringSSL (Apache-2.0), newer than AOSP external/boringssl, where BIO is opaque
+---
+SPDX-License-Identifier: Apache-2.0
+ src/ssl/bio.rs | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/src/ssl/bio.rs b/src/ssl/bio.rs
+index 36cea23fdc9bc0b3968562222953749dd5d1d0fe..ff5f5f81ccdedb473f7eaf06a55144727d2a332f 100644
+--- a/src/ssl/bio.rs
++++ b/src/ssl/bio.rs
+@@ -190,7 +190,7 @@ unsafe extern "C" fn destroy<S>(bio: *mut BIO) -> c_int {
+ }
+ 
+ cfg_if! {
+-    if #[cfg(any(ossl110, libressl273))] {
++    if #[cfg(any(ossl110, libressl273, boringssl))] {
+         use ffi::{BIO_get_data, BIO_set_data, BIO_set_flags, BIO_set_init};
+         use crate::cvt;
+ 
+@@ -202,15 +202,34 @@ cfg_if! {
+ 
+         impl BIO_METHOD {
+             fn new<S: Read + Write>() -> Result<BIO_METHOD, ErrorStack> {
++                #[cfg(not(boringssl))]
++                use ffi::{
++                    BIO_meth_set_write__fixed_rust as BIO_meth_set_write,
++                    BIO_meth_set_read__fixed_rust as BIO_meth_set_read,
++                    BIO_meth_set_puts__fixed_rust as BIO_meth_set_puts,
++                    BIO_meth_set_ctrl__fixed_rust as BIO_meth_set_ctrl,
++                    BIO_meth_set_create__fixed_rust as BIO_meth_set_create,
++                    BIO_meth_set_destroy__fixed_rust as BIO_meth_set_destroy,
++                };
++                #[cfg(boringssl)]
++                use ffi::{
++                    BIO_meth_set_write,
++                    BIO_meth_set_read,
++                    BIO_meth_set_puts,
++                    BIO_meth_set_ctrl,
++                    BIO_meth_set_create,
++                    BIO_meth_set_destroy,
++                };
++
+                 unsafe {
+                     let ptr = cvt_p(ffi::BIO_meth_new(ffi::BIO_TYPE_NONE, b"rust\0".as_ptr() as *const _))?;
+                     let method = BIO_METHOD(ptr);
+-                    cvt(ffi::BIO_meth_set_write__fixed_rust(method.0, Some(bwrite::<S>)))?;
+-                    cvt(ffi::BIO_meth_set_read__fixed_rust(method.0, Some(bread::<S>)))?;
+-                    cvt(ffi::BIO_meth_set_puts__fixed_rust(method.0, Some(bputs::<S>)))?;
+-                    cvt(ffi::BIO_meth_set_ctrl__fixed_rust(method.0, Some(ctrl::<S>)))?;
+-                    cvt(ffi::BIO_meth_set_create__fixed_rust(method.0, Some(create)))?;
+-                    cvt(ffi::BIO_meth_set_destroy__fixed_rust(method.0, Some(destroy::<S>)))?;
++                    cvt(BIO_meth_set_write(method.0, Some(bwrite::<S>)))?;
++                    cvt(BIO_meth_set_read(method.0, Some(bread::<S>)))?;
++                    cvt(BIO_meth_set_puts(method.0, Some(bputs::<S>)))?;
++                    cvt(BIO_meth_set_ctrl(method.0, Some(ctrl::<S>)))?;
++                    cvt(BIO_meth_set_create(method.0, Some(create)))?;
++                    cvt(BIO_meth_set_destroy(method.0, Some(destroy::<S>)))?;
+                     Ok(method)
+                 }
+             }

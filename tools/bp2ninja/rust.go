@@ -180,12 +180,8 @@ func (g *Graph) rustNode(n *Node) {
 	}
 	r.crateType = map[Kind]string{Rlib: "rlib", ProcMacro: "proc-macro", Binary: "bin"}[n.kind]
 	r.crateName = p.str("crate_name")
-	if r.crateName == "" {
-		if n.kind != Binary {
-			fail("crate_name is required")
-		}
-		// binary.go: a binary's crate is named after its stem
-		r.crateName = strings.ReplaceAll(g.rustStem(n), "-", "_")
+	if r.crateName == "" && n.kind != Binary {
+		fail("crate_name is required")
 	}
 	// crate root: a source provider's first output (library.go checkedCrateRootPath), else crate_root, else the one plain source of srcs, else the first output of its first generated source
 	// (compiler.go srcPathFromModuleSrcs)
@@ -321,7 +317,11 @@ func (g *Graph) rustNode(n *Node) {
 	} else {
 		r.flags = append(r.flags, "--cap-lints", "allow")
 	}
-	r.flags = append(r.flags, "--crate-type="+r.crateType, "--crate-name="+r.crateName)
+	r.flags = append(r.flags, "--crate-type="+r.crateType)
+	// builder.go transformSrctoCrate: no --crate-name without crate_name (a binary's then comes from rustc: the root file's stem)
+	if r.crateName != "" {
+		r.flags = append(r.flags, "--crate-name="+r.crateName)
+	}
 	edition := p.str("edition")
 	if edition == "" {
 		edition = rustDefaultEdition
@@ -614,16 +614,26 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 }
 
 // rustLinkArgs: a Rust binary's link: the cc link driver (Soong's rustc_linker runs clang++), the cc libraries its crates need (rustCcLibs) as link args, and their dirs as -L (rustLinkDirs).
-// A cross host's product binary links for its target as its cc links do: the side's Link (--target, --sysroot) and the lld flags (Soong's rust link takes the toolchain's link flags, lld among them).
+// A cross host's product binary links for its target as its cc links do: the side's Link (--target, --sysroot). The lld flags go to every side (Soong's rust link takes the toolchain's link flags, lld among them).
 func (g *Graph) rustLinkArgs(n *Node, linker string) (flags, inputs []string) {
 	flags = []string{"-C", "linker=" + linker}
+	link := g.soong.Lldflags
 	if g.cfg.machine(n.side) == "host" {
-		for _, f := range slices.Concat(g.soong.Flags.Link[n.side], g.soong.Lldflags) {
-			flags = append(flags, "-C", "link-arg="+f)
-		}
+		link = slices.Concat(g.soong.Flags.Link[n.side], link)
+	}
+	// every side takes lld (rust/config global.go deviceGlobalLinkFlags carries DeviceGlobalLldflags): ld.bfd would need -rpath-link for a needed library's own needs (libbinder_ndk -> libbinder)
+	for _, f := range link {
+		flags = append(flags, "-C", "link-arg="+f)
 	}
 	libs, inputs := g.rustCcLibs(n)
-	for _, l := range libs {
+	// linkLibs' provided shared objects (its prefix before the first -Wl, flag: --whole-archive or --start-group, always there) must lead DT_NEEDED (xtask provided gate); link-args come after
+	// the upstream crates' own libraries (android_log_sys -> liblog, std -> libc), so they go as this crate's -l, which rustc links before its upstream crates' (-L below finds them)
+	provided := slices.IndexFunc(libs, func(l string) bool { return strings.HasPrefix(l, "-Wl,") })
+	for i, l := range libs {
+		if i < provided {
+			flags = append(flags, "-l", "dylib:+verbatim="+filepath.Base(l))
+			continue
+		}
 		flags = append(flags, "-C", "link-arg="+l)
 	}
 	for _, d := range rustLinkDirs(libs) {
