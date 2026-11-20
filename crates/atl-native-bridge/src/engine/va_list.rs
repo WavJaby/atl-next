@@ -118,16 +118,29 @@ const SLOT32: usize = 4;
 #[cfg(atl_nb_va32_slot8)]
 const SLOT32: usize = 8;
 
-/// [`jvalues`] for an ARM guest: `ap` is the `va_list`'s `__ap` (the lane's value, the struct being passed by value). Each value is widened into its `jvalue` word: I/S/B sign- or zero-free as jni.h's union stores the low bytes, L a 32-bit pointer zero-extended.
+/// Why an AAPCS32 list was not read ([`jvalues32`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Bad32 {
+    /// a shorty character outside `ZBSCIJFDL`
+    Shorty(u8),
+    /// the arguments run past `end`: a `...` call's lane image ([`image32`]) ends at the lanes' stack window
+    Past,
+}
+
+/// [`jvalues`] for an ARM guest: `ap` is the `va_list`'s `__ap` (the lane's value, the struct being passed by value), `end` the first byte past the list's readable words (`usize::MAX` for a guest `va_list`, whose words are the guest's). Each value is widened into its `jvalue` word: I/S/B sign- or zero-free as jni.h's union stores the low bytes, L a 32-bit pointer zero-extended. Checked before any read: no word at or past `end` is read.
 ///
 /// # Safety
-/// `ap` is the live guest `__ap` whose remaining arguments are at least `params`.
-pub(super) unsafe fn jvalues32(ap: usize, params: &[u8]) -> Result<Vec<u64>, u8> {
+/// `ap` is the live guest `__ap` whose remaining arguments are at least `params`, or a list readable up to `end`.
+pub(super) unsafe fn jvalues32(ap: usize, end: usize, params: &[u8]) -> Result<Vec<u64>, Bad32> {
     let mut ap = ap;
-    let mut word = |wide: bool| -> u64 {
+    let mut word = |wide: bool| -> Result<u64, Bad32> {
         let align = if wide { 8 } else { SLOT32 };
         ap = ap.next_multiple_of(align);
-        // SAFETY: caller contract: the next argument's word(s) of the guest's list.
+        let next = ap + if wide { 8 } else { SLOT32 };
+        if next > end {
+            return Err(Bad32::Past);
+        }
+        // SAFETY: caller contract: the next argument's word(s) of the guest's list, below `end`.
         let v = unsafe {
             if wide {
                 load(ap)
@@ -135,21 +148,29 @@ pub(super) unsafe fn jvalues32(ap: usize, params: &[u8]) -> Result<Vec<u64>, u8>
                 u64::from(std::ptr::read_unaligned(ap as *const u32))
             }
         };
-        ap += if wide { 8 } else { SLOT32 };
-        v
+        ap = next;
+        Ok(v)
     };
     params
         .iter()
         .map(|&c| {
             Ok(match c {
-                b'Z' | b'B' => word(false) & 0xff,
-                b'S' | b'C' => word(false) & 0xffff,
-                b'I' | b'L' => word(false),
-                b'J' | b'D' => word(true),
-                b'F' => u64::from((f64::from_bits(word(true)) as f32).to_bits()),
-                _ => return Err(c),
+                b'Z' | b'B' => word(false)? & 0xff,
+                b'S' | b'C' => word(false)? & 0xffff,
+                b'I' | b'L' => word(false)?,
+                b'J' | b'D' => word(true)?,
+                b'F' => u64::from((f64::from_bits(word(true)?) as f32).to_bits()),
+                _ => return Err(Bad32::Shorty(c)),
             })
         })
+        .collect()
+}
+
+/// An ARM guest's argument words `words` (r0-r3, then its stack window; each lane's low 32 bits) as one 8-aligned run of 4-byte words. That is the layout `va_start` reads (AAPCS32 B.1: r0-r3 spilled directly below the stack arguments, which start 8-aligned at a call, 5.2.1.2), so a `...` call's variadic arguments are read from it as from a `va_list` whose `__ap` is the word after the fixed parameters. Byte length = 4 x the word count.
+pub(super) fn image32(words: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let w: Vec<u32> = words.into_iter().map(|x| x as u32).collect();
+    w.chunks(2)
+        .map(|p| u64::from(p[0]) | p.get(1).map_or(0, |&h| u64::from(h) << 32))
         .collect()
 }
 
@@ -181,7 +202,7 @@ mod tests {
             )
         };
         // SAFETY: the list above, one argument per shorty character.
-        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"IIJLLDF") }.unwrap();
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, usize::MAX, b"IIJLLDF") }.unwrap();
         assert_eq!(
             v,
             [7, 9, j, 0x8000_1234, 0x5678, d, u64::from(1.5f32.to_bits())]
@@ -189,13 +210,41 @@ mod tests {
         // an int then a long long: the pair skips word 1
         let pad = [3u64, j];
         // SAFETY: two 8-aligned u64: int 3 at 0, j at 8.
-        let v = unsafe { jvalues32(pad.as_ptr() as usize, b"IJ") };
+        let v = unsafe { jvalues32(pad.as_ptr() as usize, usize::MAX, b"IJ") };
         assert_eq!(v.unwrap(), [3, j]);
         // SAFETY: as above, a byte promoted to int.
-        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"Z") };
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, usize::MAX, b"Z") };
         assert_eq!(v.unwrap(), [7]);
         // SAFETY: an unknown shorty character is refused before any read.
-        let v = unsafe { jvalues32(aligned.as_ptr() as usize, b"Q") };
-        assert_eq!(v, Err(b'Q'));
+        let v = unsafe { jvalues32(aligned.as_ptr() as usize, usize::MAX, b"Q") };
+        assert_eq!(v, Err(Bad32::Shorty(b'Q')));
+    }
+
+    /// A `...` call's lanes as its `va_list` (AAPCS32 base PCS, Parameter Passing): `CallStaticIntMethod(env, cls, mid, 2, 3)` puts env, cls, mid, 2 in r0-r3 and 3 in the first stack word, so from word 3 (after the three fixed words) the list reads 2, 3. `CallStaticVoidMethod(env, cls, mid, j)`: j needs an even register (C.3), r4 does not exist, so j goes to the stack at offset 0 (C.7, C.12), r3 unused -- the reader's 8-alignment from word 3 lands on word 4 = stack word 0. Arguments past the window are refused before a read.
+    #[test]
+    fn aapcs32_variadic_lanes_read_as_a_va_list() {
+        let (env, cls, mid) = (0x1000u64, 0x2005, 0x41);
+        let mut stack = [0u64; 16];
+        stack[0] = 3;
+        let img = image32([env, cls, mid, 2].into_iter().chain(stack));
+        assert_eq!(img.len(), 10);
+        let base = img.as_ptr() as usize;
+        let end = base + 4 * 20;
+        // SAFETY: `img` holds 20 words up to `end`.
+        let v = unsafe { jvalues32(base + 4 * 3, end, b"II") };
+        assert_eq!(v.unwrap(), [2, 3]);
+        let j = 0x0102_0304_0506_0708u64;
+        let mut stack = [0u64; 16];
+        (stack[0], stack[1]) = (j & 0xffff_ffff, j >> 32);
+        // r3 holds junk: an unused register is never read
+        let img = image32([env, cls, mid, 0xdead].into_iter().chain(stack));
+        let base = img.as_ptr() as usize;
+        // SAFETY: as above.
+        let v = unsafe { jvalues32(base + 4 * 3, base + 4 * 20, b"J") };
+        assert_eq!(v.unwrap(), [j]);
+        // nine longs need 72 bytes from word 4; the image has 64: refused
+        // SAFETY: as above; nothing at or past `end` is read.
+        let v = unsafe { jvalues32(base + 4 * 3, base + 4 * 20, b"JJJJJJJJJ") };
+        assert_eq!(v, Err(Bad32::Past));
     }
 }

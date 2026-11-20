@@ -115,6 +115,11 @@ pub(super) const fn a_slot(id: usize) -> usize {
     id + 1
 }
 
+/// The `...A` sibling of `...` slot `id`: jni.h declares `X`, `XV`, `XA` in that order (unit test `a_slot_follows_each_variadic_slot`).
+pub(super) const fn variadic_a_slot(id: usize) -> usize {
+    a_slot(id + 1)
+}
+
 /// The host env behind guest env `guest` (0 = 0), for the NDK shims (ndk.rs): an NDK function takes a `JNIEnv*` and calls the host library through it.
 /// Deliberate break `ATL_NB_BREAK=ndk_env`: the guest env itself, whose function table is the guest's.
 ///
@@ -282,6 +287,25 @@ mod tests {
             assert_eq!(a.params.len(), k + 1, "{}", v.name);
             assert_eq!(a.params[..k], v.params[..k], "{}", v.name);
             assert_eq!(a.ret, v.ret, "{}", v.name);
+        }
+        assert_eq!(n, 31);
+    }
+
+    /// Every `...` slot `X` has `XA` at `variadic_a_slot`: the same fixed parameters, then one `jvalue*`, and the same result; as many as the V slots (31).
+    #[test]
+    fn a_slot_follows_each_variadic_slot() {
+        let mut n = 0;
+        for (id, lane) in objects::LANES[ENV_TABLE].iter().enumerate() {
+            let Some(x) = lane.filter(|l| l.variadic) else {
+                continue;
+            };
+            n += 1;
+            let a = objects::LANES[ENV_TABLE][variadic_a_slot(id)].expect("an A slot");
+            assert_eq!(a.name.strip_suffix('A'), Some(x.name), "{}", x.name);
+            assert!(!a.variadic, "{}", x.name);
+            assert_eq!(a.params.len(), x.params.len() + 1, "{}", x.name);
+            assert_eq!(a.params[..x.params.len()], *x.params, "{}", x.name);
+            assert_eq!(a.ret, x.ret, "{}", x.name);
         }
         assert_eq!(n, 31);
     }

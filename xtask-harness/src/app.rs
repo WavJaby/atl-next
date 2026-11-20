@@ -1109,7 +1109,7 @@ const QEMU_DEFERRED: &[&str] = &[
 ];
 /// The diag key prefix of the bridge's refusals of a host pointer to a 32-bit guest (atl-native-bridge engine dispatch.rs `REFUSED_*`).
 const ILP32_REFUSAL: &str = "native-bridge.ilp32-";
-/// The bridge-1 calls a 32-bit guest carries (32-bit JNI objects, first slice: the guest's JavaVM / JNIEnv in `JNI_OnLoad` with GetEnv, FindClass and RegisterNatives, and native methods answering an int). Every other call of a 32-bit fixture is deferred until the JNI slice that carries it (variadic Call*Method, string and array copies, guest threads, the NDK rows).
+/// The bridge-1 calls a 32-bit guest carries (32-bit JNI objects: slice 1, the guest's JavaVM / JNIEnv in `JNI_OnLoad` with GetEnv, FindClass and RegisterNatives, and native methods answering an int; slice 2, variadic Call*Method: `callJavaAdd`, `jitUpCall`). Every other call of a 32-bit fixture is deferred until the JNI slice that carries it (string and array copies, guest threads, the NDK rows).
 const ILP32_CARRIED: &[&str] = &[
     "tlsCounter#1",
     "tlsCounter#2",
@@ -1117,6 +1117,8 @@ const ILP32_CARRIED: &[&str] = &[
     "errnoRoundTrip",
     "dlopenSibling",
     "registeredAnswer",
+    "callJavaAdd",
+    "jitUpCall",
 ];
 /// The calls a run of fixture ISA `isa` (guest pointer width `pointer_bits`) on host `host` skips: none for the host's (identity), [`QEMU_DEFERRED`] for a foreign 64-bit one, all but [`ILP32_CARRIED`] for a 32-bit one.
 fn deferred(isa: &str, host: &str, pointer_bits: u32) -> Vec<&'static str> {

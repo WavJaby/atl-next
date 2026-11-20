@@ -103,37 +103,65 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     // SAFETY: x0 is the object pointer the guest called through.
     let (table, lane) =
         unsafe { objects::lane_of(guest, id as usize) }.unwrap_or_else(|r| refuse(r));
-    if lane.variadic && rules.word_bits != AAPCS64.word_bits {
-        refuse(Refused::Variadic32 { name: lane.name });
-    }
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
     let host = unsafe { objects::host_of(guest) };
     let mut lanes = *lanes;
-    // a `...V` call (Q6-7): its va_list read per the method's shorty into a jvalue array, which the `...A` sibling takes in the va_list's lane
+    let name = lane.name;
+    let bad32 = |b: va_list::Bad32| -> Vec<u64> {
+        refuse(match b {
+            va_list::Bad32::Shorty(c) => Refused::Shorty { name, c },
+            va_list::Bad32::Past => Refused::Variadic32Window { name },
+        })
+    };
+    // a `...V` call (Q6-7), or a 32-bit guest's `...` call: its arguments read per the method's shorty into a jvalue array, which the `...A` sibling takes in the lane after the fixed parameters
     let mut args: Vec<u64> = Vec::new();
     let mut va_lane = None;
-    let slot = match lane.params.iter().position(|c| *c == Class::VaList) {
-        None => id as usize,
-        Some(k) => {
-            let name = lane.name;
-            // lanes k - 1 and k located by the guest's rules (`int_arg`: every earlier JNI parameter is one word)
-            let method = *rules.int_arg(&mut lanes, k - 1) as usize;
-            // SAFETY: `host` is the host env behind the guest env; lane k - 1 is the call's jmethodID (jni.h: every V slot's va_list follows its methodID).
-            let params = unsafe { jni::method_params(host, method) }
-                .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
-            let va = *rules.int_arg(&mut lanes, k) as usize;
-            // SAFETY: lane k is the guest's va_list -- a pointer to it (AAPCS64), its `__ap` (AAPCS32: the one-word struct passed by value) -- and the guest made the call with the method's arguments (JNI contract).
-            args = unsafe {
-                if rules.word_bits == AAPCS64.word_bits {
-                    va_list::jvalues(va, params)
-                } else {
-                    va_list::jvalues32(va, params)
-                }
+    let mut sig_lane = lane;
+    let va_k = lane.params.iter().position(|c| *c == Class::VaList);
+    let slot = if let Some(k) = va_k {
+        // lanes k - 1 and k located by the guest's rules (`int_arg`: every earlier JNI parameter is one word)
+        let method = *rules.int_arg(&mut lanes, k - 1) as usize;
+        // SAFETY: `host` is the host env behind the guest env; lane k - 1 is the call's jmethodID (jni.h: every V slot's va_list follows its methodID).
+        let params = unsafe { jni::method_params(host, method) }
+            .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
+        let va = *rules.int_arg(&mut lanes, k) as usize;
+        // SAFETY: lane k is the guest's va_list -- a pointer to it (AAPCS64), its `__ap` (AAPCS32: the one-word struct passed by value) -- and the guest made the call with the method's arguments (JNI contract).
+        args = unsafe {
+            if rules.word_bits == AAPCS64.word_bits {
+                va_list::jvalues(va, params).unwrap_or_else(|c| refuse(Refused::Shorty { name, c }))
+            } else {
+                va_list::jvalues32(va, usize::MAX, params).unwrap_or_else(bad32)
             }
-            .unwrap_or_else(|c| refuse(Refused::Shorty { name, c }));
-            va_lane = Some(k);
-            jni::a_slot(id as usize)
-        }
+        };
+        va_lane = Some(k);
+        jni::a_slot(id as usize)
+    } else if lane.variadic && rules.word_bits != AAPCS64.word_bits {
+        // AAPCS32 passes `...` in r0-r3 then the stack, one run of 4-byte words with the fixed parameters (base PCS: no fp registers for a variadic call); packed into an 8-aligned image those lanes are the list `va_start` would read, starting at the word after the k fixed parameters (all one word: env, object or class, methodID last)
+        let k = lane.params.len();
+        let method = *rules.int_arg(&mut lanes, k - 1) as usize;
+        // SAFETY: as the V case: lane k - 1 is the call's jmethodID (jni.h: every `...` slot's arguments follow its methodID).
+        let params = unsafe { jni::method_params(host, method) }
+            .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
+        let words = rules.int_lanes + rules.stack_words;
+        let image = va_list::image32(
+            lanes.regs[..rules.int_lanes]
+                .iter()
+                .chain(&lanes.stack[..rules.stack_words])
+                .copied(),
+        );
+        let base = image.as_ptr() as usize;
+        // SAFETY: `image` holds `words` 4-byte words from `base`; the reader stops before `base + 4 * words`.
+        args = unsafe { va_list::jvalues32(base + 4 * k, base + 4 * words, params) }
+            .unwrap_or_else(bad32);
+        va_lane = Some(k);
+        let a = jni::variadic_a_slot(id as usize);
+        // SAFETY: as the `lane_of` above, same guest object.
+        sig_lane = unsafe { objects::lane_of(guest, a) }
+            .unwrap_or_else(|r| refuse(r))
+            .1;
+        a
+    } else {
+        id as usize
     };
     // SAFETY: `slot` is `id` or its A sibling, below the length of the table `lane_of` read, which jni.rs builds from the host object's table, so it is a slot of `host`'s own table.
     let target = unsafe { objects::host_slot(host, slot) };
@@ -153,10 +181,10 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     // host words replace guest lanes after the lanes are brought into the host's image (`call_host`), so a 32-bit guest's word never truncates them: the host object in lane 0, a `...V` slot's jvalue array in its va_list lane (an int lane: `place`)
     let mut host_words = vec![(0, arg0)];
     host_words.extend(va_lane.map(|k| (k, args.as_ptr() as u64)));
-    // the fixed parameters place the call; a variadic slot's `...` follows them unclassed, so it crosses as the guest set it (64-bit guests only: a 32-bit one is refused above)
+    // the fixed parameters place the call; a 64-bit guest's `...` follows them unclassed, so it crosses as the guest set it (AAPCS64 and the host image share the layout); a 32-bit guest's became the A sibling's above
     let sig = Sig {
-        ret: lane.ret,
-        params: (!lane.variadic).then_some(lane.params),
+        ret: sig_lane.ret,
+        params: (!sig_lane.variadic).then_some(sig_lane.params),
     };
     call_host(rules, target, &lanes, sig, &host_words)
 }
@@ -344,10 +372,10 @@ fn refuse(r: Refused) -> ! {
                 char::from(c)
             ),
         ),
-        Refused::Variadic32 { name } => (
+        Refused::Variadic32Window { name } => (
             5,
             format!(
-                "JNI {name}: a 32-bit guest's `...` arguments are not read yet (AAPCS32 variadic image)"
+                "JNI {name}: a 32-bit guest's `...` arguments run past the lanes' stack window"
             ),
         ),
     };

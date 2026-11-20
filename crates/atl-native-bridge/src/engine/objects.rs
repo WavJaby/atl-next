@@ -199,8 +199,8 @@ pub(super) enum Refused {
     NoShorty { name: &'static str },
     /// A `...V` variant whose method's shorty holds a character outside jni's `ZBSCIJFDL`.
     Shorty { name: &'static str, c: u8 },
-    /// A `...` slot called by a 32-bit guest: its words follow AAPCS32's variadic layout, which the crossing does not read yet; forwarded unclassed they would reach the host misplaced.
-    Variadic32 { name: &'static str },
+    /// A `...` slot called by a 32-bit guest whose variadic arguments run past the lanes (r0-r3 + the stack window): the words the method's shorty needs were not carried across.
+    Variadic32Window { name: &'static str },
 }
 
 /// The lane descriptor of guest object call `id` made on guest object `guest`, and its table. Refused: no registered object, an id past the table, a slot with no function.
