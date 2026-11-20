@@ -3523,10 +3523,12 @@ mod tests {
             std::fs::write(s.join(file), name).expect("staged file");
             let manifest = format!("{file}\n");
             std::fs::write(s.join(MANIFEST), &manifest).expect("manifest");
+            // as Bundle::stage writes it
+            std::fs::write(s.join(marker_name(&sha256_hex(manifest.as_bytes()))), "")
+                .expect("marker");
             (s, manifest)
         };
         let (a, a_manifest) = stage("a", "a.so");
-        // sizes differ: rsync's quick check (size + mtime) would skip a same-size manifest written in the same second
         let (b, b_manifest) = stage("b", "bundle-b.so");
         assert_ne!(a_manifest.len(), b_manifest.len());
         let host = Host::Local(dir.clone());
