@@ -41,7 +41,7 @@ use atl_android_paths::{
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
     BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Spawn, gpu, kill_sandbox,
-    seccomp_death, terminate_sandbox, to_log, tree_mounts,
+    seccomp_death, to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, AllocatorTier, NodeSource, UDMABUF_DEVICE};
 use atl_gralloc::vintf;
@@ -1530,6 +1530,7 @@ impl Host {
         let Process {
             mut child,
             host_pid,
+            ..
         } = self.broker.spawn(spawn)?;
         if controlled {
             self.controlled
@@ -2861,20 +2862,19 @@ fn run(a: &Args) -> Result<ExitCode> {
                 if let Some(s) = services.child.try_wait()? {
                     break End::Services(s);
                 }
-                for (name, p) in system_processes(&mut sm, gralloc.as_mut(), &mut daemons) {
-                    if died.iter().any(|(n, _)| *n == name) {
-                        continue;
-                    }
-                    if let Some(s) = p.child.try_wait()? {
-                        log(format_args!("system process {name} died: {s}"));
-                        atl_diag::count(SYSTEM_DIED, name, Some(&s.to_string()));
-                        died.push((name, s));
-                    }
-                }
+                reap_died(
+                    system_processes(&mut sm, gralloc.as_mut(), &mut daemons),
+                    &mut died,
+                )?;
             }
             Err(RecvTimeoutError::Disconnected) => bail!("the run's end channel closed"),
         }
     };
+    // a daemon that died after the last poll still gets its verdict, and is not stopped below
+    reap_died(
+        system_processes(&mut sm, gralloc.as_mut(), &mut daemons),
+        &mut died,
+    )?;
     let code = match &end {
         End::Command(status) => {
             log(format_args!("command ended: {status}"));
@@ -2931,7 +2931,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             log(format_args!(
                 "binderd: no exit {grace:?} after its admin connection closed: killed"
             ));
-            let _ = kill_sandbox(binderd.host_pid);
+            let _ = binderd.kill();
             let _ = binderd.child.wait();
             break;
         }
@@ -2985,21 +2985,40 @@ fn system_processes<'a>(
     v
 }
 
+/// Records each daemon of `processes` whose sandbox has ended (its pidfd: exact, no pid reuse) and has no entry in `died` yet: one line + a `system:died` diag count, its bwrap reaped for the status.
+fn reap_died(
+    processes: Vec<(&'static str, &mut Process)>,
+    died: &mut Vec<(&'static str, ExitStatus)>,
+) -> Result<()> {
+    for (name, p) in processes {
+        if died.iter().any(|(n, _)| *n == name) || !p.ended(None)? {
+            continue;
+        }
+        // the sandbox's init exited: bwrap, its parent, exits with it
+        let s = p.child.wait()?;
+        log(format_args!("system process {name} died: {s}"));
+        atl_diag::count(SYSTEM_DIED, name, Some(&s.to_string()));
+        died.push((name, s));
+    }
+    Ok(())
+}
+
 /// A shell's exit status for a process a signal ended: this plus the signal's number.
 const SIGNAL_STATUS_BASE: i32 = 128;
 /// Poll step while binderd ends: short against the grace.
 const STOP_POLL: Duration = Duration::from_millis(10);
 
-/// Stops one system process at the run's end ([`terminate_sandbox`]: SIGTERM, `grace`, SIGKILL) and reaps its bwrap; one line says which ended it.
+/// Stops one system process at the run's end ([`Process::terminate`]: SIGTERM, `grace`, SIGKILL, through its pidfd: a sandbox that ended is never signalled) and reaps its bwrap; one line says which
+/// ended it.
 fn stop_system(name: &str, p: &mut Process, grace: Duration) {
-    match terminate_sandbox(p.host_pid, grace) {
+    match p.terminate(grace) {
         Ok(true) => log(format_args!("stopped {name}")),
         Ok(false) => log(format_args!(
             "{name}: no exit {grace:?} after SIGTERM: killed"
         )),
         Err(e) => {
             log(format_args!("{name}: SIGTERM: {e}: killed"));
-            let _ = kill_sandbox(p.host_pid);
+            let _ = p.kill();
         }
     }
     let _ = p.child.wait();
@@ -3057,6 +3076,50 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in daemon: `sh -c script`, its own pid as `host_pid` (no sandbox: the pidfd logic is the same).
+    fn daemon(script: &str) -> Process {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a test's stand-in daemon, not a sandbox"
+        )]
+        let child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("sh");
+        let host_pid = i32::try_from(child.id()).expect("pid");
+        let pid = rustix::process::Pid::from_raw(host_pid).expect("pid");
+        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            .expect("pidfd_open");
+        Process {
+            child,
+            host_pid,
+            pidfd,
+        }
+    }
+
+    /// R7-7: a daemon that exits after the run's last poll gets its verdict from the end-of-run pass, once, with its status (3: the `exit 3` it ran); a live one gets none; the end's stop of the
+    /// dead one signals nothing (its pidfd says it ended: no signal can reach a process reusing its pid).
+    #[test]
+    fn reap_died_after_last_poll() {
+        let mut dead = daemon("exit 3");
+        let mut alive = daemon("sleep 30");
+        assert!(dead.ended(Some(Duration::from_secs(10))).expect("poll"));
+        let mut died = Vec::new();
+        for _ in 0..2 {
+            reap_died(
+                vec![("keystore2", &mut dead), ("keymint", &mut alive)],
+                &mut died,
+            )
+            .expect("reap");
+        }
+        assert_eq!(died.len(), 1);
+        assert_eq!(died[0].0, "keystore2");
+        assert_eq!(died[0].1.code(), Some(3));
+        assert!(dead.terminate(Duration::ZERO).expect("terminate"));
+        alive.kill().expect("kill");
+        assert!(alive.child.wait().expect("wait").code().is_none());
+    }
 
     /// Fragments go to the two partitions servicemanager reads; anything else is refused.
     #[test]

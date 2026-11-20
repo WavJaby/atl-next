@@ -31,10 +31,11 @@ use atl_android_paths::PROPERTY_AREA;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
+use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open, pidfd_send_signal};
 
 /// libbinder's driver-fd variable (atl-binder-driver `CONTROL_ENV`).
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
@@ -199,6 +200,47 @@ pub struct Process {
     pub child: Child,
     /// The tag binderd reports as the calling pid.
     pub host_pid: i32,
+    /// A pidfd of `host_pid` (pidfd_open(2)), opened at start while the sandbox runs: it names that process, never a later one reusing its pid, and turns readable when it exits.
+    pub pidfd: OwnedFd,
+}
+
+impl Process {
+    /// Whether the sandbox's init has exited, waiting up to `timeout` (`None`: no wait): its pidfd turns readable at exit (pidfd_open(2)).
+    pub fn ended(&self, timeout: Option<std::time::Duration>) -> io::Result<bool> {
+        let d = timeout.unwrap_or_default();
+        let t = rustix::time::Timespec {
+            tv_sec: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(d.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(&self.pidfd, PollFlags::IN)];
+        Ok(poll(&mut fds, Some(&t))? > 0)
+    }
+
+    /// SIGKILL to the sandbox's init through its pidfd ([`kill_sandbox`]'s effect): a sandbox that already ended is left alone (ESRCH), and no other process can receive it.
+    pub fn kill(&self) -> io::Result<()> {
+        match pidfd_send_signal(&self.pidfd, Signal::KILL) {
+            Err(rustix::io::Errno::SRCH) => Ok(()),
+            r => r.map_err(io::Error::from),
+        }
+    }
+
+    /// Stops the sandbox the Linux way: SIGTERM to its program (the init's one child; the init, pid 1 of its namespace, ignores a signal it has no handler for, and ends when its child does), then
+    /// [`Process::kill`] once `grace` passes without the init ending. An ended sandbox is not signalled. Returns whether it ended within `grace` (false: killed).
+    pub fn terminate(&self, grace: std::time::Duration) -> io::Result<bool> {
+        if self.ended(None)? {
+            return Ok(true);
+        }
+        // the init's one child, read while the init runs (pidfd not readable just above)
+        let child = program_host_pid(self.host_pid)?;
+        let pid =
+            Pid::from_raw(child).ok_or_else(|| other(format!("{child}: not a process id")))?;
+        kill_process(pid, Signal::TERM)?;
+        if self.ended(Some(grace))? {
+            return Ok(true);
+        }
+        self.kill()?;
+        Ok(false)
+    }
 }
 
 /// An entry of the host's `/` and how the sandbox shows it.
@@ -702,38 +744,6 @@ pub fn kill_sandbox(host_pid: i32) -> io::Result<()> {
     kill_process(pid, Signal::KILL).map_err(io::Error::from)
 }
 
-/// Poll step of [`terminate_sandbox`]'s wait: short against any grace worth configuring, long against a busy loop.
-const END_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Stops the sandbox whose first process is `host_pid` the Linux way: SIGTERM to its program (the init's one child; the init, pid 1 of its namespace, ignores a signal it has no handler for, and
-/// ends when its child does), then [`kill_sandbox`] once `grace` passes without the sandbox ending. Returns whether it ended within `grace` (false: killed).
-pub fn terminate_sandbox(host_pid: i32, grace: std::time::Duration) -> io::Result<bool> {
-    if !running(host_pid) {
-        return Ok(true);
-    }
-    let child = program_host_pid(host_pid)?;
-    let pid = Pid::from_raw(child).ok_or_else(|| other(format!("{child}: not a process id")))?;
-    kill_process(pid, Signal::TERM)?;
-    let deadline = std::time::Instant::now() + grace;
-    while std::time::Instant::now() < deadline {
-        if !running(host_pid) {
-            return Ok(true);
-        }
-        std::thread::sleep(END_POLL);
-    }
-    kill_sandbox(host_pid)?;
-    Ok(false)
-}
-
-/// Whether `pid` still runs: its `/proc` entry exists and is not a zombie (stat field 3, proc(5); the comm before it is parenthesised and may hold spaces).
-fn running(pid: i32) -> bool {
-    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-        s.rsplit_once(") ")
-            .and_then(|(_, rest)| rest.chars().next())
-            .is_some_and(|state| state != 'Z' && state != 'X')
-    })
-}
-
 /// The host pid of the program of the sandbox whose first process is `host_pid`: bwrap's init is that first process (pid 1; no `--as-pid-1`) and forks the program as its one child, which the stub
 /// execs into. Read from the kernel: the init's children (`/proc/<pid>/task/<pid>/children`).
 fn program_host_pid(host_pid: i32) -> io::Result<i32> {
@@ -845,7 +855,23 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
     drop(inherit);
     let mut child = child.map_err(|e| other(format!("starting {BWRAP}: {e}")))?;
     match read_info(info_r) {
-        Ok(host_pid) => Ok(Process { child, host_pid }),
+        Ok(host_pid) => {
+            let opened = Pid::from_raw(host_pid)
+                .ok_or_else(|| other(format!("{host_pid}: not a process id")))
+                .and_then(|p| pidfd_open(p, PidfdFlags::empty()).map_err(io::Error::from));
+            match opened {
+                Ok(pidfd) => Ok(Process {
+                    child,
+                    host_pid,
+                    pidfd,
+                }),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(other(format!("pidfd of sandbox {host_pid}: {e}")))
+                }
+            }
+        }
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -1027,7 +1053,11 @@ impl Broker {
             pulse: self.webspawn.as_ref().and_then(|w| w.pulse.clone()),
             app_id: spawn.app_id.clone(),
         };
-        let Process { child, host_pid } = launch(
+        let Process {
+            child,
+            host_pid,
+            pidfd,
+        } = launch(
             Launch {
                 via: None,
                 bwrap_args,
@@ -1053,7 +1083,11 @@ impl Broker {
         if let (Some(channel), Some(web)) = (broker_end, &self.webspawn) {
             self.serve_webspawn(channel, view, host_pid, web.clone())?;
         }
-        Ok(Process { child, host_pid })
+        Ok(Process {
+            child,
+            host_pid,
+            pidfd,
+        })
     }
 
     /// Serves the web-process channel of the sandbox whose pid 1 is `host_pid` on a thread of its own until the app's end closes. Its namespaces are opened now, while the broker's own child holds the
@@ -1180,6 +1214,7 @@ impl WebSpawner {
         let Process {
             mut child,
             host_pid,
+            ..
         } = launch(
             Launch {
                 via: Some(via),
@@ -1226,7 +1261,11 @@ impl Broker {
         // no rights: TCP is left handled (refused) by the stub, and the namespace has no network anyway
         let mut args = stub_args(&grants, false, &spawn.program);
         args.extend(spawn.args.iter().cloned());
-        let Process { child, host_pid } = launch(
+        let Process {
+            child,
+            host_pid,
+            pidfd,
+        } = launch(
             Launch {
                 via: None,
                 bwrap_args,
@@ -1240,7 +1279,11 @@ impl Broker {
             info_r,
             vec![info_w.into(), seccomp],
         )?;
-        Ok(Process { child, host_pid })
+        Ok(Process {
+            child,
+            host_pid,
+            pidfd,
+        })
     }
 }
 
