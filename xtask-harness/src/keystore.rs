@@ -2,11 +2,12 @@
 //! `xtask test keystore` (plan keystore S1): atld starts AOSP's keystore2 and Rust software KeyMint HAL (`Runtime::with_keystore`); the fixture (xtask-harness/testdata/keystore) runs as a plain app
 //! process under its package's app uid and calls them over binder as the framework's KeyStore2 would:
 //! - `IKeystoreService.getSecurityLevel(TRUSTED_ENVIRONMENT)` returns a binder (keystore2 connected the VINTF-declared `IKeyMintDevice/default`);
-//! - `getKeyEntry` of an absent alias in Domain::APP fails with ResponseCode KEY_NOT_FOUND: the app's keystore2_key permissions passed (patches/aosp/system/security 0001, cfg `atl_no_selinux`);
-//! - the HAL's `getHardwareInfo().securityLevel` is SOFTWARE (patches/aosp/hardware/interfaces 0001);
+//! - `getKeyEntry` of an absent alias in Domain::APP fails with ResponseCode KEY_NOT_FOUND (keystore2 answers it before any permission check, so it passes without the cfg too);
+//! - an EC P-256 signing key generated through that security level (the app's keystore2_key permissions pass: patches/aosp/system/security 0001, cfg `atl_no_selinux`) has a SOFTWARE ORIGIN authorization, the level KeyInfo.getSecurityLevel reports (patches/aosp/hardware/interfaces 0001);
+//!   KeyMetadata.keySecurityLevel stays the TEE slot keystore2 called, as on a device; the key deletes; the HAL is reached only through keystore2, as an app on a device (sepolicy keeps apps from finding hal_keymint_service);
 //! - `/data/misc/keystore`, keystore2's database, is not in the app's sandbox.
 //!
-//! Red control (by hand): drop the providers.toml `atl_no_selinux` rows and rebuild: keystore2's log names "Cannot check permission without calling_sid" and getKeyEntry answers SYSTEM_ERROR.
+//! Red control (by hand): drop the providers.toml `atl_no_selinux` rows and rebuild: keystore2's log names "Cannot check permission without calling_sid" and the generate and delete checks fail.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ const KEY_NOT_FOUND: i32 = 7;
 const SOFTWARE: i32 = 0;
 
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 5] {
+fn checks() -> [(&'static str, String); 6] {
     [
         ("keystore found", "AtlKeystore: keystore found".to_owned()),
         (
@@ -56,9 +57,10 @@ fn checks() -> [(&'static str, String); 5] {
             format!("AtlKeystore: get-key-entry error {KEY_NOT_FOUND}"),
         ),
         (
-            "KeyMint getHardwareInfo: SOFTWARE",
-            format!("AtlKeystore: hardware-level {SOFTWARE}"),
+            "an EC key generated through keystore2: ORIGIN authorization SOFTWARE",
+            format!("AtlKeystore: origin-level {SOFTWARE}"),
         ),
+        ("the generated key deletes", "AtlKeystore: delete-key ok".to_owned()),
         (
             "keystore2's database is outside the app sandbox",
             "AtlKeystore: keystore-dir absent".to_owned(),

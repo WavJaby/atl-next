@@ -40,6 +40,9 @@ use rustix::process::{Pid, Signal, kill_process};
 pub const CONTROL_ENV: &str = "ATL_BINDER_FD";
 /// Android's socket directory in every sandbox; liblog's logd socket lives in it (`/dev/socket/logdw`, logd_writer.cpp).
 const SOCKET_DIR: &str = "/dev/socket";
+/// The hwbinder device node every Android process sees, and the host node standing in for it (read/write, no binder ioctls).
+const HWBINDER: &str = "/dev/hwbinder";
+const HOST_NULL: &str = "/dev/null";
 use atl_bwrap::{self as bwrap, Access, PROGRAM as BWRAP};
 
 /// One bind mount into the sandbox.
@@ -272,6 +275,11 @@ pub fn bwrap_args(
     if profile != Profile::WebProcess {
         // init's /dev/socket (first_stage_init.cpp `mkdir("/dev/socket", 0755)`): the process's own liblog sink binds `logdw` there (atl-app-launcher logdw.rs); a web process is no Android process
         a.dir(SOCKET_DIR);
+    }
+    if !matches!(profile, Profile::WebProcess | Profile::Installer) {
+        // a device's binderfs always has hwbinder; libhidl decides "no hwservicemanager" (NoHwServiceManager) only after access(/dev/hwbinder, R|W) succeeds and returns null without it
+        // (ServiceManagement.cpp defaultServiceManager1_2), which getAllHalInstanceNames dereferences (keystore2's shared-secret negotiation). Nothing opens it: hwservicemanager is not installed.
+        a.dev_bind(HOST_NULL, HWBINDER);
     }
     a.proc("/proc").grant(Access::Ro, "/proc");
     if profile != Profile::Installer {
@@ -1467,9 +1475,9 @@ mod tests {
             },
             RootEntry::Dir("usr".into()),
         ];
-        // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev (with init's /dev/socket) and /proc, a private /tmp; then the seccomp program when given;
+        // Golden argv, written from the profile: uid map + pid namespace, gone with the broker; info fd; empty root + fresh /dev (with init's /dev/socket and the hwbinder node) and /proc, a private /tmp; then the seccomp program when given;
         // the root's dirs read-only and its symlinks recreated; the mounts, the device nodes, the area at bionic's path; the stub and the program read-only; cwd `/`; the end of options.
-        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --proc /proc --tmpfs /tmp";
+        let head = "--unshare-user --uid 10123 --gid 10123 --unshare-pid --die-with-parent --info-fd 9 --tmpfs / --dev /dev --dir /dev/socket --dev-bind /dev/null /dev/hwbinder --proc /proc --tmpfs /tmp";
         let tail = "--ro-bind /etc /etc --symlink usr/lib /lib --ro-bind /usr /usr --ro-bind /r/system /system --bind /r/data /data --dev-bind /dev/dri /dev/dri --ro-bind /r/properties /dev/__properties__ --ro-bind /b/stub /.atl-sandbox-stub --ro-bind /bin/true /bin/true --chdir / --";
         let stub = Path::new("/b/stub");
         assert_eq!(
@@ -1484,6 +1492,7 @@ mod tests {
         let (_, grants) = bwrap_args(&spawn(), Profile::App, &root, stub, 9, None);
         let want: Vec<(Access, &str)> = vec![
             (Access::Rw, "/dev"),
+            (Access::Dev, HWBINDER),
             (Access::Ro, "/proc"),
             (Access::Rw, "/tmp"),
             (Access::Ro, "/etc"),
