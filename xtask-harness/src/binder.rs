@@ -298,22 +298,67 @@ pub(crate) fn start_servicemanager(
     (s.stdout, s.stderr) = to_log(std::fs::File::create(test_root.join("servicemanager.log"))?)?;
     let mut sm = b.spawn(s).context("spawning servicemanager")?;
 
-    // servicemanager answers once its Looper runs
+    // servicemanager answers once its Looper runs; a check started before servicemanager is the context manager waits for it inside libbinder, so one check may take all of STARTUP. Both
+    // children are watched together: a servicemanager that exits is reported at once, not when the check it left waiting times out.
     let start = Instant::now();
-    let log = |n: &str| test_root.join(format!("service-{n}.log"));
-    let found = loop {
-        // a check started before servicemanager is the context manager waits for it inside libbinder, so during the start-up one check may take all of STARTUP, not RUN_LIMIT
-        let left = STARTUP.saturating_sub(start.elapsed()).max(RUN_LIMIT);
-        let r = self::service_limited(b, service, env, &["check", MANAGER], &log("check"), left)?;
-        if r.0 && r.1.contains("found") && !r.1.contains("not found") || start.elapsed() > STARTUP {
-            break r;
+    let log = test_root.join("service-check.log");
+    let mut cmd = Command::new(service);
+    cmd.args(["check", MANAGER]).envs(env.iter().cloned());
+    let found = 'checks: loop {
+        let mut check = spawn_logged(b, &cmd, AID_SHELL, &log)?;
+        loop {
+            let sm_exit = sm.child.try_wait()?;
+            let done = match check.child.try_wait()? {
+                Some(s) => Some((s.success(), std::fs::read_to_string(&log)?)),
+                None => None,
+            };
+            match startup_step(done, sm_exit, start.elapsed()) {
+                Step::Wait => std::thread::sleep(Duration::from_millis(10)),
+                Step::Retry => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue 'checks;
+                }
+                Step::End(r) => {
+                    let _ = check.child.kill();
+                    let _ = check.child.wait();
+                    break 'checks r;
+                }
+            }
         }
-        if let Some(status) = sm.child.try_wait()? {
-            break (false, format!("servicemanager exited: {status}"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
     };
     Ok((sm, found))
+}
+
+/// What [`start_servicemanager`]'s wait does next.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// the check still runs
+    Wait,
+    /// the check answered without finding the manager: start another
+    Retry,
+    /// the result: the check's answer, or why there is none
+    End((bool, String)),
+}
+
+/// One step of the start-up wait, from the check's answer (`done`: success + output, once it exited), servicemanager's exit status and the time since start. servicemanager's exit wins over
+/// everything (the check it leaves waits until killed: its status is the diagnosis); then a found manager; then STARTUP.
+fn startup_step(
+    done: Option<(bool, String)>,
+    sm_exit: Option<std::process::ExitStatus>,
+    elapsed: Duration,
+) -> Step {
+    if let Some(status) = sm_exit {
+        return Step::End((false, format!("servicemanager exited: {status}")));
+    }
+    match done {
+        Some(r) if r.0 && r.1.contains("found") && !r.1.contains("not found") => Step::End(r),
+        _ if elapsed > STARTUP => Step::End((
+            false,
+            format!("servicemanager did not answer a check in {STARTUP:?}"),
+        )),
+        Some(_) => Step::Retry,
+        None => Step::Wait,
+    }
 }
 
 /// The test /system, /vendor, /odm under `root` (see `layout`), recreated empty.
@@ -455,6 +500,31 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R7-10: a servicemanager that exited is reported as exited at once, with its status, while its check still waits (`None`) and also past STARTUP (was `killed after 60s`, 60 s late).
+    /// Raw wait status 0x100 = exit code 1 (wait(2) WEXITSTATUS: the code in bits 8-15).
+    #[test]
+    fn startup_reports_an_exited_servicemanager_at_once() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = std::process::ExitStatus::from_raw(0x100);
+        let want = Step::End((false, "servicemanager exited: exit status: 1".to_owned()));
+        for elapsed in [Duration::from_millis(50), STARTUP + Duration::from_secs(1)] {
+            assert_eq!(startup_step(None, Some(exited), elapsed), want);
+        }
+        let found = (true, format!("Service {MANAGER}: found\n"));
+        let small = Duration::from_millis(50);
+        assert_eq!(startup_step(None, None, small), Step::Wait);
+        assert_eq!(
+            startup_step(Some(found.clone()), None, small),
+            Step::End(found)
+        );
+        let absent = (true, format!("Service {MANAGER}: not found\n"));
+        assert_eq!(startup_step(Some(absent), None, small), Step::Retry);
+        assert!(matches!(
+            startup_step(None, None, STARTUP + Duration::from_secs(1)),
+            Step::End((false, _))
+        ));
+    }
 
     /// Each check fires on its own: a missing listing, a failed lookup, an absent name reported found, a counter that did not fire.
     #[test]
