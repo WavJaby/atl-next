@@ -116,6 +116,44 @@ public class Main extends Activity {
         } catch (Throwable t) {
             Log.i(TAG, "wv api threw " + t);
         }
+        offThread(w);
+    }
+
+    /**
+     * A targetSdk < 18 app's off-thread call: WebView.checkThread only logs for it and calls the provider (WebView.java, sEnforceThreadChecking false below JELLY_BEAN_MR2), so the flag is cleared
+     * for the call. One line: `wv offthread url=<what getUrl answered or threw> settings=<ok or what threw>`.
+     */
+    private static void offThread(final WebView w) {
+        // an anonymous class: the fixture compiles against android.jar, which has no LambdaMetafactory
+        Thread t = new Thread(new Runnable() { @Override public void run() {
+            String url;
+            String settings = "ok";
+            try {
+                java.lang.reflect.Field f = WebView.class.getDeclaredField("sEnforceThreadChecking");
+                f.setAccessible(true);
+                f.setBoolean(null, false);
+                try {
+                    try {
+                        url = String.valueOf(w.getUrl());
+                    } catch (Throwable e) {
+                        url = e.getClass().getName();
+                    }
+                    try {
+                        android.webkit.WebSettings s = w.getSettings();
+                        s.setJavaScriptEnabled(true);
+                        if (!s.getJavaScriptEnabled()) settings = "lost";
+                    } catch (Throwable e) {
+                        settings = e.getClass().getName();
+                    }
+                } finally {
+                    f.setBoolean(null, true);
+                }
+            } catch (Throwable e) {
+                url = "reflection " + e;
+            }
+            Log.i(TAG, "wv offthread url=" + url + " settings=" + settings);
+        }}, "wv-worker");
+        t.start();
     }
 
     @Override

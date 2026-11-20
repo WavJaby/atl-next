@@ -386,7 +386,23 @@ pub fn checks(
         ("after-intercept", after_intercept(app)),
         ("esc-handled", esc_handled(app)),
         ("esc-back", esc_back_check(app, esc_back)),
+        ("off-thread", off_thread(app)),
     ]
+}
+
+/// Sub-gate off-thread: a provider method called from a worker thread, as a targetSdk < 18 app reaches it (AOSP WebView.checkThread only logs for those; the fixture clears `sEnforceThreadChecking`
+/// to get there), throws Chromium's `IllegalStateException` to the caller (WebViewChromium.checkThread) and the process lives; WebSettings answer from any thread (AwSettings class doc).
+fn off_thread(app: &str) -> Result<String, String> {
+    const LINE: &str = "AtlWindow: wv offthread ";
+    let line = app
+        .lines()
+        .find_map(|l| l.find(LINE).map(|i| &l[i + LINE.len()..]))
+        .ok_or("no `wv offthread` line (the process died at the off-thread call?)")?;
+    if line == "url=java.lang.IllegalStateException settings=ok" {
+        Ok(line.to_owned())
+    } else {
+        Err(format!("{line} (want url=java.lang.IllegalStateException settings=ok)"))
+    }
 }
 
 /// Sub-gate provider-api: the fixture's SDK-style calls after the first onPageFinished threw nothing and answered AOSP's documented values: progress 100 (finished), the
@@ -715,6 +731,16 @@ mod tests {
         assert!(provider_api(ok).is_ok());
         assert!(provider_api(&ok.replace("original=data:text/html,x", "original=null")).is_err());
         assert!(provider_api("").is_err());
+    }
+
+    /// off-thread: Chromium's exception at the call and working settings pass; no line (an abort), an answer, or a settings failure fail.
+    #[test]
+    fn off_thread_by_hand() {
+        let ok = "x AtlWindow: wv offthread url=java.lang.IllegalStateException settings=ok\n";
+        assert!(off_thread(ok).is_ok());
+        assert!(off_thread("").is_err());
+        assert!(off_thread("x AtlWindow: wv offthread url=data:text/html settings=ok\n").is_err());
+        assert!(off_thread(&ok.replace("settings=ok", "settings=java.lang.RuntimeException")).is_err());
     }
 
     /// The Esc sub-gates on hand-written logs: handled Esc no back, left Esc one back after it (esc-back on) or none (off); a duplicate key, an early back or a missing back fail.
