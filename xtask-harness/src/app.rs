@@ -653,6 +653,65 @@ const START_STALE_RESULT_TO: Line = Line {
     want: Want::Exact("started calling=null"),
     timing: Timing::Async,
 };
+/// Flags.java's launch-flag scenarios (after the no-source starts): Main starts A1; each instance's events in its own order (c create, r onResume, n onNewIntent, s<req>:<code>:<from> result,
+/// x the start threw, d onDestroy). The last start begins the unwind, so the instance that ends on top resumes once more and finishes, and so on down to Main. Expected values from AOSP:
+/// clear-top: [A1 B1] + CLEAR_TOP A -> B1 finishes (Task.finishActivityAbove), the standard A1 finishes too without SINGLE_TOP (Task.clearTopActivities :1731-1736) and A2 is new
+/// (complyActivityFlags :2533-2537); A1 stopped under B1 never resumes again. clear-top-single-top: A1 is kept and gets onNewIntent before its resume (deliverNewIntent :2532; onResume follows
+/// onNewIntent, Activity.onNewIntent docs). single-top: the top A1 gets the intent (deliverToCurrentTopIfNeeded :2441-2483). no-history: B1 (NO_HISTORY) is finished where it would stop
+/// (ActivityRecord.stopIfPossible :6324), so C1's finish resumes A1. reorder-to-front: A1 moves above B1 with onNewIntent (complyActivityFlags :2553-2570, Task.moveActivityToFront), B1 resumes
+/// after A1 finishes. forward-result: B1's FORWARD_RESULT start moves A1's request 3 to C1 (executeRequest :1123-1136), so getCallingActivity of C1 is A and A1 gets C1's RESULT_OK (-1), not B1's.
+/// refused-new-document (control, unchanged by the flags work): NEW_DOCUMENT needs a new Task, which ATL does not model: the start throws (START_CANCELED -96).
+const FLAG_LINES: [Line; 7] = [
+    flag_line(
+        "flags-clear-top",
+        "AtlTest: flags-clear-top: ",
+        "A1[c,r,d] B1[c,r,d] A2[c,r,d]",
+    ),
+    flag_line(
+        "flags-clear-top-single-top",
+        "AtlTest: flags-clear-top-single-top: ",
+        "A1[c,r,n,r,d] B1[c,r,d]",
+    ),
+    flag_line(
+        "flags-single-top",
+        "AtlTest: flags-single-top: ",
+        "A1[c,r,n,r,d]",
+    ),
+    flag_line(
+        "flags-no-history",
+        "AtlTest: flags-no-history: ",
+        "A1[c,r,r,d] B1[c,r,d] C1[c,r,d]",
+    ),
+    flag_line(
+        "flags-reorder-to-front",
+        "AtlTest: flags-reorder-to-front: ",
+        "A1[c,r,n,r,d] B1[c,r,r,d]",
+    ),
+    flag_line(
+        "flags-forward-result",
+        "AtlTest: flags-forward-result: ",
+        "A1[c,r,s3:-1:C1,r,d] B1[c,r,d] C1[c<A,r,d]",
+    ),
+    flag_line(
+        "flags-refused-new-document",
+        "AtlTest: flags-refused-new-document: ",
+        "A1[c,r,x,d]",
+    ),
+];
+
+const fn flag_line(row: &'static str, prefix: &'static str, want: &'static str) -> Line {
+    Line {
+        row,
+        prefix,
+        want: Want::Exact(want),
+        timing: Timing::Async,
+    }
+}
+
+/// Every judged prefix line: LOG_LINES, then FLAG_LINES.
+fn judged_lines() -> impl Iterator<Item = &'static Line> {
+    LOG_LINES.iter().chain(FLAG_LINES.iter())
+}
 
 /// When the fixture logs a judged line. `Async`: from a binder or WebView callback after onCreate; the watch waits for it, up to RESULT_WAIT once WINDOW_MS has passed.
 /// `Create`: in onCreate, or on a thread onCreate starts before any callback, so WINDOW_MS covers it.
@@ -2133,9 +2192,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let waiting = || {
             let log = read(&app_log);
             !log.contains(PERMISSION_REQUEST)
-                || LOG_LINES
-                    .iter()
-                    .any(|l| l.timing == Timing::Async && !log.contains(l.prefix))
+                || judged_lines().any(|l| l.timing == Timing::Async && !log.contains(l.prefix))
         };
         while ended.is_none()
             && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
@@ -2415,8 +2472,8 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     if passed && let Some(why) = webview_ua_why(webview_ua.as_deref(), engine_ua.as_deref()) {
         whys.push(why);
     }
-    // every LOG_LINES row, Async ones included: the watch above waited for them, so a missing line here is a real miss
-    for line in &LOG_LINES {
+    // every LOG_LINES and FLAG_LINES row, Async ones included: the watch above waited for them, so a missing line here is a real miss
+    for line in judged_lines() {
         let got = after(line.prefix);
         let why = match line.want {
             Want::Exact(want) => {
@@ -2591,7 +2648,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             "app: pass webview-ua {}",
             webview_ua.as_deref().unwrap_or_default()
         );
-        for line in &LOG_LINES {
+        for line in judged_lines() {
             println!(
                 "app: pass {} {}",
                 line.row,

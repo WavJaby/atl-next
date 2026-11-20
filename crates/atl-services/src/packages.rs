@@ -520,8 +520,12 @@ pub fn declared(a: &ActivityInfo) -> Declared {
         launch_mode: a.launch_mode,
         process: a.component.process_name.clone(),
         task_affinity: a.task_affinity.clone(),
+        no_history: a.flags & FLAG_NO_HISTORY != 0,
     }
 }
+
+/// ActivityInfo.FLAG_NO_HISTORY (manifest android:noHistory).
+const FLAG_NO_HISTORY: i32 = 0x0080;
 
 fn named(c: &ComponentInfo, class: &str) -> bool {
     c.item.name.as_deref() == Some(class)

@@ -867,6 +867,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "permission-request request=" + requestCode + " names=" + java.util.Arrays.toString(permissions)
                 + " results=" + java.util.Arrays.toString(grantResults) + " self=" + checkSelfPermission(POST_NOTIFICATIONS));
         noSourceStarts();
+        Flags.start(this);
     }
 
     /**

@@ -27,8 +27,9 @@ use crate::activity::{
     ActivityManager, global_configuration, launch_item, log, resume_item, security,
     sent_task_override, task_configuration,
 };
+use crate::activity_stack::{Cancelled, Push};
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
-use crate::activity_start::{self, Call, Refusal, Source, Start, Target};
+use crate::activity_start::{self, Call, Rec, Refusal, Source, Target, Then};
 use crate::config_diff::Config;
 use crate::package::USER_SYSTEM;
 use crate::packages::{Packages, Permissions, real_config_changes};
@@ -158,6 +159,19 @@ pub(crate) fn affinity_of(decl: &ActivityInfo, package: &str) -> String {
 /// Answers the result `owed` as cancelled (RESULT_CANCELED, no data), as every cancelled start does (ActivityStarter.java:1222, 2470, 2846); nothing when none is owed.
 fn cancel_owed(m: &mut Lifecycle, owed: Option<&ResultTo<SpIBinder>>) -> Vec<Cmd> {
     answer_owed(m, owed, RESULT_CANCELED, None)
+}
+
+/// The result a record the services finish answers (clear-top, clear-task, no-history: finishIfPossible): RESULT_CANCELED, no data.
+impl Cancelled<SpIBinder> for ResultInfo {
+    fn cancelled(to: &ResultTo<SpIBinder>) -> Self {
+        ResultInfo {
+            result_who: to.who.clone(),
+            request_code: to.request_code,
+            result_code: RESULT_CANCELED,
+            data: None,
+            caller_token: None,
+        }
+    }
 }
 
 /// Answers the result `owed` with (`code`, `data`) through the one deliver path (Machine::deliver: at once to a resumed caller, else with its next resume); nothing when none is owed.
@@ -411,7 +425,11 @@ impl ActivityTasks {
             },
         };
         let mut m = self.machine();
-        let commands = m.push(task, token.clone(), owner, launch);
+        let push = Push {
+            no_history: crate::packages::declared(decl).no_history,
+            ..Push::default()
+        };
+        let commands = m.push_with(task, token.clone(), owner, launch, push);
         self.note_settle(&m);
         self.send(commands);
         token
@@ -458,6 +476,7 @@ impl ActivityTasks {
             package: &o.package,
             affinity: &o.affinity,
             finishing: m.is_finishing(t) == Some(true),
+            owes: m.owed(t).is_some(),
         });
         let package = component.and_then(|(p, _)| self.packages.by_name(p));
         let info = component.and_then(|(_, class)| package.and_then(|p| p.activity(class)));
@@ -470,8 +489,10 @@ impl ActivityTasks {
             component,
             source: source_view,
         };
-        // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested); none with `results` off
+        // the result the start owes its caller: the source's record, when a result was asked and the source is not finishing (Call::result_requested); with FORWARD_RESULT the source's own,
+        // taken from it before the start is decided (ActivityStarter.java:1130-1136; a refused start then answers it cancelled, :1222); none with `results` off
         let mut owed = match (call.result_requested(), &source) {
+            (true, Some((to, _))) if call.forwards() => m.take_owed(to).filter(|_| results),
             (true, Some((to, o))) if results => Some(ResultTo {
                 token: to.clone(),
                 who: result_who.map(str::to_owned),
@@ -518,28 +539,50 @@ impl ActivityTasks {
                 m.task_by_root(|o| o.thread.as_binder() == caller.as_binder() && o.affinity == a)
             }),
         };
-        let class = component.map(|(_, class)| class);
-        let instance = source_task
-            .zip(class)
-            .and_then(|(task, class)| m.find_in_task(task, |o| o.component == class).cloned());
-        let top_is_class = source_task
-            .zip(class)
-            .is_some_and(|(task, class)| m.top(task).is_some_and(|(_, o)| o.component == class));
+        // the Task's records as the decision reads them, bottom -> top (tokens kept beside, in the same order)
+        let records: Vec<(SpIBinder, String, bool)> = source_task
+            .map(|task| {
+                m.records(task)
+                    .map(|(k, o)| {
+                        (
+                            k.clone(),
+                            o.component.clone(),
+                            m.is_finishing(k) == Some(true),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let view: Vec<Rec<'_>> = records
+            .iter()
+            .map(|(k, class, finishing)| Rec {
+                class,
+                finishing: *finishing,
+                source: source.as_ref().is_some_and(|(t, _)| t == k),
+            })
+            .collect();
         let target = Target {
             process: package.map_or("", |p| p.process_name()),
             decl: declared.as_ref(),
-            in_task: instance.is_some(),
-            top_is_class,
-            affinity_task: source.is_none() && source_task.is_some(),
+            task: source_task.map(|_| view.as_slice()),
         };
-        let (decl, start) = match activity_start::check(&call, target) {
-            Ok((_, start)) => (
-                info.expect("check accepts only a class the package declares"),
-                start,
+        let (decl, plan) = match activity_start::decide(&call, target) {
+            Ok((_, plan)) => (
+                info.expect("decide accepts only a class the package declares"),
+                plan,
             ),
-            Err(Refusal::Code { code, reason }) => {
+            Err(Refusal::Code {
+                code,
+                reason,
+                flags: bits,
+            }) => {
                 log(format_args!(
-                    "activity start refused code={code} ({reason}): component={component:?} flags=0x{flags:x} result_to={} request_code={request_code} caller={calling_package} at={}",
+                    "activity start refused code={code} ({reason}{}): component={component:?} flags=0x{flags:x} result_to={} request_code={request_code} caller={calling_package} at={}",
+                    if bits == 0 {
+                        String::new()
+                    } else {
+                        format!(": {}", activity_start::flag_names(bits))
+                    },
                     match (result_to, &source) {
                         (None, _) => "null",
                         (Some(_), None) => "no record",
@@ -566,33 +609,54 @@ impl ActivityTasks {
             self.send(commands);
             return Ok(activity_start::START_CANCELED);
         };
-        if let (Start::Reuse { .. }, false) = (start, reuse) {
+        if let (Then::Deliver { .. }, false) = (plan.then, reuse) {
             atl_diag::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
             commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
             self.note_settle(&m);
             self.send(commands);
             return Ok(activity_start::START_CANCELED);
         }
-        if let (Start::Reuse { clear_top }, Some(instance)) = (start, instance) {
-            // ActivityStarter.deliverToCurrentTopIfNeeded: the owed result is cancelled first (:2469), then the intent goes to the instance (deliverNewIntent);
-            // START_DELIVERED_TO_TOP (3) for the top, START_TASK_TO_FRONT (2) after a clear-top; both are success codes the app does not throw for
+        let token_at = |i: usize| records[i].0.clone();
+        if !plan.finish.is_empty() {
+            log(format_args!(
+                "activity start finishes {} for {component:?} flags=0x{flags:x} at={}",
+                plan.finish
+                    .iter()
+                    .map(|&i| records[i].1.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                atl_diag::wall_stamp()
+            ));
+        }
+        let finished: Vec<SpIBinder> = plan.finish.iter().map(|&i| token_at(i)).collect();
+        commands.extend(m.finish_for_start(&finished));
+        if let Then::Deliver {
+            to,
+            to_front,
+            cancel,
+        } = plan.then
+        {
+            // deliverNewIntent: deliverToCurrentTopIfNeeded cancels the owed result first (:2469); recycleTask's reuse (clear-top, singleTask, reorder) sends none, the result is
+            // never answered. START_DELIVERED_TO_TOP: a success code the app does not throw for.
+            let instance = token_at(to);
             let referrer = ReferrerIntent {
                 intent: intent.clone(),
                 referrer: Some(calling_package.to_owned()),
                 caller_token: None,
             };
-            commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+            if cancel {
+                commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
+            }
+            if to_front {
+                m.move_to_top(&instance);
+            }
             commands.extend(
-                m.new_intent(&instance, referrer, clear_top)
+                m.new_intent(&instance, referrer, plan.user_leaving)
                     .unwrap_or_default(),
             );
             self.note_settle(&m);
             self.send(commands);
-            return Ok(if clear_top {
-                activity_start::START_TASK_TO_FRONT
-            } else {
-                activity_start::START_DELIVERED_TO_TOP
-            });
+            return Ok(plan.code());
         }
         let token = token::new();
         self.tasks.bind_token(token.clone(), task);
@@ -614,10 +678,15 @@ impl ActivityTasks {
             ident: self.next_ident(),
             intent: intent.clone(),
         };
-        commands.extend(m.push_owed(task, token, owner, launch, owed));
+        let push = Push {
+            owed,
+            no_history: plan.no_history,
+            user_leaving: plan.user_leaving,
+        };
+        commands.extend(m.push_with(task, token, owner, launch, push));
         self.note_settle(&m);
         self.send(commands);
-        Ok(activity_start::START_SUCCESS)
+        Ok(plan.code())
     }
 
     /// ActivityClientController.onBackPressed's choice for the record with `token`; None when no record has it (isInRootTaskLocked null: nothing happens). A lookup only.

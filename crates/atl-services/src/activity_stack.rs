@@ -81,6 +81,31 @@ struct Record<K, O, L, I, R> {
     pending: Vec<I>,
     /// ActivityRecord.results: results of records that finished while this one was not resumed, delivered before its next Resume (TaskFragment.java:1665-1668).
     results: Vec<R>,
+    /// ActivityRecord.isNoHistory (intent FLAG_ACTIVITY_NO_HISTORY or manifest noHistory): finished instead of stopped (ActivityRecord.stopIfPossible, ActivityRecord.java:6324).
+    no_history: bool,
+}
+
+/// The result a record answers when the services finish it, not the app: RESULT_CANCELED with no data (ActivityRecord.finishIfPossible(reason) -> finishActivityResults).
+pub trait Cancelled<K> {
+    fn cancelled(to: &ResultTo<K>) -> Self;
+}
+
+/// What a pushed record carries besides its launch: the result it owes, whether it is no-history, and whether the pause its push causes is a user leave.
+pub struct Push<K> {
+    pub owed: Option<ResultTo<K>>,
+    pub no_history: bool,
+    /// false: FLAG_ACTIVITY_NO_USER_ACTION (ActivityStarter.java:2735 mUserLeaving): the record it covers pauses without onUserLeaveHint.
+    pub user_leaving: bool,
+}
+
+impl<K> Default for Push<K> {
+    fn default() -> Self {
+        Push {
+            owed: None,
+            no_history: false,
+            user_leaving: true,
+        }
+    }
 }
 
 impl<K: Clone, O: Clone, L, I, R> Record<K, O, L, I, R> {
@@ -104,6 +129,8 @@ pub struct Machine<K, O, L, I, R> {
     hidden: BTreeSet<TaskId>,
     /// Records sent their Destroy and not yet acknowledged (ActivityRecord state DESTROYING): out of the stack, still counted by [`Machine::destroyed`] until `activityDestroyed`.
     destroying: Vec<(TaskId, K, O)>,
+    /// The userLeaving of the pauses the current start causes (ActivityTaskSupervisor.mUserLeaving); true outside a NO_USER_ACTION start.
+    user_leaving: bool,
 }
 
 impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
@@ -112,11 +139,12 @@ impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
             destroying: Vec::new(),
             tasks: BTreeMap::new(),
             hidden: BTreeSet::new(),
+            user_leaving: true,
         }
     }
 }
 
-impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
+impl<K: Clone + PartialEq, O: Clone, L, I, R: Cancelled<K>> Machine<K, O, L, I, R> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -129,17 +157,17 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
         owner: O,
         launch: L,
     ) -> Vec<Command<K, O, L, I, R>> {
-        self.push_owed(task, token, owner, launch, None)
+        self.push_with(task, token, owner, launch, Push::default())
     }
 
-    /// A launch whose start owes `owed` to the record below it (ActivityStarter's resultTo): the result goes out when the new record finishes.
-    pub fn push_owed(
+    /// A launch on top of `task` with what [`Push`] carries; an owed result goes out when the new record finishes.
+    pub fn push_with(
         &mut self,
         task: TaskId,
         token: K,
         owner: O,
         launch: L,
-        owed: Option<ResultTo<K>>,
+        push: Push<K>,
     ) -> Vec<Command<K, O, L, I, R>> {
         self.tasks.entry(task).or_default().push(Record {
             token,
@@ -147,11 +175,52 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
             phase: Phase::Created,
             finishing: false,
             launch: Some(launch),
-            owed,
+            owed: push.owed,
             pending: Vec::new(),
             results: Vec::new(),
+            no_history: push.no_history,
         });
-        self.advance(task)
+        self.user_leaving = push.user_leaving;
+        let out = self.advance(task);
+        self.user_leaving = true;
+        out
+    }
+
+    /// Records a start finishes (clear-top, clear-task: Task.finishActivityAbove / removeActivities -> finishIfPossible): each is finishing and answers its owed result RESULT_CANCELED
+    /// ([`Cancelled`]). Nothing advances here: the start's push or new intent that follows advances the Task once, so no record between them is resumed on the way.
+    pub fn finish_for_start(&mut self, tokens: &[K]) -> Commands<K, O, L, I, R> {
+        let mut owed = Vec::new();
+        for token in tokens {
+            if let Some((_, r)) = self.find_mut(token) {
+                r.finishing = true;
+                r.results.clear();
+                owed.extend(r.owed.take());
+            }
+        }
+        owed.iter()
+            .flat_map(|to| self.deliver(to, R::cancelled(to)))
+            .collect()
+    }
+
+    /// FLAG_ACTIVITY_FORWARD_RESULT (ActivityStarter.java:1130-1136): the result `token`'s record owes moves to the record its start pushes; the record owes nothing after.
+    pub fn take_owed(&mut self, token: &K) -> Option<ResultTo<K>> {
+        self.find_mut(token).and_then(|(_, r)| r.owed.take())
+    }
+
+    /// FLAG_ACTIVITY_REORDER_TO_FRONT (Task.moveActivityToFront): `token`'s record moves to the top of its Task; nothing is sent until the new intent that follows advances it. False: no record.
+    pub fn move_to_top(&mut self, token: &K) -> bool {
+        let Some(task) = self.task_of(token) else {
+            return false;
+        };
+        let Some(records) = self.tasks.get_mut(&task) else {
+            return false;
+        };
+        let Some(at) = records.iter().position(|r| &r.token == token) else {
+            return false;
+        };
+        let r = records.remove(at);
+        records.push(r);
+        true
     }
 
     /// Sends `item` to the record `to` (ActivityRecord.sendResult): at once when it is resumed (Resuming counts, as in new_intent), else kept in its results for its next resume
@@ -169,44 +238,19 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
         }
     }
 
-    /// The top record of `task` that is not finishing (ActivityStarter.java:2442 topRunningNonDelayedActivityLocked): what a singleTop start reuses.
-    pub fn top(&self, task: TaskId) -> Option<(&K, &O)> {
-        self.tasks
-            .get(&task)?
-            .iter()
-            .rev()
-            .find(|r| !r.finishing)
-            .map(|r| (&r.token, &r.owner))
-    }
-
-    /// The newest non-finishing record of `task` that `matches` (Task.findActivityInHistory, Task.java clearTopActivities): what a singleTask start reuses.
-    pub fn find_in_task(&self, task: TaskId, matches: impl Fn(&O) -> bool) -> Option<&K> {
-        self.tasks
-            .get(&task)?
-            .iter()
-            .rev()
-            .find(|r| !r.finishing && matches(&r.owner))
-            .map(|r| &r.token)
-    }
-
-    /// A start reuses `token`'s record (ActivityStarter.deliverNewIntent -> ActivityRecord.deliverNewIntentLocked). `clear_top`: every record above it finishes first
-    /// (Task.clearTopActivities, finishActivityAbove), as singleTask implies (ActivityStarter.java:2510-2533). Then (ActivityRecord.java:4990-5011) a Resumed / Resuming record gets the
-    /// intent at once and stays resumed (AOSP sets RESUMED when it sends the resume, so Resuming counts), a Paused one at once without resume; any other keeps it pending for its next Resume.
+    /// A start reuses `token`'s record (ActivityStarter.deliverNewIntent -> ActivityRecord.deliverNewIntentLocked); records the start clears went through [`Machine::finish_for_start`] first.
+    /// (ActivityRecord.java:4990-5011) a Resumed / Resuming record gets the intent at once and stays resumed (AOSP sets RESUMED when it sends the resume, so Resuming counts), a Paused one at
+    /// once without resume; any other keeps it pending for its next Resume. `user_leaving`: as [`Push::user_leaving`], for the pause of a top it covers (REORDER_TO_FRONT).
     /// None when the token names no record.
     pub fn new_intent(
         &mut self,
         token: &K,
         intent: I,
-        clear_top: bool,
+        user_leaving: bool,
     ) -> Option<Commands<K, O, L, I, R>> {
         let task = self.task_of(token)?;
         let records = self.tasks.get_mut(&task)?;
         let at = records.iter().position(|r| &r.token == token)?;
-        if clear_top {
-            for r in &mut records[at + 1..] {
-                r.finishing = true;
-            }
-        }
         let r = &mut records[at];
         let mut out = Vec::new();
         match r.phase {
@@ -220,7 +264,9 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
             }])),
             _ => r.pending.push(intent),
         }
+        self.user_leaving = user_leaving;
         out.extend(self.advance(task));
+        self.user_leaving = true;
         Some(out)
     }
 
@@ -449,6 +495,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
     fn advance(&mut self, task: TaskId) -> Vec<Command<K, O, L, I, R>> {
         let mut out = Vec::new();
         let hidden = !self.is_visible(task);
+        let user_leaving = self.user_leaving;
         let Some(records) = self.tasks.get_mut(&task) else {
             return out;
         };
@@ -459,7 +506,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
                 r.phase = Phase::Pausing;
                 let steps = vec![Step::Pause {
                     finished: r.finishing,
-                    user_leaving: !r.finishing,
+                    user_leaving: !r.finishing && user_leaving,
                 }];
                 out.push(r.command(steps));
             }
@@ -517,9 +564,16 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
                 None => true,
                 Some(i) => records[i].phase == Phase::Resumed,
             };
+        // a no-history record is finished instead (ActivityRecord.stopIfPossible :6324-6331, also when its Task goes to the back): it answers its result RESULT_CANCELED, then stops and is destroyed
+        let mut owed = Vec::new();
         if ready {
             for (i, r) in records.iter_mut().enumerate() {
                 if (Some(i) != top || hidden) && r.phase == Phase::Paused {
+                    if r.no_history && !r.finishing {
+                        r.finishing = true;
+                        r.results.clear();
+                        owed.extend(r.owed.take());
+                    }
                     r.phase = Phase::Stopping;
                     out.push(r.command(vec![Step::Stop]));
                 }
@@ -538,6 +592,10 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R> Machine<K, O, L, I, R> {
         }
         if records.is_empty() {
             self.tasks.remove(&task);
+        }
+        for to in &owed {
+            let item = R::cancelled(to);
+            out.extend(self.deliver(to, item));
         }
         out
     }
@@ -559,6 +617,116 @@ mod tests {
 
     fn task(raw: i32) -> TaskId {
         TaskId::from_raw(raw).expect("a positive task id")
+    }
+
+    /// The services' cancel, as these tests name it.
+    impl Cancelled<u32> for &'static str {
+        fn cancelled(_: &super::ResultTo<u32>) -> Self {
+            "cancelled"
+        }
+    }
+
+    /// A clear-top finish answers the cleared record's own owed result RESULT_CANCELED (finishIfPossible): to its caller, at once when that caller is resumed, else with its next resume.
+    #[test]
+    fn a_record_a_start_clears_answers_its_result_cancelled() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        m.push_with(t, OTHER, APP, "other", owing(owed(MAIN, 7)));
+        m.paused(&MAIN);
+        m.resumed(&OTHER);
+        m.stopped(&MAIN);
+        assert!(
+            m.finish_for_start(&[OTHER]).is_empty(),
+            "MAIN is stopped: the cancel waits"
+        );
+        let cmds = m.new_intent(&MAIN, "again", true).expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (OTHER, vec![pause(true, false)]),
+                (
+                    MAIN,
+                    vec![
+                        Step::Start,
+                        Step::Result(vec!["cancelled"]),
+                        new_intent(false),
+                        Step::Resume
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// A no-history record is finished where it would be stopped (ActivityRecord.stopIfPossible): the record above resumed, it stops and is destroyed; its owed result is answered cancelled.
+    #[test]
+    fn a_no_history_record_finishes_instead_of_staying_stopped() {
+        let mut m = Machine::new();
+        let t = task(1);
+        m.push(t, MAIN, APP, "main");
+        m.resumed(&MAIN);
+        let no_history = Push {
+            owed: Some(owed(MAIN, 3)),
+            no_history: true,
+            user_leaving: true,
+        };
+        m.push_with(t, SPLASH, APP, "splash", no_history);
+        m.paused(&MAIN);
+        m.resumed(&SPLASH);
+        m.stopped(&MAIN);
+        m.push(t, OTHER, APP, "other");
+        m.paused(&SPLASH);
+        assert_eq!(m.is_finishing(&SPLASH), Some(false));
+        assert_eq!(sent(&m.resumed(&OTHER)), vec![(SPLASH, vec![Step::Stop])]);
+        assert_eq!(m.is_finishing(&SPLASH), Some(true));
+        assert_eq!(
+            sent(&m.stopped(&SPLASH)),
+            vec![(SPLASH, vec![Step::Destroy { finished: true }])]
+        );
+        // OTHER finishes: MAIN comes back with the no-history record's cancel, not SPLASH
+        let cmds = m.finish(&OTHER, |_| "unused").expect("known token");
+        assert_eq!(
+            sent(&cmds),
+            vec![
+                (OTHER, vec![pause(true, false)]),
+                (
+                    MAIN,
+                    vec![Step::Start, Step::Result(vec!["cancelled"]), Step::Resume]
+                )
+            ]
+        );
+    }
+
+    /// REORDER_TO_FRONT: the stopped record moves to the top and comes back with the intent; the covered top pauses as a user leave, or not with NO_USER_ACTION.
+    #[test]
+    fn a_record_moved_to_top_resumes_with_the_intent() {
+        for user_leaving in [true, false] {
+            let mut m = Machine::new();
+            let t = task(1);
+            m.push(t, MAIN, APP, "main");
+            m.resumed(&MAIN);
+            m.push(t, OTHER, APP, "other");
+            m.paused(&MAIN);
+            m.resumed(&OTHER);
+            m.stopped(&MAIN);
+            assert!(m.move_to_top(&MAIN));
+            let cmds = m
+                .new_intent(&MAIN, "again", user_leaving)
+                .expect("known token");
+            assert_eq!(
+                sent(&cmds),
+                vec![
+                    (OTHER, vec![pause(false, user_leaving)]),
+                    (MAIN, vec![Step::Start, new_intent(false), Step::Resume]),
+                ]
+            );
+            assert_eq!(
+                m.records(t).map(|(k, _)| *k).collect::<Vec<_>>(),
+                vec![OTHER, MAIN]
+            );
+        }
+        assert!(!Machine::new().move_to_top(&UNKNOWN));
     }
 
     /// (token, steps) of each command, in order.
@@ -587,10 +755,10 @@ mod tests {
         let t = task(1);
         m.push(t, MAIN, APP, "main");
         m.resumed(&MAIN);
-        let cmds = m.new_intent(&MAIN, "again", false).expect("known token");
+        let cmds = m.new_intent(&MAIN, "again", true).expect("known token");
         assert_eq!(sent(&cmds), vec![(MAIN, vec![new_intent(true)])]);
         assert_eq!(m.phase(&MAIN), Some(Phase::Resumed));
-        assert!(m.new_intent(&UNKNOWN, "again", false).is_none());
+        assert!(m.new_intent(&UNKNOWN, "again", true).is_none());
     }
 
     /// singleTask under a top: the records above finish (clear top), the stopped target comes back with the intent between Start and Resume, as TransactionExecutor cycles a stopped
@@ -606,6 +774,10 @@ mod tests {
         m.resumed(&OTHER);
         m.stopped(&MAIN);
         assert_eq!(m.phase(&MAIN), Some(Phase::Stopped));
+        assert!(
+            m.finish_for_start(&[OTHER]).is_empty(),
+            "OTHER owes nothing"
+        );
         let cmds = m.new_intent(&MAIN, "again", true).expect("known token");
         assert_eq!(
             sent(&cmds),
@@ -614,7 +786,7 @@ mod tests {
                 (MAIN, vec![Step::Start, new_intent(false), Step::Resume]),
             ]
         );
-        assert_eq!(m.top(t).map(|(k, _)| *k), Some(MAIN));
+        assert_eq!(m.is_finishing(&OTHER), Some(true));
         m.paused(&OTHER);
         assert_eq!(sent(&m.resumed(&MAIN)), vec![(OTHER, vec![Step::Stop])]);
         assert_eq!(
@@ -632,6 +804,7 @@ mod tests {
         m.resumed(&MAIN);
         m.push(t, OTHER, APP, "other");
         assert_eq!(m.phase(&MAIN), Some(Phase::Pausing));
+        m.finish_for_start(&[OTHER]);
         let cmds = m.new_intent(&MAIN, "again", true).expect("known token");
         assert_eq!(sent(&cmds), vec![(OTHER, vec![pause(true, false)])]);
         assert_eq!(
@@ -1081,7 +1254,7 @@ mod tests {
         m.set_visible(t, false);
         m.paused(&MAIN);
         m.stopped(&MAIN);
-        let cmds = m.new_intent(&MAIN, "again", false).expect("known token");
+        let cmds = m.new_intent(&MAIN, "again", true).expect("known token");
         assert!(cmds.is_empty());
         assert_eq!(
             sent(&m.set_visible(t, true)),
@@ -1098,13 +1271,20 @@ mod tests {
         }
     }
 
+    fn owing(to: super::ResultTo<u32>) -> Push<u32> {
+        Push {
+            owed: Some(to),
+            ..Push::default()
+        }
+    }
+
     /// getCallingRecord: the owed record names the caller while the child lives, also after the caller finished (AOSP keeps the reference); none once the child finished, none without a result.
     #[test]
     fn the_owed_record_names_the_caller_until_the_child_finishes() {
         let mut m = Machine::new();
         let t = task(1);
         m.push(t, MAIN, APP, "main");
-        m.push_owed(t, OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.push_with(t, OTHER, APP, "other", owing(owed(MAIN, 7)));
         m.push(t, SPLASH, APP, "splash");
         let main = Some(("app".to_owned(), format!("Caller{MAIN}")));
         assert_eq!(m.owed(&OTHER).map(|o| o.caller.clone()), main);
@@ -1125,7 +1305,7 @@ mod tests {
         let mut m = Machine::new();
         m.push(task(1), MAIN, APP, "main");
         m.resumed(&MAIN);
-        m.push_owed(task(2), OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.push_with(task(2), OTHER, APP, "other", owing(owed(MAIN, 7)));
         m.resumed(&OTHER);
         let cmds = m
             .finish(&OTHER, |to| {
@@ -1150,7 +1330,7 @@ mod tests {
         let t = task(1);
         m.push(t, SPLASH, APP, "splash");
         m.resumed(&SPLASH);
-        m.push_owed(t, MAIN, APP, "main", Some(owed(SPLASH, 7)));
+        m.push_with(t, MAIN, APP, "main", owing(owed(SPLASH, 7)));
         m.paused(&SPLASH);
         m.resumed(&MAIN);
         m.stopped(&SPLASH);
@@ -1176,12 +1356,12 @@ mod tests {
         let t = task(1);
         m.push(t, MAIN, APP, "main");
         m.resumed(&MAIN);
-        m.push_owed(t, OTHER, APP, "other", Some(owed(MAIN, 7)));
+        m.push_with(t, OTHER, APP, "other", owing(owed(MAIN, 7)));
         m.paused(&MAIN);
         m.resumed(&OTHER);
         m.stopped(&MAIN);
         assert!(
-            m.new_intent(&MAIN, "again", false)
+            m.new_intent(&MAIN, "again", true)
                 .expect("known token")
                 .is_empty()
         );
@@ -1209,7 +1389,7 @@ mod tests {
         let mut m = Machine::new();
         m.push(task(1), MAIN, APP, "main");
         m.resumed(&MAIN);
-        m.push_owed(task(2), OTHER, "other", "other", Some(owed(MAIN, 7)));
+        m.push_with(task(2), OTHER, "other", "other", owing(owed(MAIN, 7)));
         m.resumed(&OTHER);
         m.drop_owned(|o| *o == APP);
         assert_eq!(m.phase(&MAIN), None);
@@ -1224,7 +1404,7 @@ mod tests {
         m.push(task(1), MAIN, APP, "main");
         m.resumed(&MAIN);
         let mut cmds = m.deliver(&owed(MAIN, 7), "cancel");
-        cmds.extend(m.new_intent(&MAIN, "again", false).expect("known token"));
+        cmds.extend(m.new_intent(&MAIN, "again", true).expect("known token"));
         assert_eq!(
             sent(&cmds),
             vec![
