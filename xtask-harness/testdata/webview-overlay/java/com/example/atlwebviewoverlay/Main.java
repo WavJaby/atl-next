@@ -11,6 +11,7 @@ import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.webkit.WebChromeClient;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -29,7 +30,7 @@ import javax.microedition.khronos.opengles.GL10;
  * with no WebView logs `wvo back game`. The activity never finishes, so every row runs in one process.
  * The WebView gets one child of the app's (a consent SDK's loading indicator), removed with removeViewAt(0) at the first onPageFinished; `wvo web children <n>` logs the count just before.
  * Right after it, a second WebView is preloaded under an INVISIBLE parent and never shown (addPreload: Angry Birds 2's survey SDK).
- * Logs: `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
+ * Logs: `wvo focus <gl|web|none|class>` at every Android focus move, `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -101,6 +102,14 @@ public class Main extends Activity {
         });
         root.addView(gl, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
+        // every Android focus move: `wvo focus gl|web|none|<class>`
+        root.getViewTreeObserver().addOnGlobalFocusChangeListener(new ViewTreeObserver.OnGlobalFocusChangeListener() {
+            @Override
+            public void onGlobalFocusChanged(View oldFocus, View newFocus) {
+                String name = newFocus == null ? "none" : newFocus instanceof WebView ? "web" : newFocus instanceof GLSurfaceView ? "gl" : newFocus.getClass().getSimpleName();
+                Log.i(TAG, "wvo focus " + name);
+            }
+        });
         gl.requestFocus();
         root.addOnLayoutChangeListener(relayout);
     }

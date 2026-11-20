@@ -1249,8 +1249,8 @@ pub struct UiVtable {
         unsafe extern "C" fn(key: i32, widget: *mut c_void, unhandled_key: Callback<i64>),
     /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
     pub sideband_detach: unsafe extern "C" fn(key: i32),
-    /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns the left-pressed flag. UI thread.
-    pub sideband_claim: unsafe extern "C" fn(key: i32, claim: u32, time_ns: i64) -> bool,
+    /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns [`ClaimReply::bits`](crate::webview::ClaimReply::bits). UI thread.
+    pub sideband_claim: unsafe extern "C" fn(key: i32, claim: u32, time_ns: i64) -> u32,
     /// `WebView::set_focused` for `key`'s widget. UI thread.
     pub sideband_focus: unsafe extern "C" fn(key: i32, on: bool),
 }

@@ -93,10 +93,46 @@ pub trait WebView {
     /// that stream lands, at that quad's depth. The same ints for the view's life.
     fn sideband_stream(&self) -> [i32; 2];
     /// Android's dispatch delivered `claim`, stamped `time_ns` (CLOCK_MONOTONIC, the event's own time), to the View: the toolkit events held for the view up to that time reach the page
-    /// (webview plan S2.2 amended, hold-and-replay). True when a Cancel left the page mid-press: the page is told of no cancel (a counted divergence).
-    fn claim_input(&self, claim: InputClaim, time_ns: i64) -> bool;
+    /// (webview plan S2.2 amended, hold-and-replay).
+    fn claim_input(&self, claim: InputClaim, time_ns: i64) -> ClaimReply;
     /// Android focus: the view takes the toolkit's keyboard focus (and with it the desktop input method, through the engine's own context), or gives it back.
     fn set_focused(&self, on: bool);
+}
+
+/// What a claim ([`WebView::claim_input`]) found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClaimReply {
+    /// A Cancel left the page mid-press: the page is told of no cancel (a counted divergence).
+    pub left_pressed: bool,
+    /// A Down claim gave the page a mouse-button press (the toolkit event, whatever MotionEvent the desktop adaptation made of it): Chromium's WebView focuses on mouse down
+    /// (kFocusRenderWidgetHostViewAndroidOnMouseDown) but not on touch down (kFocusRenderWidgetHostViewAndroidOnActionDown, disabled for WebView). The one place input origin is classified.
+    pub mouse_press: bool,
+}
+
+impl ClaimReply {
+    const LEFT_PRESSED: u32 = 1;
+    const MOUSE_PRESS: u32 = 2;
+
+    /// The ABI form (UiVtable::sideband_claim's return).
+    pub fn bits(self) -> u32 {
+        (if self.left_pressed {
+            Self::LEFT_PRESSED
+        } else {
+            0
+        }) | (if self.mouse_press {
+            Self::MOUSE_PRESS
+        } else {
+            0
+        })
+    }
+
+    /// From [`Self::bits`].
+    pub fn of_bits(b: u32) -> Self {
+        Self {
+            left_pressed: b & Self::LEFT_PRESSED != 0,
+            mouse_press: b & Self::MOUSE_PRESS != 0,
+        }
+    }
 }
 
 /// What Android delivered to a WebView ([`WebView::claim_input`]).

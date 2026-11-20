@@ -94,9 +94,9 @@ unsafe extern "C" fn sideband_detach(key: i32) {
     crate::sideband::detach(key);
 }
 
-unsafe extern "C" fn sideband_claim(key: i32, claim: u32, time_ns: i64) -> bool {
+unsafe extern "C" fn sideband_claim(key: i32, claim: u32, time_ns: i64) -> u32 {
     atl_platform_ui_api::webview::InputClaim::of(claim)
-        .is_some_and(|c| crate::sideband::claim(key, c, time_ns))
+        .map_or(0, |c| crate::sideband::claim(key, c, time_ns).bits())
 }
 
 unsafe extern "C" fn sideband_focus(key: i32, on: bool) {

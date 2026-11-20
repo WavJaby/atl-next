@@ -226,7 +226,15 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public boolean requestFocus(int direction, Rect previouslyFocusedRect) { return mWebViewPrivate.super_requestFocus(direction, previouslyFocusedRect); }
     @Override public void computeScroll() { mWebViewPrivate.super_computeScroll(); }
     // ---- ViewDelegate input (W3b, webview plan S2.2 amended): Android's dispatch reached the View, so the natives let the page have the toolkit events held for it up to this event's time ----
-    @Override public native boolean onTouchEvent(MotionEvent ev);
+    // focus on press is keyed on the physical input, as Chromium's WebView keys it: a mouse-button press focuses an unfocused WebView (RenderWidgetHostViewAndroid mouse-down focus), a touch press
+    // does not (ACTION_DOWN focus disabled for WebView, aw_field_trials.cc; View focuses only clickable views on UP). The native knows the press's toolkit origin, also when the desktop adaptation made the left button a finger
+    @Override public boolean onTouchEvent(MotionEvent ev) {
+        if (touchEvent(ev) == TOUCH_FOCUS && !mWebView.hasFocus()) mWebView.requestFocus();
+        return true;
+    }
+    /** touchEvent's answer: the press was a mouse button's (jni.rs TOUCH_FOCUS). */
+    private static final int TOUCH_FOCUS = 1;
+    private native int touchEvent(MotionEvent ev);
     @Override public native boolean onHoverEvent(MotionEvent event);
     @Override public native boolean onGenericMotionEvent(MotionEvent event);
     @Override public native boolean dispatchKeyEvent(KeyEvent event);

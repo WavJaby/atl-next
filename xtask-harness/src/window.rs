@@ -132,6 +132,13 @@ pub struct Args {
     /// Stage mouse-touch only: the desktop adaptation is off (no `with_mouse_touch()`, so atld `--mouse-touch false`), the drag stays the mouse's (source 8194) and the mouse-touch sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_mouse_touch: bool,
+    /// Stage webview-overlay: what the page tap is (mouse: SOURCE_MOUSE; mouse-finger: a mouse click with atld `--mouse-touch true`; touch: a real `wl_touch` contact). A mouse press focuses the
+    /// WebView, a touch press does not (tap-focus, esc-keys). Run the stage each way.
+    #[arg(long, value_enum, default_value = "mouse")]
+    tap_origin: webview_overlay::TapOrigin,
+    /// Stage webview-overlay: the checks expect the other origin's focus rule, so tap-focus and esc-keys must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_tap_origin: bool,
     /// Stages widgets and webview: atld runs with the Esc -> Back adaptation on (`with_esc_back()`, atld `--esc-back true`), and the esc sub-gates expect the keyboard map's plain Esc fallback BACK (widgets: esc-fallback, esc-back; webview: esc-back); without it, AOSP's none. Run the stages both ways.
     #[arg(long)]
     esc_back: bool,
@@ -2205,11 +2212,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         rt
     };
     // the desktop's mouse-as-one-finger adaptation (atld `--mouse-touch`): this stage's drag is a touchscreen's; its break is the adaptation off, the AOSP mouse
-    let rt = if matches!(args.stage, Stage::MouseTouch) && !args.break_mouse_touch {
-        rt.with_mouse_touch()
-    } else {
-        rt
-    };
+    let overlay_finger = matches!(args.stage, Stage::WebViewOverlay)
+        && args.tap_origin == webview_overlay::TapOrigin::MouseFinger;
+    let rt =
+        if (matches!(args.stage, Stage::MouseTouch) && !args.break_mouse_touch) || overlay_finger {
+            rt.with_mouse_touch()
+        } else {
+            rt
+        };
     // the break runs atld with the adaptation off while the checks still expect it on
     let rt = if args.esc_back && !args.break_esc_back {
         rt.with_esc_back()
@@ -2472,6 +2482,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     let stage = args.stage;
     let break_mouse_back = args.break_mouse_back;
     let esc_back = args.esc_back;
+    let tap_origin = args.tap_origin;
     let break_suspended = args.break_suspended;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
@@ -2526,7 +2537,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
                 Some(capture_probe) => webview::drive(p, &log, capture_probe),
                 None => Err("no capture probe".to_owned()),
             },
-            (Stage::WebViewOverlay, _, _) => webview_overlay::drive(p, &log),
+            (Stage::WebViewOverlay, _, _) => webview_overlay::drive(p, &log, tap_origin),
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
             // local only: the nested compositor's output is the gate output, whose rate the checks judge against too
             (Stage::SlowDisplay, _, _) => {
@@ -2719,7 +2730,11 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             &format!("atl.{package}"),
             &atld_log,
         ),
-        (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(&app, args.esc_back),
+        (Stage::WebViewOverlay, Some(_)) => webview_overlay::checks(
+            &app,
+            args.esc_back,
+            args.tap_origin.focuses() != args.break_tap_origin,
+        ),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz),
         (Stage::SlowDisplay, Some(_)) => slow_display::checks(&app, display.refresh_hz, throttle),
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),

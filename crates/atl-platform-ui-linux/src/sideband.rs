@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use atl_platform_ui_api::abi::Callback;
-use atl_platform_ui_api::webview::{InputClaim, SIDEBAND_WEB_VIEW};
+use atl_platform_ui_api::webview::{ClaimReply, InputClaim, SIDEBAND_WEB_VIEW};
 use gtk4::prelude::*;
 use gtk4::{gdk, glib};
 
@@ -20,7 +20,8 @@ const MAX_HELD: usize = 512;
 /// Recent (event, stamp) pairs and replay marks kept: the events of one dispatch at most a few, so 64 only bounds a mark whose replay never reached a gate.
 const MAX_MARKS: usize = 64;
 
-/// One held event: `event`, the monotonic ns Android got it at, whether it is a key, a press (a gesture's start) or a release (its end).
+/// One held event: `event`, the monotonic ns Android got it at, whether it is a key, a press (a gesture's start) or a release (its end), and whether a press came from a mouse button
+/// (a toolkit button press, not a touch contact: what the page itself is given, whatever MotionEvent the desktop adaptation made of it).
 #[derive(Debug)]
 pub struct Held<E> {
     pub event: E,
@@ -28,6 +29,7 @@ pub struct Held<E> {
     pub key: bool,
     pub press: bool,
     pub release: bool,
+    pub mouse: bool,
 }
 
 impl<E> Held<E> {
@@ -68,6 +70,8 @@ pub struct Claimed<E> {
     /// [`Held::class`] of each `replay` event, in order.
     pub classes: Vec<&'static str>,
     pub left_pressed: bool,
+    /// A Down claim replayed a mouse-button press ([`Held::mouse`]): the provider applies Chromium's mouse-down focus rule (a touch press never focuses a WebView).
+    pub mouse_press: bool,
     /// Classes of the held events the claim dropped unclaimed (before a Down, or a cancelled gesture's).
     pub dropped: Vec<&'static str>,
 }
@@ -130,6 +134,7 @@ impl<E> Gate<E> {
                     replay: Vec::new(),
                     classes: Vec::new(),
                     left_pressed,
+                    mouse_press: false,
                     dropped,
                 };
             }
@@ -145,9 +150,11 @@ impl<E> Gate<E> {
         };
         let mut replay = Vec::new();
         let mut classes = Vec::new();
+        let mut mouse_press = false;
         let mut rest = VecDeque::with_capacity(self.held.len());
         for h in self.held.drain(..) {
             if h.ns <= t && takes(&h) {
+                mouse_press |= h.press && h.mouse;
                 classes.push(h.class());
                 replay.push(h.event);
             } else {
@@ -159,6 +166,7 @@ impl<E> Gate<E> {
             replay,
             classes,
             left_pressed,
+            mouse_press,
             dropped,
         }
     }
@@ -381,6 +389,8 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
         key: key_event,
         press,
         release,
+        // a touch-emulated button press is the touch's (GTK flags it), not the mouse's
+        mouse: event.event_type() == gdk::EventType::ButtonPress && !event.is_pointer_emulated(),
     };
     crate::count::hit(&format!("sideband.held.{}", h.class()));
     let dropped = e.gate.borrow_mut().hold(h);
@@ -395,14 +405,17 @@ fn count_dropped(classes: &[&'static str]) {
     }
 }
 
-/// The provider's View received `claim` stamped `t` (ns): `key`'s held events up to `t` go back on the queue. True when the page was left mid-press (a cancel it cannot be told of).
-pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
+/// The provider's View received `claim` stamped `t` (ns): `key`'s held events up to `t` go back on the queue.
+pub fn claim(key: i32, claim: InputClaim, t: i64) -> ClaimReply {
     let Some(e) = entry(key) else {
         crate::count::hit("sideband.claim.no-widget");
-        return false;
+        return ClaimReply::default();
     };
     let claimed = e.gate.borrow_mut().claim(claim, t);
     count_dropped(&claimed.dropped);
+    if claimed.mouse_press {
+        crate::count::hit("sideband.claim.mouse-press");
+    }
     for c in &claimed.classes {
         crate::count::hit(&format!("sideband.replayed.{c}"));
     }
@@ -425,7 +438,10 @@ pub fn claim(key: i32, claim: InputClaim, t: i64) -> bool {
         }
     }
     crate::mirror::resync();
-    claimed.left_pressed
+    ClaimReply {
+        left_pressed: claimed.left_pressed,
+        mouse_press: claimed.mouse_press,
+    }
 }
 
 /// Android focus on `key`'s View: its widget takes the toolkit's keyboard focus (WebKit's own input method context follows it), or gives it back to the window.
@@ -460,6 +476,7 @@ mod tests {
             key: false,
             press,
             release,
+            mouse: false,
         }
     }
 
@@ -470,7 +487,30 @@ mod tests {
             key: true,
             press: false,
             release: false,
+            mouse: false,
         }
+    }
+
+    /// Focus on press is keyed on the physical input (Chromium: mouse-down focuses a WebView, touch ACTION_DOWN does not -- aw_field_trials disables it): only a Down claim that replays
+    /// a mouse-button press reports one; a touch press, a Move / Up / Hover claim after a mouse press, and a Cancel report none.
+    #[test]
+    fn mouse_press_only_from_a_claimed_mouse_button_press() {
+        let mouse = |ns, press, release| Held {
+            mouse: press,
+            ..ptr(ns, press, release)
+        };
+        let mut g = Gate::default();
+        g.hold(mouse(10, true, false));
+        g.hold(mouse(15, false, false));
+        g.hold(mouse(20, false, true));
+        assert!(g.claim(InputClaim::Down, 10).mouse_press);
+        assert!(!g.claim(InputClaim::Move, 15).mouse_press);
+        assert!(!g.claim(InputClaim::Up, 20).mouse_press);
+        g.hold(ptr(30, true, false));
+        assert!(!g.claim(InputClaim::Down, 30).mouse_press);
+        let mut c = Gate::default();
+        c.hold(mouse(40, true, false));
+        assert!(!c.claim(InputClaim::Cancel, 40).mouse_press);
     }
 
     /// A tap the View gets: press at 10, release at 20; Android claims Down 10, Up 20; both replayed in order, nothing left.

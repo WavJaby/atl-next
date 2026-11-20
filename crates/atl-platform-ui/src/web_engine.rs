@@ -11,8 +11,9 @@ use atl_platform_ui_api::abi::{
     WebEventView, WebViewEntry, WebViewVtable, web_event,
 };
 use atl_platform_ui_api::webview::{
-    Cookie, CookiePolicy, InputClaim, LoadError, NavigationReply, NavigationRequest, PromptReply,
-    SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent, WebSetting, WebView, WebViewError,
+    ClaimReply, Cookie, CookiePolicy, InputClaim, LoadError, NavigationReply, NavigationRequest,
+    PromptReply, SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent, WebSetting, WebView,
+    WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -317,9 +318,9 @@ impl WebView for PlatformWebView {
         [SIDEBAND_WEB_VIEW, self.key]
     }
 
-    fn claim_input(&self, claim: InputClaim, time_ns: i64) -> bool {
+    fn claim_input(&self, claim: InputClaim, time_ns: i64) -> ClaimReply {
         // SAFETY: UI thread (trait contract); the key is this live view's.
-        unsafe { (self.ui.sideband_claim)(self.key, claim as u32, time_ns) }
+        ClaimReply::of_bits(unsafe { (self.ui.sideband_claim)(self.key, claim as u32, time_ns) })
     }
 
     fn set_focused(&self, on: bool) {

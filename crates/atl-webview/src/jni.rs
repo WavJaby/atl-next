@@ -15,8 +15,8 @@ use std::thread::ThreadId;
 use atl_looper::{LooperApi, Poster};
 
 use atl_platform_ui::webview::{
-    InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue, WebEngine as _, WebEvent,
-    WebView as _,
+    ClaimReply, InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue,
+    WebEngine as _, WebEvent, WebView as _,
 };
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
@@ -2148,15 +2148,20 @@ mod action {
 const INTERCEPT_NO_CANCEL: &str = "webview.input.intercept-no-cancel";
 
 /// Claims `claim` at `ev`'s own time (`getEventTimeNanos`: the CLOCK_MONOTONIC stamp the toolkit event was published with).
-fn claim(env: Env, n: &Native, claim: InputClaim, ev: Obj) {
+fn claim(env: Env, n: &Native, claim: InputClaim, ev: Obj) -> ClaimReply {
     let t = call_long(env, ev, c"getEventTimeNanos", c"()J");
-    if n.view.claim_input(claim, t) {
+    let r = n.view.claim_input(claim, t);
+    if r.left_pressed {
         atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
     }
+    r
 }
 
-// Chromium consumes every touch it is given (AwContents.onTouchEvent)
-provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onTouchEvent, (env, n, ev: Obj) -> u8 = 0, {
+/// `touchEvent`'s answer: 0 = consumed (Chromium consumes every touch it is given, AwContents.onTouchEvent); 1 = consumed, and the press was a mouse button's, so the Java side focuses
+/// an unfocused WebView (Chromium RenderWidgetHostViewAndroid mouse-down focus, on for WebView; touch ACTION_DOWN focus is disabled for WebView in aw_field_trials.cc).
+const TOUCH_FOCUS: i32 = 1;
+
+provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_touchEvent, (env, n, ev: Obj) -> i32 = 0, {
     let c = match call_int(env, ev, c"getActionMasked", c"()I", &[]) {
         action::DOWN => InputClaim::Down,
         action::UP => InputClaim::Up,
@@ -2164,8 +2169,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onTouchEv
         action::MOVE | action::POINTER_DOWN | action::POINTER_UP => InputClaim::Move,
         _ => InputClaim::Move,
     };
-    claim(env, n, c, ev);
-    1
+    if claim(env, n, c, ev).mouse_press { TOUCH_FOCUS } else { 0 }
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_onHoverEvent, (env, n, ev: Obj) -> u8 = 0, {

@@ -5,15 +5,33 @@
 //! Sub-gates ([`checks`]): loaded (onPageFinished), web-children (the WebView's getChildCount counts only the app's own child, which the fixture then removes by index as Battle Cats TW's consent SDK
 //! does: a provider View among the children would be the one removed, taking the page off the screen), resize (after a configure, the WebView's last placement is the window: sideband dst == the fixture's window size), page-tap (a click on the
 //! page's button reaches the page: title tap1), then three Escs (AOSP BACK semantics through the Esc -> Back adaptation; `--esc-back`): esc-page-back (WebView.canGoBack -> goBack),
-//! esc-dismiss (no history left -> the SDK's onBackPressed removes the WebView), esc-game (the WebView gone -> the activity's back). Android focus stays on the GL view throughout (the click does
-//! not move it), so each Esc goes there first and BACK is its fallback. hidden-preload: a second WebView loaded under an INVISIBLE parent (Angry Birds 2's survey SDK) is never placed and takes no click. software-layer: a third WebView under a software-layer ancestor (Angry Birds 2's account panel) is placed at its View's rectangle. Without `--esc-back` (AOSP's map: Esc has no fallback) the Escs reach the GL view as KEYCODE_ESCAPE and no back follows.
+//! esc-dismiss (no history left -> the SDK's onBackPressed removes the WebView), esc-game (the WebView gone -> the activity's back). tap-focus: a mouse click focuses the WebView, a touch tap does not
+//! (`--tap-origin`, [`tap_focus_check`]); esc-keys: each Esc goes to the focused View ([`esc_targets`]); focus-return: once the WebView is removed, focus is on the GL view again. hidden-preload: a second WebView loaded under an INVISIBLE parent (Angry Birds 2's survey SDK) is never placed and takes no click. software-layer: a third WebView under a software-layer ancestor (Angry Birds 2's account panel) is placed at its View's rectangle. Without `--esc-back` (AOSP's map: Esc has no fallback) no back follows.
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::{ACK_WAIT, Liveness, Sub, await_event, wait_for_line, widgets};
 use crate::composer::word;
-use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
+use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
+
+/// What the page tap is (`--tap-origin`): the physical input decides whether it focuses the WebView ([`tap_focus_check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TapOrigin {
+    /// A left mouse click; the app sees SOURCE_MOUSE (AOSP input).
+    Mouse,
+    /// A left mouse click with the desktop's mouse-as-one-finger adaptation on (atld `--mouse-touch true`): the app sees a touchscreen finger, the page still a mouse click.
+    MouseFinger,
+    /// A real touch contact on the proxy's own `wl_touch`.
+    Touch,
+}
+
+impl TapOrigin {
+    /// The press focuses an unfocused WebView: a mouse button's does, in both adaptation states; a touch contact's does not.
+    pub fn focuses(self) -> bool {
+        self != Self::Touch
+    }
+}
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask-harness/testdata/webview-overlay";
@@ -27,6 +45,8 @@ const BACK_PAGE: &str = "AtlWindow: wvo back page";
 const BACK_DISMISSED: &str = "AtlWindow: wvo back dismissed";
 const BACK_GAME: &str = "AtlWindow: wvo back game";
 const GL_KEY: &str = "AtlWindow: wvo gl key ";
+/// Main.java's line at every Android focus move: `gl`, `web`, `none` or the View's class.
+const FOCUS: &str = "AtlWindow: wvo focus ";
 /// Main.java's count of the WebView's children before it removes its indicator: 1 = the app's own child only (AOSP: the WebView's rendering adds no View child).
 const WEB_CHILDREN: &str = "AtlWindow: wvo web children ";
 /// Main.java's hidden preload (addPreload): its load, and the title its page sets on a click.
@@ -145,8 +165,51 @@ fn preload_check(app: &str) -> Result<String, String> {
     Ok("the hidden preload stayed off screen and got no click".to_owned())
 }
 
-/// The sub-gates.
-pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
+/// Where the three Escs go, (page, GL view), and the sub-gate's reading. Android sends a key to the focused View (ViewRootImpl); the page's onkeydown takes each Esc it gets and leaves it
+/// unhandled (no preventDefault). `focused`: the click moved Android focus to the WebView. AOSP map: every Esc goes to the focused View. `--esc-back`: an Esc the page leaves unhandled falls back
+/// to BACK: the first goes back in the page's history, the second dismisses the WebView, after which focus is back on the GL view (ViewGroup.removeViewInternal -> rootViewRequestFocus) and the
+/// third reaches it; an unfocused WebView never sees an Esc, each reaches the GL view and its BACK fallback does the same three steps.
+fn esc_targets(esc_back: bool, focused: bool) -> (usize, usize) {
+    match (focused, esc_back) {
+        (false, _) => (0, 3),
+        (true, false) => (3, 0),
+        (true, true) => (2, 1),
+    }
+}
+
+/// Sub-gate tap-focus: focus on press is keyed on the physical input, as Chromium's WebView keys it: a mouse-button press focuses an unfocused WebView (RenderWidgetHostViewAndroid
+/// kFocusRenderWidgetHostViewAndroidOnMouseDown, on for WebView), a touch press does not (kFocusRenderWidgetHostViewAndroidOnActionDown, disabled for WebView in aw_field_trials.cc; View.onTouchEvent
+/// focuses only clickable views, and WebView is not clickable). Read from the fixture's `wvo focus` lines.
+fn tap_focus_check(app: &str, focused: bool) -> Result<String, String> {
+    let moved = app.contains(&format!("{FOCUS}web"));
+    match (focused, moved) {
+        (true, true) => Ok("the mouse click moved Android focus to the WebView".to_owned()),
+        (false, false) => Ok("the touch tap left Android focus on the GL view".to_owned()),
+        (true, false) => {
+            Err("the mouse click did not move Android focus to the WebView".to_owned())
+        }
+        (false, true) => Err("the touch tap moved Android focus to the WebView".to_owned()),
+    }
+}
+
+/// Sub-gate focus-return: once the SDK removed its WebView, Android focus is on the GL view again (ViewGroup.removeViewInternal: unFocus, clearChildFocus, rootViewRequestFocus; the game must get
+/// Back/Esc after the overlay is dismissed). Without a removal (AOSP map) nothing to judge. The last focus move is read, not the ones after the `back dismissed` line: Main.java logs that after removeView.
+fn focus_return_check(app: &str) -> Result<String, String> {
+    if !app.contains(BACK_DISMISSED) {
+        return Ok("no removal (no back)".to_owned());
+    }
+    match app.lines().rev().find(|l| l.contains(FOCUS)) {
+        Some(l) if l.trim_end().ends_with(&format!("{FOCUS}gl")) => {
+            Ok("after the removal Android focus is on the GL view".to_owned())
+        }
+        Some(l) => Err(format!("last focus move after the removal: {}", l.trim())),
+        // gl.requestFocus in onCreate runs before the window is attached, so the global listener first hears of focus when it moves: no line = it never left the GL view
+        None => Ok("Android focus never left the GL view".to_owned()),
+    }
+}
+
+/// The sub-gates. `focused`: the click is expected to move Android focus to the WebView ([`tap_focus_check`]).
+pub fn checks(app: &str, esc_back: bool, focused: bool) -> Vec<Sub> {
     let has = |s: &str| app.contains(s);
     let line = |what: &str, s: &str| {
         if has(s) {
@@ -175,17 +238,23 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
             line("Esc on the GL view -> BACK -> the activity", BACK_GAME),
         )
     } else {
-        // AOSP's map: Esc stays KEYCODE_ESCAPE (111) and goes to the focused View, the GL view (the click does not move Android focus here; the toolkit's focus follows Android's)
-        let esc_keys = app.matches(&format!("{GL_KEY}111")).count();
-        (
-            no_back(),
-            no_back(),
-            if esc_keys == 3 {
-                Ok("each Esc reached the focused GL view as KEYCODE_ESCAPE".to_owned())
-            } else {
-                Err(format!("{esc_keys} Esc keys at the GL view, want 3"))
-            },
-        )
+        (no_back(), no_back(), no_back())
+    };
+    let keys = (
+        app.matches(&format!("{TITLE}key")).count(),
+        app.matches(&format!("{GL_KEY}111")).count(),
+    );
+    let want = esc_targets(esc_back, focused);
+    let esc_keys = if keys == want {
+        Ok(format!(
+            "Escs at the page {}, at the GL view {} (KEYCODE_ESCAPE)",
+            keys.0, keys.1
+        ))
+    } else {
+        Err(format!(
+            "Escs at the page {}, at the GL view {}; want {} and {}",
+            keys.0, keys.1, want.0, want.1
+        ))
     };
     let children = match app
         .lines()
@@ -218,9 +287,12 @@ pub fn checks(app: &str, esc_back: bool) -> Vec<Sub> {
                 &format!("{TITLE}scrolled"),
             ),
         ),
+        ("tap-focus", tap_focus_check(app, focused)),
+        ("esc-keys", esc_keys),
         ("esc-page-back", page_back),
         ("esc-dismiss", dismiss),
         ("esc-game", game),
+        ("focus-return", focus_return_check(app)),
         ("hidden-preload", preload_check(app)),
         ("software-layer", software_layer_check(app)),
     ]
@@ -267,7 +339,7 @@ fn esc(proxy: &Proxy) -> Result<(), String> {
 }
 
 /// The probe: configure acked, page loaded and painted; resize; click the page's button; three Escs, each waiting for its answer (a missing answer is its sub-gate's failure, not the probe's).
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
+pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness, String> {
     await_event(&proxy.events, ACK_WAIT, |e| {
         matches!(e, ProxyEvent::Acked { .. })
     })
@@ -294,6 +366,7 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
         f64::from(cw / 2) + f64::from(ox),
         f64::from(ch / 2) + f64::from(oy),
     );
+    // the pointer enters either way (the wheel after the tap needs it); only the press differs
     widgets::inject(
         &proxy,
         vec![
@@ -305,10 +378,22 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
                 x: centre.0,
                 y: centre.1,
             },
-            widgets::press(true),
-            widgets::press(false),
         ],
     )?;
+    match origin {
+        TapOrigin::Mouse | TapOrigin::MouseFinger => {
+            widgets::inject(&proxy, vec![widgets::press(true), widgets::press(false)])?
+        }
+        TapOrigin::Touch => {
+            let (x, y) = centre;
+            proxy
+                .inject_touch(TouchAction::Down { id: 0, x, y })
+                .map_err(|e| e.to_string())?;
+            proxy
+                .inject_touch(TouchAction::Up { id: 0 })
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(&format!("{TITLE}tap1")));
     widgets::inject(
         &proxy,
@@ -340,10 +425,11 @@ mod tests {
     fn sub_gates_by_hand() {
         let ok = "x AtlWindow: wvo web children 1\nx AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
                   y atl-platform-ui: sideband [1, 5] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n\
-                  x AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\nx AtlWindow: wvo back page\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo back game\n\
+                  x AtlWindow: wvo focus gl\nx AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo focus web\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\n\
+                  x AtlWindow: wvo title key1Escape\nx AtlWindow: wvo back page\nx AtlWindow: wvo title key2Escape\nx AtlWindow: wvo focus gl\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo back game\n\
                   x AtlWindow: wvo preload finished\nx AtlWindow: wvo swlayer web=40,40,200,160\n\
                   y atl-platform-ui: sideband [1, 7] placed dst=40,40,200,160 clip=40,40,200,160 alpha=1\n";
-        assert!(checks(ok, true).iter().all(|(_, r)| r.is_ok()));
+        assert!(checks(ok, true, true).iter().all(|(_, r)| r.is_ok()));
         // the Angry Birds 2 account panel: the software-layer WebView's carrier never placed, or left at the layer's origin
         let unplaced = ok.replace(
             "[1, 7] placed dst=40,40,200,160",
@@ -366,14 +452,44 @@ mod tests {
         assert!(resize_check(&old_page).is_err());
         // the Battle Cats case: the provider's carrier counted as a child, so the app's removeViewAt(0) took the page off the screen
         let carrier_child = ok.replace("wvo web children 1", "wvo web children 2");
-        assert!(checks(&carrier_child, true)[1].1.is_err());
+        let sub = |log: &str, esc_back: bool, focused: bool, name: &str| {
+            checks(log, esc_back, focused)
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, r)| r)
+                .expect("sub-gate")
+        };
+        assert!(sub(&carrier_child, true, true, "web-children").is_err());
         let no_tap = ok.replace("wvo title tap1", "wvo title x");
-        assert!(checks(&no_tap, true)[3].1.is_err());
+        assert!(sub(&no_tap, true, true, "page-tap").is_err());
         let no_back = ok.replace("wvo back page", "");
-        assert!(checks(&no_back, true)[5].1.is_err());
+        assert!(sub(&no_back, true, true, "esc-page-back").is_err());
         let no_scroll = ok.replace("wvo title scrolled", "");
-        assert!(checks(&no_scroll, true)[4].1.is_err());
+        assert!(sub(&no_scroll, true, true, "page-scroll").is_err());
         // without the adaptation the same backs fail
-        assert!(checks(ok, false)[6].1.is_err());
+        assert!(sub(ok, false, true, "esc-page-back").is_err());
+        // the origin's break: a mouse run judged by the touch rule fails tap-focus and esc-keys
+        assert!(
+            sub(ok, true, false, "tap-focus").is_err() && sub(ok, true, false, "esc-keys").is_err()
+        );
+        // the Angry Birds 2 guard: the WebView removed but focus left nowhere (or on the gone WebView) fails focus-return
+        let lost = ok.replacen(
+            "x AtlWindow: wvo focus gl\nx AtlWindow: wvo back dismissed",
+            "x AtlWindow: wvo focus none\nx AtlWindow: wvo back dismissed",
+            1,
+        );
+        assert!(sub(&lost, true, true, "focus-return").is_err());
+    }
+
+    /// Where the Escs go, from AOSP's routing (key -> focused View; the page leaves Esc unhandled): touch tap -> all 3 at the GL view either map; mouse click -> AOSP map 3 at the page;
+    /// `--esc-back` 2 at the page (goBack, dismiss), then focus returns and the third reaches the GL view. A touch run with the old GL-only answer passes the touch rule, fails the mouse one.
+    #[test]
+    fn esc_targets_follow_focus() {
+        assert_eq!(esc_targets(false, false), (0, 3));
+        assert_eq!(esc_targets(true, false), (0, 3));
+        assert_eq!(esc_targets(false, true), (3, 0));
+        assert_eq!(esc_targets(true, true), (2, 1));
+        let touch = "x AtlWindow: wvo focus gl\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo gl key 111\n";
+        assert!(tap_focus_check(touch, false).is_ok() && tap_focus_check(touch, true).is_err());
     }
 }

@@ -81,6 +81,25 @@ pub const ROWS: &[Row] = &[
     Row::new(&["window", "--stage", "ime"], true, true),
     // a GPU-starved host makes its backpressure verdict `undecided`: still red, the verdict line says so
     Row::new(&["window", "--stage", "slow-display"], true, true),
+    // the WebView's focus and key routing without the webview stage's sound route: a mouse click focuses the page, a touch tap does not; Esc -> Back reaches the game after the dismissal
+    Row::new(
+        &["window", "--stage", "webview-overlay", "--esc-back"],
+        true,
+        true,
+    ),
+    Row::new(
+        &[
+            "window",
+            "--stage",
+            "webview-overlay",
+            // AOSP map: with --esc-back a touch run's Escs reach BACK faster than WebKit commits goBack, so canGoBack still answers true (a provider race, not this row's subject)
+            "--tap-origin",
+            "touch",
+        ],
+        true,
+        true,
+    ),
+    Row::new(&["window", "--stage", "ui-block"], true, true),
 ];
 
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line.
