@@ -613,7 +613,9 @@ impl IPackageManager for PackageManager {
     }
 
     /// IPackageManagerBase.getPackageInstaller:599: mInstallerService, for every caller (instant apps aside, which do not exist here).
-    fn r#getPackageInstaller(&self) -> binder::Result<Option<binder::Strong<dyn IPackageInstaller>>> {
+    fn r#getPackageInstaller(
+        &self,
+    ) -> binder::Result<Option<binder::Strong<dyn IPackageInstaller>>> {
         Ok(Some(self.installer.clone()))
     }
 

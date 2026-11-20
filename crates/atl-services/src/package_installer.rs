@@ -63,7 +63,10 @@ impl IPackageInstaller for PackageInstaller {
     }
 
     /// PackageInstallerService.getSessionInfo:1324: null for an id with no session.
-    fn r#getSessionInfo(&self, _session_id: i32) -> binder::Result<Option<PackageInstaller_SessionInfo>> {
+    fn r#getSessionInfo(
+        &self,
+        _session_id: i32,
+    ) -> binder::Result<Option<PackageInstaller_SessionInfo>> {
         atl_diag::answered(INTERFACE, "getSessionInfo (no session)");
         Ok(None)
     }
@@ -82,7 +85,11 @@ impl IPackageInstaller for PackageInstaller {
     }
 
     /// getMySessions:1374: the cross-user check, AppOpsManager.checkPackage (the installer package must belong to the caller: SecurityException otherwise), then the sessions it owns: none.
-    fn r#getMySessions(&self, installer: Option<&str>, user: i32) -> binder::Result<Option<ParceledListSlice>> {
+    fn r#getMySessions(
+        &self,
+        installer: Option<&str>,
+        user: i32,
+    ) -> binder::Result<Option<ParceledListSlice>> {
         enforce_same_user(user, "getMySessions")?;
         let uid = ThreadState::get_calling_uid();
         let owned = installer.is_some_and(|p| {

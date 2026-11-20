@@ -220,14 +220,26 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// audiodevices: Main.audioDevices: the app's AudioPolicyService (atl-audioflinger policy.rs) lists one device port, the speaker (AudioPolicyManager::listAudioPorts:5275; AudioDeviceInfo.TYPE_BUILTIN_SPEAKER 2,
 /// a sink), no input; A2DP is not connected (getDeviceConnectionState:523 UNAVAILABLE). Without listAudioPorts, AudioManager.updateAudioPortCache fails and getDevices answers no device: `outputs=[]`.
 const SERVICE_LINES: [(&str, &str, Option<&str>); 14] = [
-    ("audio", "AtlTest: audiodevices: ", Some("outputs=[2] inputs=0 a2dp=false")),
-    ("package", "AtlTest: installer: ", Some("my=0 all=0 info=null")),
+    (
+        "audio",
+        "AtlTest: audiodevices: ",
+        Some("outputs=[2] inputs=0 a2dp=false"),
+    ),
+    (
+        "package",
+        "AtlTest: installer: ",
+        Some("my=0 all=0 info=null"),
+    ),
     (
         "package",
         "AtlTest: receiver: ",
         Some("own=com.example.atltest.AtlReceiver exported=false missing=NameNotFoundException"),
     ),
-    ("user", "AtlTest: user: ", Some("profile=false managed=false")),
+    (
+        "user",
+        "AtlTest: user: ",
+        Some("profile=false managed=false"),
+    ),
     ("notification", "AtlTest: zen: ", Some("filter=1")),
     (
         "package",
