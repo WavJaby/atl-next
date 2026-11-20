@@ -194,6 +194,9 @@ fn call_host(guest: HostRules, target: usize, lanes: &AtlLanes, sig: Sig) -> Ans
 
 /// Host pointers a 32-bit guest was refused (a result, [`ilp32_narrow`]; a down-call argument, [`place`]; a record field or out word, convert.rs): the measurement phase4-32bit P4b names its largest uncertainty; a gate on a 32-bit guest asserts it 0.
 pub static ILP32_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// Serialises every test that moves [`ILP32_REFUSED`] (the test threads share it): one that reads it before and after, and one that only causes a refusal (convert.rs `window_buffer_round_trip`), which otherwise lands between another's two reads.
+#[cfg(test)]
+pub(in crate::engine) static REFUSED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// atl-diag keys of a host pointer refused to a 32-bit guest, by where it was going.
 pub(in crate::engine) const REFUSED_RESULT: &str = "native-bridge.ilp32-result";
@@ -1249,8 +1252,7 @@ mod aapcs32_tests {
         assert_eq!(guest_answer(AAPCS64, I64, a), a);
     }
 
-    /// Serialises the tests that read [`ILP32_REFUSED`] before and after (the test threads share it).
-    static REFUSED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::REFUSED_LOCK;
 
     /// A host pointer argument of a down call into a 32-bit guest: 2^32 - 1 passes whole, 2^32 (the first a 32-bit word cannot hold) is passed null and counted; an aarch64 guest gets it whole.
     #[test]

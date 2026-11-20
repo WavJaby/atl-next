@@ -383,6 +383,8 @@ mod tests {
     /// Guest bytes -> host -> guest: values survive; the pointer is zero-extended; a host pointer above 4 GiB comes back NULL and refused.
     #[test]
     fn window_buffer_round_trip() {
+        // its >= 4 GiB `bits` refusal moves ILP32_REFUSED
+        let _serial = super::super::dispatch::REFUSED_LOCK.lock();
         let mut g = [0u8; 44];
         for (k, v) in [64u32, 32, 80, 1, 0x1234_5678].iter().enumerate() {
             g[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
