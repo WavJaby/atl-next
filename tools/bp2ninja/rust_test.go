@@ -39,6 +39,28 @@ genrule { name: "bridge_h", tools: ["tool"], cmd: "$(location tool) --header > $
 	return g, g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc", RustVersion: "1.2.3"})
 }
 
+// R5-6: a system provider's dir (/usr/lib/<triple>, holding the distro libcrypto.so) must not precede boringssl's prefix/lib: ld searches -L in order (ld(1) `-l namespec`), so the first dir holding
+// libcrypto.so wins. Expected: every non-system dir in first-seen order, then the system dirs (and a cross sysroot's) in first-seen order.
+func TestRustLinkDirsSystemLast(t *testing.T) {
+	libs := []string{
+		"/usr/lib/x86_64-linux-gnu/libelf.so",
+		"/o/upstream/boringssl/prefix/lib/libcrypto.so",
+		"-Wl,--start-group",
+		"/o/host/liblog/liblog.a",
+		"/sys/root/usr/lib/riscv64-linux-gnu/libz.so",
+		"-Wl,--end-group",
+	}
+	got := rustLinkDirs(libs, "/sys/root")
+	want := []string{"/o/upstream/boringssl/prefix/lib", "/o/host/liblog", "/usr/lib/x86_64-linux-gnu", "/sys/root/usr/lib/riscv64-linux-gnu"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("rustLinkDirs = %q, want %q", got, want)
+	}
+	// /usrx is no system dir: a prefix match must end at a path separator
+	if isSystemDir("/usrx/lib", "") || !isSystemDir("/lib64", "") {
+		t.Fatal("isSystemDir prefix rule")
+	}
+}
+
 // Expected flags: rust/compiler.go (features as `feature="x"` cfgs, cfgs, edition, `-C metadata=<module>` for libraries, `--extern proc_macro` for proc macros), rust/config/global.go (device panic=abort), rust/builder.go (--extern per direct crate, -L dependency= per crate dir).
 func TestRustCrateFlags(t *testing.T) {
 	g, ninja := rustGraph(t)

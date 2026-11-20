@@ -636,21 +636,45 @@ func (g *Graph) rustLinkArgs(n *Node, linker string) (flags, inputs []string) {
 		}
 		flags = append(flags, "-C", "link-arg="+l)
 	}
-	for _, d := range rustLinkDirs(libs) {
+	for _, d := range rustLinkDirs(libs, g.linkSysroot(n)) {
 		flags = append(flags, "-L", d)
 	}
 	return flags, inputs
 }
 
+// linkSysroot: the sysroot n's link searches by default: the cross host's on the host machine, "" (the build machine's own /usr, /lib) elsewhere.
+func (g *Graph) linkSysroot(n *Node) string {
+	if g.cfg.machine(n.side) == "host" {
+		return g.cfg.HostCross.Sysroot
+	}
+	return ""
+}
+
 // rustLinkDirs: the dirs of the library files among rustCcLibs' arguments, each once: rustc's -L for the crates' `#[link(name = ...)]` (android_log_sys's `log` -> liblog.so), as Soong passes each cc dependency's dir (rust/builder.go linkDirs).
-func rustLinkDirs(libs []string) []string {
-	var dirs []string
+// A system dir (under /usr, /lib*, or the cross sysroot `sysroot`) goes after every other: the linker searches -L in order (ld(1) `-l namespec`) and its own default dirs last, so a system dir
+// placed early shadows a provided library of the same name elsewhere (/usr/lib/<triple>/libcrypto.so is OpenSSL; boringssl's prefix/lib/libcrypto.so is the one meant). Soong's line has no system dir.
+func rustLinkDirs(libs []string, sysroot string) []string {
+	var dirs, system []string
 	for _, l := range libs {
-		if filepath.IsAbs(l) {
-			dirs = appendNew(dirs, filepath.Dir(l))
+		if !filepath.IsAbs(l) {
+			continue
+		}
+		if d := filepath.Dir(l); isSystemDir(d, sysroot) {
+			system = appendNew(system, d)
+		} else {
+			dirs = appendNew(dirs, d)
 		}
 	}
-	return dirs
+	return append(dirs, system...)
+}
+
+// isSystemDir: d is a distro library dir the linker searches by default (/usr/..., /lib, /lib64, /lib32 and below), or under the cross sysroot ("" = none).
+func isSystemDir(d, sysroot string) bool {
+	under := func(root string) bool { return d == root || strings.HasPrefix(d, root+"/") }
+	if sysroot != "" && under(filepath.Clean(sysroot)) {
+		return true
+	}
+	return under("/usr") || under("/lib") || under("/lib64") || under("/lib32")
 }
 
 // rustCcLibs: the cc libraries (whole archives, the static closure, shared libraries) a final link of Rust node n needs, as linker arguments of the cc link driver; none when neither n nor a crate it links names a cc library.

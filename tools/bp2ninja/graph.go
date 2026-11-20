@@ -55,7 +55,7 @@ func (g *Graph) artifactOf(n *Node) (a artifact, ok bool) {
 	switch {
 	case n.kind == Rlib && n.rust.broken == "":
 		link, _ := g.rustCcLibs(n)
-		return artifact{Kind: n.kind.String(), Out: n.out, Crate: n.rust.crateName, Search: crateDirs([]*Node{n}), Link: link, Native: rustLinkDirs(link)}, true
+		return artifact{Kind: n.kind.String(), Out: n.out, Crate: n.rust.crateName, Search: crateDirs([]*Node{n}), Link: link, Native: rustLinkDirs(link, g.linkSysroot(n))}, true
 	case n.kind == Shared:
 		return artifact{Kind: n.kind.String(), Out: n.out, Cxx: g.compileFlags(n).cxx, Needs: providedNeeds(n)}, n.out != ""
 	case n.kind == Binary:
