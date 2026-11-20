@@ -136,22 +136,12 @@ pub fn symbol(handle: usize, name: &CStr) -> Option<usize> {
     r.ok().filter(|&f| f != 0)
 }
 
-/// A host-callable trampoline into guest function `f` taking a first argument of `kind`, with ART's JNI `shorty` (None for JNI_OnLoad / JNI_OnUnload). One per function, kind and shorty: ART may ask again for the same symbol.
+/// A host-callable trampoline into guest function `f` taking a first argument of `kind`, with ART's JNI `shorty` (None for JNI_OnLoad / JNI_OnUnload). One per function, kind and shorty (`Active::down` deduplicates): ART may ask again for the same symbol.
+/// A refusal is also counted with its reason (atl-diag `refused`, key `native-bridge.trampoline`): ART reports a null trampoline without calling `getError`, so the reason would otherwise reach no log.
 pub fn trampoline(f: usize, kind: Down, shorty: Option<&[u8]>) -> Result<usize, String> {
-    type Stub = (usize, Down, Option<Vec<u8>>, usize);
-    static STUBS: Mutex<Vec<Stub>> = Mutex::new(Vec::new());
-    let mut stubs = STUBS
-        .lock()
-        .map_err(|_| "trampolines poisoned".to_owned())?;
-    if let Some(stub) = stubs
-        .iter()
-        .find(|s| s.0 == f && s.1 == kind && s.2.as_deref() == shorty)
-    {
-        return Ok(stub.3);
-    }
-    let t = active().down(f, kind, shorty)?;
-    stubs.push((f, kind, shorty.map(<[u8]>::to_vec), t));
-    Ok(t)
+    active().down(f, kind, shorty).inspect_err(|e| {
+        atl_diag::count(atl_diag::REFUSED, "native-bridge.trampoline", Some(e));
+    })
 }
 
 /// Whether `addr` lies in an object the guest linker loaded (guest `dladdr`); false without a guest.

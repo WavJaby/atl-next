@@ -3,7 +3,7 @@
 //! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. CallStaticDoubleMethod and CallStaticFloatMethod check the lanes they were given (the stack spill, the fp arguments) and answer from them.
 //! Driver: run without `ATL_QJ_CASE`, it first runs each refusal case in a child process (QEMU starts once per process), then the plain case in this process. A refusal case must abort by name: SIGABRT and its message on stderr.
 //! Env (xtask qemu_jni.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_JNIEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
-//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (V) CallStaticDoubleMethodV, CallLongMethodV, CallNonvirtualIntMethodV and NewObjectV with 19 mixed arguments through a guest va_list reached the `...A` slots with each jvalue right, and their results came back; (r) a reserved slot, (l) a va_list entry with no shorty source, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (R) a down call of 15 integers is refused by name in its child.
+//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (V) CallStaticDoubleMethodV, CallLongMethodV, CallNonvirtualIntMethodV and NewObjectV with 19 mixed arguments through a guest va_list reached the `...A` slots with each jvalue right, and their results came back; (r) a reserved slot, (l) a va_list entry with no shorty source, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (n) 3,000 down shells are made and the 1st, 1,025th and last return their own answers (growable shells; break `down_cap` = the retired 1,024 pool turns it red); (R) a down call of 15 integers is refused by name in its child.
 //! Output: `qemu-jni: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -221,6 +221,41 @@ struct Expected {
     scale: u64,
 }
 static EXPECTED: OnceLock<Expected> = OnceLock::new();
+
+/// Check (n): down shells requested in one run. WeChat 8.0.79 needs more than 1,024 (its 1,025th trampoline failed on the fixed pool); 3,000 also passes riscv64's old 2,048 cap and spans two 64 KiB code chunks (32-byte shells: 2,048 per chunk).
+const MANY_SHELLS: usize = 3000;
+/// The shells (n) calls: the first, the 1,025th (the first past the retired 1,024-slot pool) and the last.
+const MANY_PROBES: [usize; 3] = [0, 1024, MANY_SHELLS - 1];
+
+/// (n): MANY_SHELLS fresh down shells of nativeScale (`qemu::down` makes one per request: the dedup is `Active::down`'s, above it), each placed in the code chunks (`code_chunk::placed` grows by exactly that many), and the probes called with x = their index, n = 2: fixture.c's `x * n + 0.25f` = 2k + 0.25, exact in f32 below 2^23.
+fn many_shells(target: usize, env: usize) -> Result<(), String> {
+    use atl_native_bridge::engine::code_chunk;
+    let before = code_chunk::placed();
+    let mut shells = Vec::with_capacity(MANY_SHELLS);
+    for k in 0..MANY_SHELLS {
+        let at = qemu::down(target, Down::Env, Some(SCALE_SHORTY))
+            .map_err(|e| format!("down shell {} of {MANY_SHELLS} refused: {e}", k + 1))?;
+        shells.push(at);
+    }
+    let placed = code_chunk::placed() - before;
+    if placed != MANY_SHELLS {
+        return Err(format!("{placed} shells placed for {MANY_SHELLS} requests"));
+    }
+    for k in MANY_PROBES {
+        // SAFETY: a down shell bound for nativeScale (Env kind, SCALE_SHORTY); ScaleFn is its prototype
+        let f = unsafe { std::mem::transmute::<usize, ScaleFn>(shells[k]) };
+        let want = 2.0 * k as f32 + 0.25;
+        let got = f(env, CLASS, k as f32, 2);
+        if got.to_bits() != want.to_bits() {
+            return Err(format!("shell {} returned {got} (expected {want})", k + 1));
+        }
+    }
+    println!(
+        "qemu-jni: down shells {MANY_SHELLS} placed, code chunks {} mapped",
+        code_chunk::chunks()
+    );
+    Ok(())
+}
 
 fn check(letter: char, result: Result<(), String>) -> bool {
     match result {
@@ -648,6 +683,7 @@ fn started(r: Result<Guest, String>) -> u64 {
         MIX_K, MIX_L,
     );
     let scale_ret = scale(fake.env, CLASS, SCALE_X, SCALE_N);
+    let many = many_shells(bias.wrapping_add(x.scale) as usize, fake.env);
     // SAFETY: `run` is qj_run (ELF symbol plus the load bias), a function of a JNIEnv*, a long long[OUT_WORDS] and a long long (fixture.c); `env` is this thread's guest env and `out` stays writable for the call.
     unsafe { guest.call(run, env, out.as_mut_ptr() as usize, refuse as usize) };
     if refuse != 0 {
@@ -848,6 +884,7 @@ fn started(r: Result<Guest, String>) -> u64 {
             ))
         },
     );
+    ok &= check('n', many);
     u64::from(!(ok && REFUSALS_OK.load(Ordering::Relaxed)))
 }
 

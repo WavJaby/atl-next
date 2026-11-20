@@ -26,11 +26,11 @@ mod place;
 
 pub use super::dispatch::{Answer, OnTrap, Trap, on_trap};
 pub use arch::Arch;
+pub(super) use place::{DownSlot, down_abi};
 pub use place::{
     OBJECT_STUBS, bind, bind_result, down, is_stub, object_stub, patch_entry, patch_hook,
     patch_site, register, register_data,
 };
-pub(super) use place::{down_pool, down_slot};
 
 /// The process's QEMU guest architecture (engine/mod.rs `Active::Qemu`); aborts outside a QEMU process, where no trap reaches the QEMU paths.
 pub(in crate::engine) fn arch() -> Arch {

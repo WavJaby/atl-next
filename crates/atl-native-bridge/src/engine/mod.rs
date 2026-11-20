@@ -7,6 +7,7 @@
 mod args;
 pub mod bindings;
 mod buffers;
+pub mod code_chunk;
 pub mod convert;
 mod dispatch;
 /// The fatal-signal report both engines use (identity's signal paths, QEMU's `atl_host.fault_report`).

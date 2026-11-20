@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! riscv64 down shells of the QEMU engine (Q6-4; interface: down.rs). Host calling convention: RISC-V psABI LP64D -- integer arguments in a0..a7, float/double in fa0..fa7, the rest on the stack from the caller's sp (no return address on the stack: `ra` holds it), results in a0 / fa0; s0 and ra callee-saved; t0, t1 free scratch.
-//! The pool is assembled with `.option norvc`, so every shell is exactly `addi t1, zero, k` + `jal zero, entry` (4 + 4 bytes) whatever the target's C extension; `.option push` / `pop` restore the assembler state for the rest of the crate.
+//! The shell template is assembled with `.option norvc`, so its code is exactly four 4-byte instructions whatever the target's C extension, and the literals land at +16 / +24; `.option push` / `pop` restore the assembler state for the rest of the crate.
 
 use std::fmt::Write;
 
@@ -11,18 +11,30 @@ use crate::down::{
 /// LP64D integer argument registers a0..a7, all stored into `regs`.
 const INT_REGS: usize = 8;
 
-/// Bytes of one down shell: two uncompressed instructions.
-pub const DOWN_SHELL: usize = 8;
-/// Slots a shell can name: `addi`'s immediate is 12-bit signed, so 0..2047.
-pub const MAX_SLOTS: usize = 2048;
 /// The entry's frame: the lanes, then saved s0 and ra; a multiple of 16 (psABI stack alignment).
 const FRAME: usize = LANES + 16;
 const _: () = assert!(FRAME.is_multiple_of(16));
 
+/// The shell template, then the entry's label: `t1` = the shell's own address, so the literals are `16(t1)` / `24(t1)`; `t1` then carries the slot pointer into the entry.
+const TEMPLATE: &str = "\
+.text
+.option push
+.option norvc
+.p2align 4
+.hidden atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry
+.globl atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry
+atl_nb_down_shell:
+    auipc t1, 0
+    ld t0, 16(t1)
+    ld t1, 24(t1)
+    jr t0
+    .quad 0
+    .quad 0
+atl_nb_down_shell_end:
+";
+
 /// The riscv64 backend (down.rs [`crate::down::backend`]).
 pub const DOWN: DownBackend = DownBackend {
-    shell: DOWN_SHELL,
-    max_slots: MAX_SLOTS,
     att_syntax: false,
     abi: HostAbi {
         int_lanes: INT_REGS,
@@ -33,22 +45,9 @@ pub const DOWN: DownBackend = DownBackend {
     entries_asm: down_entries_asm,
 };
 
-/// Assembly for the down shells: slot k is `addi t1, zero, k; jal zero, atl_nb_down_entry`. The entry builds the call's lanes on its frame (regs[0..8] = a0..a7, fp[0..8] = fa0..fa7 as stored by `fsd`, stack[0..8] = the eight words at the caller's sp, every other word 0), calls `atl_nb_down_dispatch(slot, lanes)`, and returns a0 = lanes.ret[0], fa0 = lanes.fp[0]. Uses t0, t1 and its frame; s0 (frame pointer = the caller's sp) and ra are saved and restored. `drop_stack` / `swap_v`: the breaks (down.rs [`DownBackend::entries_asm`]). Panics past [`MAX_SLOTS`].
-pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String {
-    assert!(
-        slots <= MAX_SLOTS,
-        "{slots} down slots: addi names 0..{MAX_SLOTS}"
-    );
-    let mut s = String::from(
-        ".text\n.option push\n.option norvc\n.p2align 3\n.hidden atl_nb_down_pool\n.globl atl_nb_down_pool\natl_nb_down_pool:\n",
-    );
-    for k in 0..slots {
-        write!(
-            s,
-            "    addi t1, zero, {k}\n    jal zero, atl_nb_down_entry\n"
-        )
-        .expect("writing to a String");
-    }
+/// Assembly for the down-shell template and entry. The template (`atl_nb_down_shell`, down.rs [`crate::down::SHELL_LEN`] bytes) is `auipc t1, 0; ld t0, 16(t1); ld t1, 24(t1); jr t0`, then the literals entry (+16) and slot (+24): PC-relative, so a copy anywhere works (after an instruction-cache flush). The entry builds the call's lanes on its frame (regs[0..8] = a0..a7, fp[0..8] = fa0..fa7 as stored by `fsd`, stack[0..8] = the eight words at the caller's sp, every other word 0), calls `atl_nb_down_dispatch(slot, lanes)`, and returns a0 = lanes.ret[0], fa0 = lanes.fp[0]. Uses t0, t1 and its frame; s0 (frame pointer = the caller's sp) and ra are saved and restored. `drop_stack` / `swap_v`: the breaks (down.rs [`DownBackend::entries_asm`]).
+pub fn down_entries_asm(drop_stack: bool, swap_v: bool) -> String {
+    let mut s = String::from(TEMPLATE);
     write!(
         s,
         "atl_nb_down_entry:\n    addi sp, sp, -{FRAME}\n    sd ra, {}(sp)\n    sd s0, {LANES}(sp)\n    addi s0, sp, {FRAME}\n",
@@ -89,19 +88,24 @@ pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String 
 mod tests {
     use super::*;
 
-    /// One slot, no break: the whole text, written out by hand from the psABI and the 4.0 `atl_lanes` layout (regs at 0, fp at 128, stack at 256, ret at 384, 400 bytes; frame 416 with s0 at 400, ra at 408). Expected text is a literal, never the emitter's output.
+    /// No break: the whole text, written out by hand from the psABI and the 4.0 `atl_lanes` layout (regs at 0, fp at 128, stack at 256, ret at 384, 400 bytes; frame 416 with s0 at 400, ra at 408); the template's literals at +16 / +24 = four 4-byte instructions past `auipc`'s own address. Expected text is a literal, never the emitter's output.
     #[test]
-    fn one_slot_entry_is_the_psabi_sequence() {
+    fn template_and_entry_are_the_psabi_sequence() {
         let want = "\
 .text
 .option push
 .option norvc
-.p2align 3
-.hidden atl_nb_down_pool
-.globl atl_nb_down_pool
-atl_nb_down_pool:
-    addi t1, zero, 0
-    jal zero, atl_nb_down_entry
+.p2align 4
+.hidden atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry
+.globl atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry
+atl_nb_down_shell:
+    auipc t1, 0
+    ld t0, 16(t1)
+    ld t1, 24(t1)
+    jr t0
+    .quad 0
+    .quad 0
+atl_nb_down_shell_end:
 atl_nb_down_entry:
     addi sp, sp, -416
     sd ra, 408(sp)
@@ -184,29 +188,15 @@ atl_nb_down_entry:
     ret
 .option pop
 ";
-        assert_eq!(down_entries_asm(1, false, false), want);
-    }
-
-    /// Slot k names k: the third shell is `addi t1, zero, 2`.
-    #[test]
-    fn slots_name_themselves() {
-        let s = down_entries_asm(3, false, false);
-        assert_eq!(s.matches("jal zero, atl_nb_down_entry").count(), 3);
-        assert!(s.contains("    addi t1, zero, 2\n"));
+        assert_eq!(down_entries_asm(false, false), want);
     }
 
     /// Break `down_drop_stack`: the first stack word read is the caller's second. Break `down_swap_v`: fa1 lands in v[0], fa0 in v[1].
     #[test]
     fn breaks_move_one_lane_each() {
-        let d = down_entries_asm(1, true, false);
+        let d = down_entries_asm(true, false);
         assert!(d.contains("    ld t0, 8(s0)\n    sd t0, 256(sp)\n"));
-        let v = down_entries_asm(1, false, true);
+        let v = down_entries_asm(false, true);
         assert!(v.contains("    fsd fa1, 128(sp)\n    fsd fa0, 136(sp)\n"));
-    }
-
-    #[test]
-    #[should_panic(expected = "addi names")]
-    fn too_many_slots_panic() {
-        down_entries_asm(MAX_SLOTS + 1, false, false);
     }
 }

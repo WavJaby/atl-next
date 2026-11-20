@@ -673,72 +673,13 @@ fn down_stub(target: usize, kind: Down) -> [u8; encodings::DOWN_LEN] {
     s
 }
 
-/// The down-stub pool: one memfd mapped twice, RW for writing and RX for running (no page is ever writable and executable, and a stub in use never changes protection), grown by a chunk at a time.
-struct Pool {
-    rw: usize,
-    rx: usize,
-    used: usize,
-}
-const CHUNK: usize = 64 * 1024;
-
-static POOL: std::sync::Mutex<Option<Pool>> = std::sync::Mutex::new(None);
-
-fn new_chunk() -> Result<Pool, String> {
-    // SAFETY: memfd + two shared mappings of CHUNK bytes; the fd is closed once mapped (the mappings keep the file).
-    unsafe {
-        let fd = libc::memfd_create(c"atl-nb-down".as_ptr(), libc::MFD_CLOEXEC);
-        if fd < 0 || libc::ftruncate(fd, CHUNK as libc::off_t) != 0 {
-            return Err(format!(
-                "down stubs: memfd: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let map = |prot| libc::mmap(std::ptr::null_mut(), CHUNK, prot, libc::MAP_SHARED, fd, 0);
-        let rw = map(libc::PROT_READ | libc::PROT_WRITE);
-        let rx = map(libc::PROT_READ | libc::PROT_EXEC);
-        libc::close(fd);
-        if rw == libc::MAP_FAILED || rx == libc::MAP_FAILED {
-            return Err(format!(
-                "down stubs: mmap: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(Pool {
-            rw: rw as usize,
-            rx: rx as usize,
-            used: 0,
-        })
-    }
-}
-
-/// A host-callable address that runs guest function `target` on the calling thread's guest thread pointer (attaching the thread first if needed), every argument as the caller passed it.
+/// A host-callable address that runs guest function `target` on the calling thread's guest thread pointer (attaching the thread first if needed), every argument as the caller passed it: a [`down_stub`] placed in the engines' shared code chunks (engine/code_chunk.rs).
 pub fn down(target: usize, kind: Down) -> Result<usize, String> {
     if let Down::Handle(ty) = kind {
         return Err(format!("down kind Handle({ty}) is ILP32-only"));
     }
-    let mut pool = POOL.lock().map_err(|_| "down stubs: poisoned".to_owned())?;
-    if pool
-        .as_ref()
-        .is_none_or(|p| p.used + encodings::DOWN_LEN > CHUNK)
-    {
-        // the full chunk stays mapped: its stubs are in use
-        *pool = Some(new_chunk()?);
-    }
-    let Some(p) = pool.as_mut() else {
-        return Err("down stubs: no pool".into());
-    };
     let bytes = down_stub(target, kind);
-    // SAFETY: `used + DOWN_LEN <= CHUNK` bytes into the RW view; the RX view shows the same page.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            (p.rw + p.used) as *mut u8,
-            encodings::DOWN_LEN,
-        )
-    };
-    let at = p.rx + p.used;
-    p.used += encodings::DOWN_LEN;
-    Ok(at)
+    super::code_chunk::place(bytes.len(), |b, _| b.copy_from_slice(&bytes))
 }
 
 /// Whether `addr` holds an unbound interceptable stub: the `movabs $_, %r11` prefix (`encodings::STUB_PREFIX`).

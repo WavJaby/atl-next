@@ -234,14 +234,8 @@ fn pool(s: &mut String, name: &str, target: &str, slots: usize, end: usize) {
     }
 }
 
-/// Bytes of one down shell (Q6-4): `movl $slot, %r11d` (6) and `jmp atl_nb_down_entry` (5), padded to 16, so slot k is at `atl_nb_down_pool + k * DOWN_SHELL`.
-pub const DOWN_SHELL: usize = 16;
-
 /// The x86_64 down-shell backend (down.rs [`crate::down::backend`]): SysV, six integer argument registers, an fp argument past %xmm7 goes to the stack, no result widening (callers read only the bits their type names).
 pub const DOWN: DownBackend = DownBackend {
-    shell: DOWN_SHELL,
-    // `movl $k, %r11d`: a 32-bit immediate
-    max_slots: 1 << 32,
     att_syntax: true,
     abi: HostAbi {
         int_lanes: 6,
@@ -252,21 +246,14 @@ pub const DOWN: DownBackend = DownBackend {
     entries_asm: down_entries_asm,
 };
 
-/// Assembly for the down shells (QEMU host->guest, Q6-4), `.text`, AT&T syntax (backend `att_syntax`), for the engine's `global_asm!`: slot k is `movl $k, %r11d; jmp atl_nb_down_entry`. A host SysV call enters the shell; the entry builds the call's lanes on its own frame (regs[0..6] = %rdi..%r9, fp[0..8] = %xmm0..7, stack[0..8] = the eight words above the return address, every other word 0), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.ret[0] and %xmm0 = lanes.fp[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored. `drop_stack` and `swap_v` are the breaks `down_drop_stack` and `down_swap_v` (build.rs `BREAKS`): the stack words start one word late, and %xmm0 and %xmm1 are exchanged on entry. Both false in every shipped build.
-pub fn down_entries_asm(slots: usize, drop_stack: bool, swap_v: bool) -> String {
+/// Assembly for the down-shell template and entry (QEMU host->guest, Q6-4), `.text`, AT&T syntax (backend `att_syntax`), for the engine's `global_asm!`. The template (`atl_nb_down_shell`, down.rs [`crate::down::SHELL_LEN`] bytes) is `movq slot(%rip), %r11; jmp *entry(%rip)`, int3 up to 16, then the literals entry (+16) and slot (+24); RIP-relative to its own literals, so a copy anywhere works. A host SysV call enters a copy; the entry builds the call's lanes on its own frame (regs[0..6] = %rdi..%r9, fp[0..8] = %xmm0..7, stack[0..8] = the eight words above the return address, every other word 0), calls `atl_nb_down_dispatch(slot, lanes)` (engine/dispatch.rs), and returns %rax = lanes.ret[0] and %xmm0 = lanes.fp[0]. Both answers are always set; the caller reads the one its prototype names. The shells use only %r10, %r11 and the frame; %rbp is saved and restored. `drop_stack` and `swap_v` are the breaks `down_drop_stack` and `down_swap_v` (build.rs `BREAKS`): the stack words start one word late, and %xmm0 and %xmm1 are exchanged on entry. Both false in every shipped build.
+pub fn down_entries_asm(drop_stack: bool, swap_v: bool) -> String {
     let mut s = String::from(
-        ".text\n.p2align 4\n.hidden atl_nb_down_pool\n.globl atl_nb_down_pool\natl_nb_down_pool:\n",
+        ".text\n.p2align 4\n.hidden atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry\n.globl atl_nb_down_shell, atl_nb_down_shell_end, atl_nb_down_entry\natl_nb_down_shell:\n    movq .Ldown_slot(%rip), %r11\n    jmp *.Ldown_entry(%rip)\n    .p2align 3, 0xcc\n.Ldown_entry:\n    .quad 0\n.Ldown_slot:\n    .quad 0\natl_nb_down_shell_end:\n",
     );
-    for k in 0..slots {
-        write!(
-            s,
-            "    movl ${k}, %r11d\n    jmp atl_nb_down_entry\n    .p2align 4\n"
-        )
-        .expect("writing to a String");
-    }
     write!(
         s,
-        "atl_nb_down_entry:\n    push %rbp\n    mov %rsp, %rbp\n    sub ${LANES}, %rsp\n"
+        ".p2align 4\natl_nb_down_entry:\n    push %rbp\n    mov %rsp, %rbp\n    sub ${LANES}, %rsp\n"
     )
     .expect("writing to a String");
     for (i, reg) in ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]

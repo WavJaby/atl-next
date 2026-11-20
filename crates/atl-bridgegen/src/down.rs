@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT
 //! Down shells of the QEMU engine (host->guest, Q6-4), one generator interface with a backend per host ISA ([`backend`]): x86_64 SysV (`x86.rs`), riscv64 LP64D (`riscv64.rs`).
-//! A host call enters shell k of the pool, which jumps to the entry with k in a scratch register; the entry stores the host call's argument registers and [`HOST_STACK_WORDS`] caller stack words into an `atl_lanes` image on its own frame (the rest zeroed), calls `atl_nb_down_dispatch(k, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.ret[0] in the integer result register and lanes.fp[0] in the fp one.
-//! What differs per host beyond the asm is [`HostAbi`]: how dispatch.rs reads the host image and shapes the answer. build.rs writes [`DownBackend::entries_asm`] (`down.s`, assembled by place.rs `global_asm!`) and [`pool_rust`] (`down_pool.rs`).
+//! A down shell is runtime-copied bytes: a template assembled once (`atl_nb_down_shell`..`atl_nb_down_shell_end`, [`SHELL_LEN`] bytes) whose position-independent code loads two 8-byte literals stored after it -- the entry address ([`SHELL_ENTRY_AT`]) and the shell's `DownSlot` pointer ([`SHELL_SLOT_AT`]) -- and jumps to the entry with the slot pointer in a scratch register. The engine copies the template into its code chunks (atl-native-bridge engine/code_chunk.rs) and writes the two literals, so no shell count is fixed at build time (berberis' `CodePool` is unbounded too).
+//! The entry stores the host call's argument registers and [`HOST_STACK_WORDS`] caller stack words into an `atl_lanes` image on its own frame (the rest zeroed), calls `atl_nb_down_dispatch(slot, lanes)` (atl-native-bridge engine/dispatch.rs), and returns lanes.ret[0] in the integer result register and lanes.fp[0] in the fp one.
+//! What differs per host beyond the asm is [`HostAbi`]: how dispatch.rs reads the host image and shapes the answer. build.rs writes [`DownBackend::entries_asm`] (`down.s`, assembled by place.rs `global_asm!`) and [`abi_rust`] (`down_abi.rs`).
+
+/// Bytes of the shell template: 16 bytes of code (x86_64 `movq` + `jmp *` = 13, int3-padded; riscv64 four uncompressed instructions), then the two literals.
+pub const SHELL_LEN: usize = 32;
+/// Offset of the entry-address literal in a shell.
+pub const SHELL_ENTRY_AT: usize = 16;
+/// Offset of the `DownSlot` pointer literal in a shell; the entry passes it as `atl_nb_down_dispatch`'s first argument.
+pub const SHELL_SLOT_AT: usize = 24;
 
 /// Bytes of a down call's lanes (`atl_lanes`, atl_engine.h 4.0): regs[16] at 0, fp[16] at [`FP_AT`], stack[16] at [`STACK_AT`], ret[2] at [`RET_AT`]. The entry's frame holds one; atl-native-bridge asserts these against the struct ([`pool_rust`] carries them).
 pub const LANES: usize = 400;
@@ -32,15 +40,11 @@ pub struct HostAbi {
 /// One host ISA's down-shell generator.
 #[derive(Clone, Copy, Debug)]
 pub struct DownBackend {
-    /// bytes per shell: slot k sits at `atl_nb_down_pool + k * shell`
-    pub shell: usize,
-    /// the most slots its shell encoding can name
-    pub max_slots: usize,
     /// its text is AT&T syntax: the engine assembles it with `options(att_syntax)` (atl-native-bridge build.rs cfg `atl_nb_down_att`), otherwise with default options
     pub att_syntax: bool,
     pub abi: HostAbi,
-    /// the pool and entry as assembly text for the engine's `global_asm!`, with the breaks `down_drop_stack` (stack words start one word late) and `down_swap_v` (fp argument registers 0 and 1 exchanged on entry): `(slots, drop_stack, swap_v)`
-    pub entries_asm: fn(usize, bool, bool) -> String,
+    /// the shell template and the entry as assembly text for the engine's `global_asm!`, with the breaks `down_drop_stack` (stack words start one word late) and `down_swap_v` (fp argument registers 0 and 1 exchanged on entry): `(drop_stack, swap_v)`
+    pub entries_asm: fn(bool, bool) -> String,
 }
 
 /// The down-shell backend of host ISA `arch` (arches.toml key); None where no backend is written.
@@ -52,12 +56,13 @@ pub fn backend(arch: &str) -> Option<DownBackend> {
     }
 }
 
-/// `down_pool.rs`: the pool's size and shell stride, the host ABI rules dispatch.rs reads, and the lanes layout the shells' asm uses (asserted there against `AtlLanes`).
-pub fn pool_rust(b: &DownBackend, slots: usize) -> String {
+/// `down_abi.rs`: the shell template's layout, the host ABI rules dispatch.rs reads, and the lanes layout the shells' asm uses (asserted there against `AtlLanes`).
+pub fn abi_rust(b: &DownBackend) -> String {
     let a = b.abi;
     format!(
-        "pub const DOWN_SLOTS: usize = {slots};\n\
-         pub const DOWN_SHELL: usize = {};\n\
+        "pub const SHELL_LEN: usize = {SHELL_LEN};\n\
+         pub const SHELL_ENTRY_AT: usize = {SHELL_ENTRY_AT};\n\
+         pub const SHELL_SLOT_AT: usize = {SHELL_SLOT_AT};\n\
          pub const HOST_INT_LANES: usize = {};\n\
          pub const HOST_FP_TO_INT: bool = {};\n\
          pub const HOST_EXTEND_INT_RET: bool = {};\n\
@@ -68,7 +73,7 @@ pub fn pool_rust(b: &DownBackend, slots: usize) -> String {
          pub const LANES_STACK_AT: usize = {STACK_AT};\n\
          pub const LANES_RET_AT: usize = {RET_AT};\n\
          pub const LANES_SIZE: usize = {LANES};\n",
-        b.shell, a.int_lanes, a.fp_to_int, a.extend_int_ret, a.nan_box_f32
+        a.int_lanes, a.fp_to_int, a.extend_int_ret, a.nan_box_f32
     )
 }
 
@@ -110,10 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn pool_rust_names_every_rule() {
-        let s = pool_rust(&crate::riscv64::DOWN, 4);
-        assert!(s.contains("DOWN_SLOTS: usize = 4;"));
-        assert!(s.contains("DOWN_SHELL: usize = 8;"));
+    fn abi_rust_names_every_rule() {
+        let s = abi_rust(&crate::riscv64::DOWN);
+        assert!(s.contains("SHELL_LEN: usize = 32;"));
+        assert!(s.contains("SHELL_ENTRY_AT: usize = 16;"));
+        assert!(s.contains("SHELL_SLOT_AT: usize = 24;"));
         assert!(s.contains("HOST_INT_LANES: usize = 8;"));
         assert!(s.contains("HOST_FP_TO_INT: bool = true;"));
     }

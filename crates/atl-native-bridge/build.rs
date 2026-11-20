@@ -2762,6 +2762,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("shorty_swap", "atl_nb_shorty_swap"),
     // Q6-4 (engine/dispatch.rs `down_body`): a down call's first argument stays the host's, not the guest env or vm (qemu-jni gate, checks o, m and x)
     ("down_noenv", "atl_nb_down_noenv"),
+    // growable down shells (engine/qemu/place.rs `down`): the QEMU engine refuses a down shell past the retired fixed pool's count, as main did before (qemu-jni gate, check n: the 1,025th of 3,000 shells)
+    ("down_cap", "atl_nb_down_cap"),
     // p4b s3 (engine/dispatch.rs `HostRules::int_arg`): argument k is register k on every guest, AAPCS32's stack words ignored (unit test int_arg_follows_the_guest_rules)
     ("regs_k_raw", "atl_nb_regs_k_raw"),
     // p4b s3c (generated `C_<record>` converters, [`CONV_SWAP_CFG`]): the first two guest offsets of the first converter swapped -> its const assert `Conv::ordered` fails the build
@@ -2788,8 +2790,6 @@ const DOWN_DROP_CFG: &str = "atl_nb_down_drop_stack";
 const DOWN_SWAP_CFG: &str = "atl_nb_down_swap_v";
 /// The cfg naming a host down-shell backend whose text is AT&T syntax (bridgegen down.rs `att_syntax`).
 const DOWN_ATT_CFG: &str = "atl_nb_down_att";
-/// Down shells of the QEMU engine (Q6-4, bridgegen down.rs): one per host->guest trampoline a process binds (each native method, JNI_OnLoad, JNI_OnUnload). Fixed; a binding past it fails with an error (place.rs `down`).
-const DOWN_SLOTS: usize = 1024;
 
 /// The cfg naming a core built with the identity engine (arches.toml `[<arch>.host] identity`); crate code gates on it, never on an arch name.
 const IDENTITY_CFG: &str = "atl_nb_identity";
@@ -2946,7 +2946,7 @@ fn main() -> Result<()> {
     // the counted shells: feature `crossing-count` (cargo's env for build scripts), unless the `id_count` break is selected
     let x86_counted = std::env::var_os("CARGO_FEATURE_CROSSING_COUNT").is_some()
         && !selected_breaks()?.contains(&X86_COUNT_CFG);
-    // Q6-4: the QEMU engine's down shells for the host ISA (atl-bridgegen down.rs `backend`), their sizes and the host ABI rules for place.rs / dispatch.rs
+    // Q6-4: the QEMU engine's down-shell template and entry for the host ISA (atl-bridgegen down.rs `backend`), the template layout and the host ABI rules for place.rs / dispatch.rs
     let breaks = selected_breaks()?;
     let down = atl_bridgegen::down::backend(&host.arch)
         .with_context(|| format!("host {}: no down-shell backend in atl-bridgegen", host.arch))?;
@@ -2955,23 +2955,16 @@ fn main() -> Result<()> {
     if down.att_syntax {
         println!("cargo::rustc-cfg={DOWN_ATT_CFG}");
     }
-    ensure!(
-        DOWN_SLOTS <= down.max_slots,
-        "DOWN_SLOTS {DOWN_SLOTS}: host {} shells name at most {}",
-        host.arch,
-        down.max_slots
-    );
     std::fs::write(
         out.join("down.s"),
         (down.entries_asm)(
-            DOWN_SLOTS,
             breaks.contains(&DOWN_DROP_CFG),
             breaks.contains(&DOWN_SWAP_CFG),
         ),
     )?;
     std::fs::write(
-        out.join("down_pool.rs"),
-        atl_bridgegen::down::pool_rust(&down, DOWN_SLOTS),
+        out.join("down_abi.rs"),
+        atl_bridgegen::down::abi_rust(&down),
     )?;
     // one table per engine guest: identity's (the host arch's own view and stub list, the LP64 proxy lists), one per QEMU guest
     let mut tables: Vec<(String, Guest)> = Vec::new();

@@ -8,6 +8,7 @@ use atl_engine_api::AtlLanes;
 
 use super::jni;
 use super::objects::{self, Class, Refused, Sig};
+use super::qemu::DownSlot;
 use super::{unsupported, va_list};
 use crate::engine::Down;
 use crate::engine::bindings::OBJECT_STUBS;
@@ -335,21 +336,18 @@ fn refuse(r: Refused) -> ! {
     ))
 }
 
-/// Host->guest entry (Q6-4, bridgegen down.rs): the shell of down slot `slot` calls it with its frame's lanes.
+/// Host->guest entry (Q6-4, bridgegen down.rs): a down shell's entry calls it with the shell's `DownSlot` literal and its frame's lanes.
 ///
 /// # Safety
-/// `host` is the shell's frame, an `AtlLanes` live for the call and not otherwise accessed until it returns.
+/// `slot` is the leaked `DownSlot` place.rs `down` wrote into the shell; `host` is the shell's frame, an `AtlLanes` live for the call and not otherwise accessed until it returns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn atl_nb_down_dispatch(slot: usize, host: *mut AtlLanes) {
-    // SAFETY: the shell's frame, per the contract above.
-    down_body(slot, unsafe { &mut *host });
+pub unsafe extern "C" fn atl_nb_down_dispatch(slot: *const DownSlot, host: *mut AtlLanes) {
+    // SAFETY: per the contract above: a 'static binding and the shell's frame.
+    down_body(unsafe { &*slot }, unsafe { &mut *host });
 }
 
-/// The host->guest body of down slot `slot` (Q6-4): `host` is the shell's frame with the host call's lanes; the guest call's lanes are placed by the slot's classes (`place`), and the guest's answer goes back in `host.ret[0]` and `host.fp[0]`, which the shell returns.
-fn down_body(slot: usize, host: &mut AtlLanes) {
-    let Some(d) = super::qemu::down_slot(slot) else {
-        unsupported("qemu crossing: down shell without a binding")
-    };
+/// The host->guest body of down slot `d` (Q6-4): `host` is the shell's frame with the host call's lanes; the guest call's lanes are placed by the slot's classes (`place`), and the guest's answer goes back in `host.ret[0]` and `host.fp[0]`, which the shell returns.
+fn down_body(d: &DownSlot, host: &mut AtlLanes) {
     let rules = super::qemu::arch().rules();
     // an ILP32 callback's host object (`Down::Handle`, the host's first integer) -> its handle before placement; a handle issued for this call only is freed when the guest returns
     let scoped = d.kind.host_object(&mut host.regs[0]);
@@ -396,7 +394,7 @@ fn down_body(slot: usize, host: &mut AtlLanes) {
 
 // The shells' frame is an `atl_lanes`: bridgegen's offsets (down.rs, written into the shells' asm) must be the struct's.
 const _: () = {
-    use super::qemu::down_pool as p;
+    use super::qemu::down_abi as p;
     use core::mem::{offset_of, size_of};
     assert!(offset_of!(AtlLanes, regs) == p::LANES_REGS_AT);
     assert!(offset_of!(AtlLanes, fp) == p::LANES_FP_AT);
@@ -467,7 +465,7 @@ pub(in crate::engine) const AAPCS32: HostRules = HostRules {
 
 /// The build's host rules (64-bit hosts with eight fp argument registers: SysV xmm0..7, LP64D fa0..7).
 const HOST: HostRules = {
-    use super::qemu::down_pool as p;
+    use super::qemu::down_abi as p;
     HostRules {
         int_lanes: p::HOST_INT_LANES,
         fp_lanes: 8,
