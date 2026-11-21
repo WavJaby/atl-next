@@ -15,7 +15,12 @@ use atl_sepolicy::{CLASSES, Table, context_type, domains, parse_service_contexts
 use clap::Parser;
 
 // generated bindings keep the C names (FILE, sepol_av_decision)
-#[allow(non_camel_case_types, non_upper_case_globals, dead_code, clippy::upper_case_acronyms)]
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/sepol.rs"));
 }
