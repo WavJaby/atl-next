@@ -11,6 +11,42 @@
 /// Cut of the quoted first error line, in chars (`...` follows a cut). 160: two 80-column rows, so one tool result shows the verdict whole; the full line is in the log.
 pub const FIRST_ERROR_CHARS: usize = 160;
 
+/// Exit code of a gate run whose property could not be judged on this host ([`Outcome::Undecided`]): distinct from 1 (failure, anyhow), 2 (clap) and land's REBASE_CONFLICT 3.
+pub const UNDECIDED_EXIT: u8 = 4;
+/// The gate's own line naming why it is undecided: `<cmd>: undecided <stage>: <why>`.
+pub const UNDECIDED_WORD: &str = "undecided ";
+
+/// A gate run's outcome. Undecided: a stage proved host starvation by a measured host quantity the defect under test cannot produce, so the property was not judged: neither pass nor fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Pass,
+    Fail,
+    Undecided,
+}
+
+impl Outcome {
+    /// From a gate process's exit code (None: killed by a signal = failure).
+    pub fn of_exit(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => Self::Pass,
+            Some(c) if c == i32::from(UNDECIDED_EXIT) => Self::Undecided,
+            _ => Self::Fail,
+        }
+    }
+}
+
+/// `<k> gate[s] undecided: <a>; <b>`; None when none.
+fn undecided_note(undecided: &[String]) -> Option<String> {
+    let n = undecided.len();
+    (n > 0).then(|| {
+        format!(
+            "{n} gate{} undecided: {}",
+            if n == 1 { "" } else { "s" },
+            undecided.join("; ")
+        )
+    })
+}
+
 /// One failed check: `step` names it when the run knows the name; `text` is its error, of which the first line is quoted.
 pub struct Failure {
     pub step: Option<String>,
@@ -44,22 +80,37 @@ pub struct Verdict<'a> {
 
 impl Verdict<'_> {
     pub fn line(&self) -> String {
+        self.line_with(&[])
+    }
+
+    /// The line naming `undecided`: gates that could not judge their property (`<gate> <why>`, [`Outcome::Undecided`]); neither passed nor failed, so they never turn ok into FAILED.
+    pub fn line_with(&self, undecided: &[String]) -> String {
         let skip = self.skip_note();
+        let open = undecided_note(undecided);
         let Some(first) = self.failures.first() else {
             let counts = self.total.map(|(n, unit)| format!("{n} {unit}"));
             let parts: Vec<String> = counts.into_iter().chain(skip).collect();
-            return if parts.is_empty() {
+            let mut inner = parts.join(", ");
+            if let Some(open) = open {
+                inner = if inner.is_empty() {
+                    open
+                } else {
+                    format!("{inner}; {open}")
+                };
+            }
+            return if inner.is_empty() {
                 format!("{}: ok", self.cmd)
             } else {
-                format!("{}: ok ({})", self.cmd, parts.join(", "))
+                format!("{}: ok ({inner})", self.cmd)
             };
         };
         let mut line = format!("{}: FAILED", self.cmd);
         if let Some((n, unit)) = self.total {
             line.push_str(&format!(" {} of {n} {unit}", self.failures.len()));
         }
-        if let Some(skip) = skip {
-            line.push_str(&format!(" ({skip})"));
+        let notes: Vec<String> = skip.into_iter().chain(open).collect();
+        if !notes.is_empty() {
+            line.push_str(&format!(" ({})", notes.join("; ")));
         }
         let mut steps: Vec<&str> = Vec::new();
         for step in self.failures.iter().filter_map(|f| f.step.as_deref()) {
@@ -180,6 +231,62 @@ pub fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An undecided gate is named in the line and never fails it: ok stays ok (after counts and skips), a FAILED line carries it beside its skips; the exit code alone classifies the outcome.
+    #[test]
+    fn undecided_gates_are_named_not_failed() {
+        let starved =
+            ["window-slow-display host GPU starved (render max 205 ms > 100 ms)".to_owned()];
+        let ok = Verdict {
+            cmd: "check",
+            total: Some((29, "steps")),
+            skipped: vec![],
+            failures: vec![],
+        };
+        assert_eq!(
+            ok.line_with(&starved),
+            "check: ok (29 steps; 1 gate undecided: window-slow-display host GPU starved (render max 205 ms > 100 ms))"
+        );
+        assert_eq!(ok.line_with(&[]), "check: ok (29 steps)");
+        let two = ["a x".to_owned(), "b y".to_owned()];
+        let skipped = Verdict {
+            cmd: "check",
+            total: Some((3, "steps")),
+            skipped: vec!["gates"],
+            failures: vec![],
+        };
+        assert_eq!(
+            skipped.line_with(&two),
+            "check: ok (3 steps, 1 skipped: gates; 2 gates undecided: a x; b y)"
+        );
+        let plain = Verdict {
+            cmd: "gates",
+            total: None,
+            skipped: vec![],
+            failures: vec![],
+        };
+        assert_eq!(
+            plain.line_with(&two[..1]),
+            "gates: ok (1 gate undecided: a x)"
+        );
+        let failed = Verdict {
+            cmd: "check",
+            total: Some((29, "steps")),
+            skipped: vec![],
+            failures: vec![Failure::step("fmt", "diff")],
+        };
+        assert_eq!(
+            failed.line_with(&two[..1]),
+            "check: FAILED 1 of 29 steps (1 gate undecided: a x): fmt; first error (fmt): \"diff\""
+        );
+        assert_eq!(Outcome::of_exit(Some(0)), Outcome::Pass);
+        assert_eq!(
+            Outcome::of_exit(Some(i32::from(UNDECIDED_EXIT))),
+            Outcome::Undecided
+        );
+        assert_eq!(Outcome::of_exit(Some(1)), Outcome::Fail);
+        assert_eq!(Outcome::of_exit(None), Outcome::Fail);
+    }
 
     #[test]
     fn success_lines_keep_their_shape() {

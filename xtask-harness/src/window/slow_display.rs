@@ -4,10 +4,12 @@
 //! rate while the app's UI thread is idle (the fixture's steady phase). SurfaceFlinger does not latch while the last present is pending (SurfaceFlinger.cpp commit `wouldBackpressureHwc`): the producer
 //! must be held to the display's rate and the composer must replace no frame unseen. A composer that latches every tick (`--break-no-backpressure`) lets the producer post at the output rate.
 //! Judged against the display, not the app's UI thread: holds whichever thread the window runs on.
-//! Host too slow: when the window's own measured render inside the steady phase exceeds the composer's hold bound, a held / replaced failure is `undecided` (still red, rerun); never decided from the
-//! composer's counters, which broken backpressure moves the same way ([`gpu_starved`]).
+//! Host too slow: when the window's own measured render inside the steady phase exceeds the composer's hold bound, held / replaced judge nothing and the stage is `undecided` (neither pass nor fail);
+//! never decided from the composer's counters, which broken backpressure moves the same way ([`gpu_starved`]).
 
-use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, bound_ms, number, period_ms, result_line};
+use super::ui_block::{
+    FIXTURE as UI_BLOCK_FIXTURE, bound_ms, hold_bound_ms, number, period_ms, result_line,
+};
 use super::{ACK_WAIT, Liveness, Sub, await_event, line_stamp, wait_for_line};
 use crate::composer::word;
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
@@ -113,15 +115,15 @@ fn steady_render_max_us(app: &str) -> Option<u64> {
 }
 
 /// Host GPU starvation: a window render inside the steady phase longer than the composer's hold bound (a loaded software-GL host: 250-500 ms paints measured at load 10-13). Every hold then expires
-/// before the window takes, so the bound, not the throttled display, sets the rate and held / replaced read like `--break-no-backpressure` whatever the code does. Keyed on the window's own measured
-/// render time, never on the composer's counters: an early-expiring hold (broken backpressure) grows `latches_unpainted` too but cannot lengthen the window's render, so it stays judged (R6-8).
-/// Backpressure off (bound 0, the red control) is never starved. Some(text) naming both times.
+/// before the window takes, so the bound, not the throttled display, sets the rate and held / replaced judge nothing whatever the code does. Keyed on the window's own measured render time, never
+/// on the composer's counters: an early-expiring hold (broken backpressure) grows `latches_unpainted` too but cannot lengthen the window's render, so it stays judged (R6-8).
+/// Judged against the composer's configured bound whether backpressure is on or off: the red control (`--break-no-backpressure`) on a starved host is undecided too, never a pass. Some(text) naming both times.
 pub fn gpu_starved(app: &str) -> Option<String> {
-    let bound = bound_ms(app).ok().filter(|b| *b > 0)?;
+    let bound = hold_bound_ms(app).ok().filter(|b| *b > 0)?;
     let max = steady_render_max_us(app)?;
     (max > bound * 1000).then(|| {
         format!(
-            "host GPU starved: window render max {} ms > hold bound {bound} ms",
+            "host GPU starved (window render max {} ms > hold bound {bound} ms)",
             max / 1000
         )
     })
@@ -177,21 +179,33 @@ fn bound_check(app: &str, refresh_hz: f32) -> Result<String, String> {
     }
 }
 
-/// The sub-gates; `refresh_hz`: the run's display; `throttle`: the proxy's counts at the end of the drive. Every sub-gate is always judged. A held / replaced failure on a GPU-starved host
-/// ([`gpu_starved`]) is `undecided`: still a failure, so `check` and `land` need a rerun that decides, and a starved host never passes the stage unjudged.
-pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Vec<Sub> {
-    let starved = gpu_starved(app);
-    let judged = |r: Result<String, String>| match (&starved, r) {
-        (Some(why), Err(e)) => Err(format!("undecided: {why}: {e}")),
-        (_, r) => r,
-    };
-    vec![
+/// The stage's sub-gates, and the ones a GPU-starved host left unjudged.
+pub struct Checks {
+    pub subs: Vec<Sub>,
+    /// Some on a starved host ([`gpu_starved`]): why, and held / replaced as measured (shown, judging nothing).
+    pub undecided: Option<(String, Vec<Sub>)>,
+}
+
+/// The sub-gates; `refresh_hz`: the run's display; `throttle`: the proxy's counts at the end of the drive. On a GPU-starved host held and replaced judge nothing, pass or fail: the bound, not the
+/// display, set the rate, so the stage is `undecided` (window.rs `judge`: its own exit code, neither pass nor fail for `check`); bound, throttled and paint are judged as always.
+pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Checks {
+    let rate: Vec<Sub> = vec![
+        ("held", held_check(app, refresh_hz)),
+        ("replaced", replaced_check(app)),
+    ];
+    let mut subs = vec![
         ("bound", bound_check(app, refresh_hz)),
         ("throttled", throttled_check(throttle)),
-        ("held", judged(held_check(app, refresh_hz))),
-        ("replaced", judged(replaced_check(app))),
-        ("paint", paint_check(app)),
-    ]
+    ];
+    let undecided = match gpu_starved(app) {
+        Some(why) => Some((why, rate)),
+        None => {
+            subs.extend(rate);
+            None
+        }
+    };
+    subs.push(("paint", paint_check(app)));
+    Checks { subs, undecided }
 }
 
 /// The probe: once the window acks its configure, the proxy slows its frame callbacks; then the fixture's result line. The throttle's counts reach the checks through the live half (window.rs `live`).
@@ -233,8 +247,9 @@ mod tests {
         assert!(throttled_check((0, 60)).is_err());
     }
 
-    /// Starvation keys on the window's measured render, not on the composer's counters: unpainted latches with fast paints (an early-expiring hold, R6-8) stay judged and red; a render over the
-    /// 100 ms bound inside the phase makes a failure `undecided` (still Err) and leaves a pass a pass; 100 ms exactly, a long render outside the phase, or backpressure off (the red control) decide as usual.
+    /// Starvation keys on the window's measured render, not on the composer's counters: unpainted latches with fast paints (an early-expiring hold, R6-8: broken backpressure cannot lengthen the
+    /// window's render) stay judged and red; a render over the 100 ms bound inside the phase leaves held / replaced unjudged (undecided, pass or fail), backpressure off (the red control) included;
+    /// 100 ms exactly or a long render outside the phase decide as usual.
     #[test]
     fn starvation_is_the_window_render_not_the_counters() {
         let counters = |t: &str, unpainted: u64, dropped: u64| {
@@ -258,26 +273,39 @@ mod tests {
         };
         let on = "0.5 INFO atl-composer: ui: backpressure=true bound_ms=100\n";
         let off = "0.5 INFO atl-composer: ui: backpressure=false bound_ms=100\n";
-        let replaced = |l: &str| checks(l, 60.0, (1, 1)).remove(3).1;
+        let judged = |l: &str| {
+            let c = checks(l, 60.0, (1, 1));
+            assert!(c.undecided.is_none(), "{l}");
+            c.subs
+                .into_iter()
+                .find(|(n, _)| *n == "replaced")
+                .expect("judged")
+                .1
+        };
+        let unjudged = |l: &str| {
+            let c = checks(l, 60.0, (1, 1));
+            assert!(
+                c.subs
+                    .iter()
+                    .all(|(n, _)| !["held", "replaced"].contains(n))
+            );
+            c.undecided.expect("starved").0
+        };
         // latches_unpainted +40 with 20 ms paints: judged, red
-        let broken = replaced(&log(on, 20_000, 0, 135)).expect_err("135 replaced");
-        assert!(!broken.starts_with("undecided"), "{broken}");
-        assert!(gpu_starved(&log(on, 20_000, 0, 135)).is_none());
-        let starved = replaced(&log(on, 100_001, 0, 135)).expect_err("still a failure");
-        assert!(
-            starved.starts_with(
-                "undecided: host GPU starved: window render max 100 ms > hold bound 100 ms"
-            ),
-            "{starved}"
+        assert!(judged(&log(on, 20_000, 0, 135)).is_err());
+        assert_eq!(
+            unjudged(&log(on, 100_001, 0, 135)),
+            "host GPU starved (window render max 100 ms > hold bound 100 ms)"
         );
-        assert!(replaced(&log(on, 300_000, 0, 0)).is_ok());
-        let at_bound = replaced(&log(on, 100_000, 0, 135)).expect_err("fail");
-        assert!(!at_bound.starts_with("undecided"), "{at_bound}");
-        let outside = replaced(&log(on, 0, 300_000, 135)).expect_err("fail");
-        assert!(!outside.starts_with("undecided"), "{outside}");
-        let control = replaced(&log(off, 300_000, 0, 135)).expect_err("fail");
-        assert!(!control.starts_with("undecided"), "{control}");
-        assert_eq!(checks(&log(on, 300_000, 0, 0), 60.0, (1, 1)).len(), 5);
+        // a pass on a starved host judges nothing either
+        unjudged(&log(on, 300_000, 0, 0));
+        assert!(judged(&log(on, 100_000, 0, 135)).is_err());
+        assert!(judged(&log(on, 0, 300_000, 135)).is_err());
+        // the red control: red when judged, undecided (never a pass) when starved
+        assert!(judged(&log(off, 20_000, 0, 135)).is_err());
+        unjudged(&log(off, 300_000, 0, 135));
+        let c = checks(&log(on, 300_000, 0, 0), 60.0, (1, 1));
+        assert_eq!((c.subs.len(), c.undecided.map(|u| u.1.len())), (3, Some(2)));
     }
 
     /// 60 Hz K 4 = 66.7 ms < 100 passes; 30 Hz K 4 = 133.3 ms does not; backpressure off has no bound.

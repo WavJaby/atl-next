@@ -80,10 +80,28 @@ pub fn pass_through(root: &Path, name: &str, args: &[OsString]) -> Result<ExitCo
 
 /// The line a harness check step prints for "not checked: <why>"; absent = checked.
 pub const SKIP_PREFIX: &str = "skip: ";
+/// The line a harness check step prints per gate it ran whose outcome was [`crate::verdict::Outcome::Undecided`]: `<gate> <why>`, named on check's verdict line.
+pub const UNDECIDED_PREFIX: &str = "undecided-gate: ";
 
-/// Runs harness check step `step` on build dir `out`: `Some(why)` when it skipped, an error with its output when it failed.
+/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host (`<gate> <why>`), neither pass nor fail.
+#[derive(Debug, Default)]
+pub struct StepDone {
+    pub skipped: Option<String>,
+    pub undecided: Vec<String>,
+}
+
+impl From<Option<String>> for StepDone {
+    fn from(skipped: Option<String>) -> Self {
+        Self {
+            skipped,
+            undecided: Vec::new(),
+        }
+    }
+}
+
+/// Runs harness check step `step` on build dir `out`: its skip and undecided gates, an error with its output when it failed.
 /// The harness's stderr (its phase report, lock waits, cargo's lines) shows as it arrives, so the check log has it; a failure's error carries it too.
-pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<Option<String>> {
+pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<StepDone> {
     let built = Instant::now();
     let mut cmd = command(
         root,
@@ -120,10 +138,17 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<Option<String>>
     if !run.status.success() {
         bail!("{}\n{}", stdout.trim_end(), stderr.trim_end());
     }
-    Ok(stdout
-        .lines()
-        .find_map(|l| l.strip_prefix(SKIP_PREFIX))
-        .map(str::to_owned))
+    Ok(StepDone {
+        skipped: stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(SKIP_PREFIX))
+            .map(str::to_owned),
+        undecided: stdout
+            .lines()
+            .filter_map(|l| l.strip_prefix(UNDECIDED_PREFIX))
+            .map(str::to_owned)
+            .collect(),
+    })
 }
 
 /// Copies `from` to our stderr line by line as it arrives; returns what it copied.

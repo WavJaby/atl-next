@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
+use crate::verdict::{Outcome, UNDECIDED_WORD};
+
 /// One gate run: `xtask test <args>`, plus `--host <build machine>` when `host` and `--out <build dir>` when `out` (each only where the gate's own arguments have it).
 pub struct Row {
     pub args: &'static [&'static str],
@@ -79,7 +81,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["sles-bridge"], false, true),
     Row::new(&["window", "--stage", "surface-view"], true, true),
     Row::new(&["window", "--stage", "ime"], true, true),
-    // a GPU-starved host makes its backpressure verdict `undecided`: still red, the verdict line says so
+    // a GPU-starved host (window render over the hold bound) makes it `undecided`: neither pass nor fail, named on check's verdict line
     Row::new(&["window", "--stage", "slow-display"], true, true),
     // the WebView's focus and key routing without the webview stage's sound route: a mouse click focuses the page, a touch tap does not; Esc -> Back reaches the game after the dismissal
     Row::new(
@@ -102,13 +104,14 @@ pub const ROWS: &[Row] = &[
     Row::new(&["window", "--stage", "ui-block"], true, true),
 ];
 
-/// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line.
-pub fn run(root: &Path, host: &str, out: &Path) -> Result<()> {
+/// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows (`<row> <why>`), neither pass nor fail ([`Outcome`]).
+pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let exe = std::env::current_exe().context("the harness's own path")?;
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
     let mut failed = Vec::new();
+    let mut undecided = Vec::new();
     for row in ROWS {
         let log = logs.join(format!("{}.log", row.name()));
         let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
@@ -124,21 +127,37 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<()> {
             .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
         let took = started.elapsed().as_secs_f64();
         let text = std::fs::read_to_string(&log).unwrap_or_default();
-        let line = verdict_line(&text, row.cmd()).unwrap_or("no verdict line");
+        let outcome = Outcome::of_exit(status.code());
+        let line = match outcome {
+            Outcome::Undecided => undecided_line(&text, row.cmd()),
+            Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
+        }
+        .unwrap_or("no verdict line");
         eprintln!(
             "gates: {} {} ({took:.1}s) {line}",
             row.name(),
-            if status.success() { "ok" } else { "FAILED" }
+            match outcome {
+                Outcome::Pass => "ok",
+                Outcome::Fail => "FAILED",
+                Outcome::Undecided => "undecided",
+            }
         );
-        if !status.success() {
-            failed.push(format!("{}: {line} (log {})", row.name(), log.display()));
+        match outcome {
+            Outcome::Pass => {}
+            Outcome::Fail => failed.push(format!("{}: {line} (log {})", row.name(), log.display())),
+            Outcome::Undecided => undecided.push(undecided_note(row, line)),
         }
     }
     if failed.is_empty() {
-        return Ok(());
+        return Ok(undecided);
     }
+    let open = if undecided.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} undecided: {})", undecided.len(), undecided.join("; "))
+    };
     let summary = format!(
-        "{} of {} gates failed: {}",
+        "{} of {} gates failed{open}: {}",
         failed.len(),
         ROWS.len(),
         failed.join("; ")
@@ -146,6 +165,21 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<()> {
     // stdout leads the step's failure text (xtask harness.rs check_step), so check's first-error line is this one, not the first gate's progress line
     println!("gates: FAILED {summary}");
     bail!("{summary}")
+}
+
+/// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
+fn undecided_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
+    let prefix = format!("{cmd}: {UNDECIDED_WORD}");
+    text.lines().rev().find(|l| l.starts_with(&prefix))
+}
+
+/// `<row> <why>` for check's verdict line: the gate's undecided line less its `<cmd>: undecided <stage>: ` head.
+fn undecided_note(row: &Row, line: &str) -> String {
+    let why = line
+        .split_once(UNDECIDED_WORD)
+        .map(|(_, rest)| rest.split_once(": ").map_or(rest, |(_, why)| why))
+        .unwrap_or(line);
+    format!("{} {why}", row.name())
 }
 
 /// The gate's verdict among its `<cmd>: ` lines (a gate also prints counters and log tails under its name): its `FAILED` line, else the last pass / ok line.
@@ -199,6 +233,19 @@ mod tests {
                 panic!("{}: {e}", argv.join(" "));
             }
         }
+    }
+
+    /// An undecided run's note for check's line: the row name and the stage's why, from the line the window judge prints.
+    #[test]
+    fn undecided_note_names_row_and_why() {
+        let text = "window: held: undecided host GPU starved: x\nwindow: undecided slow-display: host GPU starved (render max 205 ms > 100 ms)\n";
+        let row = Row::new(&["window", "--stage", "slow-display"], true, true);
+        let line = undecided_line(text, "window").expect("line");
+        assert_eq!(
+            undecided_note(&row, line),
+            "window-slow-display host GPU starved (render max 205 ms > 100 ms)"
+        );
+        assert_eq!(undecided_line("window: pass x\n", "window"), None);
     }
 
     #[test]

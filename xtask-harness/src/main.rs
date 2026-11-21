@@ -500,7 +500,9 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
         CheckStep::Gates => {
             let arches = arches::load(root)?;
             let (arch, _) = arches::build_machine(root, &arches)?;
-            check_gates::run(root, arch, out)?;
+            for gate in check_gates::run(root, arch, out)? {
+                println!("{}{gate}", xtask::harness::UNDECIDED_PREFIX);
+            }
             None
         }
         CheckStep::Scenarios => {

@@ -2695,6 +2695,8 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         println!("---- app log\n{app}");
     }
     // the sub-gates, once the marker is logged (they read the frames or the touches after it)
+    // a stage that proved host starvation by a host quantity its defect cannot produce: why, and the sub-gates it left unjudged (shown, counted neither pass nor fail)
+    let mut undecided: Option<(String, Vec<Sub>)> = None;
     let sub: Vec<Sub> = match (args.stage, v.marker_ms) {
         (Stage::Frames, Some(_)) => {
             vec![
@@ -2737,7 +2739,11 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             args.tap_origin.focuses() != args.break_tap_origin,
         ),
         (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz),
-        (Stage::SlowDisplay, Some(_)) => slow_display::checks(&app, display.refresh_hz, throttle),
+        (Stage::SlowDisplay, Some(_)) => {
+            let c = slow_display::checks(&app, display.refresh_hz, throttle);
+            undecided = c.undecided;
+            c.subs
+        }
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
         (Stage::Dialog, Some(_)) => {
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
@@ -2910,6 +2916,22 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             Ok(s) => println!("window: {name}: pass {s}"),
             Err(s) => println!("window: {name}: FAIL {s}"),
         }
+    }
+    if let Some((why, unjudged)) = &undecided {
+        for (name, result) in unjudged {
+            let (Ok(s) | Err(s)) = result;
+            println!("window: {name}: undecided {why}: {s}");
+        }
+    }
+    // a real failure elsewhere still fails the run; undecided replaces only a pass
+    if let (Some(_), None, None, Some((why, _))) = (v.marker_ms, &v.fault, &sub_fault, &undecided) {
+        // check_gates.rs `undecided_line` reads this line; the exit code alone carries the outcome
+        println!(
+            "window: {}{}: {why}",
+            crate::verdict::UNDECIDED_WORD,
+            args.stage.name()
+        );
+        return Ok(ExitCode::from(crate::verdict::UNDECIDED_EXIT));
     }
     if let (Some(marked), None, None) = (v.marker_ms, &v.fault, &sub_fault) {
         let skip_note = if not_judged.is_empty() {

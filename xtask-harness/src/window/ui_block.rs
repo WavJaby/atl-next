@@ -40,16 +40,25 @@ pub(super) fn number(line: &str, k: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("no {k}= in {line}"))
 }
 
+/// The composer's start line.
+fn backpressure_line(app: &str) -> Result<&str, String> {
+    app.lines()
+        .find(|l| l.contains(BACKPRESSURE_LINE))
+        .ok_or_else(|| "no `atl-composer: ui: backpressure=` line".to_owned())
+}
+
 /// The composer's backpressure bound, ms: 0 when backpressure is off (the gate's break).
 pub(super) fn bound_ms(app: &str) -> Result<u64, String> {
-    let line = app
-        .lines()
-        .find(|l| l.contains(BACKPRESSURE_LINE))
-        .ok_or("no `atl-composer: ui: backpressure=` line")?;
+    let line = backpressure_line(app)?;
     if word(line, "backpressure") == Some("false") {
         return Ok(0);
     }
     number(line, "bound_ms")
+}
+
+/// The composer's configured hold bound, ms, whether backpressure is on or off.
+pub(super) fn hold_bound_ms(app: &str) -> Result<u64, String> {
+    number(backpressure_line(app)?, "bound_ms")
 }
 
 /// The frames the producer posted inside the block against the vsync grid, less the composer's bound.

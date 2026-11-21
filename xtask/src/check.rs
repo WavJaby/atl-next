@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::build_pool::{self, Class};
+use crate::harness::StepDone;
 use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
@@ -192,14 +193,14 @@ impl Step {
         }
     }
 
-    /// Runs the step; `Some(why)` when it checked only part of its input (named skipped, as [`Step::skip`]).
-    fn run(self, root: &Path, out: &Path) -> Result<Option<String>> {
+    /// Runs the step; `skipped` when it checked only part of its input (named skipped, as [`Step::skip`]), `undecided` its gates that could not judge on this host.
+    fn run(self, root: &Path, out: &Path) -> Result<StepDone> {
         if self == Step::Keepset {
             // reads the checkout's own build dir (keepset.rs own_graph), not an explicit --out
-            return crate::keepset::check_own(root);
+            return crate::keepset::check_own(root).map(Into::into);
         }
         if self == Step::LauncherClosure {
-            return crate::launcher_closure::check_own(root);
+            return crate::launcher_closure::check_own(root).map(Into::into);
         }
         if self == Step::Tables {
             self.run_whole(root)?;
@@ -210,12 +211,14 @@ impl Step {
             // the packages link the build dir's converter rlibs: a build from before a rebase fails late (E0432 on main's new parcelables), so refuse it by name, as the runtime gates do
             crate::build_state::ensure_current(root, out)?;
             let unchecked = packages::check(root, out)?;
-            return Ok((!unchecked.is_empty()).then(|| {
-                format!(
-                    "not checked: {}: run `cargo xtask native` first",
-                    unchecked.join(", ")
-                )
-            }));
+            return Ok((!unchecked.is_empty())
+                .then(|| {
+                    format!(
+                        "not checked: {}: run `cargo xtask native` first",
+                        unchecked.join(", ")
+                    )
+                })
+                .into());
         }
         if self == Step::GlProxies {
             // reads built binaries: a build from another source state would check stale proxies
@@ -239,12 +242,12 @@ impl Step {
         }
         if self == Step::GtkImports {
             // builds the module cdylibs from this checkout's sources, so it reads current binaries and needs no native build dir
-            return crate::gtk_imports::check(root, out).map(|()| None);
+            return crate::gtk_imports::check(root, out).map(|()| StepDone::default());
         }
         if self == Step::CrossBionic {
-            return cross_bionic(root);
+            return cross_bionic(root).map(Into::into);
         }
-        self.run_whole(root).map(|()| None)
+        self.run_whole(root).map(|()| StepDone::default())
     }
 
     fn run_whole(self, root: &Path) -> Result<()> {
@@ -422,6 +425,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = out::out_dir(root, args.out.as_deref())?;
     let ws = Layout::of(root)?.workspace().to_owned();
     let mut skipped = Vec::new();
+    // gates that could not judge on this host: named on the verdict line, neither pass nor fail (verdict.rs Outcome::Undecided)
+    let mut undecided: Vec<String> = Vec::new();
     let mut failures = Vec::new();
     let mut times = Timings::default();
     for (i, step) in steps.iter().enumerate() {
@@ -448,10 +453,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 step.run(root, &out)
             });
             match run {
-                Ok(None) => "ok".to_owned(),
-                Ok(Some(why)) => {
-                    skipped.push(step.name());
-                    format!("skipped: {why}")
+                Ok(done) => {
+                    let n = done.undecided.len();
+                    undecided.extend(done.undecided);
+                    let open = if n == 0 {
+                        String::new()
+                    } else {
+                        format!(" ({n} undecided)")
+                    };
+                    match done.skipped {
+                        None => format!("ok{open}"),
+                        Some(why) => {
+                            skipped.push(step.name());
+                            format!("skipped{open}: {why}")
+                        }
+                    }
                 }
                 Err(e) => {
                     failures.push(Failure::step(step.name(), format!("{e:#}")));
@@ -480,7 +496,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         skipped,
         failures,
     };
-    println!("{}", verdict.line());
+    println!("{}", verdict.line_with(&undecided));
     Ok(if verdict.failures.is_empty() {
         ExitCode::SUCCESS
     } else {
