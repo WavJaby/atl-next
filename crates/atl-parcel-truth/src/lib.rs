@@ -67,7 +67,7 @@ use atl_parcelables::com::android::internal::inputmethod::{
 };
 use atl_parcelables::java::io::FileDescriptor;
 use atl_parcelables::java::lang::CharSequence;
-use atl_parcelables::java::util::{List, Map};
+use atl_parcelables::java::util::{List, Map, TypedMap};
 use atl_parcelables::parts::{ParsedIntentInfo, Part};
 use binder::binder_impl::{BorrowedParcel, Parcel, UnstructuredParcelable};
 use binder::unstable_api::{AParcel, AsNative};
@@ -150,7 +150,7 @@ fn round_trip_part<T: Part>(input: &[u8], mode: i32) -> Result<Vec<u8>, String> 
     finish(&out, mode)
 }
 
-/// java.util.Map (typed `in Map<String, String>`) and java.util.List (raw `in List`, Parcel.writeList) as AIDL carries them: no parcelable null flag (null is size -1), so through their Option form.
+/// java.util.TypedMap (generic `in Map<String, String>`) and java.util.List (raw `in List`, Parcel.writeList) as AIDL carries them: no parcelable null flag (null is size -1), so through their Option form.
 fn round_trip_sized<T>(input: &[u8], mode: i32) -> Result<Vec<u8>, String>
 where
     Option<T>: binder::binder_impl::Serialize + binder::binder_impl::Deserialize,
@@ -187,6 +187,23 @@ fn copy_as<T: UnstructuredParcelable>(
         .map_err(|e| format!("encode refused: {e:?}"))
 }
 
+/// [`copy_as`] for a type with no parcelable null flag (raw `Map`: size -1 = null), through its Option form; binders travel with the bytes.
+fn copy_sized<T>(src: &BorrowedParcel<'_>, dst: &mut BorrowedParcel<'_>) -> Result<(), String>
+where
+    Option<T>: binder::binder_impl::Serialize + binder::binder_impl::Deserialize,
+{
+    let v: Option<T> = src.read().map_err(|e| format!("decode refused: {e:?}"))?;
+    if src.get_data_position() != src.get_data_size() {
+        return Err(format!(
+            "decode stopped at byte {} of {}",
+            src.get_data_position(),
+            src.get_data_size()
+        ));
+    }
+    dst.write(&v)
+        .map_err(|e| format!("encode refused: {e:?}"))
+}
+
 /// The codec of `class` over Java parcels (see `Java_ParcelTruth_roundTripParcel`).
 fn copy_class(
     class: &str,
@@ -210,6 +227,7 @@ fn copy_class(
         }
         "android.view.inputmethod.ImeTracker$Token" => copy_as::<ImeTracker_Token>(src, dst),
         "android.media.PlayerBase$PlayerIdCard" => copy_as::<PlayerBase_PlayerIdCard>(src, dst),
+        "java.util.Map" => copy_sized::<Map>(src, dst),
         _ => Err(format!("no parcel-copy codec for {class}")),
     }
 }
@@ -405,7 +423,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         "android.view.InputDevice" => round_trip_as::<InputDevice>(input, mode),
         "android.view.PointerIcon" => round_trip_as::<PointerIcon>(input, mode),
         "android.view.inputmethod.EditorInfo" => round_trip_as::<EditorInfo>(input, mode),
-        "java.util.Map" => round_trip_sized::<Map>(input, mode),
+        "java.util.TypedMap" => round_trip_sized::<TypedMap>(input, mode),
         "java.util.List" => round_trip_sized::<List>(input, mode),
         _ => Err(format!("no codec for {class}")),
     }

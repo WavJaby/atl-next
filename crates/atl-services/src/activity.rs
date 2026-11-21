@@ -41,7 +41,9 @@ use atl_parcelables::android::os::Bundle;
 use atl_parcelables::android::util::MergedConfiguration;
 use atl_parcelables::android::window::SizeConfigurationBuckets;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
+use atl_parcelables::codecs::java::util::Map::Value as MapValue;
 use atl_parcelables::java::io::FileDescriptor;
+use atl_parcelables::java::util::Map;
 use atl_parcelables::parts::{
     ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo,
     ConfigurationChangeItem, LaunchActivityItem, ResumeActivityItem,
@@ -622,6 +624,52 @@ struct Inner {
     bind_services: bool,
     /// Removed Tasks whose processes wait for the top's activityDestroyed or the timeout (Task.mKillProcessesOnDestroyed)
     kill_armed: Mutex<std::collections::BTreeSet<TaskId>>,
+    /// bindApplication's `services` (mAppBindArgs, [`common_services`]), built at the first bind
+    common_services: std::sync::OnceLock<Map>,
+}
+
+/// ActivityManagerService.getCommonServicesLocked (:2793-2833, the non-isolated list; no isolated processes here), by Context constant value. ActivityThread puts the map in ServiceManager's
+/// cache, so an app reaches these without a servicemanager lookup -- the only way for those its domain may not `find` (window, display: system_api_service, not app_api_service).
+const COMMON_SERVICES: [&str; 21] = [
+    "package",
+    "permissionmgr",
+    "window",
+    "alarm",
+    "display",
+    "network_management",
+    "connectivity",
+    "accessibility",
+    "input_method",
+    "input",
+    "graphicsstats",
+    "appops",
+    "content",
+    "jobscheduler",
+    "notification",
+    "vibrator",
+    "account",
+    "power",
+    "user",
+    "mount",
+    "platform_compat",
+];
+
+/// The map of [`COMMON_SERVICES`] as addServiceToMap fills it: ServiceManager.getService of each, an absent one skipped. Built once at the first bind, as mAppBindArgs is: atl-system-services
+/// registers every service before `services: ready`, and no process starts before that, so no later registration is missed.
+fn common_services() -> Map {
+    Map {
+        entries: COMMON_SERVICES
+            .iter()
+            .filter_map(|&name| {
+                binder::check_service(name).map(|b| {
+                    (
+                        MapValue::String(Some(name.to_owned())),
+                        MapValue::Binder(Some(b)),
+                    )
+                })
+            })
+            .collect(),
+    }
 }
 
 /// The service; a clone shares it (one is registered with servicemanager, another starts the launcher package).
@@ -725,6 +773,7 @@ impl ActivityManager {
                     service_calls: active_services::Outbox::new(),
                     bind_services,
                     kill_armed: Mutex::default(),
+                    common_services: std::sync::OnceLock::new(),
                 }
             }),
         }
@@ -2133,7 +2182,8 @@ impl IActivityManager for ActivityManager {
                 inner.tasks.locale(),
             )),
             Some(&CompatibilityInfo::default()),
-            None,
+            // :4773 getCommonServicesLocked
+            Some(inner.common_services.get_or_init(common_services)),
             Some(&Bundle::default()),
             Some(BUILD_UNKNOWN),
             None,

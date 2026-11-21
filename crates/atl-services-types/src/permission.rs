@@ -7,6 +7,9 @@ pub const PER_USER_RANGE: u32 = 100_000;
 /// AID_ROOT / AID_SYSTEM.
 pub const ROOT_UID: u32 = 0;
 pub const SYSTEM_UID: u32 = 1000;
+/// The process name AMS gives system_server's own process record (ActivityManagerService.setSystemProcess; ContentProviderHelper.installSystemProviders looks it up as ("system", SYSTEM_UID)):
+/// a system-uid component declaring `android:process="system"` (SettingsProvider) runs inside system_server.
+pub const SYSTEM_PROCESS: &str = "system";
 
 /// UserHandle.getAppId.
 pub fn app_id(uid: u32) -> u32 {

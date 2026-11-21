@@ -332,8 +332,16 @@ public class ParcelTruth {
         HashMap<String, String> contexts = new HashMap<>();
         contexts.put("/data/app/com.example.app/base.apk", "PCL[]");
         contexts.put("/data/app/com.example.app/split.apk", null);
-        checkMap("Map", contexts);
-        checkMap("Map:null", null);
+        checkMap("TypedMap", contexts);
+        checkMap("TypedMap:null", null);
+        // IApplicationThread.bindApplication's raw `in Map services` (AMS getCommonServicesLocked: name -> binder), a null value and a String value included
+        HashMap<String, Object> services = new HashMap<>();
+        services.put("window", new Echo());
+        services.put("package", new Echo());
+        services.put("absent", null);
+        services.put("text", "value");
+        checkRawMap("Map", services);
+        checkRawMap("Map:null", null);
         // IPackageManager.requestPackageChecksums' trustedInstallers: two encoded certificates (odd length: the 4-byte padding) and a null element; null = TRUST_ALL; empty = TRUST_NONE
         checkList("List", Arrays.asList(new byte[] {0x30, (byte) 0x82, 0x01}, null, new byte[] {1, 2, 3, 4, 5}));
         checkList("List:null", null);
@@ -1753,6 +1761,52 @@ public class ParcelTruth {
         return m;
     }
 
+    /// Captures the raw `in Map batchedNoteOps` of an IAppOpsService.noteOperationsInBatch transaction (its only argument) as a parcel of its own: binders stay objects (appendFrom).
+    static class RawMapCapture extends Binder {
+        Parcel map;
+
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
+            data.enforceInterface("com.android.internal.app.IAppOpsService");
+            int start = data.dataPosition();
+            map = Parcel.obtain();
+            map.appendFrom(data, start, data.dataAvail());
+            map.setDataPosition(0);
+            return true;
+        }
+    }
+
+    /// java.util.Map as AIDL's raw `in Map` carries it (Parcel.writeMap, tagged values): the parcel comes from the real generated IAppOpsService Proxy, whose raw Map parameter takes any value,
+    /// as bindApplication's `services` does; Rust copies it (binders travel), Java reads the copy back the generated Stub's way (readHashMap) and gets the same keys, strings and binder objects.
+    static void checkRawMap(String name, Map<String, Object> m) {
+        RawMapCapture capture = new RawMapCapture();
+        try {
+            com.android.internal.app.IAppOpsService.Stub.asInterface(capture).noteOperationsInBatch(m);
+        } catch (Exception e) {
+            result(false, name, "generated proxy: " + e);
+            return;
+        }
+        Parcel in = capture.map;
+        Parcel out = Parcel.obtain();
+        if (roundTripParcel("java.util.Map", in, out) != 0) {
+            result(false, name, "rust: " + lastError());
+            return;
+        }
+        boolean sized = out.dataSize() == in.dataSize();
+        out.setDataPosition(0);
+        HashMap<Object, Object> back = out.readHashMap(null);
+        boolean consumed = out.dataPosition() == out.dataSize();
+        boolean same = (m == null) == (back == null) && (m == null || m.size() == back.size());
+        for (Map.Entry<String, Object> e : m == null ? Map.<String, Object>of().entrySet() : m.entrySet()) {
+            // a binder must come back as the same object (identity), a string equal
+            same = same && back.containsKey(e.getKey()) && (e.getValue() instanceof IBinder ? back.get(e.getKey()) == e.getValue() : Objects.equals(e.getValue(), back.get(e.getKey())));
+        }
+        boolean ok = sized && consumed && same;
+        result(ok, name, ok ? in.dataSize() + " bytes, java -> rust -> java, binders identical" : "sizes " + in.dataSize() + "/" + out.dataSize() + ", consumed " + consumed + ", read back " + back);
+        in.recycle();
+        out.recycle();
+    }
+
     /// java.util.Map as AIDL's typed `in Map<String, String>` carries it: the bytes come from the real generated IPackageManager Proxy (notifyDexLoad), so the codec is checked against the
     /// AIDL compiler's output, not a hand-written writer; Java reads Rust's bytes back the generated Stub's way.
     static void checkMap(String name, Map<String, String> m) {
@@ -1764,7 +1818,7 @@ public class ParcelTruth {
             return;
         }
         byte[] java = capture.map;
-        byte[] rust = roundTrip("java.util.Map", java, MODE_PLAIN);
+        byte[] rust = roundTrip("java.util.TypedMap", java, MODE_PLAIN);
         if (rust == null) {
             result(false, name, "rust: " + lastError());
             return;

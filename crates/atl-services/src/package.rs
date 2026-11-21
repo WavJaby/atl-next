@@ -833,7 +833,7 @@ impl IPackageManager for PackageManager {
     fn r#notifyDexLoad(
         &self,
         package: Option<&str>,
-        _contexts: Option<&atl_parcelables::java::util::Map>,
+        _contexts: Option<&atl_parcelables::java::util::TypedMap>,
         _isa: Option<&str>,
     ) -> binder::Result<()> {
         let caller = ThreadState::get_calling_uid();

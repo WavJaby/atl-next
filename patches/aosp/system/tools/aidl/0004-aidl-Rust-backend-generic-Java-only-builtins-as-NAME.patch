@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sun, 22 Nov 2026 03:51:14 +0800
+Subject: [PATCH] aidl: Rust backend: generic Java-only builtins as NAME<>
+
+The Java backend writes Map<K,V> as size + typed entries and a raw Map
+through Parcel.writeMap (tagged values): one Rust type cannot read both.
+--rust_java_type NAME<>=RUST_TYPE names the generic form; an
+unconfigured generic builtin (List<T>) stays the Rust backend own type,
+which retires the generic-List special case.
+
+Upstream-Status: Inappropriate [ATL host tool: Rust services serve framework AIDL to Java callers]
+Patch-Reason: one --rust_java_type per builtin name maps raw Map and Map<K,V> to one Rust type, but their bytes differ (IApplicationThread.bindApplication raw Map vs IPackageManager.notifyDexLoad Map<String,String>); no build config or preprocessed declaration names a generic builtin
+---
+SPDX-License-Identifier: Apache-2.0
+ options.cpp | 8 +++++---
+ options.h   | 8 +++++---
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/options.cpp b/options.cpp
+index 03800a8d32d2d97694e0dd0ec244d4c4d7573805..dd419330d8d825ea6d68d10947c13edc8a0203d0 100644
+--- a/options.cpp
++++ b/options.cpp
+@@ -145,7 +145,7 @@ string Options::GetUsage() const {
+        << "  --previous_hash=HASH" << endl
+        << "          Set the interface previous version's hash to HASH." << endl
+        << "  --rust_java_type=NAME=RUST_TYPE" << endl
+-       << "          Rust: accept Java-only builtin NAME, spelled RUST_TYPE." << endl
++       << "          Rust: accept Java-only builtin NAME (NAME<>: its generic form), spelled RUST_TYPE." << endl
+        << "  --rust_reply_hook=PATH" << endl
+        << "          Rust: methods default to UNKNOWN_TRANSACTION; PATH sees each non-OK reply." << endl
+        << "  --rust_java_nullability" << endl
+@@ -306,8 +306,10 @@ bool& Options::RustJavaNullability() {
+ }
+ 
+ const string* Options::RustJavaOnlyType(const string& name, bool is_generic) {
+-  auto it = RustJavaOnlyTypes().find(name);
+-  if (it == RustJavaOnlyTypes().end() || (name == "List" && is_generic)) return nullptr;
++  // the Java backend writes a generic builtin differently (Map<K,V>: size + typed entries, not
++  // Parcel.writeMap's tagged values), so it is a separate type, configured as NAME<>
++  auto it = RustJavaOnlyTypes().find(is_generic ? name + "<>" : name);
++  if (it == RustJavaOnlyTypes().end()) return nullptr;
+   return &it->second;
+ }
+ 
+diff --git a/options.h b/options.h
+index 3def689cc7eeec51ad8f6affd38cd0f52b598d33..34c8df00ab3da3fb8181515a9a4e0eb2a3f4c674 100644
+--- a/options.h
++++ b/options.h
+@@ -170,10 +170,12 @@ class Options final {
+   const vector<string>& PreprocessedFiles() const { return preprocessed_files_; }
+ 
+   // --rust_java_type NAME=RUST_TYPE: Java-only builtin NAME (Map, CharSequence, FileDescriptor,
+-  // non-generic List) is accepted by the Rust backend and spelled RUST_TYPE. Process-wide: type
+-  // checks and the Rust name mapping have no Options at hand.
++  // non-generic List) is accepted by the Rust backend and spelled RUST_TYPE; NAME<> names its
++  // generic form (Map<K,V>). Process-wide: type checks and the Rust name mapping have no Options
++  // at hand.
+   static std::map<string, string>& RustJavaOnlyTypes();
+-  // RUST_TYPE configured for a type named `name`, or nullptr; a generic List is not Java-only.
++  // RUST_TYPE configured for `name` (generic: `name<>`), or nullptr; generic List is unconfigured
++  // and stays the Rust backend's own list.
+   static const string* RustJavaOnlyType(const string& name, bool is_generic);
+   // --rust_java_nullability: every object type is nullable, as in the Java backend. Process-wide:
+   // AidlTypeSpecifier::IsNullable has no Options at hand.

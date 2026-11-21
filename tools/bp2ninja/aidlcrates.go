@@ -64,8 +64,9 @@ type AidlParcelables struct {
 }
 
 // aidlJavaOnly: the builtins aidl accepts for Java only (aidl_language.cpp LanguageSpecificCheckValid), by the Java class the Java backend spells each as (aidl_to_java.cpp); the Rust
-// backend takes them as `--rust_java_type <builtin>=<crate>::<class path>` (patches/aosp/system/tools/aidl).
-var aidlJavaOnly = [][2]string{{"Map", "java.util.Map"}, {"CharSequence", "java.lang.CharSequence"}, {"FileDescriptor", "java.io.FileDescriptor"}, {"List", "java.util.List"}}
+// backend takes them as `--rust_java_type <builtin>=<crate>::<class path>` (patches/aosp/system/tools/aidl). `Map<>` = the generic `Map<K,V>`, which the Java backend writes as size + typed
+// entries instead of Parcel.writeMap's tagged values: same Java class, other bytes, so its own Rust type, named java.util.TypedMap (no such Java class).
+var aidlJavaOnly = [][2]string{{"Map", "java.util.Map"}, {"Map<>", "java.util.TypedMap"}, {"CharSequence", "java.lang.CharSequence"}, {"FileDescriptor", "java.io.FileDescriptor"}, {"List", "java.util.List"}}
 
 // aidlCrateSpec is what an aidl crate's interface compiles (Module.aidlCrate).
 type aidlCrateSpec struct {

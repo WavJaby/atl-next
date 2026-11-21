@@ -25,7 +25,7 @@ use atl_parcelables::android::content::{ComponentName, Intent};
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::codecs::android::os::Bundle::BUNDLE_MAGIC;
-use atl_parcelables::java::util::Map;
+use atl_parcelables::java::util::{Map, TypedMap};
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::{
     BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, StatusCode,
@@ -319,7 +319,7 @@ fn app(package: &str, uid: i32, activity: &str, start_seq: i64) -> Result<usize>
         matches!(unknown, Ok(-4)),
         format!("{ABSENT}: {unknown:?}"),
     );
-    let map = Map {
+    let map = TypedMap {
         entries: vec![(
             Some(format!("{}/base.apk", atl_android_paths::DATA_APP)),
             Some("PCL[]".into()),

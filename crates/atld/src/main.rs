@@ -61,6 +61,7 @@ use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
+use atl_services_types::permission::SYSTEM_PROCESS;
 use atl_services_types::system_packages;
 use clap::Parser;
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -1446,10 +1447,12 @@ impl Host {
     /// mount namespace or cpuinfo mount of ART's own; the sandbox gives both); ignored by ART when no bridge is loaded.
     /// With `--ui` the sandbox shows the compositor socket's path; where the compositor has security contexts, that path is this process's own context socket, returned for [`Host::start`] to hold.
     /// Likewise the PipeWire socket's path shows this process's PipeWire context where PipeWire has SecurityContext; `rights` (the process's [`Right`]s) decide its audio / video source grants.
-    /// The context of a process [`Host::app_spawn`] starts: an app uid's from plat_seapp_contexts ([`atl_sepolicy::Seapp::app_context`]; seinfo `default`); a system uid's package process
-    /// (SettingsProvider, shared user android.uid.system, platform-signed) `system_app` (`user=system seinfo=platform domain=system_app`); the shell's commands (`--run-class` as AID_SHELL) `shell`.
-    fn app_context(&self, uid: u32, package: Option<&str>, target_sdk: i32) -> Result<String> {
+    /// The context of a process [`Host::app_spawn`] starts, keyed on what the process hosts: an app uid's from plat_seapp_contexts ([`atl_sepolicy::Seapp::app_context`]; seinfo `default`);
+    /// the system uid's process named [`SYSTEM_PROCESS`] (SettingsProvider's `android:process="system"`) is system_server's own process on AOSP -> `system_server`; any other system uid package
+    /// process (shared user android.uid.system, platform-signed) `system_app` (`user=system seinfo=platform domain=system_app`); the shell's commands (`--run-class` as AID_SHELL) `shell`.
+    fn app_context(&self, uid: u32, name: &str, package: Option<&str>, target_sdk: i32) -> Result<String> {
         match atl_services_types::permission::app_id(uid) {
+            AID_SYSTEM if name == SYSTEM_PROCESS => Ok(atl_sepolicy::domains::SYSTEM_SERVER.to_owned()),
             AID_SYSTEM => Ok("u:r:system_app:s0".to_owned()),
             AID_SHELL => Ok(atl_sepolicy::domains::SHELL.to_owned()),
             _ => self
@@ -1571,7 +1574,7 @@ impl Host {
                 uid,
                 context_manager: false,
                 binder_pids: BinderPids::Sandbox,
-                context: self.app_context(uid, package, target_sdk)?,
+                context: self.app_context(uid, name, package, target_sdk)?,
                 mounts: [Mount {
                 host: self.root.system(),
                 at: SYSTEM.into(),

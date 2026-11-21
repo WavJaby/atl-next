@@ -211,7 +211,7 @@ func TestAidlCrates(t *testing.T) {
 	if !slices.Contains(m.Props.strs("rustlibs"), "libx") {
 		t.Errorf("rustlibs %v lack libx, the crate of IFoo's `R rust_type \"x::R\"`", m.Props.strs("rustlibs"))
 	}
-	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || len(m.aidl.preprocessed) != 1 || !m.aidl.rustServed {
+	if !slices.Contains(m.Props.strs("rustlibs"), "libp") || !slices.Contains(m.aidl.javaTypes, "Map=p::java::util::Map") || !slices.Contains(m.aidl.javaTypes, "Map<>=p::java::util::TypedMap") || len(m.aidl.preprocessed) != 1 || !m.aidl.rustServed {
 		t.Errorf("rustlibs %v, java types %v, preprocessed %v, served %v", m.Props.strs("rustlibs"), m.aidl.javaTypes, m.aidl.preprocessed, m.aidl.rustServed)
 	}
 	if !slices.Contains(m.Props.strs("rustlibs"), "libh") || m.aidl.replyHook != "h::reply" || len(g.mods[Device]["libh"]) != 1 {
