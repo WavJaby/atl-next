@@ -29,6 +29,11 @@ literal = "/mnt"
 reason = "WSL's host-drive mount root (automount.root default), a Linux host path, not an Android one"
 
 [[allow]]
+file = "xtask/src/ws_config.rs"
+literal = "/mnt/atl-zram"
+reason = "default delta.ram_store: the Linux build host's zram mount point (plan ram-delta D7), not an Android path"
+
+[[allow]]
 file = "xtask/src/host_disk.rs"
 literal = "/mnt/c/WSL/Debian/ext4.vhdx"
 reason = "WSL vhdx path under the host-drive mount as the test's expected value"

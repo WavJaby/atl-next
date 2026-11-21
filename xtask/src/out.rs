@@ -1594,7 +1594,7 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
     let store = crate::ws_config::load(ws)?.delta.ram_store.value;
     let mut keep = live.clone();
     keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
-    let strays = crate::delta::orphan_store_dirs(&store, &keep);
+    let strays = crate::delta::orphan_store_dirs(&store, ws, &keep);
     for (id, path) in &strays {
         if !execute {
             println!("orphan ram delta {id}: {} (checkout gone)", path.display());

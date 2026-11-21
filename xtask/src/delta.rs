@@ -27,6 +27,8 @@ pub const RECORD: &str = ".delta";
 pub const ENV: &str = "ATL_XTASK_DELTA";
 /// In `<store>/<id>/`: the dir was just made; the first mount forgets the base's units reading the land checkout (out::forget_runs_reading), then removes it.
 const FRESH: &str = "fresh";
+/// In `<store>/<id>/`: the workspace path that made it. Ids are unique per workspace only.
+const OWNER: &str = "workspace";
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 /// statfs f_type of tmpfs (linux/magic.h TMPFS_MAGIC).
@@ -468,11 +470,17 @@ pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path) -> Result<Record
     };
     let sd = rec.dir(id);
     if out::present(&sd)? {
+        ensure!(
+            owned(&sd, ws),
+            "{} belongs to another workspace (its {OWNER} file): a store is shared by id, so rename this worktree",
+            sd.display()
+        );
         remove_tree(&sd)?;
     }
     std::fs::create_dir_all(sd.join("upper"))
         .with_context(|| format!("creating {}", sd.display()))?;
     std::fs::create_dir_all(sd.join("work"))?;
+    std::fs::write(sd.join(OWNER), format!("{}\n", ws.display()))?;
     std::fs::write(sd.join("upper").join(out::BASE_FILE), format!("{base}\n"))?;
     std::fs::write(sd.join(FRESH), "")?;
     let parent = dir.parent().context("build dir has no parent")?;
@@ -528,9 +536,15 @@ fn remove_tree(path: &Path) -> Result<()> {
     std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
 }
 
-/// Store dirs `<store>/<id>` (ours: holding `upper` or `work`) whose id is not in `keep`.
+/// Whether store dir `sd` names workspace `ws` as its owner ([`OWNER`]).
+fn owned(sd: &Path, ws: &Path) -> bool {
+    std::fs::read_to_string(sd.join(OWNER)).is_ok_and(|t| Path::new(t.trim()) == ws)
+}
+
+/// Store dirs `<store>/<id>` of workspace `ws` (their [`OWNER`] names it) whose id is not in `keep`. Never another workspace's: one store serves every workspace on the host, and a scratch workspace's prune once deleted a live checkout's upper mid-build (2026-11-21).
 pub fn orphan_store_dirs(
     store: &Path,
+    ws: &Path,
     keep: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, PathBuf)> {
     let Ok(rd) = std::fs::read_dir(store) else {
@@ -538,7 +552,7 @@ pub fn orphan_store_dirs(
     };
     let mut found: Vec<_> = rd
         .flatten()
-        .filter(|e| e.path().join("upper").is_dir() || e.path().join("work").is_dir())
+        .filter(|e| owned(&e.path(), ws))
         .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
         .filter(|(id, _)| !keep.contains(id))
         .collect();
@@ -966,6 +980,29 @@ mod tests {
         assert!(!rec.dir("r").exists() && !ram_dir.exists());
         std::fs::remove_dir_all(&ws).unwrap();
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Regression (2026-11-21): a scratch workspace's prune deleted a live checkout's upper in the shared store. Only dirs whose owner file names this workspace are candidates.
+    #[test]
+    fn orphan_store_dirs_are_this_workspaces_only() {
+        let store = std::env::temp_dir().join(format!("xtask-delta-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let (me, other) = (Path::new("/w/me"), Path::new("/w/other"));
+        for (id, owner) in [("mine", Some(me)), ("theirs", Some(other)), ("none", None)] {
+            std::fs::create_dir_all(store.join(id).join("upper")).unwrap();
+            if let Some(o) = owner {
+                std::fs::write(store.join(id).join(OWNER), format!("{}\n", o.display())).unwrap();
+            }
+        }
+        let keep = std::collections::BTreeSet::new();
+        let got: Vec<String> = orphan_store_dirs(&store, me, &keep)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(got, ["mine"]);
+        let keep = std::collections::BTreeSet::from(["mine".to_owned()]);
+        assert!(orphan_store_dirs(&store, me, &keep).is_empty());
+        std::fs::remove_dir_all(&store).unwrap();
     }
 
     /// Tier choice: the role rule names main and land; any other id is a child.
