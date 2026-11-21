@@ -225,6 +225,50 @@ fn centre(size: Size, display: Rect) -> Rect {
     }
 }
 
+/// Which freeform Tasks an activity's fixed-orientation request reshapes. A desktop setting (plan behaviour decision 2): the default keeps a phone app usable in a desktop window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OrientationReshape {
+    /// Every Task, resizeable ones too: a portrait request on a landscape window turns the window portrait. Our adaptation: AOSP letterboxes a resizeable activity inside the unchanged
+    /// Task instead (ActivityRecord.resolveFixedOrientationConfiguration), which needs size-compat rendering this platform does not have yet.
+    #[default]
+    Every,
+    /// AOSP: only a non-resizeable activity's Task (DesktopActivityOrientationChangeHandler.handleActivityOrientationChange returns for `task.isResizeable`).
+    Unresizeable,
+}
+
+/// The Task size an orientation request reshapes a Task of `current` size to, None when it stays: DesktopActivityOrientationChangeHandler.handleActivityOrientationChange (`:84-126`).
+/// `activity` carries the requested orientation. A square Task or a request matching the Task's shape (an unspecified one included) keeps the size; otherwise the size is calculateInitialBounds
+/// for the request ([`initial_bounds`]). AOSP anchors the new bounds at the old centre x and top; the compositor places our window, so only the size is returned.
+pub fn reshaped_size(
+    display: Rect,
+    current: (i32, i32),
+    activity: &ActivityInput,
+    policy: OrientationReshape,
+) -> Option<(i32, i32)> {
+    if policy == OrientationReshape::Unresizeable && activity.resizeable {
+        return None;
+    }
+    let (width, height) = current;
+    if width == height {
+        return None;
+    }
+    let task = if width > height {
+        Orientation::Landscape
+    } else {
+        Orientation::Portrait
+    };
+    let opposite = match activity.orientation {
+        ActivityOrientation::Portrait => task == Orientation::Landscape,
+        ActivityOrientation::Landscape => task == Orientation::Portrait,
+        ActivityOrientation::Unspecified => false,
+    };
+    if !opposite {
+        return None;
+    }
+    let bounds = initial_bounds(display, display, activity);
+    Some((bounds.width(), bounds.height()))
+}
+
 #[cfg(test)]
 mod tests {
     // Expected values are derived by hand from the AOSP formulas in each test's comment, with f32 semantics where AOSP does int/float math:
@@ -417,6 +461,49 @@ mod tests {
                 Unspecified
             );
         }
+    }
+
+    #[test]
+    fn reshape_on_a_request_against_the_task_shape() {
+        use OrientationReshape::{Every, Unresizeable};
+        // 1920x1200 display, aspect 1.6 (exact in f32), ideal 1440x900.
+        let d = at(0, 0, 1920, 1200);
+        let landscape_task = (1440, 900);
+        // Portrait resizeable on a landscape display: 1200 / 1.6 + 0.5 = 750.5 -> 750, ideal height 900.
+        assert_eq!(
+            reshaped_size(d, landscape_task, &act(Portrait, true), Every),
+            Some((750, 900))
+        );
+        // Portrait unresizeable: maximise 1440x900 portrait at 1.6: 900 / 1.6 = 562.5 -> 562 <= 1440.
+        for policy in [Every, Unresizeable] {
+            assert_eq!(
+                reshaped_size(d, landscape_task, &act(Portrait, false), policy),
+                Some((562, 900))
+            );
+        }
+        // AOSP's rule leaves a resizeable Task alone.
+        assert_eq!(
+            reshaped_size(d, landscape_task, &act(Portrait, true), Unresizeable),
+            None
+        );
+        // Landscape on a portrait Task: the display's orientation, so the ideal size.
+        assert_eq!(
+            reshaped_size(d, (750, 900), &act(Landscape, true), Every),
+            Some((1440, 900))
+        );
+        // Matching, unspecified or square: unchanged.
+        assert_eq!(
+            reshaped_size(d, landscape_task, &act(Landscape, false), Every),
+            None
+        );
+        assert_eq!(
+            reshaped_size(d, landscape_task, &act(Unspecified, false), Every),
+            None
+        );
+        assert_eq!(
+            reshaped_size(d, (900, 900), &act(Portrait, false), Every),
+            None
+        );
     }
 
     #[test]

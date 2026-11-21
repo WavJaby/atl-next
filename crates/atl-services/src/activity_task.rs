@@ -31,6 +31,7 @@ use crate::activity_stack::{Cancelled, Push};
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
 use crate::activity_start::{self, Call, Rec, Refusal, Source, Target, Then};
 use crate::config_diff::Config;
+use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
 use crate::package::USER_SYSTEM;
 use crate::packages::{Packages, Permissions, real_config_changes};
 use crate::permission_request;
@@ -39,6 +40,7 @@ use crate::token;
 use atl_parcelables::android::content::pm::{ActivityInfo, ConfigurationInfo};
 use atl_parcelables::android::content::res::Configuration;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
+use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{ROOT_UID, SYSTEM_UID};
 
 const ATM: &str = "IActivityTaskManager";
@@ -92,6 +94,20 @@ pub(crate) struct Owner {
     pub entry: bool,
     /// the label of the activity's last setTaskDescription (ActivityRecord.taskDescription.getLabel()); None until it sets one, and for a null label
     pub task_label: Option<String>,
+    /// ActivityRecord.mOrientation: the manifest's screenOrientation, then each setRequestedOrientation; kept across a relaunch (same record)
+    pub orientation: i32,
+    /// the manifest's resize mode and aspect limits as the initial-bounds rule reads them (packages::bounds_input); read through [`Owner::bounds_input`], which takes the orientation from `orientation`
+    pub bounds: ActivityInput,
+}
+
+impl Owner {
+    /// What the bounds rules read of this activity now: its manifest limits with its requested orientation.
+    pub(crate) fn bounds_input(&self) -> ActivityInput {
+        ActivityInput {
+            orientation: ActivityOrientation::from_screen_orientation(self.orientation),
+            ..self.bounds
+        }
+    }
 }
 
 /// What a Task's window is titled from ([`ActivityTasks::task_title`]): the merged TaskDescription label, and the root activity whose label stands in when there is none.
@@ -410,7 +426,12 @@ impl ActivityTasks {
             relaunching: false,
             entry: true,
             task_label: None,
+            orientation: decl.screen_orientation,
+            bounds: crate::packages::bounds_input(decl),
         };
+        // the Task's size came from this root's orientation (initial_size): the base the first top change is compared with
+        self.tasks
+            .replace_top_orientation(task, decl.screen_orientation);
         let launch = Launch {
             package: package.to_owned(),
             decl: decl.clone(),
@@ -673,6 +694,8 @@ impl ActivityTasks {
             relaunching: false,
             entry: false,
             task_label: None,
+            orientation: decl.screen_orientation,
+            bounds: crate::packages::bounds_input(decl),
         };
         let launch = Launch {
             package: calling_package.to_owned(),
@@ -908,6 +931,49 @@ impl ActivityTasks {
             package: root.package.clone(),
             class: root.component.clone(),
         })
+    }
+
+    /// setRequestedOrientation of `token`'s record (ActivityRecord.setRequestedOrientation -> setOrientation): the request becomes its mOrientation; when the record is its Task's top it is also the
+    /// Task's top orientation ([`Tasks::replace_top_orientation`]). Returns the record's Task and bounds input for the reshape check AOSP runs on every request
+    /// (notifyActivityRequestedOrientationChanged -> DesktopActivityOrientationChangeHandler); None when no record has the token.
+    pub(crate) fn set_requested_orientation(
+        &self,
+        token: &SpIBinder,
+        orientation: i32,
+    ) -> Option<(TaskId, ActivityInput)> {
+        let mut m = self.machine();
+        let owner = m.owner_mut(token)?;
+        owner.orientation = orientation;
+        let input = owner.bounds_input();
+        let task = m.task_of(token)?;
+        if m.records(task).last().is_some_and(|(top, _)| top == token) {
+            self.tasks.replace_top_orientation(task, orientation);
+        }
+        Some((task, input))
+    }
+
+    /// ActivityClientController.getRequestedOrientation:843-850: the record's mOrientation (no app-compat override is modelled), SCREEN_ORIENTATION_UNSPECIFIED for no record.
+    pub(crate) fn requested_orientation(&self, token: &SpIBinder) -> i32 {
+        self.machine()
+            .owner(token)
+            .map_or(SCREEN_ORIENTATION_UNSPECIFIED, |o| o.orientation)
+    }
+
+    /// DesktopActivityOrientationChangeHandler's task-info branch (`:72-81`): a new top activity whose orientation differs from the previous top's is checked as a request. When `token`'s record
+    /// is its Task's top and its orientation differs from the Task's top orientation at the last check, returns the Task and the record's bounds input; the check's value becomes the record's.
+    /// Called at each resume (the top changes by a push or by a finish, and the new top resumes either way).
+    pub(crate) fn top_orientation_changed(
+        &self,
+        token: &SpIBinder,
+    ) -> Option<(TaskId, ActivityInput)> {
+        let m = self.machine();
+        let task = m.task_of(token)?;
+        let (top, owner) = m.records(task).last()?;
+        if top != token {
+            return None;
+        }
+        let before = self.tasks.replace_top_orientation(task, owner.orientation);
+        (before.is_some_and(|b| b != owner.orientation)).then(|| (task, owner.bounds_input()))
     }
 
     /// Whether a record of `task` waits for its relaunch.

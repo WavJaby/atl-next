@@ -43,6 +43,8 @@ public class Main extends Activity {
     /** REMOVE_TASK (compositor_registry.rs) and the Task it names for the foreign-close probe: Integer.MAX_VALUE, a valid Task number the services never reach in one run, so no Task of this uid. */
     static final int REMOVE_TASK = 6;
     static final int FOREIGN_TASK = Integer.MAX_VALUE;
+    /** The activity meta-data whose int value the activity requests with setRequestedOrientation (window-orientation; xtask-harness/src/window.rs stage orientation). */
+    static final String REQUEST_ORIENTATION = "atl.requestOrientation";
 
     private int frameCallbacks;
 
@@ -56,6 +58,26 @@ public class Main extends Activity {
         attrs.setTitle(WINDOW_TITLE);
         getWindow().setAttributes(attrs);
         setContentView(new Quadrants(this));
+        requestOrientation();
+    }
+
+    /** Manifest meta-data REQUEST_ORIENTATION on this activity (window-orientation): setRequestedOrientation with its value at the first create, then the request read back (orientation stage). */
+    private void requestOrientation() {
+        Bundle meta;
+        try {
+            meta = getPackageManager().getActivityInfo(getComponentName(), android.content.pm.PackageManager.GET_META_DATA).metaData;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            Log.w(TAG, "own activity info: " + e);
+            return;
+        }
+        if (meta == null || !meta.containsKey(REQUEST_ORIENTATION)) {
+            return;
+        }
+        int wanted = meta.getInt(REQUEST_ORIENTATION);
+        if (getRequestedOrientation() != wanted) {
+            setRequestedOrientation(wanted);
+        }
+        Log.i(TAG, "requested orientation set=" + wanted + " get=" + getRequestedOrientation());
     }
 
     /** A start that reused this instance (singleTop in window-start): the start-finish stage's new-intent sub-gate reads this line. */
@@ -169,7 +191,7 @@ public class Main extends Activity {
     @Override
     public void onConfigurationChanged(android.content.res.Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        Log.i(TAG, "configuration changed screenWidthDp=" + newConfig.screenWidthDp);
+        Log.i(TAG, "configuration changed screenWidthDp=" + newConfig.screenWidthDp + " orientation=" + newConfig.orientation);
         logDensity("changed", newConfig);
     }
 
@@ -244,7 +266,8 @@ public class Main extends Activity {
             Rect display = wm.getMaximumWindowMetrics().getBounds();
             Log.i(TAG, "size=" + w + "x" + h + " screenWidthDp=" + getResources().getConfiguration().screenWidthDp
                     + " window=" + window.width() + "x" + window.height()
-                    + " display=" + display.width() + "x" + display.height());
+                    + " display=" + display.width() + "x" + display.height()
+                    + " orientation=" + getResources().getConfiguration().orientation);
         }
 
         /** Logs each touch: the action, the pointer's x and y, the pointer count (xtask-harness/src/window.rs input_check). An UP past BLOCK_MIN_X sleeps BLOCK_MS on the UI thread: the gtk stage's liveness probe expects no pong meanwhile. */

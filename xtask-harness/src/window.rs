@@ -254,6 +254,9 @@ enum Stage {
     Portrait,
     /// UI mode, the window tiled: the proxy gives every compositor configure the size [`TILE`], the first included, as a tiling compositor sizes a window without asking it; the Task's bounds, every layout, the display metrics and the picture are the tile's content ([`tiled_checks`]).
     Tiled,
+    /// UI mode with the orientation fixture (xtask-harness/testdata/window-orientation): opened landscape, the activity's setRequestedOrientation(PORTRAIT) reshapes the window to AOSP's portrait size
+    /// and the activity is told the portrait configuration ([`orientation_checks`]).
+    Orientation,
     /// UI mode, two processes of one uid (window-aux): a `:aux` process registered before the window's first layout, killed, restarted, then a dialog; the main window's and the dialog's layers stay in the main process's compositor (xtask-harness/src/window/aux_process.rs).
     AuxProcess,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
@@ -294,6 +297,7 @@ impl Stage {
             Stage::AuxProcess => "aux-process",
             Stage::Portrait => "portrait",
             Stage::Tiled => "tiled",
+            Stage::Orientation => "orientation",
             Stage::AppId => "app-id",
             Stage::Title => "title",
             Stage::Capture => "capture",
@@ -314,6 +318,7 @@ impl Stage {
             | Stage::Gles1
             | Stage::Portrait
             | Stage::Tiled
+            | Stage::Orientation
             | Stage::AppId
             | Stage::Title
             | Stage::Splash => GTK_WINDOW_MS,
@@ -390,6 +395,8 @@ const START_FIXTURE: &str = "xtask-harness/testdata/window-start";
 const HWUI_FIXTURE: &str = "xtask-harness/testdata/window-hwui";
 /// FIXTURE fixed to portrait and resizeable (stage portrait): its java/ links to FIXTURE's.
 const PORTRAIT_FIXTURE: &str = "xtask-harness/testdata/window-portrait";
+/// FIXTURE with no manifest orientation, requesting portrait at its first create (stage orientation): its java/ links to FIXTURE's.
+const ORIENTATION_FIXTURE: &str = "xtask-harness/testdata/window-orientation";
 /// The fixture's first onDraw on hwui's RecordingCanvas (Canvas.isHardwareAccelerated).
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
@@ -496,6 +503,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Capture
         | Stage::Portrait
         | Stage::Tiled
+        | Stage::Orientation
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -877,6 +885,88 @@ fn portrait_expected((width, height): (i32, i32)) -> (i32, i32) {
         (height as f32 / aspect + 0.5) as i32,
         (height as f32 * 0.75) as i32,
     )
+}
+
+/// Configuration.ORIENTATION_LANDSCAPE / ORIENTATION_PORTRAIT (Configuration.java:713-714) and ActivityInfo.SCREEN_ORIENTATION_PORTRAIT (1), the fixture's request (window-orientation's meta-data).
+const CONFIG_LANDSCAPE: i32 = 2;
+const CONFIG_PORTRAIT: i32 = 1;
+const REQUESTED_PORTRAIT: i32 = 1;
+/// The fixture's line after its setRequestedOrientation (Main.java requestOrientation).
+const REQUESTED_LINE: &str = "AtlWindow: requested orientation";
+
+/// Stage `orientation` sub-gates on the app's log, against values worked out from AOSP and the gate's display, not read from the services:
+/// `requested`: getRequestedOrientation returns the request. `opened`: the first layout is the landscape opening size (AOSP's ideal size, [`opening_size_i32`]), so the change is the request's.
+/// `reshaped`: the last layout is AOSP's portrait size for the display ([`portrait_expected`]) as content and window frame, in a portrait configuration. `told`: the activity (size and orientation
+/// declared) got the change as onConfigurationChanged with a portrait orientation and the portrait width in dp (px / (dpi / 160), rounded), and was created once (no relaunch).
+fn orientation_checks(app: &str, display: DisplayModel) -> Vec<Sub> {
+    let opening = opening_size_i32(display);
+    let want = portrait_expected((display.width, display.height));
+    let want_dp = (want.0 as f32 / (display.dpi as f32 / 160.0) + 0.5) as i32;
+    let layouts: Vec<&str> = app.lines().filter(|l| l.contains(LAYOUT_LINE)).collect();
+    let layout_of = |line: &str| {
+        (
+            word(line, "size").and_then(parse_wxh),
+            word(line, "window").and_then(parse_wxh),
+            word(line, "orientation").and_then(|o| o.parse::<i32>().ok()),
+        )
+    };
+    let requested = match app.lines().find(|l| l.contains(REQUESTED_LINE)) {
+        Some(line) if word(line, "get") == Some(&REQUESTED_PORTRAIT.to_string()) => {
+            Ok(line.trim().to_owned())
+        }
+        Some(line) => Err(format!("{line}: want get={REQUESTED_PORTRAIT}")),
+        None => Err("the fixture never requested an orientation".to_owned()),
+    };
+    let opened = match layouts.first().map(|l| layout_of(l)) {
+        Some((Some(size), Some(window), Some(CONFIG_LANDSCAPE)))
+            if size == opening && window == opening =>
+        {
+            Ok(format!(
+                "first layout {}x{} landscape",
+                opening.0, opening.1
+            ))
+        }
+        Some(seen) => Err(format!(
+            "first layout {seen:?}, want {opening:?} landscape ({CONFIG_LANDSCAPE})"
+        )),
+        None => Err("the fixture never laid out".to_owned()),
+    };
+    let reshaped = match layouts.last().map(|l| layout_of(l)) {
+        Some((Some(size), Some(window), Some(CONFIG_PORTRAIT)))
+            if size == want && window == want =>
+        {
+            Ok(format!(
+                "last of {} layouts {}x{} portrait",
+                layouts.len(),
+                want.0,
+                want.1
+            ))
+        }
+        Some(seen) => Err(format!(
+            "last layout {seen:?}, want {want:?} portrait ({CONFIG_PORTRAIT})"
+        )),
+        None => Err("the fixture never laid out".to_owned()),
+    };
+    let creates = app.matches(CREATE_LINE).count();
+    let told_portrait = app.lines().filter(|l| l.contains(CHANGED_LINE)).any(|l| {
+        word(l, "orientation") == Some(&CONFIG_PORTRAIT.to_string())
+            && word(l, "screenWidthDp") == Some(&want_dp.to_string())
+    });
+    let told = if creates == 1 && told_portrait {
+        Ok(format!(
+            "onConfigurationChanged screenWidthDp={want_dp} orientation={CONFIG_PORTRAIT}, 1 onCreate"
+        ))
+    } else {
+        Err(format!(
+            "{creates} onCreate, portrait change (screenWidthDp={want_dp}) told: {told_portrait}"
+        ))
+    };
+    vec![
+        ("requested", requested),
+        ("opened", opened),
+        ("reshaped", reshaped),
+        ("told", told),
+    ]
 }
 
 /// Stage `portrait` sub-gate (b): every layout's content view (`size=`) and window frame (`window=`, the relayout frame) are `want`, on the gate's display (`display=`).
@@ -2249,6 +2339,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Capture
         | Stage::Portrait
         | Stage::Tiled
+        | Stage::Orientation
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -3009,6 +3100,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             sub.push(("pong", pong_check(&liveness)));
             sub
         }
+        (Stage::Orientation, Some(_)) => {
+            let mut sub = vec![("mapped", gtk_window_check(&app))];
+            sub.extend(orientation_checks(&app, display));
+            sub.push(("pong", pong_check(&liveness)));
+            sub
+        }
         (Stage::AppId, Some(_)) => {
             let seen = app_ids.lock().map(|seen| seen.clone()).unwrap_or_default();
             vec![(
@@ -3199,6 +3296,7 @@ fn fixture(stage: Stage) -> &'static str {
         Stage::Gles2 => gles2_fixture::FIXTURE,
         Stage::Gles1 => gles1::FIXTURE,
         Stage::Portrait => PORTRAIT_FIXTURE,
+        Stage::Orientation => ORIENTATION_FIXTURE,
         Stage::AuxProcess => aux_process::FIXTURE,
         _ => FIXTURE,
     }
@@ -3827,6 +3925,49 @@ mod tests {
     fn portrait_expected_is_aosp_on_the_gate_outputs() {
         assert_eq!(portrait_expected((1920, 1200)), (750, 900));
         assert_eq!(portrait_expected((2560, 1440)), (810, 1080));
+    }
+
+    /// A run that opened landscape and ended at the portrait size, told once, passes; a run left landscape (no reshape) or relaunched fails the sub-gate that names it.
+    #[test]
+    fn orientation_checks_want_the_reshape_and_the_change() {
+        let display = DisplayModel {
+            width: 1920,
+            height: 1200,
+            dpi: 160,
+            ..DisplayModel::default()
+        };
+        // opening 1440x900 (3/4 of 1920x1200); portrait 750x900 (portrait_expected); 750 px at 160 dpi = 750 dp
+        let layout = |w: i32, h: i32, o: i32| {
+            format!(
+                "AtlWindow: size={w}x{h} screenWidthDp={w} window={w}x{h} display=1920x1200 orientation={o}\n"
+            )
+        };
+        let requested = "AtlWindow: requested orientation set=1 get=1\n";
+        let created = "AtlWindow: onCreate reached\n";
+        let told = "AtlWindow: configuration changed screenWidthDp=750 orientation=1\n";
+        let good = format!(
+            "{created}{requested}{}{told}{}",
+            layout(1440, 900, 2),
+            layout(750, 900, 1)
+        );
+        let failed = |app: &str| -> Vec<&'static str> {
+            orientation_checks(app, display)
+                .into_iter()
+                .filter(|(_, r)| r.is_err())
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert!(
+            failed(&good).is_empty(),
+            "{:?}",
+            orientation_checks(&good, display)
+        );
+        let kept = format!("{created}{requested}{}", layout(1440, 900, 2));
+        assert_eq!(failed(&kept), vec!["reshaped", "told"]);
+        let relaunched = format!("{good}{created}");
+        assert_eq!(failed(&relaunched), vec!["told"]);
+        let ignored = good.replace("get=1", "get=-1");
+        assert_eq!(failed(&ignored), vec!["requested"]);
     }
 
     /// Every layout must be the portrait size as content and as window frame, on the gate's display; one layout at another size fails the sub-gate.

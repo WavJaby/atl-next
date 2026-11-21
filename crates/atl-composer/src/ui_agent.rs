@@ -122,6 +122,17 @@ impl IUiAgent for UiAgent {
         Ok(())
     }
 
+    /// A non-positive size is the caller's bug: refused, nothing asked of the window.
+    fn resize(&self, width: i32, height: i32) -> Result<(), StatusCode> {
+        match (u32::try_from(width), u32::try_from(height)) {
+            (Ok(width @ 1..), Ok(height @ 1..)) => {
+                crate::ui_window::resize(width, height);
+                Ok(())
+            }
+            _ => Err(StatusCode::BAD_VALUE),
+        }
+    }
+
     /// The task's title as recents shows it: the TaskDescription label when it has text, else the root activity's label loaded by the app's PackageManager (Launcher3 TaskIconCache's fallback,
     /// ActivityInfo.loadLabel). The one place the window's title is decided after it opens. A failed lookup keeps the current title.
     fn task_title(

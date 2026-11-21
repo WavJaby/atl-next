@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityManager::BnActivityManager;
 use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
-use atl_services::activity::{ActivityManager, RootBack};
+use atl_services::activity::{ActivityManager, OrientationReshape, RootBack};
 use atl_services::app_id::AppIds;
 use atl_services::install;
 use atl_services::package::PackageManager;
@@ -96,6 +96,10 @@ struct Args {
     /// What an unhandled Back on a Task's launcher root does: `minimize` (Android 12+ moveTaskToBack; the app keeps running) or `close` (the root finishes; pre-Android-12).
     #[arg(long, value_parser = parse_root_back, default_value = "minimize")]
     root_back: RootBack,
+    /// Which windows an activity's fixed-orientation request (manifest screenOrientation of a new top activity, or setRequestedOrientation) reshapes: `every` (a portrait request turns a landscape
+    /// window portrait, resizeable apps included: the desktop default) or `unresizeable` (AOSP desktop windowing: only non-resizeable activities; a resizeable one keeps its window).
+    #[arg(long, value_parser = parse_orientation_reshape, default_value = "every")]
+    orientation_reshape: OrientationReshape,
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
@@ -198,6 +202,15 @@ fn parse_root_back(s: &str) -> Result<RootBack, String> {
     }
 }
 
+/// `--orientation-reshape`'s values.
+fn parse_orientation_reshape(s: &str) -> Result<OrientationReshape, String> {
+    match s {
+        "every" => Ok(OrientationReshape::Every),
+        "unresizeable" => Ok(OrientationReshape::Unresizeable),
+        _ => Err(format!("{s}: expected every or unresizeable")),
+    }
+}
+
 /// ActivityTaskManagerService's GL_ES_VERSION: `SystemProperties.getInt("ro.opengles.version", GL_ES_VERSION_UNDEFINED)` (:867); unset -> 0. A value that is not an int is atld's bug: fail the start.
 fn gl_es_version() -> Result<i32> {
     let name = atl_property_service::GLES_VERSION;
@@ -287,6 +300,7 @@ fn main() -> Result<()> {
         Arc::clone(&agents),
         !a.no_back_finish,
         a.root_back,
+        a.orientation_reshape,
         !a.no_bind_service,
     );
     if let Some(package) = &a.launch

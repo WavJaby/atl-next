@@ -60,6 +60,8 @@ use crate::broadcast::{
 };
 use crate::broadcast_queue::{self, Job};
 use crate::config_diff::{self, Config, Delivery};
+pub use crate::desktop_bounds::OrientationReshape;
+use crate::desktop_bounds::{self, ActivityInput, reshaped_size};
 use crate::memory_levels;
 use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
@@ -72,6 +74,7 @@ use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::display_model::DisplayModel;
+use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
 use atl_services_wire::ui_agent::IUiAgent;
@@ -727,7 +730,7 @@ fn under_policy(back: Back, root: RootBack) -> Back {
 
 impl ActivityManager {
     /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them.
-    /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`]. `bind_services` false is the test-only
+    /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`]. `orientation_reshape`: see [`OrientationReshape`]. `bind_services` false is the test-only
     /// break `--no-bind-service`: every bindService answers 0.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -738,6 +741,7 @@ impl ActivityManager {
         agents: Arc<UiAgents>,
         back_finish: bool,
         root_back: RootBack,
+        orientation_reshape: OrientationReshape,
         bind_services: bool,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
@@ -750,6 +754,7 @@ impl ActivityManager {
                         agents,
                         back_finish,
                         root_back,
+                        orientation_reshape,
                     },
                     BinderFeatures::default(),
                 )
@@ -3097,6 +3102,8 @@ struct ActivityClientController {
     back_finish: bool,
     /// what an unhandled Back on a launcher root does
     root_back: RootBack,
+    /// which Tasks an orientation request reshapes
+    orientation_reshape: OrientationReshape,
 }
 
 impl ActivityClientController {
@@ -3106,6 +3113,41 @@ impl ActivityClientController {
         self.agents
             .agent(process)
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
+    }
+
+    /// The reshape check (desktop_bounds::reshaped_size) of `task` for `input`, an orientation request (`why`: what made it): a due reshape goes to the Task's window as RESIZE. Logged as
+    /// `orientation reshape task=<id> <w>x<h> -> <w>x<h> (<why>)`. No Task size or no agent (headless): counted, nothing else.
+    fn reshape(&self, inner: &Inner, task: TaskId, input: &ActivityInput, why: &str) {
+        let Some(size) = inner.tasks.size(task) else {
+            atl_diag::answered(ACC, "orientation reshape: no Task size");
+            return;
+        };
+        let display = inner.tasks.display();
+        let area = desktop_bounds::Rect {
+            left: 0,
+            top: 0,
+            right: display.width,
+            bottom: display.height,
+        };
+        let current = (size.width, size.height);
+        let Some((width, height)) = reshaped_size(area, current, input, self.orientation_reshape)
+        else {
+            return;
+        };
+        log(format_args!(
+            "orientation reshape task={} {}x{} -> {width}x{height} ({why})",
+            task.raw(),
+            size.width,
+            size.height
+        ));
+        let Some(agent) = self.task_agent(task) else {
+            atl_diag::answered(ACC, "orientation reshape: no UI agent");
+            return;
+        };
+        atl_diag::answered(ACC, "orientation reshape (window resize asked)");
+        if let Err(e) = agent.resize(width, height) {
+            log(format_args!("orientation reshape: resize: {e:?}"));
+        }
     }
 
     /// moveActivityTaskToBack of `task`, of the app of `uid`: its window's UI agent minimizes the window (the desktop's "back": the Task stays, behind the others). Logged as `onBackPressed: moveTaskToBack uid=<uid>`.
@@ -3140,13 +3182,13 @@ impl IActivityClientController for ActivityClientController {
         token: Option<&SpIBinder>,
         _handle_splash_screen_exit: bool,
     ) -> binder::Result<()> {
-        if let Some(token) = token {
-            let known = self
-                .inner
-                .upgrade()
-                .is_some_and(|inner| inner.atm.resumed(token));
-            if !known {
+        if let (Some(token), Some(inner)) = (token, self.inner.upgrade()) {
+            if !inner.atm.resumed(token) {
                 atl_diag::answered(ACC, "activityResumed: no such activity");
+                return Ok(());
+            }
+            if let Some((task, input)) = inner.atm.top_orientation_changed(token) {
+                self.reshape(&inner, task, &input, "top activity");
             }
         }
         Ok(())
@@ -3237,6 +3279,38 @@ impl IActivityClientController for ActivityClientController {
             }
         }
         Ok(())
+    }
+
+    /// ActivityClientController.setRequestedOrientation:826-840 -> ActivityRecord.setRequestedOrientation: the record keeps the request, then the Task gets AOSP's reshape check
+    /// (notifyActivityRequestedOrientationChanged, every call). Not modelled: the API 36 large-screen "ignore" rule (isRestrictedFixedOrientation), which the initial bounds do not apply either.
+    /// A Task whose reshape is due asks its window for the new size; the size the compositor grants comes back as SET_BOUNDS, and the configuration change follows from there (task_resized).
+    fn r#setRequestedOrientation(
+        &self,
+        token: Option<&SpIBinder>,
+        orientation: i32,
+    ) -> binder::Result<()> {
+        let (Some(token), Some(inner)) = (token, self.inner.upgrade()) else {
+            atl_diag::answered(ACC, "setRequestedOrientation: no token");
+            return Ok(());
+        };
+        let Some((task, input)) = inner.atm.set_requested_orientation(token, orientation) else {
+            atl_diag::answered(ACC, "setRequestedOrientation: no such activity");
+            return Ok(());
+        };
+        log(format_args!(
+            "setRequestedOrientation task={} orientation={orientation}",
+            task.raw()
+        ));
+        self.reshape(&inner, task, &input, "setRequestedOrientation");
+        Ok(())
+    }
+
+    /// ActivityClientController.getRequestedOrientation:843-850.
+    fn r#getRequestedOrientation(&self, token: Option<&SpIBinder>) -> binder::Result<i32> {
+        Ok(match (token, self.inner.upgrade()) {
+            (Some(token), Some(inner)) => inner.atm.requested_orientation(token),
+            _ => SCREEN_ORIENTATION_UNSPECIFIED,
+        })
     }
 
     /// ActivityClientController.getDisplayId:626-635: the root task's display, DEFAULT_DISPLAY when invalid or when the token has no task. M2 has one display.
@@ -3350,6 +3424,7 @@ mod tests {
             Arc::new(UiAgents::default()),
             true,
             RootBack::default(),
+            OrientationReshape::default(),
             true,
         )
     }

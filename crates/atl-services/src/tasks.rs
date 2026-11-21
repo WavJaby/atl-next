@@ -40,6 +40,8 @@ struct TaskRecord {
     size: TaskSize,
     /// The seq of the override this size makes (config_seq).
     config_seq: i32,
+    /// The requested orientation of the top activity at the last orientation check (replace_top_orientation); None before the first.
+    top_orientation: Option<i32>,
 }
 
 /// What a window's frame and surface position are computed from (WindowState.mAttrs + mRequestedWidth/Height): set at addToDisplay, replaced by each relayout, read again by `resized`.
@@ -187,6 +189,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
                 package: package.to_owned(),
                 size,
                 config_seq: 0,
+                top_orientation: None,
             },
         );
         id
@@ -215,6 +218,15 @@ impl<C: Clone + PartialEq> Tasks<C> {
     /// Whether the app `owner` has a Task: only such an app reports the monitor (registry SET_DISPLAY).
     pub fn owns_any(&self, owner: u32) -> bool {
         self.lock().tasks.values().any(|t| t.owner == owner)
+    }
+
+    /// Sets `task`'s top orientation (the requested orientation of its top activity at the last check, activity_task.rs top_orientation_changed) and returns the one it replaces: None before
+    /// the first, and for no Task.
+    pub fn replace_top_orientation(&self, task: TaskId, orientation: i32) -> Option<i32> {
+        self.lock()
+            .tasks
+            .get_mut(&task)
+            .and_then(|t| t.top_orientation.replace(orientation))
     }
 
     /// The size of `task`; None for no Task.

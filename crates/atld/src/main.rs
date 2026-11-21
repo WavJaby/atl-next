@@ -241,6 +241,10 @@ struct Args {
     /// What an unhandled Back on an app's root activity does, passed to the services: `minimize` (the window is minimized, the app keeps running; Android 12+) or `close` (the app's window closes).
     #[arg(long, value_parser = ["minimize", "close"], default_value = "minimize")]
     root_back: String,
+    /// Which windows an activity's fixed-orientation request reshapes, passed to the services: `every` (a portrait request turns a landscape window portrait, resizeable apps included) or
+    /// `unresizeable` (AOSP desktop windowing: only non-resizeable activities).
+    #[arg(long, value_parser = ["every", "unresizeable"], default_value = "every")]
+    orientation_reshape: String,
     /// Test only: passed to the services (`--no-sensor-service`), the deliberate break of the sensors gate's empty stage.
     #[arg(long)]
     no_sensor_service: bool,
@@ -2945,6 +2949,8 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     services_args.push("--root-back".into());
     services_args.push(a.root_back.clone().into());
+    services_args.push("--orientation-reshape".into());
+    services_args.push(a.orientation_reshape.clone().into());
     if a.no_sensor_service {
         services_args.push("--no-sensor-service".into());
     }

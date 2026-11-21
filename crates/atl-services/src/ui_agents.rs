@@ -234,6 +234,9 @@ pub(crate) mod tests_support {
         fn minimize(&self) -> Result<(), StatusCode> {
             Ok(())
         }
+        fn resize(&self, _: i32, _: i32) -> Result<(), StatusCode> {
+            Ok(())
+        }
         fn task_title(&self, _: Option<&str>, _: &str, _: &str) -> Result<(), StatusCode> {
             Ok(())
         }

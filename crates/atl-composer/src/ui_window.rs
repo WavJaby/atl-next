@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
-    Capture, DisplayInvoker, FrameClock, FrameRequester, InputSource, LooperPoster, PlatformUi,
-    PlatformWindow, Ui, UiError, Window, WindowAttributes,
+    Capture, DisplayInvoker, FrameClock, FrameRequester, InputSource, LooperPoster, PhysSize,
+    PlatformUi, PlatformWindow, Ui, UiError, Window, WindowAttributes,
 };
 
 use atl_services_types::compositor_registry::Splash;
@@ -73,6 +73,22 @@ pub fn minimize() {
         SESSION.with_borrow(|session| {
             if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
                 window.minimize();
+            }
+        });
+    }));
+}
+
+/// The services' wanted Task size (UI agent RESIZE, an orientation request's reshape) as the window's requested content size, physical px; from any thread. The compositor decides: the size it
+/// grants reaches the services as the Task's bounds through the window's size reports (task_reports.rs), the one route a size change takes. Logged as `atl-composer: ui: resize <w>x<h>`.
+pub fn resize(width: u32, height: u32) {
+    let Some(invoker) = INVOKER.get() else {
+        return;
+    };
+    invoker.invoke(Box::new(move || {
+        SESSION.with_borrow(|session| {
+            if let Some(window) = session.as_ref().and_then(|s| s.window.as_ref()) {
+                tracing::info!("atl-composer: ui: resize {width}x{height}");
+                window.set_size(PhysSize { width, height });
             }
         });
     }));
