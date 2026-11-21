@@ -1132,6 +1132,26 @@ fn a_queued_transaction_keeps_its_layer_until_it_is_applied() {
     assert_eq!(releases(&gone.calls).len(), 1, "the shown buffer goes with it");
 }
 
+/// The gate's break (`hold_handles` false): the death goes before the tick's transactions, so the same sequence meets an unknown layer.
+#[test]
+fn without_the_hold_a_queued_transaction_meets_an_unknown_layer() {
+    let layer = local(1);
+    let mut c = Compositor::new(CompositorConfig {
+        hold_handles: false,
+        ..Default::default()
+    });
+    c.create_layer(spec(layer, 1, None)).unwrap();
+    c.queue_transaction(tx(vec![flags_state(
+        &layer,
+        layer_flags::HIDDEN,
+        layer_flags::HIDDEN,
+    )]));
+    c.handle_destroyed(key(&layer));
+    c.on_frame(1);
+    assert_eq!(c.counters().unknown_layer, 1);
+    assert_eq!(c.layer_count(), 0);
+}
+
 /// RequestedLayerState::canBeDestroyed (`!handleAlive && parentId == UNASSIGNED`): a child whose handle died stays, drawn, while its parent lives; the parent's end takes it along. A child whose
 /// handle lives survives its parent's end, offscreen.
 #[test]

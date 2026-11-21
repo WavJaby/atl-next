@@ -47,7 +47,8 @@ pub struct CompositorConfig {
     /// Queued buffers are latched. false = a gate's deliberate break only (`xtask test window --stage hwui --break-queue`): every buffer a transaction carries is dropped unlatched, as if the producer never queued it, so no frame reaches the scene and the readback check must fail.
     pub latch_buffers: bool,
     /// A queued transaction holds the handles it names ([`Compositor::handle_destroyed`]). false = a gate's deliberate break only (`xtask test window --stage aux-process --break-handle-hold`): a handle's
-    /// death is processed at the next tick whatever is queued, so a transaction applied after its sender released the layer meets an unknown layer and the stage's `released-layer` check must fail.
+    /// death is processed at the next tick before that tick's transactions, whatever is queued (the order before handles held layers), so a transaction applied after its sender released the layer
+    /// meets an unknown layer and the stage's `released-layer` check must fail.
     pub hold_handles: bool,
 }
 
@@ -844,11 +845,15 @@ impl Compositor {
         let mut calls = Vec::new();
         let mut applied = Vec::new();
         // the deaths this tick processes: a queued transaction holds its handles until it is applied, so a handle it names dies at a later tick (after the transaction, as in SurfaceFlinger)
-        let (due, held): (Vec<BinderKey>, Vec<BinderKey>) = self
+        let (mut due, held): (Vec<BinderKey>, Vec<BinderKey>) = self
             .dead_handles
             .iter()
             .partition(|k| !self.config.hold_handles || !self.queued_hold(**k));
         self.counters.handle_deaths_deferred += held.len() as u64;
+        // the break: every death before the tick's transactions, which then meet unknown layers
+        if !self.config.hold_handles {
+            self.process_dead_handles(std::mem::take(&mut due), &mut calls);
+        }
         let tokens: Vec<_> = self.queues.keys().copied().collect();
         for token in tokens {
             while let Some(front) = self.queues.get(&token).and_then(VecDeque::front) {
