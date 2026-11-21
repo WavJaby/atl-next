@@ -99,12 +99,6 @@ impl Latch<'_> {
             s.pending_since = Some(at_ns);
         }
     }
-
-    /// The slot's scene names a buffer released outside a latch (a destroyed layer): it is dropped, and the next tick publishes the scene without it.
-    pub fn clear(&mut self) {
-        self.inner.scene = None;
-        self.inner.pending_since = None;
-    }
 }
 
 fn buffers(scene: &Scene) -> impl Iterator<Item = (u64, i32)> + '_ {
@@ -243,7 +237,7 @@ mod tests {
         assert_eq!((s.published, s.dropped, s.taken), (2, 1, 1));
     }
 
-    /// The pending present: set by the publish that fills the empty slot, kept by a replacement, ended by a take or a clear.
+    /// The pending present: set by the publish that fills the empty slot, kept by a replacement, ended by a take.
     #[test]
     fn pending_since_the_first_untaken_publish() {
         let m = Mailbox::default();
@@ -257,9 +251,6 @@ mod tests {
         );
         m.take().expect("a scene");
         assert_eq!(m.latch().pending_since(), None, "taken");
-        m.latch().publish(scene(3, &[(7, 12)]), 300);
-        m.latch().clear();
-        assert_eq!(m.latch().pending_since(), None, "cleared");
     }
 
     /// A buffer stays held from its take until its release report; the report's fence reaches the clock once, with the report flag.
