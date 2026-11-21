@@ -17,6 +17,7 @@
 //! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
+//! Security contexts: a `wp_security_context_manager_v1.create_listener` is relayed ([`relay_context`]), so atld's per-app context sockets reach the compositor through the proxy too, under the context.
 //! Forwarding keeps libwayland's fd semantics: fds are a FIFO attached to bytes, so each batch of complete messages goes out with all fds received so far (at most [`MAX_FDS_PER_SEND`] per `sendmsg`).
 
 use std::collections::HashMap;
@@ -601,24 +602,24 @@ impl Proxy {
         let (tx, events) = channel();
         let injections = Arc::new(Mutex::new(Vec::new()));
         let wakes = Arc::new(Mutex::new(Vec::new()));
-        let (up, inj, wk) = (
-            upstream.to_owned(),
-            Arc::clone(&injections),
-            Arc::clone(&wakes),
-        );
-        // the connection that owns the window (server_to_client): set once, never handed over
-        let window: Shared<Option<usize>> = Arc::default();
         let presented: Arc<Presented> = Arc::default();
         let throttle: Arc<Throttle> = Arc::default();
-        let counters = Counters {
-            presented: Arc::clone(&presented),
-            throttle: Arc::clone(&throttle),
+        let hub = Hub {
+            upstream: upstream.to_owned(),
+            events: tx,
+            injections: Arc::clone(&injections),
+            wakes: Arc::clone(&wakes),
+            // the connection that owns the window (server_to_client): set once, never handed over
+            window: Arc::default(),
+            counters: Counters {
+                presented: Arc::clone(&presented),
+                throttle: Arc::clone(&throttle),
+            },
         };
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
-                match serve(client, &up, &tx, &inj, &wk, &window, &counters) {
-                    Ok(()) => {}
-                    Err(e) => eprintln!("wayland proxy: connection setup failed: {e:#}"),
+                if let Err(e) = serve(client, &hub) {
+                    eprintln!("wayland proxy: connection setup failed: {e:#}");
                 }
             }
         });
@@ -742,42 +743,53 @@ impl Drop for Proxy {
 type Shared<T> = Arc<Mutex<T>>;
 
 /// The proxy-wide counters every connection adds to.
+#[derive(Clone)]
 struct Counters {
     presented: Arc<Presented>,
     throttle: Arc<Throttle>,
 }
 
-fn serve(
-    client: UnixStream,
-    upstream: &Path,
-    events: &Sender<(Instant, Event)>,
-    injections: &Shared<Vec<Injection>>,
-    wakes: &Shared<Vec<OwnedFd>>,
-    window: &Shared<Option<usize>>,
-    counters: &Counters,
-) -> Result<()> {
-    let server = UnixStream::connect(upstream)
-        .with_context(|| format!("connecting to {}", upstream.display()))?;
+/// What every connection of one proxy shares. A security context's relayed connections ([`relay_context`]) share it too, with the proxy's context listener as their upstream.
+#[derive(Clone)]
+struct Hub {
+    upstream: PathBuf,
+    events: Sender<(Instant, Event)>,
+    injections: Shared<Vec<Injection>>,
+    wakes: Shared<Vec<OwnedFd>>,
+    window: Shared<Option<usize>>,
+    counters: Counters,
+}
+
+/// security-context-v1.xml: `wp_security_context_manager_v1` request 1 `create_listener(new_id, listen_fd, close_fd)`.
+const SECURITY_CONTEXT_MANAGER: &str = "wp_security_context_manager_v1";
+const CREATE_LISTENER: u16 = 1;
+
+fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
+    let server = UnixStream::connect(&hub.upstream)
+        .with_context(|| format!("connecting to {}", hub.upstream.display()))?;
     let ids: Shared<Ids> = Arc::new(Mutex::new(Ids {
-        presented: Arc::clone(&counters.presented),
-        throttle: Arc::clone(&counters.throttle),
+        presented: Arc::clone(&hub.counters.presented),
+        throttle: Arc::clone(&hub.counters.throttle),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
-    wakes
+    hub.wakes
         .lock()
         .map_err(|_| anyhow::anyhow!("wake list poisoned"))?
         .push(wake.try_clone()?);
 
     let (client_r, server_w) = (client.try_clone()?, server.try_clone()?);
-    let (ids_c, events_c) = (Arc::clone(&ids), events.clone());
+    let (ids_c, hub_c) = (Arc::clone(&ids), hub.clone());
     thread::spawn(move || {
-        let _ = client_to_server(&client_r, &server_w, &ids_c, &events_c);
+        let _ = client_to_server(&client_r, &server_w, &ids_c, &hub_c);
         let _ = server_w.shutdown(std::net::Shutdown::Both);
-        let _ = events_c.send((Instant::now(), Event::Closed));
+        let _ = hub_c.events.send((Instant::now(), Event::Closed));
     });
-    let (events_s, injections, window) =
-        (events.clone(), Arc::clone(injections), Arc::clone(window));
+    let (events_s, injections, window) = (
+        hub.events.clone(),
+        Arc::clone(&hub.injections),
+        Arc::clone(&hub.window),
+    );
     thread::spawn(move || {
         let _ = server_to_client(
             &server,
@@ -797,8 +809,9 @@ fn client_to_server(
     client: &UnixStream,
     server: &UnixStream,
     ids: &Shared<Ids>,
-    events: &Sender<(Instant, Event)>,
+    hub: &Hub,
 ) -> Result<()> {
+    let events = &hub.events;
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
     loop {
@@ -832,6 +845,14 @@ fn client_to_server(
                         &raw[HEADER_BYTES..HEADER_BYTES + 4],
                     ));
                 } else if !absorbed {
+                    if opcode == CREATE_LISTENER
+                        && ids.interfaces.get(&object).map(String::as_str)
+                            == Some(SECURITY_CONTEXT_MANAGER)
+                    {
+                        // a refused relay must not leave the client's listener served by the compositor directly, past the proxy
+                        relay_context(hub, &mut fds)
+                            .context("wayland proxy: relaying a security context")?;
+                    }
                     forwarded.extend_from_slice(raw);
                 }
                 if let Some(event) = event {
@@ -845,6 +866,57 @@ fn client_to_server(
             forward(server.as_fd(), &forwarded, &mut fds)?;
         }
         pending.drain(..complete);
+    }
+}
+
+/// `create_listener`'s fds in `fds` (listen, close: argument order) swapped for the proxy's own: the compositor serves a listener of the proxy's under the client's context (the metadata requests that follow pass unchanged),
+/// and the proxy accepts on the client's listener and relays each connection there like any other, so injections and events reach a context's clients too. The client's close_fd hanging up ends the relay and hangs up the compositor's.
+fn relay_context(hub: &Hub, fds: &mut Vec<OwnedFd>) -> Result<()> {
+    static CONTEXTS: AtomicU64 = AtomicU64::new(0);
+    // any other fd queued with the request would make the two ambiguous; the context's creator sends it on a connection of its own (atl-platform-host wayland_context)
+    let [listen, close]: [OwnedFd; 2] =
+        std::mem::take(fds).try_into().map_err(|v: Vec<OwnedFd>| {
+            anyhow::anyhow!("create_listener with {} queued fds, not its 2", v.len())
+        })?;
+    let n = CONTEXTS.fetch_add(1, Ordering::Relaxed);
+    // beside the compositor's socket (the gate's private runtime dir)
+    let path = PathBuf::from(format!("{}-proxy-context-{n}", hub.upstream.display()));
+    let _ = std::fs::remove_file(&path);
+    let ours = UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    let (close_r, close_w) = std::io::pipe()?;
+    fds.push(OwnedFd::from(ours));
+    fds.push(OwnedFd::from(close_r));
+    let relay = Hub {
+        upstream: path,
+        ..hub.clone()
+    };
+    let theirs = UnixListener::from(listen);
+    thread::spawn(move || {
+        if let Err(e) = accept_context(&theirs, &close, &relay) {
+            eprintln!("wayland proxy: security context relay ended: {e:#}");
+        }
+        // the compositor's close_fd hangs up with close_w; its listener's file goes
+        drop(close_w);
+        let _ = std::fs::remove_file(&relay.upstream);
+    });
+    Ok(())
+}
+
+/// Accepts on a context client's `listener` until its `close` fd is readable or hangs up.
+fn accept_context(listener: &UnixListener, close: &OwnedFd, relay: &Hub) -> Result<()> {
+    loop {
+        let mut watch = [
+            PollFd::new(listener, PollFlags::IN),
+            PollFd::new(close, PollFlags::IN),
+        ];
+        poll(&mut watch, None)?;
+        if !watch[1].revents().is_empty() {
+            return Ok(());
+        }
+        if !watch[0].revents().is_empty() {
+            let (client, _) = listener.accept()?;
+            serve(client, relay)?;
+        }
     }
 }
 

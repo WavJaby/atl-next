@@ -16,6 +16,9 @@ fontconfig.workspace = true
 gtk4.workspace = true
 rustix.workspace = true
 tracing.workspace = true
+# atld's own compositor connection, only to register per-app security contexts (wayland_context.rs; staging protocol security-context-v1)
+wayland-client.workspace = true
+wayland-protocols = { workspace = true, features = ["staging"] }
 zbus.workspace = true
 
 [lints]

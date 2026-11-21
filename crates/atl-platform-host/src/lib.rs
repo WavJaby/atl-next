@@ -29,6 +29,9 @@ pub use atl_platform_host_linux::ui_locale;
 /// The user's persistent data root (atld `--data-root` default) in the desktop's per-user data dir (Linux: `$XDG_DATA_HOME/atl`, else `~/.local/share/atl`); `None` where the OS names no such dir.
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::user_data_root;
+/// Per-app-process Wayland security contexts (`wp_security_context_v1`): a listening socket the compositor serves with privileged globals withheld; probed, so a compositor without the protocol gives `Probe::Unavailable`.
+#[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::wayland_context;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("atl-platform-host has no implementation for this target OS");

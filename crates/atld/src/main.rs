@@ -45,6 +45,7 @@ use atl_broker::{
 };
 use atl_gralloc::node::{self, AllocatorTier, NodeSource, UDMABUF_DEVICE};
 use atl_gralloc::vintf;
+use atl_platform_host::wayland_context::{self, AppContext};
 use atl_platform_host::{
     DesktopNotification, Notifications, PlatformNotifications, Posted, Urgency,
 };
@@ -585,15 +586,43 @@ fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
     Ok(model.dirs)
 }
 
-/// The desktop paths a UI app reads (atl_platform_host::app_access), read-only at their own paths. No compositor socket is an error: a UI run without one cannot show a window.
+/// fontconfig's paths a UI app reads (atl_platform_host::app_access), read-only at their own paths.
 fn desktop_mounts() -> Result<Vec<Mount>> {
-    use atl_platform_host::app_access;
-    let socket = app_access::wayland_socket()
-        .context("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)")?;
-    Ok(std::iter::once(socket)
-        .chain(app_access::fontconfig_paths()?)
-        .map(|p| ro_at_own_path(&p))
+    Ok(atl_platform_host::app_access::fontconfig_paths()?
+        .iter()
+        .map(|p| ro_at_own_path(p))
         .collect())
+}
+
+/// The compositor a UI run's apps connect to: its socket (atl_platform_host::app_access::wayland_socket) and, where it offers `wp_security_context_manager_v1`, the per-process contexts an app connects through instead
+/// (its sandbox shows its context socket at the compositor socket's path; the compositor withholds its privileged globals from it). Without the protocol the app sees the socket as-is.
+struct Wayland {
+    socket: PathBuf,
+    contexts: Option<wayland_context::Contexts>,
+}
+
+impl Wayland {
+    /// Probes the compositor once; logs `wayland: security context available|unavailable (<reason>)`. No compositor socket is an error: a UI run without one cannot show a window.
+    fn probe() -> Result<Self> {
+        let socket = atl_platform_host::app_access::wayland_socket()
+            .context("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)")?;
+        let contexts = match wayland_context::Contexts::probe(&socket) {
+            wayland_context::Probe::Available(c) => {
+                log(format_args!(
+                    "wayland: security context available (engine {})",
+                    wayland_context::SANDBOX_ENGINE
+                ));
+                Some(c)
+            }
+            wayland_context::Probe::Unavailable(why) => {
+                log(format_args!(
+                    "wayland: security context unavailable ({why}): apps get the compositor socket as-is"
+                ));
+                None
+            }
+        };
+        Ok(Self { socket, contexts })
+    }
 }
 
 /// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it; /system's CA store from the distro bundle.
@@ -1135,8 +1164,10 @@ struct Host {
     screencap: Option<PathBuf>,
     /// The host paths every process of the runtime reads, at the same paths (ro_at_own_path): the LD_LIBRARY_PATH dirs, the ART root, the host files /system and /vendor link to.
     shared_ro: Vec<Mount>,
-    /// With `--ui`: what each app's GTK side reads from the desktop, read-only at its own path (atl_platform_host::app_access): the compositor socket, fontconfig's file and font dirs. Headless: none.
+    /// With `--ui`: fontconfig's file and font dirs each app's GTK side reads, read-only at their own paths (atl_platform_host::app_access). Headless: none.
     desktop_ro: Vec<Mount>,
+    /// With `--ui`: the compositor an app's GTK side connects to. Headless: None.
+    wayland: Option<Wayland>,
     /// The desktop's PipeWire socket (atl_platform_host::app_access::pipewire_socket): every app process gets it read-only at its own path and names it to its launcher (`--pipewire-socket`). None: no server, and the apps' tracks fail.
     pipewire: Option<PathBuf>,
     /// The device nodes each app process may open: the run's GPU's class and the heap tier's heap (`run`).
@@ -1311,6 +1342,7 @@ impl Host {
     /// that starts again keeps the earlier run's lines). `instruction_set`: an app package's ([`InstructionSets`]), passed as zygote args carry it; None for a process of no package (the shell's), which runs
     /// the runtime's own ISA. `package`: the app's, whose data dir ([`app_data_dir`]) ART's native bridge gets as zygote's specialization hands it (`-Xnative-bridge-app-data-dir`, patches/aosp/art 0004: its code cache there, no
     /// mount namespace or cpuinfo mount of ART's own; the sandbox gives both); ignored by ART when no bridge is loaded.
+    /// With `--ui` the sandbox shows the compositor socket's path; where the compositor has security contexts, that path is this process's own context socket, returned for [`Host::start`] to hold.
     #[allow(clippy::too_many_arguments)]
     fn app_spawn(
         &self,
@@ -1322,7 +1354,30 @@ impl Host {
         boot: &[String],
         class: &str,
         args: &[String],
-    ) -> Result<Spawn> {
+    ) -> Result<(Spawn, Option<AppContext>)> {
+        let app_id = package.map(atl_launch::app_id).transpose()?;
+        let (wayland_mount, wayland) = match &self.wayland {
+            None => (None, None),
+            Some(Wayland {
+                socket,
+                contexts: None,
+            }) => (Some(ro_at_own_path(socket)), None),
+            Some(Wayland {
+                socket,
+                contexts: Some(c),
+            }) => {
+                let ctx = c
+                    .create(app_id.as_deref())
+                    .with_context(|| format!("{name}: Wayland security context"))?;
+                log(format_args!("wayland: security context applied ({name})"));
+                let m = Mount {
+                    host: ctx.socket().to_path_buf(),
+                    at: socket.clone(),
+                    writable: false,
+                };
+                (Some(m), Some(ctx))
+            }
+        };
         let boot = boot.join(":");
         let launcher_args: Vec<OsString> =
             [format!("--target-sdk={target_sdk}"), "--app".to_owned()]
@@ -1355,11 +1410,12 @@ impl Host {
                 .map(OsString::from)
                 .collect();
         let (stdout, stderr) = self.bounded_log(name)?;
-        Ok(Spawn {
-            uid,
-            context_manager: false,
-            binder_pids: BinderPids::Sandbox,
-            mounts: [Mount {
+        Ok((
+            Spawn {
+                uid,
+                context_manager: false,
+                binder_pids: BinderPids::Sandbox,
+                mounts: [Mount {
                 host: self.root.system(),
                 at: SYSTEM.into(),
                 writable: false,
@@ -1388,27 +1444,30 @@ impl Host {
             // the runtime's shared host paths; the package's own directories come with start_app (package_mounts)
             .chain(self.shared_ro.iter().cloned())
             .chain(self.desktop_ro.iter().cloned())
+            .chain(wayland_mount)
             .chain(self.pipewire.iter().map(|p| ro_at_own_path(p)))
             // a translated app's host readers see the guest's CPU, as on a device (libnativebridge MountCpuinfo); the broker binds it after the fresh /proc
             .chain(cpuinfo_mount(&self.cpuinfo, instruction_set))
             .collect(),
-            links: vec![],
-            devices: self.app_devices.clone(),
-            property_area: Some(self.process_properties(uid, name)?),
-            rights: vec![],
-            app_id: package.map(atl_launch::app_id).transpose()?,
-            program: self.launcher.clone(),
-            args: launcher_args,
-            env: self
-                .art_env()
-                .into_iter()
-                .chain(self.app_env.iter().cloned())
-                .collect(),
-            cwd: None,
-            stdin: None,
-            stdout,
-            stderr,
-        })
+                links: vec![],
+                devices: self.app_devices.clone(),
+                property_area: Some(self.process_properties(uid, name)?),
+                rights: vec![],
+                app_id,
+                program: self.launcher.clone(),
+                args: launcher_args,
+                env: self
+                    .art_env()
+                    .into_iter()
+                    .chain(self.app_env.iter().cloned())
+                    .collect(),
+                cwd: None,
+                stdin: None,
+                stdout,
+                stderr,
+            },
+            wayland,
+        ))
     }
 
     /// A package's own directories (as commit made them): its APKs and native libraries read-only at /data/app/<package> (a `system` package's code is in its partition, bound for every app),
@@ -1450,8 +1509,15 @@ impl Host {
         });
     }
 
-    /// Starts `spawn`; a thread reaps it. `main`: the `--run-class` command, whose end is the run's (`done`).
-    fn start(self: &Arc<Self>, spawn: Spawn, main: bool, controlled: bool) -> Result<i32> {
+    /// Starts `spawn`; a thread reaps it. `wayland`: the process's security context ([`Host::app_spawn`]), held until the process is reaped, so the compositor serves its socket exactly while it lives.
+    /// `main`: the `--run-class` command, whose end is the run's (`done`).
+    fn start(
+        self: &Arc<Self>,
+        spawn: Spawn,
+        wayland: Option<AppContext>,
+        main: bool,
+        controlled: bool,
+    ) -> Result<i32> {
         let Process {
             mut child,
             host_pid,
@@ -1467,6 +1533,7 @@ impl Host {
             .name(format!("reap-{host_pid}"))
             .spawn(move || {
                 let status = child.wait();
+                drop(wayland);
                 host.controlled
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1518,7 +1585,7 @@ impl Host {
             req.package,
             self.root.data_root.display()
         );
-        let mut spawn = self.app_spawn(
+        let (mut spawn, wayland) = self.app_spawn(
             req.uid,
             &req.process_name,
             req.target_sdk,
@@ -1544,7 +1611,7 @@ impl Host {
             });
         }
         spawn.rights = req.rights.clone();
-        let pid = self.start(spawn, false, true)?;
+        let pid = self.start(spawn, wayland, false, true)?;
         let _ = self.first_app_ms.set(wall_ms());
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -2557,6 +2624,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         } else {
             vec![]
         },
+        wayland: a.ui.is_some().then(Wayland::probe).transpose()?,
         pipewire: atl_platform_host::app_access::pipewire_socket(),
         first_app_ms: OnceLock::new(),
         log_limits: applog::Limits {
@@ -2751,7 +2819,7 @@ fn run(a: &Args) -> Result<ExitCode> {
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
-        let spawn = host.app_spawn(
+        let (spawn, wayland) = host.app_spawn(
             uid,
             name,
             PLATFORM_SDK,
@@ -2761,7 +2829,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             class,
             &a.run_args,
         )?;
-        let pid = host.start(spawn, true, false)?;
+        let pid = host.start(spawn, wayland, true, false)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }
     // the control socket is up once everything above is: a `start` reaches running services

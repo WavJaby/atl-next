@@ -7,6 +7,7 @@
 //! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
 //! The resolver (judge_resolv): with INTERNET the probe reads the host's /etc/resolv.conf through whatever link chain the host has (WSL `/mnt/wsl/resolv.conf`, systemd-resolved `/run/...`); a dangling link reads ENOENT and fails it.
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
+//! Wayland (wayland_rows): on the gates' labwc, the probe connects through a per-app security context as atld gives it; no privileged interface offered, a privileged bind fails, ATL's interfaces stay. Deliberate break: mount `nested.socket` instead of the context socket; the row must then fail.
 //! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
 
 use std::collections::BTreeMap;
@@ -123,6 +124,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     drop(listener);
     let mut fails = Vec::new();
     let mut lines = Vec::new();
+    let (wl_line, wl_fails) = wayland_rows(&broker, &probe, &work)?;
+    println!(
+        "sandbox: wayland {}",
+        if wl_fails.is_empty() { "ok" } else { "FAILED" }
+    );
+    fails.extend(wl_fails);
+    lines.push(format!("[wayland] {wl_line}"));
     for (tag, run) in runs {
         let p = run?;
         match p.abi {
@@ -420,6 +428,149 @@ fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
                 "TCP connect not refused without INTERNET",
             )
         });
+    }
+    fails
+}
+
+/// Interfaces no sandboxed client may get: screen capture, clipboard managers, other windows' list, input injection, output / gamma / power control, shell layers and locks, input methods, DRM leases, a nested context.
+/// The ones every surveyed wlroots-family policy withholds: sway server.c `is_privileged` (deny-list), labwc server.c `server_global_filter` (allow-list `allow_for_sandbox`, these all outside it), Hyprland ProtocolManager.cpp
+/// `isGlobalPrivileged` (allow-list, these all outside it) -- read 2026-11-21. Plus Hyprland's own capture/shortcut/input-capture/CTM managers, which only it offers (outside its allow-list). Interfaces the policies disagree on (zxdg_output_manager_v1,
+/// keyboard-shortcuts-inhibit) are left out: neither answer is a leak this row can name.
+const PRIVILEGED: &[&str] = &[
+    "zwlr_screencopy_manager_v1",
+    "ext_image_copy_capture_manager_v1",
+    "zwlr_export_dmabuf_manager_v1",
+    "zwlr_data_control_manager_v1",
+    "ext_data_control_manager_v1",
+    "zwlr_foreign_toplevel_manager_v1",
+    "ext_foreign_toplevel_list_v1",
+    "zwp_virtual_keyboard_manager_v1",
+    "zwlr_virtual_pointer_manager_v1",
+    "zwlr_output_manager_v1",
+    "zwlr_output_power_manager_v1",
+    "zwlr_gamma_control_manager_v1",
+    "zwlr_layer_shell_v1",
+    "ext_session_lock_manager_v1",
+    "zwp_input_method_manager_v2",
+    "wp_drm_lease_device_v1",
+    "wp_security_context_manager_v1",
+    "hyprland_toplevel_export_manager_v1",
+    "hyprland_global_shortcuts_manager_v1",
+    "hyprland_input_capture_manager_v1",
+    "hyprland_ctm_control_manager_v1",
+];
+
+/// What ATL's app side binds (GTK 4's Wayland backend + atl-platform-ui-linux: presentation.rs, outputs.rs, text_input.rs, ping.rs on xdg_wm_base, the clipboard on wl_data_device): through a context each must stay offered where the compositor offers it at all.
+/// Every one is on labwc's and Hyprland's sandbox allow-lists (wl_output: Hyprland never filters outputs).
+const NEEDED: &[&str] = &[
+    "wl_compositor",
+    "wl_subcompositor",
+    "wl_shm",
+    "wl_seat",
+    "wl_output",
+    "wl_data_device_manager",
+    "xdg_wm_base",
+    "zwp_linux_dmabuf_v1",
+    "wp_presentation",
+    "zwp_text_input_manager_v3",
+    "wp_fractional_scale_manager_v1",
+    "wp_viewporter",
+    "xdg_activation_v1",
+];
+
+/// The Wayland rows: on the gates' own compositor (labwc, nested_wayland), the probe as an app process connects through a security context made as atld makes one (atl_platform_host::wayland_context, mounted at the compositor socket's path, atld `Host::app_spawn`).
+/// Pass: the compositor offers the manager (the tier is probed, never assumed); no [`PRIVILEGED`] interface is offered through the context; a bind of a privileged global the gate saw offered outside fails; every [`NEEDED`] interface offered outside is offered inside.
+fn wayland_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(String, Vec<String>)> {
+    use atl_platform_host::wayland_context::{Contexts, MANAGER_INTERFACE, Probe};
+    let dir = work.join("wl");
+    let nested = crate::nested_wayland::NestedCompositor::start(&dir)?;
+    let (_outside, _, outside) = nested.connect()?;
+    let contexts = match Contexts::probe(&nested.socket) {
+        Probe::Available(c) => c,
+        Probe::Unavailable(why) => {
+            return Ok((
+                format!("wayland: security context unavailable ({why})"),
+                vec![format!(
+                    "wayland: the gates' compositor offers no {MANAGER_INTERFACE}: the context tier cannot be judged"
+                )],
+            ));
+        }
+    };
+    let ctx = contexts.create(Some(&format!("atl.{PACKAGE}")))?;
+    // the bind target: the first privileged global offered outside (its name is the display's, the same for every client)
+    let (target, (name, version)) = PRIVILEGED
+        .iter()
+        .find_map(|i| outside.get(*i).map(|g| (*i, *g)))
+        .context("the gates' compositor offers no privileged global to bind")?;
+    let mut cmd = Command::new(probe);
+    cmd.arg("wayland")
+        .arg(&nested.socket)
+        .arg(name.to_string())
+        .arg(target)
+        .arg(version.to_string());
+    let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+    spawn.mounts.push(Mount {
+        host: ctx.socket().to_path_buf(),
+        at: nested.socket.clone(),
+        writable: false,
+    });
+    let log = work.join("probe-wayland.log");
+    (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
+    let mut p = broker.spawn(spawn).context("starting the wayland probe")?;
+    let status = binder::wait_limited(&mut p.child, LIMIT)?;
+    let line = fs::read_to_string(&log)?
+        .lines()
+        .find(|l| l.starts_with("probe: wayland "))
+        .unwrap_or("probe: wayland no line in the probe's log")
+        .to_owned();
+    let mut fails = Vec::new();
+    if !status.is_some_and(|s| s.success()) {
+        fails.push(format!("wayland probe ended {status:?}"));
+    }
+    fails.extend(judge_wayland(&line, target, |i| outside.contains_key(i)));
+    Ok((line, fails))
+}
+
+/// The verdict on the probe's `wayland` line ([`wayland_rows`]): `bound` = the privileged interface it tried to bind; `offered_outside` = what the compositor offers an unsandboxed client.
+fn judge_wayland(line: &str, bound: &str, offered_outside: impl Fn(&str) -> bool) -> Vec<String> {
+    let field = |key: &str| {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(key))
+            .unwrap_or("missing")
+            .to_owned()
+    };
+    let interfaces = field("interfaces=");
+    let inside: Vec<&str> = interfaces.split(',').collect();
+    let mut fails = Vec::new();
+    let leaked: Vec<&str> = PRIVILEGED
+        .iter()
+        .copied()
+        .filter(|i| inside.contains(i))
+        .collect();
+    if !leaked.is_empty() {
+        fails.push(format!(
+            "wayland: {} privileged interfaces offered through the context: {}",
+            leaked.len(),
+            leaked.join(",")
+        ));
+    }
+    let bind = field("bind=");
+    // libwayland's registry_bind of a filtered global: wl_display.error invalid_object (0); a hang-up after it reads as closed
+    if bind == "ok" || bind.starts_with("not-tried") || bind == "missing" {
+        fails.push(format!(
+            "wayland: bind of {bound} through the context: {bind} (want err:protocol or err:closed)"
+        ));
+    }
+    let lost: Vec<&str> = NEEDED
+        .iter()
+        .copied()
+        .filter(|i| offered_outside(i) && !inside.contains(i))
+        .collect();
+    if !lost.is_empty() {
+        fails.push(format!(
+            "wayland: interfaces ATL binds missing through the context: {}",
+            lost.join(",")
+        ));
     }
     fails
 }

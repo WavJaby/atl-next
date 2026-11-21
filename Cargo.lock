@@ -569,6 +569,8 @@ dependencies = [
  "gtk4",
  "rustix",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
  "zbus",
 ]
 
