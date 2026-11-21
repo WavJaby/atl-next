@@ -158,6 +158,8 @@ pub struct Counters {
     pub handle_deaths_deferred: u64,
     /// Handles that died while their layer had a parent: the layer stays until the parent goes.
     pub layers_kept_by_parent: u64,
+    /// Layers that went offscreen: reparented to null or to a layer that is gone, or left with a live handle by a destroyed parent.
+    pub layers_offscreen: u64,
     /// A cached-buffer id with no buffer behind it (the buffer is released at once).
     pub cache_misses: u64,
     /// `eMatrixChanged` with rotation or shear (only scale is applied).
@@ -706,6 +708,11 @@ impl Compositor {
         self.dead_handles.remove(&handle);
         if let Some(mut layer) = self.layers.remove(&handle) {
             self.dirty = true;
+            self.counters.layers_offscreen += self
+                .layers
+                .values()
+                .filter(|l| l.parent == Some(handle) && l.handle_alive)
+                .count() as u64;
             if let Some(h) = layer.held.take() {
                 if h.presented {
                     self.counters.releases_held += 1;
@@ -942,6 +949,7 @@ impl Compositor {
         let mut frame_number = 0u64;
         let mut previous_frame_number = 0u64;
         let mut previous_release = None;
+        let mut reparented = false;
         {
             let l = self.layers.get_mut(&key).expect("checked above");
             if w & what::E_POSITION_CHANGED != 0 {
@@ -962,6 +970,7 @@ impl Compositor {
             if w & what::E_REPARENT != 0 {
                 l.parent = s.parent.as_ref().and_then(|p| p.handle.key());
                 handled |= what::E_REPARENT;
+                reparented = true;
             }
             if w & what::E_COLOR_CHANGED != 0 {
                 l.color = [s.color[0], s.color[1], s.color[2]];
@@ -1014,6 +1023,9 @@ impl Compositor {
             }
             // listener callbacks are answered per transaction (see `complete`)
             handled |= what::E_HAS_LISTENER_CALLBACKS_CHANGED;
+        }
+        if reparented && !self.layers.get(&key).is_some_and(|l| self.parented(l)) {
+            self.counters.layers_offscreen += 1;
         }
         if w & what::E_BUFFER_CHANGED != 0 && self.config.latch_buffers {
             handled |= what::E_BUFFER_CHANGED;

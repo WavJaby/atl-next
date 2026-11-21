@@ -318,7 +318,7 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} backpressure_same_thread={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} handle_deaths_deferred={} layers_kept_by_parent={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} backpressure_same_thread={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} handle_deaths_deferred={} layers_kept_by_parent={} layers_offscreen={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
             s.ticks,
             s.latches,
             s.backpressure_holds,
@@ -332,6 +332,7 @@ impl State {
             c.unknown_layer,
             c.handle_deaths_deferred,
             c.layers_kept_by_parent,
+            c.layers_offscreen,
             c.buffers_acquired,
             c.buffers_released,
             c.completions_sent,

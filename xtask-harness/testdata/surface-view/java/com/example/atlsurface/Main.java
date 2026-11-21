@@ -7,6 +7,7 @@ import android.graphics.PixelFormat;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.SurfaceControl;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -21,6 +22,7 @@ import android.widget.FrameLayout;
  * - C: a SurfaceView below the window, opaque RGBX_8888, never drawn: its hole shows its background colour layer (SurfaceView.mBackgroundControl, black).
  * Rectangles are in window pixels, set as layout params so no density rounding applies; after the layout the fixture logs each view's rectangle in the window, and each SurfaceView frame it posts.
  * A key release redraws A with the same colour: the gate sends one after the settled picture, so a buffer the window shows is replaced (the release check's precondition) and the picture stays.
+ * Then ENTER reparents B's SurfaceControl to null (the handle stays alive): B goes offscreen, so the next picture shows B's rectangle as the window draws it (overlay, window colour).
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -76,6 +78,14 @@ public class Main extends Activity {
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_ENTER) {
+            // what clearChildSurfacePackage / Transaction.remove do (SurfaceView.java, SurfaceControl.java): reparent to null, the handle kept alive by SurfaceView -> offscreen, not composed
+            SurfaceControl.Transaction t = new SurfaceControl.Transaction();
+            t.reparent(b.getSurfaceControl(), null);
+            t.addTransactionCommittedListener(getMainExecutor(), () -> Log.i(TAG, "sv b offscreen committed"));
+            t.apply();
+            return true;
+        }
         Canvas canvas = a.getHolder().lockCanvas();
         if (canvas == null) {
             Log.i(TAG, "sv a lockCanvas failed on key " + keyCode);

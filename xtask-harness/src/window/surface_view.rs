@@ -5,7 +5,8 @@
 //! background colour layer, black (SurfaceView.mBackgroundControl, `setRelativeLayer(.., Integer.MIN_VALUE)`, SurfaceView.java:2150; the colour quad of the compositor's Scene).
 //! Sub-gates ([`checks`]): drawn (A and B posted a frame, C was left undrawn), readback (the last settled readback is that picture), pong (the window answered a ping),
 //! controls: the picture check rejects pictures with one rule broken (no hole: A hidden under the window; z ignored: B under its overlay; no colour layer: C shows the window),
-//! replaced: a key after the settled picture made A post a second frame over its shown one, so the window's release check has a shown buffer to judge.
+//! replaced: a key after the settled picture made A post a second frame over its shown one, so the window's release check has a shown buffer to judge;
+//! offscreen: ENTER makes the fixture reparent B to null with its handle alive, and the second settled picture shows B's rectangle as the window draws it (SurfaceFlinger composes only layers under a root).
 
 use std::path::Path;
 
@@ -112,12 +113,21 @@ struct Rules {
     hole: bool,
     z_on_top: bool,
     colour_layer: bool,
+    /// B is on screen; false after the fixture reparents its SurfaceControl to null (offscreen: SurfaceFlinger composes only what hangs from a root, LayerHierarchy.cpp attachToParent).
+    b_on_screen: bool,
 }
 
 const ALL: Rules = Rules {
     hole: true,
     z_on_top: true,
     colour_layer: true,
+    b_on_screen: true,
+};
+
+/// The picture after ENTER: B offscreen, everything else as [`ALL`].
+const B_OFFSCREEN: Rules = Rules {
+    b_on_screen: false,
+    ..ALL
 };
 
 /// The picture of `l` under `rules`, RGBA rows of the window's width, top first: per pixel the topmost of (window content, SurfaceViews by z).
@@ -126,7 +136,7 @@ fn picture(l: &Layout, rules: Rules) -> Vec<u8> {
     for y in 0..l.height {
         for x in 0..l.width {
             // z ignored: B sits under the window, which draws its own colour there (an on-top SurfaceView punches no hole)
-            let px = if rules.z_on_top && l.b.contains(x, y) {
+            let px = if rules.b_on_screen && rules.z_on_top && l.b.contains(x, y) {
                 B
             } else if l.over_a.contains(x, y) || l.over_b.contains(x, y) {
                 OVERLAY
@@ -157,8 +167,13 @@ fn drawn_check(app: &str) -> Result<String, String> {
 }
 
 /// The settled picture's size and digest against [`picture`] under `rules`.
-fn readback(pictures: &Mutex<capture::Seen>, l: &Layout, rules: Rules) -> Result<String, String> {
-    let shot = capture::picture(pictures, 0)?;
+fn readback(
+    pictures: &Mutex<capture::Seen>,
+    index: usize,
+    l: &Layout,
+    rules: Rules,
+) -> Result<String, String> {
+    let shot = capture::picture(pictures, index)?;
     let size = format!("{}x{}", shot.size.0, shot.size.1);
     let want_size = format!("{}x{}", l.width, l.height);
     if size != want_size {
@@ -174,7 +189,27 @@ fn readback(pictures: &Mutex<capture::Seen>, l: &Layout, rules: Rules) -> Result
 
 fn readback_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
     let l = layout(app)?;
-    readback(pictures, &l, ALL)
+    readback(pictures, 0, &l, ALL)
+}
+
+/// The fixture's line once its `reparent(b, null)` transaction committed (Main.java onKeyUp ENTER).
+const OFFSCREEN: &str = "AtlWindow: sv b offscreen committed";
+/// input-event-codes.h KEY_ENTER: the fixture's reparent key (KeyEvent.KEYCODE_ENTER).
+const KEY_ENTER: u32 = 28;
+
+/// After B's SurfaceControl was reparented to null with its handle alive, the second settled picture is [`B_OFFSCREEN`] and the compositor counted the layer offscreen (`layers_offscreen`).
+fn offscreen_check(pictures: &Mutex<capture::Seen>, app: &str) -> Result<String, String> {
+    if !app.contains(OFFSCREEN) {
+        return Err(format!("no `{OFFSCREEN}` line"));
+    }
+    let line = crate::composer::last_counters(app).ok_or("no `composer: counters` line")?;
+    let offscreen = crate::composer::field(line, "layers_offscreen").unwrap_or(0);
+    if offscreen == 0 {
+        return Err("B reparented to null, but layers_offscreen=0".to_owned());
+    }
+    let l = layout(app)?;
+    let shown = readback(pictures, 1, &l, B_OFFSCREEN)?;
+    Ok(format!("B offscreen ({offscreen} layer(s)): {shown}"))
 }
 
 /// Each picture with one rule broken differs from the real one; with the real readback passing, each would fail it.
@@ -197,6 +232,7 @@ fn controls(app: &str) -> Result<String, String> {
                 ..ALL
             },
         ),
+        ("B offscreen", B_OFFSCREEN),
     ];
     let same: Vec<&str> = broken
         .iter()
@@ -204,7 +240,10 @@ fn controls(app: &str) -> Result<String, String> {
         .map(|(n, _)| *n)
         .collect();
     if same.is_empty() {
-        Ok("no hole / z ignored / no colour layer each change the picture".to_owned())
+        Ok(
+            "no hole / z ignored / no colour layer / B offscreen each change the picture"
+                .to_owned(),
+        )
     } else {
         Err(format!("broken rules {same:?} give the real picture"))
     }
@@ -229,6 +268,7 @@ pub fn checks(
         ),
         ("controls", controls(app)),
         ("replaced", replaced_check(app)),
+        ("offscreen", offscreen_check(pictures, app)),
     ]
 }
 
@@ -284,6 +324,17 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     wait_for_line(app_log, REDREW, ACK_WAIT)
         .then_some(())
         .ok_or("the fixture never redrew A on the key")?;
+    // B offscreen: ENTER reparents it to null; the second settled picture is judged by `offscreen_check`
+    proxy
+        .inject_key(KEY_ENTER, true)
+        .map_err(|e| e.to_string())?;
+    proxy
+        .inject_key(KEY_ENTER, false)
+        .map_err(|e| e.to_string())?;
+    wait_for_line(app_log, OFFSCREEN, ACK_WAIT)
+        .then_some(())
+        .ok_or("the fixture never committed B's reparent to null")?;
+    probe.record_settled();
     Ok(Liveness {
         answered,
         ..Liveness::default()
@@ -313,6 +364,11 @@ mod tests {
         assert_eq!(at(&p, 7, 3), WINDOW);
         assert_eq!(at(&p, 3, 3), WINDOW);
         assert!(controls(LINE).is_ok());
+        // B offscreen: its rectangle is the window's own drawing (on-top B punched no hole)
+        let off = picture(&l, B_OFFSCREEN);
+        assert_eq!(at(&off, 5, 1), OVERLAY);
+        assert_eq!(at(&off, 4, 0), WINDOW);
+        assert_eq!(at(&off, 0, 0), A);
     }
 
     /// The precondition holds only with A's second frame logged and a shown buffer retired; the dropped-scene run (releases_held=0) and a run whose key never arrived fail it.
