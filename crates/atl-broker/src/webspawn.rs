@@ -96,6 +96,8 @@ pub enum Reply {
 #[derive(Debug, Clone)]
 pub struct AppView {
     pub uid: u32,
+    /// The app's SELinux context (crate::Spawn::context): its web processes run in it, as they run with its uid.
+    pub context: String,
     /// The app's device nodes (its DRM nodes), shown to the web process under `share-gpu`.
     pub devices: Vec<PathBuf>,
     /// The app's writable mounts: the only dirs an expose path may lie in.
@@ -424,6 +426,7 @@ mod tests {
     fn app() -> AppView {
         AppView {
             uid: 10_123,
+            context: "u:r:untrusted_app:s0:c123,c256,c512,c768".into(),
             devices: vec![PathBuf::from("/dev/dri")],
             writable: vec![Mount {
                 host: PathBuf::from("/host/appdata/com.example"),

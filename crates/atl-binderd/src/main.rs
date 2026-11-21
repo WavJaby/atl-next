@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! atl-binderd: binderd as its own process, for tests until atld hosts it. Its stdin is the admin connection (a SOCK_SEQPACKET socket): the harness registers each process there (`server::encode_register` + the process's control connection as fd).
-//! Exits when stdin closes, printing on stderr one `binderd: <counter> <n>` line per nonzero counter (core rejections, ignored inputs, protocol faults), then `binderd: exit (<n> nonzero counters)`.
+//! Exits when stdin closes, printing on stderr one `binderd: <counter> <n>` line per nonzero counter (core rejections, protocol faults), then `binderd: exit (<n> nonzero counters)`.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -26,16 +26,13 @@ fn main() -> ExitCode {
     for (k, n) in server.core().rejects() {
         let _ = writeln!(err, "binderd: reject {k:?} {n}");
     }
-    for (k, n) in server.core().ignored() {
-        let _ = writeln!(err, "binderd: ignored {k:?} {n}");
-    }
     let mut lines = 0usize;
     for (k, n) in server.faults() {
         // hex: an ioctl code reads as its _IOC fields
         let _ = writeln!(err, "binderd: fault {k:x?} {n}");
         lines += 1;
     }
-    lines += server.core().rejects().len() + server.core().ignored().len();
+    lines += server.core().rejects().len();
     // always written: an orderly exit with every counter zero still says it ran to its end (a SIGKILL leaves no line)
     let _ = writeln!(err, "{EXIT_LINE} ({lines} nonzero counters)");
     match result {

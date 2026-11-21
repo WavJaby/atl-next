@@ -208,6 +208,238 @@ pub fn parse_service_contexts(text: &str) -> Result<Vec<ServiceContext>, Error> 
     Ok(out)
 }
 
+/// libselinux android_seapp.c `enum levelFrom`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LevelFrom {
+    #[default]
+    None,
+    App,
+    User,
+    All,
+}
+
+/// A user= or name= selector: a trailing `*` makes it a prefix (android_seapp.c `prefix_str`), compared case-insensitively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selector {
+    text: String,
+    prefix: bool,
+}
+
+impl Selector {
+    fn new(v: &str) -> Selector {
+        match v.strip_suffix('*') {
+            Some(p) => Selector {
+                text: p.to_owned(),
+                prefix: true,
+            },
+            None => Selector {
+                text: v.to_owned(),
+                prefix: false,
+            },
+        }
+    }
+
+    fn matches(&self, s: &str) -> bool {
+        if self.prefix {
+            s.len() >= self.text.len()
+                && s.as_bytes()[..self.text.len()].eq_ignore_ascii_case(self.text.as_bytes())
+        } else {
+            s.eq_ignore_ascii_case(&self.text)
+        }
+    }
+}
+
+/// One rule of a seapp_contexts file (android_seapp.c `struct seapp_context`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SeappRule {
+    is_system_server: bool,
+    is_ephemeral_app: Option<bool>,
+    user: Option<Selector>,
+    seinfo: Option<String>,
+    name: Option<Selector>,
+    domain: Option<String>,
+    level_from: LevelFrom,
+    level: Option<String>,
+    is_priv_app: Option<bool>,
+    min_target_sdk: i32,
+    from_run_as: bool,
+    is_isolated_compute_app: bool,
+    is_sdk_sandbox_audit: bool,
+    is_sdk_sandbox_next: bool,
+}
+
+/// The facts ATL's installer has about an app process: zygote's `selinux_android_setcontext(uid, isSystemServer=false, seinfo, pkgname)` inputs. seinfo is always `default` (ATL holds no platform
+/// key, so no app is platform-signed) with no privileged / ephemeral / isolated-compute / sdk-sandbox / fromRunAs flag: a rule needing one of them never matches.
+#[derive(Debug, Clone, Copy)]
+pub struct AppFacts<'a> {
+    pub uid: u32,
+    pub package: &'a str,
+    pub target_sdk: i32,
+}
+
+/// android_filesystem_config.h: AID_USER_OFFSET, AID_APP_START, AID_SDK_SANDBOX_PROCESS_START, AID_ISOLATED_START; android_seapp.c CAT_MAPPING_MAX_ID.
+const AID_USER_OFFSET: u32 = 100_000;
+const AID_APP_START: u32 = 10_000;
+const AID_SDK_SANDBOX_PROCESS_START: u32 = 20_000;
+const AID_ISOLATED_START: u32 = 90_000;
+const CAT_MAPPING_MAX_ID: u32 = 0x1 << 16;
+
+/// A parsed seapp_contexts file in libselinux's precedence order: what `seapp_context_lookup` (android_seapp.c, pinned external/selinux) walks for an app's domain.
+#[derive(Debug, Clone)]
+pub struct Seapp {
+    rules: Vec<SeappRule>,
+}
+
+impl Seapp {
+    /// android_seapp.c `selinux_android_seapp_context_reload` over one (platform) file: `key=value` tokens per line, `#` comment lines; an unknown key or value is an error, as there.
+    /// `neverallow` lines are checkseapp's input, not rules (a device's installed file has none): skipped.
+    pub fn parse(text: &str) -> Result<Seapp, Error> {
+        let mut rules = Vec::new();
+        for (i, l) in text.lines().enumerate() {
+            let err = |why: String| Error::Contexts { line: i + 1, why };
+            let l = l.trim_start();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let mut tokens = l.split([' ', '\t']).filter(|t| !t.is_empty()).peekable();
+            if tokens.peek() == Some(&"neverallow") {
+                continue;
+            }
+            let mut r = SeappRule::default();
+            for t in tokens {
+                let (k, v) = t
+                    .split_once('=')
+                    .ok_or_else(|| err(format!("not key=value: {t}")))?;
+                let flag = |v: &str| match v.to_ascii_lowercase().as_str() {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    _ => Err(err(format!("{k}: not true/false: {v}"))),
+                };
+                match k.to_ascii_lowercase().as_str() {
+                    "issystemserver" => r.is_system_server = flag(v)?,
+                    "isephemeralapp" => r.is_ephemeral_app = Some(flag(v)?),
+                    "user" => r.user = Some(Selector::new(v)),
+                    "seinfo" => r.seinfo = Some(v.to_owned()),
+                    "name" => r.name = Some(Selector::new(v)),
+                    "domain" => r.domain = Some(v.to_owned()),
+                    "type" => {}
+                    "levelfrom" => {
+                        r.level_from = match v.to_ascii_lowercase().as_str() {
+                            "none" => LevelFrom::None,
+                            "app" => LevelFrom::App,
+                            "user" => LevelFrom::User,
+                            "all" => LevelFrom::All,
+                            _ => return Err(err(format!("levelFrom: {v}"))),
+                        }
+                    }
+                    "level" => r.level = Some(v.to_owned()),
+                    "isprivapp" => r.is_priv_app = Some(flag(v)?),
+                    "mintargetsdkversion" => {
+                        r.min_target_sdk = v
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|n| *n >= 0)
+                            .ok_or_else(|| err(format!("minTargetSdkVersion: {v}")))?
+                    }
+                    "fromrunas" => r.from_run_as = flag(v)?,
+                    "isisolatedcomputeapp" => r.is_isolated_compute_app = flag(v)?,
+                    "issdksandboxaudit" => r.is_sdk_sandbox_audit = flag(v)?,
+                    "issdksandboxnext" => r.is_sdk_sandbox_next = flag(v)?,
+                    _ => return Err(err(format!("unknown key {k}"))),
+                }
+            }
+            rules.push(r);
+        }
+        // qsort with seapp_context_cmp; a stable sort keeps file order among equals (libselinux rejects equal-precedence rules that would select differently)
+        rules.sort_by(seapp_cmp);
+        Ok(Seapp { rules })
+    }
+
+    /// The app process's context (`seapp_context_lookup_internal`, kind SEAPP_DOMAIN, user `u`, role `r`, level `s0` before the rule's): None when no rule gives a domain (libselinux fails the spawn
+    /// then: "Fail to prevent staying in the zygote's context") or the uid is no app uid.
+    pub fn app_context(&self, app: AppFacts<'_>) -> Option<String> {
+        let userid = app.uid / AID_USER_OFFSET;
+        let appid = app.uid % AID_USER_OFFSET;
+        // a uid below AID_APP_START is named by getpwuid there: no app process has one
+        let (username, appid) = if appid < AID_APP_START {
+            return None;
+        } else if appid < AID_SDK_SANDBOX_PROCESS_START {
+            ("_app", appid - AID_APP_START)
+        } else if appid < AID_ISOLATED_START {
+            ("_sdksandbox", appid - AID_SDK_SANDBOX_PROCESS_START)
+        } else {
+            ("_isolated", appid - AID_ISOLATED_START)
+        };
+        if appid >= CAT_MAPPING_MAX_ID || userid >= CAT_MAPPING_MAX_ID {
+            return None;
+        }
+        let r = self.rules.iter().find(|r| {
+            !r.is_system_server
+                && r.is_ephemeral_app != Some(true)
+                && r.user.as_ref().is_none_or(|u| u.matches(username))
+                && r.seinfo
+                    .as_ref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("default"))
+                && r.name.as_ref().is_none_or(|n| n.matches(app.package))
+                && r.is_priv_app != Some(true)
+                && r.min_target_sdk <= app.target_sdk
+                && !r.from_run_as
+                && !r.is_isolated_compute_app
+                && !r.is_sdk_sandbox_audit
+                && !r.is_sdk_sandbox_next
+                && r.domain.is_some()
+        })?;
+        let level = match r.level_from {
+            LevelFrom::None => r.level.clone().unwrap_or_else(|| "s0".to_owned()),
+            LevelFrom::App => format!("s0:c{},c{}", appid & 0xff, 256 + (appid >> 8 & 0xff)),
+            LevelFrom::User => format!(
+                "s0:c{},c{}",
+                512 + (userid & 0xff),
+                768 + (userid >> 8 & 0xff)
+            ),
+            LevelFrom::All => format!(
+                "s0:c{},c{},c{},c{}",
+                appid & 0xff,
+                256 + (appid >> 8 & 0xff),
+                512 + (userid & 0xff),
+                768 + (userid >> 8 & 0xff)
+            ),
+        };
+        Some(format!("u:r:{}:{level}", r.domain.as_deref()?))
+    }
+}
+
+/// android_seapp.c `seapp_context_cmp` (one platform file: the partition step never decides).
+fn seapp_cmp(s1: &SeappRule, s2: &SeappRule) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    // true first
+    let first = |a: bool, b: bool| match (a, b) {
+        (true, false) => Less,
+        (false, true) => Greater,
+        _ => Equal,
+    };
+    // a fixed string before a prefix, a longer prefix before a shorter
+    let sel = |a: &Option<Selector>, b: &Option<Selector>| match (a, b) {
+        (Some(a), Some(b)) => first(!a.prefix, !b.prefix).then(if a.prefix && b.prefix {
+            b.text.len().cmp(&a.text.len())
+        } else {
+            Equal
+        }),
+        _ => first(a.is_some(), b.is_some()),
+    };
+    first(s1.is_system_server, s2.is_system_server)
+        .then(first(
+            s1.is_ephemeral_app.is_some(),
+            s2.is_ephemeral_app.is_some(),
+        ))
+        .then(sel(&s1.user, &s2.user))
+        .then(first(s1.seinfo.is_some(), s2.seinfo.is_some()))
+        .then(sel(&s1.name, &s2.name))
+        .then(first(s1.is_priv_app.is_some(), s2.is_priv_app.is_some()))
+        .then(s2.min_target_sdk.cmp(&s1.min_target_sdk))
+        .then(first(s1.from_run_as, s2.from_run_as))
+}
+
 /// The `domain=` values of a `seapp_contexts` file's rules (`private/seapp_contexts`: `key=value` selectors and outputs per line), sorted; `neverallow` lines (regex selectors, read only by checkseapp) are no rules.
 pub fn seapp_domains(text: &str) -> BTreeSet<String> {
     text.lines()
@@ -315,6 +547,100 @@ mod tests {
             }
         );
         assert!(parse_service_contexts("activity\n").is_err());
+    }
+
+    /// private/seapp_contexts at the pin, lines 174-224 minus the vendor-only and duplicate privileged rows; the rule order is reversed so the result rests on seapp_context_cmp, not file order.
+    const SEAPP: &str = "\
+neverallow user=_app domain=((?!x).)*
+isSystemServer=true domain=system_server_startup
+user=_app seinfo=platform name=com.android.traceur domain=traceur_app type=app_data_file levelFrom=all
+user=_isolated domain=isolated_app levelFrom=user
+user=_isolated isIsolatedComputeApp=true domain=isolated_compute_app levelFrom=user
+user=_app seinfo=platform domain=platform_app type=app_data_file levelFrom=user
+user=_app isEphemeralApp=true domain=ephemeral_app type=app_data_file levelFrom=all
+user=_app isPrivApp=true domain=priv_app type=privapp_data_file levelFrom=user
+user=_app isPrivApp=true name=com.android.rkpdapp domain=rkpdapp type=privapp_data_file levelFrom=all
+user=_app minTargetSdkVersion=34 domain=untrusted_app type=app_data_file levelFrom=all
+user=_app minTargetSdkVersion=32 domain=untrusted_app_32 type=app_data_file levelFrom=all
+user=_app minTargetSdkVersion=30 domain=untrusted_app_30 type=app_data_file levelFrom=all
+user=_app minTargetSdkVersion=29 domain=untrusted_app_29 type=app_data_file levelFrom=all
+user=_app minTargetSdkVersion=28 domain=untrusted_app_27 type=app_data_file levelFrom=all
+user=_app minTargetSdkVersion=26 domain=untrusted_app_27 type=app_data_file levelFrom=user
+user=_app domain=untrusted_app_25 type=app_data_file levelFrom=user
+user=_app minTargetSdkVersion=28 fromRunAs=true domain=runas_app levelFrom=all
+user=_app fromRunAs=true domain=runas_app levelFrom=user
+";
+
+    fn reversed(text: &str) -> String {
+        text.lines().rev().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// Expected contexts: the domain from the rule seapp_context_cmp ranks first among those matching, the level from set_range_from_level (all: c<appid&0xff>,c<256+(appid>>8&0xff)>,
+    /// c<512+(user&0xff)>,c<768+(user>>8&0xff)>; user: the last two), appid = uid % 100000 - 10000 (_app) or - 90000 (_isolated).
+    #[test]
+    fn seapp_selects_as_libselinux() {
+        let s = Seapp::parse(&reversed(SEAPP)).expect("parses");
+        let ctx = |uid, target_sdk| {
+            s.app_context(AppFacts {
+                uid,
+                package: "org.example",
+                target_sdk,
+            })
+        };
+        let c = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            ctx(10_123, 36),
+            c("u:r:untrusted_app:s0:c123,c256,c512,c768")
+        );
+        assert_eq!(
+            ctx(10_123, 34),
+            c("u:r:untrusted_app:s0:c123,c256,c512,c768")
+        );
+        assert_eq!(
+            ctx(10_123, 33),
+            c("u:r:untrusted_app_32:s0:c123,c256,c512,c768")
+        );
+        assert_eq!(
+            ctx(10_123, 28),
+            c("u:r:untrusted_app_27:s0:c123,c256,c512,c768")
+        );
+        // minTargetSdkVersion=26: levelFrom=user
+        assert_eq!(ctx(10_123, 27), c("u:r:untrusted_app_27:s0:c512,c768"));
+        assert_eq!(ctx(10_123, 25), c("u:r:untrusted_app_25:s0:c512,c768"));
+        // appid 300: 300 & 0xff = 44, 256 + 1; user 10: 512 + 10
+        assert_eq!(
+            ctx(1_010_300, 34),
+            c("u:r:untrusted_app:s0:c44,c257,c522,c768")
+        );
+        assert_eq!(ctx(90_005, 34), c("u:r:isolated_app:s0:c512,c768"));
+        // no app uid: getpwuid's names, never an app process
+        assert_eq!(ctx(1000, 34), None);
+        // name= rules need seinfo=platform or isPrivApp: never an ATL app
+        let traceur = s.app_context(AppFacts {
+            uid: 10_123,
+            package: "com.android.traceur",
+            target_sdk: 34,
+        });
+        assert_eq!(traceur, c("u:r:untrusted_app:s0:c123,c256,c512,c768"));
+        // a file without a rule for plain apps: no domain (libselinux fails the spawn)
+        let only_priv = Seapp::parse("user=_app isPrivApp=true domain=priv_app levelFrom=user\n")
+            .expect("parses");
+        assert_eq!(
+            only_priv.app_context(AppFacts {
+                uid: 10_123,
+                package: "p",
+                target_sdk: 34
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn seapp_refuses_what_libselinux_refuses() {
+        assert!(Seapp::parse("user=_app domain\n").is_err());
+        assert!(Seapp::parse("user=_app isPrivApp=maybe\n").is_err());
+        assert!(Seapp::parse("user=_app colour=blue\n").is_err());
+        assert!(Seapp::parse("user=_app minTargetSdkVersion=-1\n").is_err());
     }
 
     #[test]

@@ -28,12 +28,19 @@ struct World {
     b: ProcId,
 }
 
+/// A process tagged with the context [`context_of`] its uid.
 fn tag(uid: u32, host_pid: i32, pid_ns: PidNs) -> Tag {
     Tag {
         uid,
         host_pid,
         pid_ns,
+        context: context_of(uid).into(),
     }
+}
+
+/// A distinct context per test uid (any string the broker registers; binderd does not parse it).
+fn context_of(uid: u32) -> String {
+    format!("u:r:uid_{uid}:s0")
 }
 
 /// atld's ServiceManager (system uid 1000, host pid ns) and two apps in their own sandboxes.
@@ -1190,12 +1197,93 @@ fn region_mapped_once_and_needed() {
     assert_eq!(d.rejects()[&Reject::NoSpace], 1);
 }
 
-/// servicemanager's `becomeContextManager` flags its node `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (ProcessState.cpp:232): accepted, counted, and its calls still arrive as plain BR_TRANSACTION.
+/// servicemanager's `becomeContextManager` flags its node `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (ProcessState.cpp:232): a call to it arrives as BR_TRANSACTION_SEC_CTX with the caller's context,
+/// NUL-terminated, at `buf_offset = ALIGN(data_size, 8) + ALIGN(offsets_size, 8)` (binder_transaction); the sender's reply to the caller stays BR_REPLY (a reply has no target node).
 #[test]
-fn security_ctx_flag_ignored_and_counted() {
+fn security_ctx_node_gets_the_senders_context() {
     let mut w = world_with(REGION, FLAT_BINDER_FLAG_TXN_SECURITY_CTX);
-    assert_eq!(w.d.ignored()[&Ignored::TxnSecurityCtx], 1);
-    let _s = waiting_looper(&mut w.d, w.sm);
+    let s = waiting_looper(&mut w.d, w.sm);
+    let a = thread(&mut w.d, w.a, false);
+    // 12 data bytes, no objects: the context follows the data padded to 8
+    let o = wr(
+        &mut w.d,
+        a,
+        &[Command::Transaction(call(0, 1, 0, 12, 0))],
+        &[7; 12],
+        vec![],
+    );
+    assert_eq!(o.read, Read::Blocked);
+    let out = completed(&mut w.d, s);
+    let r = rets(&out);
+    let Return::TransactionSecCtx { data, secctx } = r[1] else {
+        panic!("{r:?}")
+    };
+    assert_eq!((data.sender_euid, data.data_size), (10001, 12));
+    // ALIGN(12, 8) = 16, no offsets
+    assert_eq!(secctx, data.buffer + 16);
+    assert_eq!(out.copies.len(), 1);
+    assert_eq!(out.copies[0].offset, data.buffer);
+    assert_eq!(&out.copies[0].bytes[..12], &[7; 12]);
+    assert_eq!(
+        &out.copies[0].bytes[16..],
+        format!("{}\0", context_of(10001)).as_bytes()
+    );
+    // the reply: plain BR_REPLY
+    let _ = wr(
+        &mut w.d,
+        s,
+        &[Command::Reply(TransactionData {
+            data_size: 8,
+            offsets: 8,
+            ..Default::default()
+        })],
+        &[0; 8],
+        vec![],
+    );
+    let back = completed(&mut w.d, a);
+    assert!(
+        rets(&back).iter().any(|r| matches!(r, Return::Reply(_))),
+        "{:?}",
+        rets(&back)
+    );
+}
+
+/// The context takes region space: ALIGN(secctx_sz, 8) more per buffer (binder_alloc `sanitized_size` with extra_buffers_size). Two one-way calls: the second is placed when sent, after the first's
+/// 8 data bytes + ALIGN(len("u:r:uid_10001:s0") + 1, 8) = 8 + 24 = 32, and delivered once the first is freed (binder_free_buf: the node's next async work).
+#[test]
+fn security_ctx_grows_the_buffer() {
+    let mut w = world_with(REGION, FLAT_BINDER_FLAG_TXN_SECURITY_CTX);
+    let s = waiting_looper(&mut w.d, w.sm);
+    let a = thread(&mut w.d, w.a, false);
+    let oneway = Command::Transaction(call(0, 1, TF_ONE_WAY, 8, 0));
+    let _ = wr(&mut w.d, a, &[oneway, oneway], &[0; 8], vec![]);
+    let out = completed(&mut w.d, s);
+    let Return::TransactionSecCtx { data: first, .. } = rets(&out)[1] else {
+        panic!("{:?}", rets(&out))
+    };
+    let o = wr(
+        &mut w.d,
+        s,
+        &[Command::FreeBuffer(first.buffer)],
+        &[],
+        vec![],
+    );
+    let second = done(&o.read)
+        .into_iter()
+        .find_map(|r| match r {
+            Return::TransactionSecCtx { data, secctx } => Some((data, secctx)),
+            _ => None,
+        })
+        .expect("the second call");
+    assert_eq!(second.0.buffer, first.buffer + 32);
+    assert_eq!(second.1, second.0.buffer + 8);
+}
+
+/// A node without the flag gets plain BR_TRANSACTION (the kernel sends the secctx record only when `t->security_ctx` is set).
+#[test]
+fn unflagged_node_gets_plain_transaction() {
+    let mut w = world();
+    let s = waiting_looper(&mut w.d, w.sm);
     let a = thread(&mut w.d, w.a, false);
     let _ = wr(
         &mut w.d,
@@ -1204,12 +1292,13 @@ fn security_ctx_flag_ignored_and_counted() {
         &[0; 8],
         vec![],
     );
-    let out = completed(&mut w.d, _s);
+    let out = completed(&mut w.d, s);
     assert!(
         matches!(rets(&out)[1], Return::Transaction(_)),
         "{:?}",
         rets(&out)
     );
+    assert_eq!(out.copies[0].bytes.len(), 8);
 }
 
 /// Poll readability (`binder_poll` -> `binder_has_work_ilocked`): a new thread is readable once (`looper_need_return`); a looper with no work is not; process work makes an idle looper readable; a non-looper is not woken by process work.

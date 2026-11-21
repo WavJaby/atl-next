@@ -159,20 +159,32 @@ impl<F> Binderd<F> {
         ) else {
             return Err(in_reply_failure(self.fail(Reject::PayloadOutOfBounds)));
         };
-        let buffer =
-            match self
-                .proc_mut(target_proc)
-                .alloc
-                .alloc(td.data_size, td.offsets_size, oneway)
-            {
-                Ok(off) => off,
-                Err(AllocError::NoSpace) => {
-                    return Err(in_reply_failure(self.fail(Reject::NoSpace)));
-                }
-                Err(AllocError::Invalid) => {
-                    return Err(in_reply_failure(self.fail(Reject::PayloadOutOfBounds)));
-                }
-            };
+        // binder_transaction: a call to a node flagged txn_security_ctx carries the sender's context, NUL-terminated (secctx_sz counts the NUL), as ALIGN(secctx_sz, 8) extra bytes after the offsets
+        let secctx: Option<Vec<u8>> =
+            target_node
+                .filter(|n| self.nodes[n].txn_security_ctx)
+                .map(|_| {
+                    let mut s = self.proc(p).tag.context.as_bytes().to_vec();
+                    s.push(0);
+                    s
+                });
+        let extra = secctx
+            .as_ref()
+            .map_or(0, |s| s.len().next_multiple_of(size_of::<u64>()) as u64);
+        let buffer = match self.proc_mut(target_proc).alloc.alloc(
+            td.data_size,
+            td.offsets_size,
+            extra,
+            oneway,
+        ) {
+            Ok(off) => off,
+            Err(AllocError::NoSpace) => {
+                return Err(in_reply_failure(self.fail(Reject::NoSpace)));
+            }
+            Err(AllocError::Invalid) => {
+                return Err(in_reply_failure(self.fail(Reject::PayloadOutOfBounds)));
+            }
+        };
         if let Some(n) = target_node {
             // the buffer holds a strong ref on its target until freed (binder.c:2948-2967)
             self.inc_node(n, true, false, None);
@@ -216,12 +228,19 @@ impl<F> Binderd<F> {
             return Err(in_reply_failure(failed()));
         }
 
+        // buf_offset = ALIGN(data_size, 8) + ALIGN(offsets_size, 8) + ALIGN(extra, 8) - ALIGN(secctx_sz, 8): the context is the buffer's last bytes, right after the offsets (no other extra here)
+        let secctx_at = secctx.map(|s| {
+            let at = bytes.len();
+            bytes.extend_from_slice(&s);
+            buffer + at as u64
+        });
+
         let id = TxnId(self.id());
         self.txns.insert(
             id,
             Txn {
                 from: (!reply && !oneway).then_some(t),
-                sender: self.proc(p).tag,
+                sender: self.proc(p).tag.clone(),
                 to_proc: target_proc,
                 to_thread: None,
                 from_parent: None,
@@ -233,6 +252,7 @@ impl<F> Binderd<F> {
                 offsets_size: td.offsets_size,
                 buffer: Some(buffer),
                 bytes,
+                secctx: secctx_at,
                 fds: fixups,
             },
         );

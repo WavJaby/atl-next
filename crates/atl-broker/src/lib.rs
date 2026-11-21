@@ -82,6 +82,8 @@ pub struct Spawn {
     /// The pids its binder peers see, as binderd tags it ([`atl_binderd::server::Server::register`]): [`BinderPids::Sandbox`] for an app process (calls across sandboxes carry calling pid 0,
     /// as the kernel gives between sibling pid namespaces; AttributionSource then takes the pid as unknown instead of refusing a namespace-local one), [`BinderPids::Host`] for atld's system processes.
     pub binder_pids: BinderPids,
+    /// Its SELinux context (`u:r:<domain>:<level>`), what init's `seclabel` / zygote's `selinux_android_setcontext` gives the process on a device: binderd hands it to every node that asks for its callers' contexts (`FLAT_BINDER_FLAG_TXN_SECURITY_CTX`). Required; atld picks it (atl_sepolicy::domains, the seapp evaluator for apps).
+    pub context: String,
     pub mounts: Vec<Mount>,
     /// Symbolic links made after the mounts (bwrap `--symlink`): the app's `/sdcard`.
     pub links: Vec<Link>,
@@ -1061,6 +1063,7 @@ impl Broker {
         // the web-process channel's view of this app, before the spawn's fields move
         let view = webspawn::AppView {
             uid: spawn.uid,
+            context: spawn.context.clone(),
             devices: spawn.devices.clone(),
             writable: spawn
                 .mounts
@@ -1091,10 +1094,13 @@ impl Broker {
         atl_binderd::server::register(
             self.admin.as_fd(),
             ours.as_fd(),
-            spawn.uid,
-            host_pid,
-            spawn.binder_pids == BinderPids::Sandbox,
-            spawn.context_manager,
+            &atl_binderd::server::Registration {
+                uid: spawn.uid,
+                host_pid,
+                sandboxed: spawn.binder_pids == BinderPids::Sandbox,
+                context_manager: spawn.context_manager,
+                context: spawn.context,
+            },
         )
         .map_err(|e| registration_error(host_pid, e))?;
         if let (Some(channel), Some(web)) = (broker_end, &self.webspawn) {
@@ -1166,6 +1172,7 @@ impl WebSpawner {
             uid: app.uid,
             context_manager: false,
             binder_pids: BinderPids::Sandbox,
+            context: app.context.clone(),
             mounts: plan
                 .expose
                 .iter()
@@ -1560,6 +1567,7 @@ mod tests {
             uid: 10_123,
             context_manager: false,
             binder_pids: BinderPids::Sandbox,
+            context: "u:r:untrusted_app:s0:c123,c256,c512,c768".into(),
             mounts: vec![
                 Mount {
                     host: "/r/system".into(),

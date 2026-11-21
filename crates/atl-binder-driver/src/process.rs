@@ -284,7 +284,7 @@ mod tests {
         Command, CommandWriter, Object, Return, TransactionData, decode_returns,
     };
     use atl_binderd::Reject;
-    use atl_binderd::server::{Server, register};
+    use atl_binderd::server::{Registration, Server, register};
     use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
     use super::*;
@@ -305,7 +305,14 @@ mod tests {
 
     fn connect(admin: &OwnedFd, uid: u32, cm: bool) -> Process {
         let (ours, theirs) = pair();
-        register(admin.as_fd(), theirs.as_fd(), uid, 1, false, cm).expect("register");
+        let r = Registration {
+            uid,
+            host_pid: 1,
+            sandboxed: false,
+            context_manager: cm,
+            context: format!("u:r:uid_{uid}:s0"),
+        };
+        register(admin.as_fd(), theirs.as_fd(), &r).expect("register");
         let p = Process::connect(ours).expect("connect");
         p.mmap(REGION).expect("mmap");
         p

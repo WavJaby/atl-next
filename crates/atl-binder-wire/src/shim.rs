@@ -2,7 +2,7 @@
 //! The client side's stream rewriting (atl-binder-driver), safe over byte buffers: what a process sends and receives instead of the kernel's pointer-based ioctl.
 //!
 //! Outgoing (`outgoing`): `BC_TRANSACTION` / `BC_REPLY` name their data and offsets by user pointer; their bytes are copied into the request's payload and the two fields become payload offsets. `BC_FREE_BUFFER` names a buffer by its address in the region; it becomes the region offset. `BINDER_TYPE_FD` objects' fds are collected in stream and object order (they travel by `SCM_RIGHTS`).
-//! Incoming (`incoming`): `BR_TRANSACTION` / `BR_REPLY` carry region offsets; they become addresses (region base + offset).
+//! Incoming (`incoming`): `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX` / `BR_REPLY` carry region offsets (buffer, offsets, the sender's context); they become addresses (region base + offset).
 //! Every other command and return passes through unchanged. A malformed stream is left as it is from the first bad item on: binderd (outgoing) rejects it as the kernel would; incoming streams come from binderd.
 
 use core::mem::offset_of;
@@ -21,6 +21,7 @@ const OFFSETS: usize = CODE_SIZE
     + offset_of!(binder_transaction_data, data)
     + offset_of!(binder_transaction_data_data, ptr)
     + offset_of!(binder_transaction_data_data_ptr, offsets);
+const SECCTX: usize = CODE_SIZE + offset_of!(binder_transaction_data_secctx, secctx);
 
 /// Largest data or offsets array copied: the kernel's region cap (4 MiB); larger is left for binderd to refuse.
 const MAX_ARRAY: u64 = 4 << 20;
@@ -87,7 +88,7 @@ pub fn outgoing(
     out
 }
 
-/// Rewrites the BR stream `returns` in place: buffer and offsets of `BR_TRANSACTION` / `BR_REPLY` from region offsets to addresses at `base`.
+/// Rewrites the BR stream `returns` in place: buffer and offsets of `BR_TRANSACTION` / `BR_TRANSACTION_SEC_CTX` / `BR_REPLY`, and the secctx of `BR_TRANSACTION_SEC_CTX`, from region offsets to addresses at `base`.
 pub fn incoming(returns: &mut [u8], base: Uptr) {
     let mut at = 0;
     while at + CODE_SIZE <= returns.len() {
@@ -96,12 +97,15 @@ pub fn incoming(returns: &mut [u8], base: Uptr) {
         if end > returns.len() {
             break;
         }
-        if code == BR_TRANSACTION || code == BR_REPLY {
-            let item = &mut returns[at..end];
-            for field in [BUFFER, OFFSETS] {
-                let v = rd_u64(item, field).wrapping_add(base);
-                wr(item, field, &v.to_ne_bytes());
-            }
+        let fields: &[usize] = match code {
+            BR_TRANSACTION | BR_REPLY => &[BUFFER, OFFSETS],
+            BR_TRANSACTION_SEC_CTX => &[BUFFER, OFFSETS, SECCTX],
+            _ => &[],
+        };
+        let item = &mut returns[at..end];
+        for &field in fields {
+            let v = rd_u64(item, field).wrapping_add(base);
+            wr(item, field, &v.to_ne_bytes());
         }
         at = end;
     }
@@ -181,5 +185,30 @@ mod tests {
             panic!("{r:?}")
         };
         assert_eq!((t.buffer, t.offsets), (0x7000_0040, 0x7000_0050));
+    }
+
+    #[test]
+    fn incoming_adds_base_to_secctx() {
+        let mut s = Vec::new();
+        Return::TransactionSecCtx {
+            data: TransactionData {
+                buffer: 0x40,
+                offsets: 0x50,
+                ..Default::default()
+            },
+            secctx: 0x58,
+        }
+        .encode(&mut s);
+        Return::Noop.encode(&mut s);
+        incoming(&mut s, 0x7000_0000);
+        let r = crate::decode_returns(&s).unwrap();
+        let Return::TransactionSecCtx { data, secctx } = r[0] else {
+            panic!("{r:?}")
+        };
+        assert_eq!(
+            (data.buffer, data.offsets, secctx),
+            (0x7000_0040, 0x7000_0050, 0x7000_0058)
+        );
+        assert_eq!(r[1], Return::Noop);
     }
 }

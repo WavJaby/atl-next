@@ -320,6 +320,22 @@ const AID_SYSTEM: u32 = 1000;
 const AID_KEYSTORE: u32 = 1017;
 const AID_SHELL: u32 = 2000;
 const AID_NOBODY: u32 = 9999;
+/// The installer's context: AOSP parses packages in system_server (PackageManagerService); the installer holds no binder, so only its own view of itself could read it.
+const INSTALLER_CONTEXT: &str = atl_sepolicy::domains::SYSTEM_SERVER;
+
+/// The image's plat_seapp_contexts (a `--file` at atl_android_paths::SEAPP_CONTEXTS, from the converter's sepolicy goal): every app process's context comes from it, so a run without it does not start.
+/// `files`: `--file` rows as [`partition_file`] keeps them, the Android path relative to `/`.
+fn load_seapp(files: &[(PathBuf, PathBuf)]) -> Result<atl_sepolicy::Seapp> {
+    let at = Path::new(atl_android_paths::SEAPP_CONTEXTS);
+    let (host, _) = files
+        .iter()
+        .find(|(_, a)| Path::new("/").join(a) == at)
+        .with_context(|| format!("no --file places {}", at.display()))?;
+    let text =
+        std::fs::read_to_string(host).with_context(|| format!("reading {}", host.display()))?;
+    Ok(atl_sepolicy::Seapp::parse(&text)?)
+}
+
 /// The run's control socket, below the root (serve_run_control).
 const CONTROL_SOCKET: &str = "control.sock";
 /// How often the run checks that the services still run while it waits for its end: a dead services process is noticed within this.
@@ -990,6 +1006,7 @@ impl Host {
                 uid: INSTALLER_UID,
                 context_manager: false,
                 binder_pids: BinderPids::Sandbox,
+                context: INSTALLER_CONTEXT.to_owned(),
                 mounts: i
                     .mounts
                     .iter()
@@ -1115,6 +1132,7 @@ impl Host {
             uid: INSTALLER_UID,
             context_manager: false,
             binder_pids: BinderPids::Sandbox,
+            context: INSTALLER_CONTEXT.to_owned(),
             mounts: i.mounts.iter().chain(&i.scan_mounts).cloned().collect(),
             links: vec![],
             devices: vec![],
@@ -1220,6 +1238,8 @@ fn property_area(a: &Args, r: &Root, tier: LinearTier) -> Result<Vec<Property>> 
 
 /// What spawning a process takes beyond the process itself: everything the apps share, and the table of the processes the services started.
 struct Host {
+    /// The image's plat_seapp_contexts: each app process's context ([`Host::app_context`]).
+    seapp: atl_sepolicy::Seapp,
     broker: Broker,
     root: Root,
     launcher: PathBuf,
@@ -1426,6 +1446,23 @@ impl Host {
     /// mount namespace or cpuinfo mount of ART's own; the sandbox gives both); ignored by ART when no bridge is loaded.
     /// With `--ui` the sandbox shows the compositor socket's path; where the compositor has security contexts, that path is this process's own context socket, returned for [`Host::start`] to hold.
     /// Likewise the PipeWire socket's path shows this process's PipeWire context where PipeWire has SecurityContext; `rights` (the process's [`Right`]s) decide its audio / video source grants.
+    /// The context of a process [`Host::app_spawn`] starts: an app uid's from plat_seapp_contexts ([`atl_sepolicy::Seapp::app_context`]; seinfo `default`); a system uid's package process
+    /// (SettingsProvider, shared user android.uid.system, platform-signed) `system_app` (`user=system seinfo=platform domain=system_app`); the shell's commands (`--run-class` as AID_SHELL) `shell`.
+    fn app_context(&self, uid: u32, package: Option<&str>, target_sdk: i32) -> Result<String> {
+        match atl_services_types::permission::app_id(uid) {
+            AID_SYSTEM => Ok("u:r:system_app:s0".to_owned()),
+            AID_SHELL => Ok(atl_sepolicy::domains::SHELL.to_owned()),
+            _ => self
+                .seapp
+                .app_context(atl_sepolicy::AppFacts {
+                    uid,
+                    package: package.unwrap_or(""),
+                    target_sdk,
+                })
+                .with_context(|| format!("uid {uid}: no plat_seapp_contexts rule gives a domain")),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn app_spawn(
         &self,
@@ -1534,6 +1571,7 @@ impl Host {
                 uid,
                 context_manager: false,
                 binder_pids: BinderPids::Sandbox,
+                context: self.app_context(uid, package, target_sdk)?,
                 mounts: [Mount {
                 host: self.root.system(),
                 at: SYSTEM.into(),
@@ -1844,6 +1882,7 @@ impl Host {
                 uid: AID_SHELL,
                 context_manager: false,
                 binder_pids: BinderPids::Host,
+                context: atl_sepolicy::domains::SHELL.to_owned(),
                 mounts: vec![],
                 links: vec![],
                 devices: vec![],
@@ -1901,6 +1940,7 @@ impl Host {
                 uid: AID_SHELL,
                 context_manager: false,
                 binder_pids: BinderPids::Host,
+                context: atl_sepolicy::domains::SHELL.to_owned(),
                 mounts: vec![],
                 links: vec![],
                 devices: vec![],
@@ -2248,6 +2288,8 @@ fn run(a: &Args) -> Result<ExitCode> {
             uid: AID_SYSTEM,
             context_manager: cm,
             binder_pids: BinderPids::Host,
+            // system_server's: atl-system-services and the probes doing system_server's work (ABI choice, WebView provider); a HAL or daemon sets its own domain, as it sets its uid
+            context: atl_sepolicy::domains::SYSTEM_SERVER.to_owned(),
             // the VINTF manifests are servicemanager's alone to read; the others reach HALs through it
             mounts: shared_ro
                 .iter()
@@ -2280,6 +2322,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         })
     };
     let mut sm_spawn = system_spawn("servicemanager", &a.servicemanager, vec![], true, None)?;
+    sm_spawn.context = atl_sepolicy::domains::SERVICEMANAGER.to_owned();
     kernel_log_to_log(&mut sm_spawn, &r.log("servicemanager"))?;
     let mut sm = broker.spawn(sm_spawn).context("starting servicemanager")?;
     log(format_args!("servicemanager: host pid {}", sm.host_pid));
@@ -2291,6 +2334,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the health HAL (its .rc: `user system`), the battery services' source: the host's power-supply sysfs read-only, nothing else of /sys (atl_broker::power_supply_sysfs)
     if let Some(health) = &a.health {
         let mut hal = system_spawn("health", health, vec![], false, None)?;
+        hal.context = atl_sepolicy::domains::HEALTH.to_owned();
         logdw_to_log(
             &mut hal.mounts,
             &sockets.join("health"),
@@ -2311,6 +2355,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let (Some(keystore2), Some(keymint)) = (&a.keystore2, &a.keymint) {
         let mut hal = system_spawn("keymint", keymint, vec![], false, None)?;
         hal.uid = AID_NOBODY;
+        hal.context = atl_sepolicy::domains::KEYMINT.to_owned();
         logdw_to_log(
             &mut hal.mounts,
             &sockets.join("keymint"),
@@ -2333,6 +2378,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             None,
         )?;
         ks.uid = AID_KEYSTORE;
+        ks.context = atl_sepolicy::domains::KEYSTORE.to_owned();
         logdw_to_log(
             &mut ks.mounts,
             &sockets.join("keystore2"),
@@ -2398,6 +2444,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                     false,
                     None,
                 )?;
+                spawn.context = atl_sepolicy::domains::GRAPHICS_ALLOCATOR.to_owned();
                 // every GPU's class: the probe asks which one the display picks, and NVIDIA's EGL opens its nodes even to decline
                 spawn.devices = gpu::all_device_classes().context("the GPUs' device nodes")?;
                 log(format_args!("gpu-probe: devices {:?}", spawn.devices));
@@ -2427,6 +2474,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 // gralloc's own trial (atl_gralloc_service Backend::start), in the probe, with the grant the trial needs: every GPU
                 let mut spawn =
                     system_spawn("gpu-trial", probe, vec!["--trial-node".into()], false, None)?;
+                spawn.context = atl_sepolicy::domains::GRAPHICS_ALLOCATOR.to_owned();
                 spawn.devices = gpu::all_device_classes().context("the GPUs' device nodes")?;
                 let mut p = broker
                     .spawn(spawn)
@@ -2522,6 +2570,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 false,
                 None,
             )?;
+            spawn.context = atl_sepolicy::domains::GRAPHICS_ALLOCATOR.to_owned();
             spawn.devices = devices;
             // as arguments, not the probe's environment: it allocates its import buffer before setting them, as the allocator (without them) does
             for (k, v) in env {
@@ -2640,6 +2689,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             false,
             None,
         )?;
+        spawn.context = atl_sepolicy::domains::GRAPHICS_ALLOCATOR.to_owned();
         for (fourcc, mods) in &modifiers {
             let arg = node::modifier_arg(*fourcc, mods);
             // own prefix: `gpu:` is the one node line the run-apk gate reads
@@ -2720,6 +2770,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     app_env.extend(a.app_env.iter().cloned());
     log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
+        seapp: load_seapp(&a.files)?,
         app_env,
         app_devices,
         gpu,

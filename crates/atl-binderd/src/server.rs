@@ -44,29 +44,35 @@ pub enum Fault {
     Overflow,
 }
 
-/// Admin registration: uid, host pid, whether the process lives in a sandbox pid namespace of its own, context-manager flag; the control connection is its fd.
-pub fn encode_register(uid: u32, host_pid: i32, sandboxed: bool, context_manager: bool) -> Vec<u8> {
-    let mut v = uid.to_ne_bytes().to_vec();
-    v.extend_from_slice(&host_pid.to_ne_bytes());
-    v.extend_from_slice(&u32::from(sandboxed).to_ne_bytes());
-    v.extend_from_slice(&u32::from(context_manager).to_ne_bytes());
+/// One process as the admin side registers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    pub uid: u32,
+    pub host_pid: i32,
+    /// It lives in a sandbox pid namespace of its own: see [`Server::register`].
+    pub sandboxed: bool,
+    pub context_manager: bool,
+    /// Its SELinux context (`user:role:type:level`): non-empty, no NUL.
+    pub context: String,
+}
+
+/// Admin registration: uid, host pid, sandboxed flag, context-manager flag (4 bytes each), then the context's bytes; the control connection is its fd.
+pub fn encode_register(r: &Registration) -> Vec<u8> {
+    let mut v = r.uid.to_ne_bytes().to_vec();
+    v.extend_from_slice(&r.host_pid.to_ne_bytes());
+    v.extend_from_slice(&u32::from(r.sandboxed).to_ne_bytes());
+    v.extend_from_slice(&u32::from(r.context_manager).to_ne_bytes());
+    v.extend_from_slice(r.context.as_bytes());
     v
 }
 
-/// The admin side (broker, test harness): registers the process whose control connection is `control` and waits for binderd's answer. `sandboxed`: see [`Server::register`].
+/// The admin side (broker, test harness): registers the process whose control connection is `control` and waits for binderd's answer.
 pub fn register(
     admin: BorrowedFd<'_>,
     control: BorrowedFd<'_>,
-    uid: u32,
-    host_pid: i32,
-    sandboxed: bool,
-    context_manager: bool,
+    r: &Registration,
 ) -> Result<(), SysErrno> {
-    proto::send(
-        admin,
-        &encode_register(uid, host_pid, sandboxed, context_manager),
-        &[control],
-    )?;
+    proto::send(admin, &encode_register(r), &[control])?;
     let (msg, _) = proto::recv(admin)?.ok_or(SysErrno::PIPE)?;
     match Reply::decode(&msg) {
         Ok(Reply::Status(0)) => Ok(()),
@@ -75,12 +81,21 @@ pub fn register(
     }
 }
 
-fn decode_register(b: &[u8]) -> Option<(u32, i32, bool, bool)> {
-    if b.len() != 16 {
+/// A registration without a context, or one holding a NUL or non-UTF-8 bytes, is malformed.
+fn decode_register(b: &[u8]) -> Option<Registration> {
+    let (head, context) = b.split_at_checked(16)?;
+    let context = std::str::from_utf8(context).ok()?;
+    if context.is_empty() || context.contains('\0') {
         return None;
     }
-    let u = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().expect("4 bytes"));
-    Some((u(0), u(4) as i32, u(8) != 0, u(12) != 0))
+    let u = |o: usize| u32::from_ne_bytes(head[o..o + 4].try_into().expect("4 bytes"));
+    Some(Registration {
+        uid: u(0),
+        host_pid: u(4) as i32,
+        sandboxed: u(8) != 0,
+        context_manager: u(12) != 0,
+        context: context.to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -261,8 +276,8 @@ impl Server {
 
     fn admin_message(&mut self, id: ConnId, msg: &[u8], mut fds: Vec<OwnedFd>) {
         let status = match (decode_register(msg), fds.len()) {
-            (Some((uid, host_pid, sandboxed, cm)), 1) => {
-                self.register(fds.remove(0), uid, host_pid, sandboxed, cm);
+            (Some(r), 1) => {
+                self.register(fds.remove(0), r);
                 0
             }
             _ => {
@@ -277,17 +292,10 @@ impl Server {
     /// peers outside it read its calling pid as 0 and it reads theirs as 0, as the kernel's task_tgid_nr_ns gives between sibling namespaces; else it is tagged with the host's namespace, seeing and
     /// seen by every host pid (atld's system processes: system_server shares the apps' namespace on a device). The pid inside the sandbox is 0: one process per sandbox, and libbinder never
     /// transacts to a node of its own process, so no peer shares its namespace.
-    pub fn register(
-        &mut self,
-        control: OwnedFd,
-        uid: u32,
-        host_pid: i32,
-        sandboxed: bool,
-        context_manager: bool,
-    ) {
-        let pid_ns = if sandboxed {
+    pub fn register(&mut self, control: OwnedFd, r: Registration) {
+        let pid_ns = if r.sandboxed {
             PidNs::Sandbox {
-                id: host_pid as u64,
+                id: r.host_pid as u64,
                 pid: 0,
             }
         } else {
@@ -295,11 +303,12 @@ impl Server {
         };
         let proc = self.core.add_proc(ProcSpec {
             tag: Tag {
-                uid,
-                host_pid,
+                uid: r.uid,
+                host_pid: r.host_pid,
                 pid_ns,
+                context: r.context.into(),
             },
-            may_be_context_manager: context_manager,
+            may_be_context_manager: r.context_manager,
         });
         self.add_conn(control, Kind::Control { proc, hello: false });
     }

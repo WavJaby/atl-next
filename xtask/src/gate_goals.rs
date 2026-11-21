@@ -130,7 +130,7 @@ pub const NB_GUEST_LIBS: [&str; 24] = [
 /// (ParsingPackageUtils.getSigningDetails) and refuses an unsigned APK. Every gate that builds an APK through ApkTools (atld runs, binder's and the installer's fixtures, gles2-fixture) reads it.
 pub const APK_SIGNER: &str = "apksigner";
 
-/// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, framework-res, AOSP's SettingsProvider (placed in /system/priv-app by every run), the WebView
+/// What every atld run (atld_run `Runtime`) reads: ART and its boot jars' JNI libraries, servicemanager, the compiled sepolicy's files, framework-res, AOSP's SettingsProvider (placed in /system/priv-app by every run), the WebView
 /// provider `webview` (repo `java/webview-provider`, placed in /product by every run), the billing-unavailable responder `Vending` (repo `java/vending`, placed when a run asks: run-apk's default), the converter crates the service packages link (packages.rs), and the Codec2 store's libraries (codec2_store.rs: its constructor dlopens each one in every app process that decodes).
 pub fn runtime() -> Goals {
     Goals::host(&[
@@ -165,6 +165,8 @@ pub fn runtime() -> Goals {
         // AOSP's default health HAL (hardware/interfaces/health/aidl/default) atld starts in every run, and its Rust backend the battery service calls (atl-services battery.rs)
         "android.hardware.health-service.example",
         "android.hardware.health-V4-rust",
+        // the compiled policy's context files and service access table: every run places them in /system/etc/selinux (atld picks each spawn's context from plat_seapp_contexts)
+        crate::native::SEPOLICY_GOAL,
     ])
     .with(Goals::host(&EXTRACTOR_PLUGINS))
     .with(Goals::host(&FRAMEWORK_JNI))

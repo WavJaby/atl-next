@@ -81,6 +81,11 @@ const _: () = assert!(ioc_size(BC_TRANSACTION) == size_of::<binder_transaction_d
 const _: () = assert!(ioc_size(BC_REPLY) == size_of::<binder_transaction_data>());
 const _: () = assert!(ioc_size(BR_TRANSACTION) == size_of::<binder_transaction_data>());
 const _: () = assert!(ioc_size(BR_REPLY) == size_of::<binder_transaction_data>());
+const _: () =
+    assert!(ioc_size(BR_TRANSACTION_SEC_CTX) == size_of::<binder_transaction_data_secctx>());
+// the secctx record is the plain record followed by the context pointer: TransactionSecCtx encodes it so
+const _: () = assert!(offset_of!(binder_transaction_data_secctx, transaction_data) == 0);
+const _: () = assert!(offset_of!(binder_transaction_data_secctx, secctx) == TXN_SIZE);
 const _: () = assert!(ioc_size(BC_INCREFS_DONE) == size_of::<binder_ptr_cookie>());
 const _: () = assert!(ioc_size(BR_INCREFS) == size_of::<binder_ptr_cookie>());
 const _: () = assert!(ioc_size(BC_REQUEST_DEATH_NOTIFICATION) == size_of::<binder_handle_cookie>());
@@ -455,6 +460,11 @@ pub enum Return {
     Error(i32),
     Ok,
     Transaction(TransactionData),
+    /// `BR_TRANSACTION_SEC_CTX`: a transaction to a node flagged `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`, with the sender's SELinux context (NUL-terminated) at `secctx` (a region offset in binderd's stream, an address after the shim).
+    TransactionSecCtx {
+        data: TransactionData,
+        secctx: Uptr,
+    },
     Reply(TransactionData),
     DeadReply,
     TransactionComplete,
@@ -488,6 +498,7 @@ impl Return {
             Return::Error(_) => BR_ERROR,
             Return::Ok => BR_OK,
             Return::Transaction(_) => BR_TRANSACTION,
+            Return::TransactionSecCtx { .. } => BR_TRANSACTION_SEC_CTX,
             Return::Reply(_) => BR_REPLY,
             Return::DeadReply => BR_DEAD_REPLY,
             Return::TransactionComplete => BR_TRANSACTION_COMPLETE,
@@ -510,6 +521,10 @@ impl Return {
         match self {
             Return::Error(e) => out.extend_from_slice(&e.to_ne_bytes()),
             Return::Transaction(t) | Return::Reply(t) => t.encode(out),
+            Return::TransactionSecCtx { data, secctx } => {
+                data.encode(out);
+                out.extend_from_slice(&secctx.to_ne_bytes());
+            }
             Return::IncRefs(pc)
             | Return::Acquire(pc)
             | Return::Release(pc)
@@ -543,6 +558,10 @@ pub fn decode_returns(stream: &[u8]) -> Result<Vec<Return>, WireError> {
             BR_ERROR => Return::Error(i32::from_ne_bytes(rd(p, 0))),
             BR_OK => Return::Ok,
             BR_TRANSACTION => Return::Transaction(TransactionData::decode(p)),
+            BR_TRANSACTION_SEC_CTX => Return::TransactionSecCtx {
+                data: TransactionData::decode(p),
+                secctx: rd_u64(p, TXN_SIZE),
+            },
             BR_REPLY => Return::Reply(TransactionData::decode(p)),
             BR_DEAD_REPLY => Return::DeadReply,
             BR_TRANSACTION_COMPLETE => Return::TransactionComplete,

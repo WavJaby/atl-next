@@ -20,6 +20,12 @@ pub const SYSTEM_LIB: &str = if cfg!(target_pointer_width = "64") {
 /// The platform's executables.
 pub const SYSTEM_BIN: &str = "/system/bin";
 
+/// The compiled SELinux policy's files where a device installs them (Soong `relative_install_path: "selinux"` under each partition's `etc`): seapp rules, service label files; the service access table is ATL's (atl-sepolicy), next to them.
+pub const SEAPP_CONTEXTS: &str = "/system/etc/selinux/plat_seapp_contexts";
+pub const PLAT_SERVICE_CONTEXTS: &str = "/system/etc/selinux/plat_service_contexts";
+pub const SYSTEM_EXT_SERVICE_CONTEXTS: &str = "/system_ext/etc/selinux/system_ext_service_contexts";
+pub const SERVICE_ACCESS: &str = "/system/etc/selinux/service_access";
+
 /// Guest native libraries of native-bridge ISA `isa` at guest pointer width `pointer_bits`: Soong installs a `native_bridge_supported` module's bridge variant under
 /// `lib<bits>/<NativeBridgeRelativePath>` by the module's own width (`lib` for 32-bit, `lib64` for 64-bit), whatever the host's: the guest linker's default search path.
 pub fn native_bridge_lib(isa: &str, pointer_bits: u32) -> String {

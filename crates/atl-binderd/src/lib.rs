@@ -24,6 +24,7 @@ mod transact;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use atl_binder_wire::{
     MAX_RETURN_SIZE, PtrCookie, Return, TransactionData, Uptr, decode_command, uapi,
@@ -59,12 +60,14 @@ pub enum PidNs {
     Sandbox { id: u64, pid: i32 },
 }
 
-/// The broker's identity tag for a process: the kernel's `task_euid` / `task_tgid_nr_ns` inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The broker's identity tag for a process: the kernel's `task_euid` / `task_tgid_nr_ns` inputs, and its SELinux context (`security_cred_getsecid` + `security_secid_to_secctx` of the opener's cred).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub uid: u32,
     pub host_pid: i32,
     pub pid_ns: PidNs,
+    /// `user:role:type:level`, no NUL; what a node flagged `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` receives with each call from this process.
+    pub context: Arc<str>,
 }
 
 impl Tag {
@@ -80,7 +83,7 @@ impl Tag {
 }
 
 /// A new process connection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ProcSpec {
     pub tag: Tag,
     /// Only atld's ServiceManager may become the context manager; replaces the kernel's SELinux check.
@@ -149,13 +152,6 @@ pub enum Reject {
     ThreadBusy,
     /// A second region mapping (`-EBUSY`).
     AlreadyMapped,
-}
-
-/// Inputs accepted without their kernel effect, counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Ignored {
-    /// A node flagged `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (servicemanager's `becomeContextManager`): no SELinux contexts exist, so its transactions arrive as plain `BR_TRANSACTION`, never `BR_TRANSACTION_SEC_CTX`.
-    TxnSecurityCtx,
 }
 
 /// One `BINDER_WRITE_READ` request.
@@ -280,6 +276,8 @@ struct Node {
     ptr: Uptr,
     cookie: Uptr,
     accept_fds: bool,
+    /// `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` (kernel `node->txn_security_ctx`): calls to it carry the sender's context.
+    txn_security_ctx: bool,
     internal_strong: u32,
     local_strong: u32,
     local_weak: u32,
@@ -346,8 +344,10 @@ struct Txn<F> {
     offsets_size: u64,
     /// Region offset of its buffer in `to_proc`; `None` once the buffer was released.
     buffer: Option<u64>,
-    /// Translated data, padding, offsets: the buffer's contents.
+    /// Translated data, padding, offsets, then (a call to a node flagged `FLAT_BINDER_FLAG_TXN_SECURITY_CTX`) the sender's context: the buffer's contents.
     bytes: Vec<u8>,
+    /// Region offset of the sender's context in the buffer, for `BR_TRANSACTION_SEC_CTX`.
+    secctx: Option<u64>,
     /// (region offset of the fd number, token)
     fds: Vec<(u64, F)>,
 }
@@ -365,7 +365,6 @@ pub struct Binderd<F> {
     woken: VecDeque<ThreadId>,
     completed: Vec<(ThreadId, ReadOut<F>)>,
     rejects: BTreeMap<Reject, u64>,
-    ignored: BTreeMap<Ignored, u64>,
 }
 
 impl<F> Default for Binderd<F> {
@@ -387,7 +386,6 @@ impl<F> Binderd<F> {
             woken: VecDeque::new(),
             completed: Vec::new(),
             rejects: BTreeMap::new(),
-            ignored: BTreeMap::new(),
         }
     }
 
@@ -400,11 +398,6 @@ impl<F> Binderd<F> {
     /// Counted rejections so far.
     pub fn rejects(&self) -> &BTreeMap<Reject, u64> {
         &self.rejects
-    }
-
-    /// Counted inputs accepted without their kernel effect.
-    pub fn ignored(&self) -> &BTreeMap<Ignored, u64> {
-        &self.ignored
     }
 
     fn reject(&mut self, r: Reject) {
@@ -581,10 +574,6 @@ impl<F> Binderd<F> {
     }
 
     fn new_node(&mut self, proc: ProcId, ptr: Uptr, cookie: Uptr, flags: u32) -> NodeId {
-        // the kernel then delivers transactions to this node as BR_TRANSACTION_SEC_CTX with the sender's SELinux context (binder_new_node, binder_transaction); there is none here, so plain BR_TRANSACTION (receivers take a null context: IPCThreadState.cpp `tr_secctx.secctx = 0`)
-        if flags & uapi::FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0 {
-            *self.ignored.entry(Ignored::TxnSecurityCtx).or_default() += 1;
-        }
         let id = NodeId(self.id());
         self.nodes.insert(
             id,
@@ -593,6 +582,8 @@ impl<F> Binderd<F> {
                 ptr,
                 cookie,
                 accept_fds: flags & uapi::FLAT_BINDER_FLAG_ACCEPTS_FDS != 0,
+                // binder_init_node_ilocked: `node->txn_security_ctx = !!(flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX)`
+                txn_security_ctx: flags & uapi::FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0,
                 internal_strong: 0,
                 local_strong: 0,
                 local_weak: 0,
@@ -836,13 +827,13 @@ impl<F> Binderd<F> {
         }
     }
 
-    /// BR_TRANSACTION / BR_REPLY for `id` (binder.c:4925-5060).
+    /// BR_TRANSACTION / BR_TRANSACTION_SEC_CTX / BR_REPLY for `id` (binder.c:4925-5060).
     fn deliver(&mut self, t: ThreadId, id: TxnId, out: &mut ReadOut<F>) {
         let p = self.threads[&t].proc;
         let mut txn = self.txns.remove(&id).expect("queued txn");
-        let receiver = self.proc(p).tag;
+        let receiver = &self.proc(p).tag;
         let sender_pid = match txn.from {
-            Some(from) if self.threads.contains_key(&from) => txn.sender.pid_seen_by(&receiver),
+            Some(from) if self.threads.contains_key(&from) => txn.sender.pid_seen_by(receiver),
             _ => 0,
         };
         let buffer = txn.buffer.expect("delivered txn has a buffer");
@@ -863,11 +854,13 @@ impl<F> Binderd<F> {
             buffer,
             offsets: buffer + alloc::align(txn.data_size).expect("checked at send"),
         };
-        if target_node.is_some() {
-            Return::Transaction(data).encode(&mut out.returns);
-        } else {
-            Return::Reply(data).encode(&mut out.returns);
+        // binder_thread_read: `t->security_ctx` set -> BR_TRANSACTION_SEC_CTX with tr.secctx, the longer record
+        match (target_node, txn.secctx) {
+            (Some(_), Some(secctx)) => Return::TransactionSecCtx { data, secctx },
+            (Some(_), None) => Return::Transaction(data),
+            (None, _) => Return::Reply(data),
         }
+        .encode(&mut out.returns);
         out.copies.push(RegionCopy {
             offset: buffer,
             bytes: std::mem::take(&mut txn.bytes),

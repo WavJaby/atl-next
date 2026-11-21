@@ -207,6 +207,33 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
     Ok(rows)
 }
 
+/// The compiled policy's files (converter goal atl-sepolicy, `<out>/gen/sepolicy`) where a device installs them (atl_android_paths): atld picks every app process's context from plat_seapp_contexts.
+/// Every [`Runtime`] places them; not in [`platform_rows`], whose native-load layout builds without the policy.
+fn sepolicy_rows(out: &Path) -> Result<Vec<(PathBuf, String)>> {
+    use atl_android_paths as paths;
+    let gen_dir = out.join("gen/sepolicy");
+    let rows: Vec<(PathBuf, String)> = [
+        ("plat_seapp_contexts", paths::SEAPP_CONTEXTS),
+        ("plat_service_contexts", paths::PLAT_SERVICE_CONTEXTS),
+        (
+            "system_ext_service_contexts",
+            paths::SYSTEM_EXT_SERVICE_CONTEXTS,
+        ),
+        ("service_access", paths::SERVICE_ACCESS),
+    ]
+    .into_iter()
+    .map(|(file, at)| (gen_dir.join(file), at.to_owned()))
+    .collect();
+    for (host, _) in &rows {
+        ensure!(
+            host.is_file(),
+            "missing input {} (xtask native builds goal atl-sepolicy)",
+            host.display()
+        );
+    }
+    Ok(rows)
+}
+
 /// The converter's AOSP SettingsProvider at its Soong install path, as a device's /system always has it: the system scan finds it (priv-app: privileged) and the `settings` authority is served by its
 /// own process, started at the first getContentProvider. Every [`Runtime`] places it (PhoneWindow's constructor reads Settings.Global, so any Activity needs it); not in [`platform_rows`], whose
 /// native-load layout reads no APK.
@@ -842,6 +869,7 @@ impl Runtime {
         let mut platform_files = platform_rows(&out, &layout.src().join("aosp"))?;
         platform_files.push(settings_provider_row(&out)?);
         platform_files.push(webview_provider_row(&out)?);
+        platform_files.extend(sepolicy_rows(&out)?);
         for (file, _) in tree::KEYBOARD_FILES {
             let path = keychars.join(file);
             ensure!(path.is_file(), "missing input {}", path.display());

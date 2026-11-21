@@ -43,14 +43,11 @@ const ABSENT: &str = "android.hardware.atltest.IAbsent/default";
 /// How long servicemanager may take to answer its first `service check` (a cold start reads VINTF and starts its Looper: well under a second measured on a quiet host). The bound only bites
 /// when it never comes up; 10 s, with each check killed at RUN_LIMIT, failed gates compositor and gralloc at load 10-22 (2026-11-20, `killed after 5s`); 60 s is generous on purpose.
 const STARTUP: Duration = Duration::from_secs(60);
-/// binderd counter lines this workload must produce (atl-binderd main.rs prints them; any nonzero count): servicemanager's nodes carry TXN_SECURITY_CTX (`becomeContextManager`, and `setRequestingSid` on its services), and libbinder sends BINDER_ENABLE_ONEWAY_SPAM_DETECTION at open (ProcessState.cpp `open_driver`). Measured 2026-11-02: 3 and 4.
+/// binderd counter lines this workload must produce (atl-binderd main.rs prints them; any nonzero count): libbinder sends BINDER_ENABLE_ONEWAY_SPAM_DETECTION at open (ProcessState.cpp `open_driver`).
 /// 0x40046210 = _IOW('b', 16, __u32) = BINDER_ENABLE_ONEWAY_SPAM_DETECTION (uapi binder.h), once per process open (9 in this workload, 2026-11-06). Left unsupported on purpose:
 /// EINVAL is what a kernel without the feature answers, libbinder tolerates it (logs only when binderfs advertises `features/oneway_spam_detection`), and accepting it
 /// without BR_ONEWAY_SPAM_SUSPECT (async-space accounting binderd lacks) would claim a detection that never runs.
-const MUST_FIRE: &[&str] = &[
-    "binderd: ignored TxnSecurityCtx ",
-    "binderd: fault UnsupportedIoctl(40046210) ",
-];
+const MUST_FIRE: &[&str] = &["binderd: fault UnsupportedIoctl(40046210) "];
 /// Every fault line not in MUST_FIRE fails the gate.
 const FAULT_PREFIX: &str = "binderd: fault ";
 
@@ -121,6 +118,8 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
         context_manager: false,
         // the gate's processes see the host's pids, as before sandbox tags existed: its checks read sender pids as host pids
         binder_pids: atl_broker::BinderPids::Host,
+        // a gate's binder clients and servicemanager alike: any context serves while servicemanager decides by uid (the sweep's own domain comes with the policy decision)
+        context: atl_sepolicy::domains::SHELL.to_owned(),
         mounts,
         links: vec![],
         devices: vec![],
@@ -535,8 +534,7 @@ mod tests {
         );
         let found = (true, format!("Service {MANAGER}: found\n"));
         let absent = (true, format!("Service {ABSENT}: not found\n"));
-        let counters =
-            "binderd: ignored TxnSecurityCtx 1\nbinderd: fault UnsupportedIoctl(40046210) 2\n";
+        let counters = "binderd: fault UnsupportedIoctl(40046210) 2\n";
         // another fault, or another unsupported ioctl, fails even with the expected ones present
         for extra in [
             "binderd: fault BadHandshake 1\n",
@@ -566,13 +564,7 @@ mod tests {
             1
         );
         assert_eq!(
-            verdict(
-                &list,
-                &found,
-                &absent,
-                "binderd: ignored TxnSecurityCtx 1\n"
-            )
-            .len(),
+            verdict(&list, &found, &absent, "binderd: reject NoSpace 1\n").len(),
             1
         );
     }

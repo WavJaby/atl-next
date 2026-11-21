@@ -12,14 +12,24 @@ use std::time::Duration;
 use atl_binder_wire::proto::{self, Reply, Request, VERSION, WriteReadReply};
 use atl_binder_wire::uapi::*;
 use atl_binder_wire::{Command, CommandWriter, Return, TransactionData, decode_returns};
-use atl_binderd::server::{Fault, MAX_QUEUED, Server, encode_register};
-use atl_binderd::{Ignored, Reject};
+use atl_binderd::Reject;
+use atl_binderd::server::{Fault, MAX_QUEUED, Registration, Server, encode_register};
 use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 /// libbinder's region (ProcessState.cpp BINDER_VM_SIZE, 4 KiB pages) and read buffer (256).
 const REGION: u64 = (1 << 20) - 2 * 4096;
 const READ: u64 = 256;
+
+fn registration(uid: u32, cm: bool) -> Registration {
+    Registration {
+        uid,
+        host_pid: 1,
+        sandboxed: false,
+        context_manager: cm,
+        context: format!("u:r:uid_{uid}:s0"),
+    }
+}
 
 fn pair() -> (OwnedFd, OwnedFd) {
     socketpair(
@@ -52,7 +62,7 @@ impl Harness {
         let (ours, theirs) = pair();
         proto::send(
             self.admin.as_fd(),
-            &encode_register(uid, 1, false, cm),
+            &encode_register(&registration(uid, cm)),
             &[theirs.as_fd()],
         )
         .unwrap();
@@ -158,7 +168,7 @@ fn control_requests() {
         errno(rustix::io::Errno::INVAL)
     );
     assert_eq!(call(&app, Request::Poll).0, errno(rustix::io::Errno::INVAL));
-    // only the tagged process may become the context manager; the flag is accepted and counted
+    // only the tagged process may become the context manager (with servicemanager's secctx flag)
     let cm = Request::SetContextMgr {
         ptr: 0,
         cookie: 0,
@@ -174,7 +184,25 @@ fn control_requests() {
     proto::send(app.as_fd(), &[1, 2], &[]).unwrap();
     assert_eq!(recv(&app), errno(rustix::io::Errno::PROTO));
     // admin: a registration without its fd
-    proto::send(h.admin.as_fd(), &encode_register(1, 1, false, false), &[]).unwrap();
+    proto::send(
+        h.admin.as_fd(),
+        &encode_register(&registration(1, false)),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(recv(&h.admin), errno(rustix::io::Errno::INVAL));
+    // admin: a registration without a context (every process has one)
+    let (_, theirs) = pair();
+    let no_context = Registration {
+        context: String::new(),
+        ..registration(1, false)
+    };
+    proto::send(
+        h.admin.as_fd(),
+        &encode_register(&no_context),
+        &[theirs.as_fd()],
+    )
+    .unwrap();
     assert_eq!(recv(&h.admin), errno(rustix::io::Errno::INVAL));
     let s = h.stop();
     let f = s.faults();
@@ -192,11 +220,10 @@ fn control_requests() {
             f[&Fault::Malformed],
             f[&Fault::BadRegistration]
         ),
-        (2, 1, 1)
+        (2, 1, 2)
     );
     assert_eq!(s.core().rejects()[&Reject::ContextManagerDenied], 1);
     assert_eq!(s.core().rejects()[&Reject::AlreadyMapped], 1);
-    assert_eq!(s.core().ignored()[&Ignored::TxnSecurityCtx], 1);
 }
 
 /// A call from an app to handle 0 reaches a polling context manager: Wake once while work is pending, the read delivers BR_TRANSACTION with the region copy, the reply reaches the blocked caller with the request's write_consumed.

@@ -26,9 +26,11 @@ pub fn align(n: u64) -> Option<u64> {
     n.checked_add(PTR - 1).map(|v| v & !(PTR - 1))
 }
 
-/// Region bytes a buffer of `data_size` + `offsets_size` occupies.
-pub fn sanitized_size(data_size: u64, offsets_size: u64) -> Option<u64> {
-    let total = align(data_size)?.checked_add(align(offsets_size)?)?;
+/// Region bytes a buffer of `data_size` + `offsets_size` + `extra_size` occupies (`extra_buffers_size`: binderd's only extra is the sender's security context, binder.c `binder_transaction`).
+pub fn sanitized_size(data_size: u64, offsets_size: u64, extra_size: u64) -> Option<u64> {
+    let total = align(data_size)?
+        .checked_add(align(offsets_size)?)?
+        .checked_add(align(extra_size)?)?;
     Some(total.max(PTR))
 }
 
@@ -55,14 +57,16 @@ impl Alloc {
         }
     }
 
-    /// Offset of a new buffer for `data_size` + `offsets_size` bytes.
+    /// Offset of a new buffer for `data_size` + `offsets_size` + `extra_size` bytes.
     pub fn alloc(
         &mut self,
         data_size: u64,
         offsets_size: u64,
+        extra_size: u64,
         is_async: bool,
     ) -> Result<u64, AllocError> {
-        let size = sanitized_size(data_size, offsets_size).ok_or(AllocError::Invalid)?;
+        let size =
+            sanitized_size(data_size, offsets_size, extra_size).ok_or(AllocError::Invalid)?;
         if is_async && self.free_async < size {
             return Err(AllocError::NoSpace);
         }
@@ -115,39 +119,42 @@ mod tests {
     #[test]
     fn sizes_follow_sanitized_size() {
         // ALIGN(5, 8) + ALIGN(8, 8) = 16; an empty buffer still takes one pointer
-        assert_eq!(sanitized_size(5, 8), Some(16));
-        assert_eq!(sanitized_size(0, 0), Some(8));
-        assert_eq!(sanitized_size(u64::MAX, 0), None);
+        assert_eq!(sanitized_size(5, 8, 0), Some(16));
+        assert_eq!(sanitized_size(0, 0, 0), Some(8));
+        assert_eq!(sanitized_size(u64::MAX, 0, 0), None);
+        // + ALIGN(19, 8) = 24 of extra (a context string padded as binder_transaction pads it)
+        assert_eq!(sanitized_size(5, 8, 19), Some(40));
+        assert_eq!(sanitized_size(0, 0, u64::MAX), None);
     }
 
     #[test]
     fn best_fit_split_merge_and_async_half() {
         let mut a = Alloc::new(64);
-        assert_eq!(a.alloc(16, 0, false), Ok(0));
-        assert_eq!(a.alloc(8, 0, false), Ok(16));
-        assert_eq!(a.alloc(16, 0, false), Ok(24));
+        assert_eq!(a.alloc(16, 0, 0, false), Ok(0));
+        assert_eq!(a.alloc(8, 0, 0, false), Ok(16));
+        assert_eq!(a.alloc(16, 0, 0, false), Ok(24));
         // free [0,16): two holes, 16 at 0 and 24 at 40; 16 bytes go to the exact fit
         assert!(a.free(0));
-        assert_eq!(a.alloc(16, 0, false), Ok(0));
+        assert_eq!(a.alloc(16, 0, 0, false), Ok(0));
         assert!(a.free(16));
         assert!(!a.free(16));
         // freeing neighbours merges back to one range
         assert!(a.free(0));
         assert!(a.free(24));
-        assert_eq!(a.alloc(64, 0, false), Ok(0));
+        assert_eq!(a.alloc(64, 0, 0, false), Ok(0));
         assert!(a.free(0));
         // async: half of 64 = 32
-        assert_eq!(a.alloc(24, 0, true), Ok(0));
-        assert_eq!(a.alloc(16, 0, true), Err(AllocError::NoSpace));
-        assert_eq!(a.alloc(8, 0, true), Ok(24));
+        assert_eq!(a.alloc(24, 0, 0, true), Ok(0));
+        assert_eq!(a.alloc(16, 0, 0, true), Err(AllocError::NoSpace));
+        assert_eq!(a.alloc(8, 0, 0, true), Ok(24));
         assert!(a.free(0));
-        assert_eq!(a.alloc(16, 0, true), Ok(0));
+        assert_eq!(a.alloc(16, 0, 0, true), Ok(0));
         // the region cap: all of 4 MiB, not a byte more
         let mut a = Alloc::new(u64::MAX);
         assert_eq!(
-            a.alloc(MAX_REGION_SIZE + 8, 0, false),
+            a.alloc(MAX_REGION_SIZE + 8, 0, 0, false),
             Err(AllocError::NoSpace)
         );
-        assert_eq!(a.alloc(MAX_REGION_SIZE, 0, false), Ok(0));
+        assert_eq!(a.alloc(MAX_REGION_SIZE, 0, 0, false), Ok(0));
     }
 }
