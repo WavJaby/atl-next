@@ -319,7 +319,7 @@ impl State {
         let ignored: Vec<String> = c.ignored.iter().map(|(k, n)| format!("{k}:{n}")).collect();
         let m = self.mailbox.as_ref().map(|m| m.stats()).unwrap_or_default();
         format!(
-            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} backpressure_same_thread={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
+            "composer: counters ticks={} latches={} backpressure_holds={} latches_unpainted={} backpressure_same_thread={} transactions={} layers_created={} layers_alive={} transactions_applied={} layer_states={} unknown_layer={} handle_deaths_deferred={} layers_kept_by_parent={} buffers_acquired={} buffers_released={} completions={} scenes={} scenes_taken={} scenes_dropped={} presents_refused={} release_reports={} max_held_per_layer={} vsync_sent={} vsync_dropped={} callbacks_sent={} callbacks_failed={} releases_on_channel={} releases_peer_gone={} releases_fenced={} releases_fenced_unmatched={} releases_carried={} releases_held={} completions_held={} fence_waits={} fds_held={} fds_taken={} fds_closed={} post_draw_received={} post_draw_applied={} ticks_short={} tick_late_max_us={} tick_intervals={} vsync_source={} vsync_samples={} vsync_samples_other={} vsync_source_changes={} ignored={}",
             s.ticks,
             s.latches,
             s.backpressure_holds,
@@ -331,6 +331,8 @@ impl State {
             c.transactions_applied,
             c.layer_states_applied,
             c.unknown_layer,
+            c.handle_deaths_deferred,
+            c.layers_kept_by_parent,
             c.buffers_acquired,
             c.buffers_released,
             c.completions_sent,
@@ -780,23 +782,12 @@ impl Composer {
         calls
     }
 
-    /// The last reference to a layer's handle went away.
+    /// The last reference to a layer's handle went away: the core processes the death at a tick, as SurfaceFlinger does ([`Compositor::handle_destroyed`]), so the layer's buffers are released through the tick's
+    /// own hold and scene path. Keys are never reused ([`ObjectMap`]), so the key stays valid for a layer that outlives its handle.
     fn layer_dropped(&self, key: u64) {
         let mut st = self.lock();
         let gone = st.objects.remove(key);
-        let mailbox = st.mailbox.clone();
-        let mut latch = mailbox.as_deref().map(Mailbox::latch);
-        if let Some(l) = &latch {
-            let held = self.held(l);
-            st.compositor.set_held(&held);
-        }
-        let calls = st.compositor.destroy_layer(BinderKey::Local(key));
-        // a buffer released now may be in the scene waiting in the mailbox: that scene goes, the next tick publishes one without the layer
-        if let Some(l) = latch.as_mut().filter(|_| !calls.is_empty()) {
-            l.clear();
-        }
-        drop(latch);
-        st.pending_calls.extend(calls);
+        st.compositor.handle_destroyed(BinderKey::Local(key));
         drop(st);
         // a weak reference: dropping it takes no lock of ours
         drop(gone);

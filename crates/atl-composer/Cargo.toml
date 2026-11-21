@@ -27,6 +27,7 @@ break-input-no-wake = []
 break-no-serve = []
 break-ignore-vsync-flag = []
 break-outbox = []
+break-handle-hold = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }

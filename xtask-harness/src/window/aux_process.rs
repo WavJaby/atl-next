@@ -3,7 +3,8 @@
 //! activity's first layout, kills it after the window presented, starts a new `:aux` (so one registers after the first layout too), then shows a dialog: a new window of the main process.
 //! Each app process registers its own UI agent and compositor (atl-services ui_agents.rs); a window's layers must reach the compositor of the process that opened its session, whichever process of
 //! the uid registered last, and a sibling's death must leave them there. Pass: the fixture logged the sequence in order; the services removed the dead `:aux` agent's entry before the new one
-//! registered; the main process's compositor made the window's layers before the kill and the dialog's after it, with no new unknown layer ([`layers_check`]).
+//! registered; the main process's compositor made the window's layers before the kill and the dialog's after it, with no new unknown layer ([`layers_check`]); and before the kill it met no unknown
+//! layer at all, though AuxStart released a layer right after a transaction on it and finished ([`released_check`]; red under `--break-handle-hold`).
 //! Red on the per-uid table (origin/main 65f97e24, 2026-11-21): main `layers_created=1 layers_alive=0 unknown_layer=20`, WeChat r1's symptom; no removal line.
 
 use std::path::Path;
@@ -28,6 +29,8 @@ const SEQUENCE: [&str; 6] = [
 ];
 /// The fixture's last line: the probe waits for it.
 const LAST: &str = "aux dialog drawn";
+/// AuxStart's line after its transaction on a layer it then released ([`released_check`]).
+const RELEASED: &str = "aux layer released";
 /// AuxMain's line when it sent the kill: the counters before it hold the window's layers before any `:aux` death.
 const KILL: &str = "aux kill sent";
 /// Layers the main compositor made before the kill: AuxStart's window's and AuxMain's, one each from the window service's `window_surface`.
@@ -70,7 +73,41 @@ pub fn checks(app: &str, services: &str, liveness: &Result<Liveness, String>) ->
         ("sequence", sequence_check(app)),
         ("aux-death", death_check(services)),
         ("main-layers", layers_check(app)),
+        ("released-layer", released_check(app)),
     ]
+}
+
+/// The main compositor met no unknown layer before the kill: AuxStart's transaction on a layer it released right after apply ([`RELEASED`]) and AuxStart's finish both name layers whose last handle
+/// goes while their transactions wait for a tick; SurfaceFlinger keeps such a layer until they are applied (atl-compositor `Compositor::handle_destroyed`). Red under `--break-handle-hold`.
+/// `handle_deaths_deferred` is reported, not required: a tick between the apply and the release leaves nothing to defer.
+fn released_check(app: &str) -> Result<String, String> {
+    if !app.lines().any(|l| l.contains(RELEASED)) {
+        return Err(format!("the fixture never logged `{RELEASED}`"));
+    }
+    let kill = app
+        .lines()
+        .filter(|l| l.contains(KILL))
+        .find_map(line_stamp)
+        .ok_or(format!("no `{KILL}` line"))?;
+    let before = app
+        .lines()
+        .filter(|l| l.contains("composer: counters "))
+        .filter_map(|l| Some((line_stamp(l)?, l)))
+        .rfind(|(t, _)| *t < kill)
+        .ok_or("no composer counters line before the kill")?
+        .1;
+    let n = |key: &str| {
+        word(before, key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or(format!("no {key} before the kill"))
+    };
+    let (unknown, deferred) = (n("unknown_layer")?, n("handle_deaths_deferred")?);
+    let summary = format!("before the kill: unknown_layer={unknown} handle_deaths_deferred={deferred}");
+    if unknown == 0 {
+        Ok(summary)
+    } else {
+        Err(format!("want unknown_layer=0: {summary}"))
+    }
 }
 
 fn sequence_check(app: &str) -> Result<String, String> {
@@ -116,7 +153,7 @@ fn death_check(services: &str) -> Result<String, String> {
 /// - before: at least [`MIN_LAYERS_BEFORE_KILL`] layers created: AuxStart's window and AuxMain's, whose first layout came after `:aux` registered;
 /// - after: the dialog's layer created since `before`, at least [`MIN_LAYERS`] alive, and `unknown_layer` unchanged since `before`.
 ///
-/// `unknown_layer` is judged as growth across the sibling's death and re-registration, not from 0: AuxStart's finish can leave a few (0 and 5 measured, 2026-11-21) when the app's transactions on its window's layer land after the window service removed the layer, a single-process race of layer lifetime this stage does not test.
+/// `unknown_layer` is judged as growth across the sibling's death and re-registration; the count before the kill is [`released_check`]'s.
 fn layers_check(app: &str) -> Result<String, String> {
     let stamp_of = |needle: &str| {
         app.lines()
@@ -170,6 +207,7 @@ mod tests {
     fn app(before: &str, after: &str) -> String {
         format!(
             "1762500000.000  INFO AtlWindow: aux bound before main\n\
+             1762500000.001  INFO AtlWindow: aux layer released\n\
              1762500001.000  INFO AtlWindow: onResume reached\n\
              1762500002.000  INFO composer: counters ticks=5 {before} ignored=\n\
              1762500004.000  INFO AtlWindow: aux kill sent\n\
@@ -216,6 +254,23 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    /// Green: no unknown layer before the kill. Red: the 5 that AuxStart's finish left on origin/main (2026-11-21), or the fixture's line missing.
+    #[test]
+    fn released_layer_needs_no_unknown_layer_before_the_kill() {
+        let after = "layers_created=4 layers_alive=3 unknown_layer=0 handle_deaths_deferred=1";
+        let good = app(
+            "layers_created=3 layers_alive=2 unknown_layer=0 handle_deaths_deferred=1",
+            after,
+        );
+        assert!(released_check(&good).is_ok());
+        let leaked = app(
+            "layers_created=3 layers_alive=2 unknown_layer=5 handle_deaths_deferred=0",
+            after,
+        );
+        assert!(released_check(&leaked).is_err());
+        assert!(released_check(&good.replace("aux layer released", "aux layer kept")).is_err());
     }
 
     #[test]

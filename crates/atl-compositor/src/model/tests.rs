@@ -217,7 +217,8 @@ fn every_acquired_buffer_is_released_and_the_producer_never_stalls() {
     assert_eq!(c.counters().buffers_acquired, 25);
     assert_eq!(c.counters().buffers_released, 24);
     assert_eq!(c.counters().cache_misses, 0);
-    let end = c.destroy_layer(key(&layer));
+    c.handle_destroyed(key(&layer));
+    let end = c.on_frame(26 * 16).calls;
     assert_eq!(
         releases(&end).len(),
         1,
@@ -1081,14 +1082,86 @@ fn hidden_and_destroyed_layers_leave_the_scene() {
     assert_eq!(c.on_frame(2).scene.unwrap().quads.len(), 0);
     c.queue_transaction(tx(vec![flags_state(&root, 0, layer_flags::HIDDEN)]));
     assert_eq!(c.on_frame(3).scene.unwrap().quads.len(), 2);
-    let calls = c.destroy_layer(key(&root));
+    c.handle_destroyed(key(&root));
+    let out = c.on_frame(4);
     assert_eq!(
-        releases(&calls).len(),
+        releases(&out.calls).len(),
         1,
         "the root's shown buffer is released to its listener (no channel registered)"
     );
-    let scene = c.on_frame(4).scene.unwrap();
-    assert!(scene.quads.is_empty(), "the orphaned child is not drawn");
+    assert!(
+        out.scene.unwrap().quads.is_empty(),
+        "the orphaned child is not drawn"
+    );
+    assert_eq!(
+        c.layer_count(),
+        1,
+        "the child's handle lives: it stays, offscreen"
+    );
+}
+
+/// SurfaceFlinger keeps a queued transaction's layers alive (`layer_state_t` holds `sp<IBinder> surface`): a handle dropped while a transaction on its layer waits dies only after that
+/// transaction is applied, so the transaction never meets an unknown layer. The death takes effect at the next tick (LayerLifecycleManager: applyTransactions, then onHandlesDestroyed).
+#[test]
+fn a_queued_transaction_keeps_its_layer_until_it_is_applied() {
+    let layer = local(1);
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(layer, 1, None)).unwrap();
+    show(&mut c, &layer, 11, 10, 10);
+    c.on_frame(1);
+    c.queue_transaction(tx(vec![flags_state(
+        &layer,
+        layer_flags::HIDDEN,
+        layer_flags::HIDDEN,
+    )]));
+    c.handle_destroyed(key(&layer));
+    let applied = c.on_frame(2);
+    assert_eq!(c.counters().unknown_layer, 0);
+    assert_eq!(
+        c.layer_count(),
+        1,
+        "the transaction held the handle this tick"
+    );
+    assert!(
+        releases(&applied.calls).is_empty(),
+        "nothing released yet: {applied:?}"
+    );
+    assert_eq!(c.counters().handle_deaths_deferred, 1);
+    let gone = c.on_frame(3);
+    assert_eq!(c.layer_count(), 0);
+    assert_eq!(releases(&gone.calls).len(), 1, "the shown buffer goes with it");
+}
+
+/// RequestedLayerState::canBeDestroyed (`!handleAlive && parentId == UNASSIGNED`): a child whose handle died stays, drawn, while its parent lives; the parent's end takes it along. A child whose
+/// handle lives survives its parent's end, offscreen.
+#[test]
+fn a_parent_keeps_a_child_whose_handle_died() {
+    let (root, dead, live) = (local(1), local(2), local(3));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(root, 1, None)).unwrap();
+    c.create_layer(spec(dead, 2, Some(key(&root)))).unwrap();
+    c.create_layer(spec(live, 3, Some(key(&root)))).unwrap();
+    show(&mut c, &root, 11, 10, 10);
+    show(&mut c, &dead, 12, 10, 10);
+    show(&mut c, &live, 13, 10, 10);
+    assert_eq!(c.on_frame(1).scene.unwrap().quads.len(), 3);
+    c.handle_destroyed(key(&dead));
+    let kept = c.on_frame(2);
+    assert_eq!(c.layer_count(), 3, "the parent keeps the dead-handle child");
+    assert!(releases(&kept.calls).is_empty());
+    assert_eq!(c.counters().layers_kept_by_parent, 1);
+    c.handle_destroyed(key(&root));
+    let out = c.on_frame(3);
+    assert_eq!(
+        c.layer_count(),
+        1,
+        "root and its dead-handle child go, the live child stays"
+    );
+    assert_eq!(releases(&out.calls).len(), 2, "both shown buffers released");
+    assert!(out.scene.unwrap().quads.is_empty(), "the live child is offscreen");
+    c.handle_destroyed(key(&live));
+    c.on_frame(4);
+    assert_eq!(c.layer_count(), 0, "an offscreen layer goes with its handle");
 }
 
 /// A layer created hidden (`createSurface` eHidden, RequestedLayerState's constructor: a SurfaceView's layer) stays out of the scene with a buffer until a transaction shows it.
@@ -1430,7 +1503,8 @@ fn referenced_fds_follow_queue_layer_and_cache() {
     c.on_frame(30);
     assert_eq!(c.referenced_fds(), BTreeSet::from([90, 242]));
     // the layer goes: its channel and shown buffer with it, the cache entry of 202 stays
-    c.destroy_layer(key(&layer));
+    c.handle_destroyed(key(&layer));
+    c.on_frame(25);
     assert_eq!(c.referenced_fds(), BTreeSet::from([242]));
     let mut uncache = TransactionState::new();
     uncache.uncache_buffers.push(UncacheBuffer {
@@ -1793,7 +1867,9 @@ fn destroyed_presented_buffer_is_released_at_the_paint() {
     )]));
     let first = c.on_frame(10);
     taken(&mut c, first.scene.as_ref().expect("a scene"));
-    let end = c.destroy_layer(key(&layer));
+    c.handle_destroyed(key(&layer));
+    let end = c.on_frame(20).calls;
+    assert_eq!(c.layer_count(), 0);
     assert!(releases(&end).is_empty(), "held: {end:?}");
     let paint = c.painted(&BTreeSet::new());
     assert_eq!(

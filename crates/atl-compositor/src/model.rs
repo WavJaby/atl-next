@@ -46,6 +46,9 @@ pub struct CompositorConfig {
     pub z_order: bool,
     /// Queued buffers are latched. false = a gate's deliberate break only (`xtask test window --stage hwui --break-queue`): every buffer a transaction carries is dropped unlatched, as if the producer never queued it, so no frame reaches the scene and the readback check must fail.
     pub latch_buffers: bool,
+    /// A queued transaction holds the handles it names ([`Compositor::handle_destroyed`]). false = a gate's deliberate break only (`xtask test window --stage aux-process --break-handle-hold`): a handle's
+    /// death is processed at the next tick whatever is queued, so a transaction applied after its sender released the layer meets an unknown layer and the stage's `released-layer` check must fail.
+    pub hold_handles: bool,
 }
 
 impl Default for CompositorConfig {
@@ -55,6 +58,7 @@ impl Default for CompositorConfig {
             layer_stack: 0,
             z_order: true,
             latch_buffers: true,
+            hold_handles: true,
         }
     }
 }
@@ -149,6 +153,10 @@ pub struct Counters {
     pub ignored: BTreeMap<&'static str, u64>,
     /// Layer states naming a layer that does not exist.
     pub unknown_layer: u64,
+    /// Ticks a dead handle waited because a queued transaction still named it ([`Compositor::handle_destroyed`]).
+    pub handle_deaths_deferred: u64,
+    /// Handles that died while their layer had a parent: the layer stays until the parent goes.
+    pub layers_kept_by_parent: u64,
     /// A cached-buffer id with no buffer behind it (the buffer is released at once).
     pub cache_misses: u64,
     /// `eMatrixChanged` with rotation or shear (only scale is applied).
@@ -266,6 +274,8 @@ struct Layer {
     release_channel: Option<FdObject>,
     latched_this_frame: bool,
     seq: u64,
+    /// The client still holds the handle (RequestedLayerState::handleAlive); false once its death was processed at a tick ([`Compositor::handle_destroyed`]).
+    handle_alive: bool,
 }
 
 /// What applying a buffer did to its layer: the frame numbers it replaced and took (0 when none), and the replaced buffer's release when its completion carries it.
@@ -457,6 +467,8 @@ pub struct Compositor {
     retired: Vec<Retired>,
     /// Completions held back ([`Pending`]), in the order they were produced.
     pending: Vec<Pending>,
+    /// Handles whose last client reference went, not yet processed at a tick (SurfaceFlinger `mDestroyedHandles`).
+    dead_handles: BTreeSet<BinderKey>,
 }
 
 /// The probe of a compositor whose producers fence nothing (the model tests): every fence counts as signalled.
@@ -479,6 +491,7 @@ impl Compositor {
             fence_signalled: every_fence_signalled,
             retired: Vec::new(),
             pending: Vec::new(),
+            dead_handles: BTreeSet::new(),
         }
     }
 
@@ -541,7 +554,7 @@ impl Compositor {
 
     /// Whether the next tick has anything to do: the platform's frame clock may stay stopped otherwise.
     pub fn wants_frame(&self) -> bool {
-        self.dirty || self.pending_transactions() > 0
+        self.dirty || self.pending_transactions() > 0 || !self.dead_handles.is_empty()
     }
 
     /// A layer was created.
@@ -581,6 +594,7 @@ impl Compositor {
                 release_channel: None,
                 latched_this_frame: false,
                 seq: self.next_seq,
+                handle_alive: true,
             },
         );
         self.dirty = true;
@@ -629,9 +643,66 @@ impl Compositor {
         true
     }
 
-    /// The client dropped its last reference to the layer: it leaves the tree (its children with it) and the buffer it held is released.
-    pub fn destroy_layer(&mut self, handle: BinderKey) -> Vec<ClientCall> {
+    /// The client dropped its last reference to the layer's handle. SurfaceFlinger's rule (LayerHandle::~LayerHandle -> onHandleDestroyed queues it in `mDestroyedHandles`; commit runs
+    /// LayerLifecycleManager::applyTransactions, then onHandlesDestroyed): the death is processed at a tick, after that tick's transactions, and only once no queued transaction names the handle
+    /// (a queued `layer_state_t` holds `sp<IBinder> surface` and `sp<SurfaceControl>` parent / relative layer, so the handle cannot die before it is applied). Then the layer goes only if nothing
+    /// parents it (RequestedLayerState::canBeDestroyed: `!handleAlive && parentId == UNASSIGNED`); a parented one stays in the tree until its parent goes.
+    pub fn handle_destroyed(&mut self, handle: BinderKey) {
+        if self.layers.contains_key(&handle) {
+            self.dead_handles.insert(handle);
+        }
+    }
+
+    /// Whether a queued transaction holds `key`: as a layer it changes, a new parent or a relative layer.
+    fn queued_hold(&self, key: BinderKey) -> bool {
+        self.queues.values().flatten().any(|t| {
+            t.composer_states.iter().any(|s| {
+                s.surface.key() == Some(key)
+                    || s.parent.as_ref().and_then(|p| p.handle.key()) == Some(key)
+                    || s.relative_layer.as_ref().and_then(|r| r.handle.key()) == Some(key)
+            })
+        })
+    }
+
+    /// Whether `l` has a parent in the tree. A layer whose parent went is offscreen (SurfaceFlinger unlinks it: parentId UNASSIGNED) and keeps its stale key, which `z_order` skips.
+    fn parented(&self, l: &Layer) -> bool {
+        l.parent.is_some_and(|p| self.layers.contains_key(&p))
+    }
+
+    /// LayerLifecycleManager::onHandlesDestroyed at a tick: the handles due (dead at the tick's start, held by no queued transaction then) are marked dead; each such layer with no parent is
+    /// destroyed, and with it every child whose handle is dead too (the children with live handles go offscreen).
+    fn process_dead_handles(&mut self, due: Vec<BinderKey>, calls: &mut Vec<ClientCall>) {
+        let mut doomed = Vec::new();
+        for key in due {
+            self.dead_handles.remove(&key);
+            let Some(l) = self.layers.get_mut(&key) else {
+                continue;
+            };
+            l.handle_alive = false;
+            if self.layers.get(&key).is_some_and(|l| !self.parented(l)) {
+                doomed.push(key);
+            } else {
+                self.counters.layers_kept_by_parent += 1;
+            }
+        }
+        while let Some(key) = doomed.pop() {
+            if !self.layers.contains_key(&key) {
+                continue;
+            }
+            calls.extend(self.destroy(key));
+            doomed.extend(
+                self.layers
+                    .iter()
+                    .filter(|(_, l)| l.parent == Some(key) && !l.handle_alive)
+                    .map(|(k, _)| *k),
+            );
+        }
+    }
+
+    /// The layer leaves the tree (its children with it) and the buffer it held is released.
+    fn destroy(&mut self, handle: BinderKey) -> Vec<ClientCall> {
         let mut calls = Vec::new();
+        self.dead_handles.remove(&handle);
         if let Some(mut layer) = self.layers.remove(&handle) {
             self.dirty = true;
             if let Some(h) = layer.held.take() {
@@ -671,7 +742,7 @@ impl Compositor {
         }
         let keys: Vec<BinderKey> = self.layers.keys().copied().collect();
         for k in keys {
-            calls.extend(self.destroy_layer(k));
+            calls.extend(self.destroy(k));
         }
         calls
     }
@@ -772,6 +843,12 @@ impl Compositor {
         }
         let mut calls = Vec::new();
         let mut applied = Vec::new();
+        // the deaths this tick processes: a queued transaction holds its handles until it is applied, so a handle it names dies at a later tick (after the transaction, as in SurfaceFlinger)
+        let (due, held): (Vec<BinderKey>, Vec<BinderKey>) = self
+            .dead_handles
+            .iter()
+            .partition(|k| !self.config.hold_handles || !self.queued_hold(**k));
+        self.counters.handle_deaths_deferred += held.len() as u64;
         let tokens: Vec<_> = self.queues.keys().copied().collect();
         for token in tokens {
             while let Some(front) = self.queues.get(&token).and_then(VecDeque::front) {
@@ -789,6 +866,7 @@ impl Compositor {
             }
         }
         self.queues.retain(|_, q| !q.is_empty());
+        self.process_dead_handles(due, &mut calls);
         self.complete(applied, now_ns, &mut calls);
         let scene = if std::mem::take(&mut self.dirty) {
             let (scene, unbounded) = self.build_scene();
@@ -843,8 +921,7 @@ impl Compositor {
             return None;
         };
         if !self.layers.contains_key(&key) {
-            self.counters.unknown_layer += 1;
-            // a buffer for a layer that is gone still has a producer waiting for its release
+            self.counters.unknown_layer += 1;            // a buffer for a layer that is gone still has a producer waiting for its release
             if s.what & what::E_BUFFER_CHANGED != 0
                 && let Some(bd) = &s.buffer_data
             {

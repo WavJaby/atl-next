@@ -180,9 +180,10 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {
-            // break `z-order`: siblings ignore their z; break `queue`: no queued buffer is latched
+            // break `z-order`: siblings ignore their z; break `queue`: no queued buffer is latched; break `handle-hold`: queued transactions do not keep their layers
             z_order: !cfg!(feature = "break-z-order"),
             latch_buffers: !cfg!(feature = "break-queue"),
+            hold_handles: !cfg!(feature = "break-handle-hold"),
             ..Default::default()
         },
         // break `post-draw`: the window service's forwarded post-draw Transactions are dropped; break `ignore-hold`: a shown buffer is released at the latch that replaces it;

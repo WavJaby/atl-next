@@ -115,6 +115,10 @@ pub struct Args {
     /// outbox sub-gate must fail.
     #[arg(long)]
     break_outbox: bool,
+    /// Stage aux-process only: a queued transaction does not keep the layers it names (atl-composer feature `break-handle-hold`), so the fixture's transaction on a layer it released at once meets
+    /// an unknown layer and the released-layer sub-gate must fail.
+    #[arg(long)]
+    break_handle_hold: bool,
     /// Stage ime only: the fake input method sends its delete as after_length (after the cursor, where nothing is), so the delete sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_delete: bool,
@@ -2151,6 +2155,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     (args.break_input_frames, "input-frames"),
                     (args.break_input_no_wake, "input-no-wake"),
                     (args.break_outbox, "outbox"),
+                    (args.break_handle_hold, "handle-hold"),
                 ]
                 .into_iter()
                 .find_map(|(on, rule)| on.then_some(rule));
