@@ -36,7 +36,7 @@ use binder::{
 use crate::activity;
 use crate::packages::Permissions;
 use crate::tasks::{DEFAULT_IN_TOUCH_MODE, Placement, TaskId, TaskSize, Tasks};
-use crate::ui_agents::UiAgents;
+use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_wire::ui_agent::IUiAgent;
 
 /// The interface names counters use.
@@ -66,19 +66,20 @@ const ADD_BAD_APP_TOKEN: i32 = -1;
 /// WindowManagerGlobal.ADD_BAD_SUBWINDOW_TOKEN: a sub-window whose token is no window's.
 const ADD_BAD_SUBWINDOW_TOKEN: i32 = -2;
 
-/// The UI agent of the app that opened a session (ui_agent.rs): the registry holds one per uid, so a session asks the agent of its own uid.
+/// The UI agent of the process that opened a session (ui_agent.rs): the registry holds one per app process (ui_agents.rs), and a session's windows are its process's (Session.java:130-141), so
+/// a session asks the agent of the process that opened it, whatever other processes of its uid registered.
 struct RegisteredAgent {
     agents: Arc<UiAgents>,
-    uid: u32,
+    process: AppProcess,
 }
 
 impl RegisteredAgent {
-    /// The app's UI agent; None, counted under `call`, when the app registered no agent or it is not an IUiAgent.
+    /// The process's UI agent; None, counted under `call`, when the process registered no agent or it is not an IUiAgent.
     fn agent(&self, call: &str) -> Option<Strong<dyn IUiAgent>> {
-        let Some(binder) = self.agents.get(self.uid) else {
+        let Some(binder) = self.agents.agent(self.process) else {
             atl_diag::answered(
                 WINDOW_SESSION,
-                &format!("{call}: no UI agent registered for the app's uid"),
+                &format!("{call}: no UI agent registered for the session's process"),
             );
             return None;
         };
@@ -332,7 +333,8 @@ impl IWindowManager for WindowManager {
         Ok(false)
     }
 
-    /// WindowManagerService.openSession:6004-6005: a session for the caller's callback; the callback is not kept (no window event reaches the app yet).
+    /// WindowManagerService.openSession:6004-6005: a session for the caller's callback, bound to the calling process (Session.java:130-141 records its pid and uid); the callback is not kept (no
+    /// window event reaches the app yet).
     fn r#openSession(
         &self,
         _callback: Option<
@@ -343,7 +345,7 @@ impl IWindowManager for WindowManager {
             Session {
                 agent: RegisteredAgent {
                     agents: Arc::clone(&self.agents),
-                    uid: ThreadState::get_calling_uid(),
+                    process: AppProcess::calling(),
                 },
                 tasks: Arc::clone(&self.tasks),
                 windows: Mutex::new(Vec::new()),
@@ -930,7 +932,36 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui_agents::tests_support::recording_agent;
     use atl_services_types::display_model::DisplayModel;
+
+    /// Two processes of one uid (WeChat's main and `:push`) register in either order: a window of a session opened by process A asks A's agent for its layer, never B's.
+    #[test]
+    fn a_session_asks_its_own_process_agent_whatever_registered_last() {
+        const UID: u32 = 10_003;
+        let a = AppProcess { uid: UID, pid: 200 };
+        let b = AppProcess { uid: UID, pid: 300 };
+        for a_first in [true, false] {
+            let agents = Arc::new(UiAgents::default());
+            let ((agent_a, asked_a), (agent_b, asked_b)) = (recording_agent(), recording_agent());
+            let mut order = vec![(a, agent_a), (b, agent_b)];
+            if !a_first {
+                order.reverse();
+            }
+            for (p, agent) in order {
+                let (composer, _) = recording_agent();
+                agents.insert(p, agent, composer).expect("insert");
+            }
+            let session_a = RegisteredAgent {
+                agents: Arc::clone(&agents),
+                process: a,
+            };
+            // the recording agent refuses the layer (no compositor behind it): what is judged is who was asked
+            assert!(session_a.window_surface("main").is_none());
+            assert_eq!(*asked_a.lock().expect("a"), ["main"], "a_first={a_first}");
+            assert!(asked_b.lock().expect("b").is_empty(), "a_first={a_first}");
+        }
+    }
 
     /// Each flag set exactly when its condition holds. Expected bits: WindowManagerGlobal.java:117-124 (IN_TOUCH_MODE 0x1, APP_VISIBLE 0x2, ALWAYS_CONSUME_SYSTEM_BARS 0x4); ADD_OKAY 0.
     #[test]

@@ -68,7 +68,7 @@ use crate::process_control::ProcessControl;
 use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
-use crate::ui_agents::UiAgents;
+use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::size_buckets::SizeBuckets;
@@ -1097,6 +1097,11 @@ impl ActivityManager {
             .and_then(|r| r.task)
     }
 
+    /// The process `task` was launched in ([`Self::task_of_process`]'s inverse): the process whose window shows the Task. None when none lives.
+    pub(crate) fn process_of_task(&self, task: TaskId) -> Option<AppProcess> {
+        self.inner.process_of_task(task)
+    }
+
     /// ActivityTaskSupervisor.removeTask(killProcess=true), the desktop window's close (registry REMOVE_TASK): every activity of `task` finishes; its processes end once the shown top
     /// reported its destroy, at most [`KILL_TASK_PROCESSES_TIMEOUT`] later, or at once when the top was not shown. cleanUpServices is not separate: the kill ends the process's services
     /// (Q-B1: a foreground service does not keep it, M29).
@@ -1307,6 +1312,18 @@ impl Inner {
 
     fn task_relaunching(&self, task: TaskId) -> bool {
         self.atm.task_relaunching(task)
+    }
+
+    /// The process `task` was launched in (the oldest live record whose launch made it): the process whose window shows the Task. None when none lives.
+    fn process_of_task(&self, task: TaskId) -> Option<AppProcess> {
+        self.state()
+            .processes
+            .iter()
+            .find(|r| r.task == Some(task))
+            .map(|r| AppProcess {
+                uid: r.uid,
+                pid: r.pid,
+            })
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -3024,7 +3041,7 @@ impl ReportedBuckets {
 struct ActivityClientController {
     buckets: Arc<ReportedBuckets>,
     inner: Weak<Inner>,
-    /// the apps' UI agents, by uid: a move to the back minimizes the app's window through its agent
+    /// the app processes' UI agents: a move to the back minimizes, and a TaskDescription titles, the Task's window through the agent of the process the Task was launched in
     agents: Arc<UiAgents>,
     /// false: onBackPressed sends no requestFinish (`--no-back-finish`, the dialog gate's back sub-gate's deliberate break); a Back then never finishes an activity.
     back_finish: bool,
@@ -3033,15 +3050,19 @@ struct ActivityClientController {
 }
 
 impl ActivityClientController {
-    /// moveActivityTaskToBack for the app of `uid`: its UI agent minimizes the window (the desktop's "back": the Task stays, behind the others). Logged as `onBackPressed: moveTaskToBack uid=<uid>`.
-    /// No agent (headless, or not registered yet): counted, nothing else; the activity stays.
-    fn task_to_back(&self, uid: u32) {
-        log(format_args!("onBackPressed: moveTaskToBack uid={uid}"));
-        let Some(agent) = self
-            .agents
-            .get(uid)
+    /// The UI agent of the process `task`'s window is in (Inner::process_of_task). Not the binder caller's: onBackPressed is oneway, and a oneway call carries no calling pid.
+    fn task_agent(&self, task: TaskId) -> Option<Strong<dyn IUiAgent>> {
+        let process = self.inner.upgrade()?.process_of_task(task)?;
+        self.agents
+            .agent(process)
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
-        else {
+    }
+
+    /// moveActivityTaskToBack of `task`, of the app of `uid`: its window's UI agent minimizes the window (the desktop's "back": the Task stays, behind the others). Logged as `onBackPressed: moveTaskToBack uid=<uid>`.
+    /// No agent (headless, or not registered yet): counted, nothing else; the activity stays.
+    fn task_to_back(&self, uid: u32, task: TaskId) {
+        log(format_args!("onBackPressed: moveTaskToBack uid={uid}"));
+        let Some(agent) = self.task_agent(task) else {
             atl_diag::answered(ACC, "onBackPressed: moveTaskToBack, no UI agent");
             return;
         };
@@ -3157,7 +3178,7 @@ impl IActivityClientController for ActivityClientController {
             _ => None,
         };
         match back.map(|b| under_policy(b, self.root_back)) {
-            Some(Back::TaskToBack { uid }) => self.task_to_back(uid),
+            Some(Back::TaskToBack { uid, task }) => self.task_to_back(uid, task),
             Some(Back::Finish) if !self.back_finish => {
                 atl_diag::refused(ACC, "onBackPressed (--no-back-finish)");
             }
@@ -3231,11 +3252,7 @@ impl IActivityClientController for ActivityClientController {
             atl_diag::answered(ACC, "setTaskDescription: no such activity");
             return Ok(());
         };
-        let Some(agent) = self
-            .agents
-            .get(title.uid)
-            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
-        else {
+        let Some(agent) = self.task_agent(title.task) else {
             atl_diag::answered(ACC, "setTaskDescription (kept, no UI agent)");
             return Ok(());
         };
@@ -3421,7 +3438,10 @@ mod tests {
     /// Minimize keeps the move to the back; Close turns it into the pre-Android-12 finish; a plain finish stays a finish under both.
     #[test]
     fn root_back_policy() {
-        let back = Back::TaskToBack { uid: 10_001 };
+        let back = Back::TaskToBack {
+            uid: 10_001,
+            task: TaskId::from_raw(1).expect("task number"),
+        };
         assert_eq!(under_policy(back, RootBack::Minimize), back);
         assert_eq!(under_policy(back, RootBack::Close), Back::Finish);
         assert_eq!(under_policy(Back::Finish, RootBack::Minimize), Back::Finish);

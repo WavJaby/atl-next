@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! The compositor registry service (compositor_registry.rs is the protocol). REGISTER takes the app's UI agent (ui_agent.rs), kept under the caller's uid in the table the window service reads:
-//! constructor injection into [`Registry`], so the table is not part of the interface.
+//! The compositor registry service (compositor_registry.rs is the protocol). REGISTER takes the app process's UI agent (ui_agent.rs) and compositor, kept under the calling process (uid + binder
+//! calling pid, ui_agents.rs) in the table the window service reads: constructor injection into [`Registry`], so the table is not part of the interface.
 
-use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use binder::binder_impl::{Binder, BorrowedParcel, TransactionCode};
 use binder::{
@@ -16,7 +15,7 @@ use crate::activity::ActivityManager;
 use crate::display::DisplayCallbacks;
 use crate::input::KeyMaps;
 use crate::tasks::{TaskId, TaskSize, Tasks};
-use crate::ui_agents::UiAgents;
+use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::compositor_registry::{
     DESCRIPTOR, GET_COMPOSER, KEY_MAP, REGISTER, REMOVE_TASK, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
 };
@@ -33,15 +32,16 @@ pub struct TaskInfo {
 }
 
 pub trait ICompositorRegistry: Interface {
-    /// REGISTER once its arguments are read: the agent and the compositor are kept under `caller_uid`.
+    /// REGISTER once its arguments are read: the agent and the compositor are kept under the calling process `caller`, until the agent dies.
     fn register(
         &self,
-        caller_uid: u32,
+        caller: AppProcess,
         ui_agent: SpIBinder,
         composer: SpIBinder,
     ) -> Result<(), StatusCode>;
 
-    /// GET_COMPOSER once the package is read: the compositor of the newest launch of `package`, for a caller that is the shell or the system uid; any other caller gets SECURITY (compositor_registry.rs GET_COMPOSER).
+    /// GET_COMPOSER once the package is read: the compositor of the process the newest launch of `package` made its Task in (the process whose window shows it), for a caller that is the shell
+    /// or the system uid; any other caller gets SECURITY (compositor_registry.rs GET_COMPOSER).
     fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>>;
 
     /// SET_BOUNDS once its arguments are read: Task `task` (its number, tasks.rs) is `width` x `height` physical pixels. The caller's uid must own the Task; a non-positive size is refused; a size change notifies the Task's windows.
@@ -106,7 +106,7 @@ fn on_transact(
     })
 }
 
-/// REGISTER: the UI agent; the calling uid is taken from the transaction.
+/// REGISTER: the UI agent and compositor; the calling process (uid, pid) is taken from the transaction.
 fn dispatch(
     service: &dyn ICompositorRegistry,
     code: TransactionCode,
@@ -167,7 +167,7 @@ fn dispatch(
     }
     let ui_agent: SpIBinder = data.read()?;
     let composer: SpIBinder = data.read()?;
-    service.register(ThreadState::get_calling_uid(), ui_agent, composer)
+    service.register(AppProcess::calling(), ui_agent, composer)
 }
 
 impl ICompositorRegistry for BpCompositorRegistry {
@@ -187,7 +187,7 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn register(&self, _: u32, _: SpIBinder, _: SpIBinder) -> Result<(), StatusCode> {
+    fn register(&self, _: AppProcess, _: SpIBinder, _: SpIBinder) -> Result<(), StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -225,11 +225,11 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 
     fn register(
         &self,
-        caller_uid: u32,
+        caller: AppProcess,
         ui_agent: SpIBinder,
         composer: SpIBinder,
     ) -> Result<(), StatusCode> {
-        self.0.register(caller_uid, ui_agent, composer)
+        self.0.register(caller, ui_agent, composer)
     }
 
     fn composer(&self, caller_uid: u32, package: &str) -> binder::Result<Option<SpIBinder>> {
@@ -248,8 +248,6 @@ struct Registry {
     activities: ActivityManager,
     /// the display service's callbacks: a display change reaches them (display.rs)
     display_callbacks: Arc<DisplayCallbacks>,
-    /// each registered app's compositor, under its uid (GET_COMPOSER)
-    composers: Mutex<BTreeMap<u32, SpIBinder>>,
     /// the input service's key maps (input.rs), served by KEY_MAP
     key_maps: Arc<KeyMaps>,
 }
@@ -377,18 +375,14 @@ impl ICompositorRegistry for Registry {
 
     fn register(
         &self,
-        caller_uid: u32,
+        caller: AppProcess,
         ui_agent: SpIBinder,
         composer: SpIBinder,
     ) -> Result<(), StatusCode> {
-        self.agents.insert(caller_uid, ui_agent);
-        self.composers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(caller_uid, composer);
+        self.agents.insert(caller, ui_agent, composer)?;
         let _ = writeln!(
             std::io::stderr(),
-            "services: registered the UI agent and compositor of uid {caller_uid}"
+            "services: registered the UI agent and compositor of {caller}"
         );
         Ok(())
     }
@@ -401,17 +395,16 @@ impl ICompositorRegistry for Registry {
                 Some("composer: the caller is not the shell or system"),
             ));
         }
-        let owner = self.tasks.owner_of_package(package);
-        let composer = owner.and_then(|uid| {
-            self.composers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&uid)
-                .cloned()
-        });
+        // AOSP's captureDisplay reads the display, which shows the Task's window: here that window's layers are in the compositor of the process the Task was launched in
+        let process = self
+            .tasks
+            .newest_of_package(package)
+            .and_then(|task| self.activities.process_of_task(task));
+        let composer = process.and_then(|p| self.agents.composer(p));
         let _ = writeln!(
             std::io::stderr(),
-            "services: composer of {package}: uid {owner:?}, {}",
+            "services: composer of {package}: {}, {}",
+            process.map_or_else(|| "no process".to_owned(), |p| p.to_string()),
             if composer.is_some() { "served" } else { "none" }
         );
         Ok(composer)
@@ -432,7 +425,6 @@ pub fn new_binder(
             tasks,
             activities,
             display_callbacks,
-            composers: Mutex::new(BTreeMap::new()),
             key_maps,
         },
         BinderFeatures::default(),

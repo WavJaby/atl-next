@@ -406,7 +406,8 @@ fn log_showing(frames: &[u32]) -> String {
 }
 
 fn good_services() -> String {
-    format!("{}\n", agent_line(SELF_TEST_UID))
+    // any pid: the line names the registering process (ui_agents.rs AppProcess), the check only the uid
+    format!("{}2\n", agent_line(SELF_TEST_UID))
 }
 
 /// atl-composer start's line once both services are in the process's service view.
@@ -415,9 +416,9 @@ fn served_line() -> String {
     format!("composer: serving {SURFACE_FLINGER}, {SURFACE_FLINGER_AIDL} in-process")
 }
 
-/// The registry's line once the client's UI agent and compositor are registered (registry_service.rs).
+/// The registry's line once a process of the client's uid registered its UI agent and compositor (registry_service.rs), up to the process's pid.
 fn agent_line(app_uid: u32) -> String {
-    format!("services: registered the UI agent and compositor of uid {app_uid}")
+    format!("services: registered the UI agent and compositor of uid {app_uid} pid ")
 }
 
 /// One synthetic run and the checks that must fail on it (empty: the run must pass).

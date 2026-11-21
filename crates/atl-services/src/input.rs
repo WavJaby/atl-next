@@ -9,7 +9,7 @@ use atl_parcelables::codecs::android::view::InputDevice::set_key_character_map;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
 use crate::packages::Permissions;
-use crate::ui_agents::UiAgents;
+use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::input_devices::{
     KEYBOARD, POINTER, SOURCE_KEYBOARD, SOURCE_MOUSE, SOURCE_TOUCHPAD, SOURCE_TOUCHSCREEN,
     TOUCHPAD, TOUCHSCREEN, VIRTUAL_KEYBOARD,
@@ -29,7 +29,7 @@ const TYPE_ARROW: i32 = 1000;
 struct InputManager {
     permissions: Arc<Permissions>,
     devices: Vec<InputDevice>,
-    /// The apps' UI agents: setPointerIcon goes to the caller's.
+    /// The app processes' UI agents: setPointerIcon goes to the calling process's.
     agents: Arc<UiAgents>,
 }
 
@@ -170,7 +170,7 @@ impl IInputManager for InputManager {
         Ok(())
     }
 
-    /// ViewRootImpl.updatePointerIcon calls this when the icon resolved for a mouse event changed. Relayed (oneway) to the calling app's UI agent, which shows it on its window; true once relayed (InputManager.setPointerIcon: whether the icon was set).
+    /// ViewRootImpl.updatePointerIcon calls this when the icon resolved for a mouse event changed. Relayed (oneway) to the calling process's UI agent, which shows it on its window; true once relayed (InputManager.setPointerIcon: whether the icon was set).
     /// The token is unused: one window per app (multi-window resolves `inputToken` to its window). A caller with no agent (headless) or no icon -> false, counted.
     fn r#setPointerIcon(
         &self,
@@ -182,7 +182,7 @@ impl IInputManager for InputManager {
     ) -> binder::Result<bool> {
         let agent = self
             .agents
-            .get(ThreadState::get_calling_uid())
+            .agent(AppProcess::calling())
             .and_then(|b| b.into_interface::<dyn IUiAgent>().ok());
         let (Some(icon), Some(agent)) = (icon, agent) else {
             atl_diag::answered(INTERFACE, "setPointerIcon (no icon or no UI agent)");

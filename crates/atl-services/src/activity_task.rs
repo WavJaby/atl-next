@@ -97,7 +97,8 @@ pub(crate) struct Owner {
 /// What a Task's window is titled from ([`ActivityTasks::task_title`]): the merged TaskDescription label, and the root activity whose label stands in when there is none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskTitle {
-    pub uid: u32,
+    /// the Task titled: its window is in the process the Task was launched in (activity.rs process_of_task)
+    pub task: TaskId,
     pub label: Option<String>,
     pub package: String,
     pub class: String,
@@ -108,8 +109,8 @@ pub(crate) struct TaskTitle {
 pub(crate) enum Back {
     /// requestFinish: the app finishes the activity (the default, :1744).
     Finish,
-    /// moveActivityTaskToBack (:1736-1739): the Task of the app with this uid goes to the back, the activity stays.
-    TaskToBack { uid: u32 },
+    /// moveActivityTaskToBack (:1736-1739): `task`, of the app with this uid, goes to the back, the activity stays.
+    TaskToBack { uid: u32, task: TaskId },
 }
 
 /// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
@@ -703,6 +704,7 @@ impl ActivityTasks {
             if *root == token && root_owner.entry && top == Some(token) {
                 Back::TaskToBack {
                     uid: root_owner.uid,
+                    task,
                 }
             } else {
                 Back::Finish
@@ -901,7 +903,7 @@ impl ActivityTasks {
         let records: Vec<_> = m.records(task).collect();
         let (_, root) = records.first()?;
         Some(TaskTitle {
-            uid: root.uid,
+            task,
             label: records.iter().rev().find_map(|(_, o)| o.task_label.clone()),
             package: root.package.clone(),
             class: root.component.clone(),
