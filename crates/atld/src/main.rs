@@ -71,6 +71,7 @@ use signal_hook::iterator::Signals;
 mod applog;
 mod cacerts;
 mod host_layout;
+mod installed_code;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -907,12 +908,19 @@ struct Installd {
     session_mounts: Vec<Mount>,
     /// a system scan's installer view besides `mounts`: /system, /product, /system_ext read-only at their Android paths and the host files their links name at their own
     scan_mounts: Vec<Mount>,
-    /// staged sessions -> the uid they were staged for
-    staged: Mutex<BTreeMap<u32, u32>>,
+    /// staged sessions -> the uid they were staged for, and where
+    staged: Mutex<BTreeMap<u32, Staged>>,
     /// scanned package dirs (Android paths) the installer parsed, not yet committed
     scanned: Mutex<BTreeSet<String>>,
     /// committed packages: what a start request may name
     committed: Mutex<BTreeMap<String, Committed>>,
+}
+
+/// One staged session: the uid it was staged for; `in_place`: the installed package whose code it equals (installed_code.rs), parsed where it lies instead of in a staging dir.
+#[derive(Clone, PartialEq, Eq)]
+struct Staged {
+    uid: u32,
+    in_place: Option<String>,
 }
 
 /// One committed package: its uid, and whether its code lies in a partition (a system scan) rather than /data/app.
@@ -973,6 +981,8 @@ fn staging_name(session: u32) -> String {
 
 impl Host {
     /// Request `Install`: stages session `session` for `uid` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
+    /// A session equal to an installed package's code (installed_code.rs) is not staged: the installer runs over that code dir where it lies, its native-library root the package's own, so AOSP's
+    /// NativeLibraryHelper finds every library already there and copies none (isFileDifferent). Log `install skipped: unchanged`.
     fn install(&self, session: u32, uid: u32) -> Result<String> {
         ensure!(
             uid > INSTALLER_UID,
@@ -990,17 +1000,34 @@ impl Host {
                 .contains_key(&session),
             "session {session}: already staged"
         );
-        let name = staging_name(session);
-        let host_dir = self.root.data().join("app").join(&name);
-        let at = Path::new(DATA_APP).join(&name);
-        // a dir a killed run left under this session name (the device outlives runs): the session's files must be the only ones here
-        if host_dir.exists() {
-            std::fs::remove_dir_all(&host_dir)?;
-        }
-        std::fs::create_dir_all(&host_dir)?;
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        let in_place = installed_code::unchanged(&self.root.data_root, &paths)?;
+        let (host_dir, at) = match &in_place {
+            Some(p) => {
+                log(format_args!(
+                    "install session {session}: install skipped: unchanged ({p}'s installed code, parsed in place)"
+                ));
+                (
+                    self.root.package(p, host_layout::Item::Apk),
+                    Path::new(DATA_APP).join(p),
+                )
+            }
+            None => {
+                let name = staging_name(session);
+                let host_dir = self.root.data().join("app").join(&name);
+                // a dir a killed run left under this session name (the device outlives runs): the session's files must be the only ones here
+                if host_dir.exists() {
+                    std::fs::remove_dir_all(&host_dir)?;
+                }
+                std::fs::create_dir_all(&host_dir)?;
+                (host_dir, Path::new(DATA_APP).join(name))
+            }
+        };
         let staged = (|| -> Result<String> {
-            for f in files {
-                stage_file(&f.path, &host_dir.join(f.session_name()?))?;
+            if in_place.is_none() {
+                for f in files {
+                    stage_file(&f.path, &host_dir.join(f.session_name()?))?;
+                }
             }
             let lib = LIB_DIR_NAME;
             std::fs::create_dir_all(host_dir.join(lib))?;
@@ -1072,11 +1099,14 @@ impl Host {
                 i.staged
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(session, uid);
+                    .insert(session, Staged { uid, in_place });
                 Ok(frames)
             }
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&host_dir);
+                // an installed package's code stays: only a staging dir is this session's own
+                if in_place.is_none() {
+                    let _ = std::fs::remove_dir_all(&host_dir);
+                }
                 Err(e)
             }
         }
@@ -1090,26 +1120,41 @@ impl Host {
         );
         let i = &self.installd;
         let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
-        ensure!(
-            staged.get(&session) == Some(&uid),
-            "session {session}: not staged for uid {uid}"
-        );
+        let in_place = match staged.get(&session) {
+            Some(s) if s.uid == uid => s.in_place.clone(),
+            _ => bail!("session {session}: not staged for uid {uid}"),
+        };
         let mut committed = i.committed.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
             !committed.contains_key(package),
             "{package}: already installed"
         );
-        let code = self.root.package(package, host_layout::Item::Apk);
-        let staged_dir = self.root.data().join("app").join(staging_name(session));
-        rename_staged(&staged_dir, names)?;
-        // the data root keeps the code across runs: the new code replaces an earlier install's, as an update does (the data dirs are its siblings and stay)
-        if code.exists() {
-            std::fs::remove_dir_all(&code)?;
+        match in_place {
+            // the installed code is the parse's: its files already carry the AOSP names the parse gives
+            Some(p) => {
+                ensure!(
+                    p == package,
+                    "session {session}: equals {p}'s code but parsed as {package}"
+                );
+                ensure!(
+                    names.iter().all(|n| n.staged == n.name),
+                    "session {session}: {package}'s installed names differ from the parse's"
+                );
+            }
+            None => {
+                let code = self.root.package(package, host_layout::Item::Apk);
+                let staged_dir = self.root.data().join("app").join(staging_name(session));
+                rename_staged(&staged_dir, names)?;
+                // the data root keeps the code across runs: the new code replaces an earlier install's, as an update does (the data dirs are its siblings and stay)
+                if code.exists() {
+                    std::fs::remove_dir_all(&code)?;
+                }
+                let parent = code.parent().context("package dir has no parent")?;
+                std::fs::create_dir_all(parent)?;
+                std::fs::rename(&staged_dir, &code)
+                    .with_context(|| format!("moving session {session} to {}", code.display()))?;
+            }
         }
-        let parent = code.parent().context("package dir has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        std::fs::rename(&staged_dir, &code)
-            .with_context(|| format!("moving session {session} to {}", code.display()))?;
         self.create_app_data(package)?;
         staged.remove(&session);
         committed.insert(package.to_owned(), Committed { uid, system: false });
