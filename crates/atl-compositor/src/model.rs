@@ -250,13 +250,34 @@ impl Held {
     }
 }
 
+/// Where a layer hangs: SurfaceFlinger's `parentId` with `canBeRoot` (RequestedLayerState::isRoot = canBeRoot && no parent). canBeRoot holds only for a layer created parentless and is cleared by
+/// every eReparent, so the three states are exhaustive. A layer is drawn only when its chain reaches a [`Parent::Root`] (LayerHierarchyBuilder::attachToParent puts the rest under the offscreen root,
+/// which composition never walks); one value, so "drawn" and canBeDestroyed (`!handleAlive && no parent`) read the same fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Parent {
+    /// Created with no parent (the window manager's window and dim layers): a root of the layer stack.
+    Root,
+    /// A child of this live layer.
+    Layer(BinderKey),
+    /// No parent, not a root: reparented to null or to a layer that is not there, or its parent was destroyed. Alive while its handle is, not drawn; a reparent under a drawn layer shows it again.
+    Offscreen,
+}
+
+/// The layer a layer is ordered relative to (eRelativeLayerChanged). `Gone`: it named a layer that is not there or was destroyed; SurfaceFlinger keeps such a layer relative but unreachable
+/// (RequestedLayerState::hasValidRelativeParent, `relativeParentId` UNASSIGNED with `isRelativeOf`), so it is not drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Relative {
+    Layer(BinderKey),
+    Gone,
+}
+
 #[derive(Clone, Debug)]
 struct Layer {
     handle: StrongBinder,
     id: i32,
     name: String,
-    parent: Option<BinderKey>,
-    relative_to: Option<BinderKey>,
+    parent: Parent,
+    relative_to: Option<Relative>,
     z: i32,
     x: f32,
     y: f32,
@@ -567,13 +588,22 @@ impl Compositor {
             return Err(ModelError::DuplicateLayer(key));
         }
         self.next_seq += 1;
+        // SurfaceFlinger::createLayer: an invalid parent handle drops addToRoot, so the layer starts offscreen
+        let parent = match spec.parent {
+            None => Parent::Root,
+            Some(p) if self.layers.contains_key(&p) => Parent::Layer(p),
+            Some(_) => {
+                self.counters.layers_offscreen += 1;
+                Parent::Offscreen
+            }
+        };
         self.layers.insert(
             key,
             Layer {
                 handle: spec.handle,
                 id: spec.id,
                 name: spec.name,
-                parent: spec.parent,
+                parent,
                 relative_to: None,
                 z: 0,
                 x: 0.0,
@@ -632,7 +662,7 @@ impl Compositor {
         let Some(l) = self.layers.values_mut().find(|l| l.id == id) else {
             return false;
         };
-        l.relative_to = Some(anchor);
+        l.relative_to = Some(Relative::Layer(anchor));
         l.z = c.z;
         l.color = c.color;
         l.alpha = c.alpha;
@@ -667,9 +697,9 @@ impl Compositor {
         })
     }
 
-    /// Whether `l` has a parent in the tree. A layer whose parent went is offscreen (SurfaceFlinger unlinks it: parentId UNASSIGNED) and keeps its stale key, which `z_order` skips.
-    fn parented(&self, l: &Layer) -> bool {
-        l.parent.is_some_and(|p| self.layers.contains_key(&p))
+    /// Whether `l` has a parent: SurfaceFlinger's `parentId != UNASSIGNED`, which keeps a dead-handle layer alive (canBeDestroyed). A root and an offscreen layer have none.
+    fn parented(l: &Layer) -> bool {
+        matches!(l.parent, Parent::Layer(_))
     }
 
     /// LayerLifecycleManager::onHandlesDestroyed at a tick: the handles due (dead at the tick's start, held by no queued transaction then) are marked dead; each such layer with no parent is
@@ -682,37 +712,44 @@ impl Compositor {
                 continue;
             };
             l.handle_alive = false;
-            if self.layers.get(&key).is_some_and(|l| !self.parented(l)) {
-                doomed.push(key);
-            } else {
+            if Self::parented(l) {
                 self.counters.layers_kept_by_parent += 1;
+            } else {
+                doomed.push(key);
             }
         }
         while let Some(key) = doomed.pop() {
             if !self.layers.contains_key(&key) {
                 continue;
             }
-            calls.extend(self.destroy(key));
             doomed.extend(
                 self.layers
                     .iter()
-                    .filter(|(_, l)| l.parent == Some(key) && !l.handle_alive)
+                    .filter(|(_, l)| l.parent == Parent::Layer(key) && !l.handle_alive)
                     .map(|(k, _)| *k),
             );
+            calls.extend(self.destroy(key));
         }
     }
 
-    /// The layer leaves the tree (its children with it) and the buffer it held is released.
+    /// The layer leaves the tree and the buffer it held is released. Its children go offscreen and the layers relative to it become unreachable (LayerLifecycleManager::onHandlesDestroyed unlinks
+    /// both); the caller destroys the children whose handles are dead.
     fn destroy(&mut self, handle: BinderKey) -> Vec<ClientCall> {
         let mut calls = Vec::new();
         self.dead_handles.remove(&handle);
         if let Some(mut layer) = self.layers.remove(&handle) {
             self.dirty = true;
-            self.counters.layers_offscreen += self
-                .layers
-                .values()
-                .filter(|l| l.parent == Some(handle) && l.handle_alive)
-                .count() as u64;
+            for l in self.layers.values_mut() {
+                if l.parent == Parent::Layer(handle) {
+                    l.parent = Parent::Offscreen;
+                    if l.handle_alive {
+                        self.counters.layers_offscreen += 1;
+                    }
+                }
+                if l.relative_to == Some(Relative::Layer(handle)) {
+                    l.relative_to = Some(Relative::Gone);
+                }
+            }
             if let Some(h) = layer.held.take() {
                 if h.presented {
                     self.counters.releases_held += 1;
@@ -949,7 +986,12 @@ impl Compositor {
         let mut frame_number = 0u64;
         let mut previous_frame_number = 0u64;
         let mut previous_release = None;
-        let mut reparented = false;
+        // SurfaceFlinger resolves a handle that names no live layer to UNASSIGNED (LayerLifecycleManager::linkLayer)
+        let live = |b: Option<BinderKey>| b.filter(|k| self.layers.contains_key(k));
+        let new_parent = live(s.parent.as_ref().and_then(|p| p.handle.key()))
+            .map_or(Parent::Offscreen, Parent::Layer);
+        let new_relative = live(s.relative_layer.as_ref().and_then(|r| r.handle.key()))
+            .map_or(Relative::Gone, Relative::Layer);
         {
             let l = self.layers.get_mut(&key).expect("checked above");
             if w & what::E_POSITION_CHANGED != 0 {
@@ -964,13 +1006,17 @@ impl Compositor {
             }
             if w & what::E_RELATIVE_LAYER_CHANGED != 0 {
                 l.z = s.z;
-                l.relative_to = s.relative_layer.as_ref().and_then(|r| r.handle.key());
+                l.relative_to = Some(new_relative);
                 handled |= what::E_RELATIVE_LAYER_CHANGED;
             }
             if w & what::E_REPARENT != 0 {
-                l.parent = s.parent.as_ref().and_then(|p| p.handle.key());
+                // RequestedLayerState::merge: every reparent clears canBeRoot; one to no parent also clears relative z
+                l.parent = new_parent;
+                if new_parent == Parent::Offscreen {
+                    l.relative_to = None;
+                    self.counters.layers_offscreen += 1;
+                }
                 handled |= what::E_REPARENT;
-                reparented = true;
             }
             if w & what::E_COLOR_CHANGED != 0 {
                 l.color = [s.color[0], s.color[1], s.color[2]];
@@ -1023,9 +1069,6 @@ impl Compositor {
             }
             // listener callbacks are answered per transaction (see `complete`)
             handled |= what::E_HAS_LISTENER_CALLBACKS_CHANGED;
-        }
-        if reparented && !self.layers.get(&key).is_some_and(|l| self.parented(l)) {
-            self.counters.layers_offscreen += 1;
         }
         if w & what::E_BUFFER_CHANGED != 0 && self.config.latch_buffers {
             handled |= what::E_BUFFER_CHANGED;
@@ -1304,9 +1347,10 @@ impl Compositor {
         if depth > self.layers.len() {
             return None; // a parent cycle: the layer is not shown
         }
+        // an offscreen layer drawn through its relative parent transforms from the offscreen root, which has no transform
         let parent = match l.parent {
-            Some(p) => self.geometry(p, depth + 1)?,
-            None => Geometry::root(self.config.layer_stack),
+            Parent::Layer(p) => self.geometry(p, depth + 1)?,
+            Parent::Root | Parent::Offscreen => Geometry::root(self.config.layer_stack),
         };
         let own = Geometry {
             sx: parent.sx * l.scale_x,
@@ -1328,18 +1372,17 @@ impl Compositor {
         Some(Geometry { clip, ..own })
     }
 
-    /// The z-ordered draw list: per layer, children below zero, itself, children from zero up; a layer ordered `relative_to` another sorts among that layer's children.
+    /// The z-ordered draw list: per layer, children below zero, itself, children from zero up; a layer ordered `relative_to` another sorts among that layer's children. Only what hangs from a root
+    /// is drawn (SurfaceFlinger composes `mRoot`'s hierarchy, never the offscreen one): an offscreen layer, a layer relative to a gone one, and everything below them are left out.
     fn z_order(&self) -> Vec<BinderKey> {
         let mut children: HashMap<Option<BinderKey>, Vec<BinderKey>> = HashMap::new();
         for (k, l) in &self.layers {
-            let anchor = match l.relative_to {
-                Some(r) if self.layers.contains_key(&r) => Some(r),
-                _ => l.parent.filter(|p| self.layers.contains_key(p)),
+            let anchor = match (l.relative_to, l.parent) {
+                (Some(Relative::Layer(r)), _) => Some(r),
+                (None, Parent::Layer(p)) => Some(p),
+                (None, Parent::Root) => None,
+                (Some(Relative::Gone), _) | (None, Parent::Offscreen) => continue,
             };
-            // a layer whose parent is gone leaves the tree with it
-            if anchor.is_none() && l.parent.is_some() {
-                continue;
-            }
             children.entry(anchor).or_default().push(*k);
         }
         for v in children.values_mut() {

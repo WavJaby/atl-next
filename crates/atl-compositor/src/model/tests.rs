@@ -1249,6 +1249,149 @@ fn relative_layer_orders_against_its_anchor() {
     assert_eq!(ids, [1, 3, 2]);
 }
 
+fn control(handle: &StrongBinder) -> atl_libgui_parcel::state::SurfaceControlParcel {
+    atl_libgui_parcel::state::SurfaceControlParcel {
+        client: local(50),
+        handle: *handle,
+        layer_id: 0,
+        name: String::new(),
+        transform_hint: 0,
+        width: 0,
+        height: 0,
+        format: 0,
+    }
+}
+
+/// `Transaction.reparent(layer, parent)`; `None` = reparent to null.
+fn reparent_state(layer: &StrongBinder, parent: Option<&StrongBinder>) -> LayerState {
+    let mut s = LayerState::new();
+    s.surface = *layer;
+    s.what = what::E_REPARENT;
+    s.parent = parent.map(control);
+    s
+}
+
+fn drawn(out: &FrameOutput) -> Vec<i32> {
+    out.scene
+        .as_ref()
+        .expect("a scene")
+        .quads
+        .iter()
+        .map(|q| q.layer_id)
+        .collect()
+}
+
+/// RequestedLayerState::isRoot (`canBeRoot && no parent`; every eReparent clears canBeRoot) and LayerHierarchyBuilder::attachToParent: reparented to null, a layer goes under the offscreen root with its
+/// subtree: alive, not drawn. Reparented under a drawn layer it is drawn again, children with it. Expected ids: the root (1) with its child (2) and grandchild (3), ordered by creation (z 0).
+#[test]
+fn reparent_to_null_takes_a_layer_and_its_children_offscreen_until_reattached() {
+    let (root, child, grand) = (local(1), local(2), local(3));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(root, 1, None)).unwrap();
+    c.create_layer(spec(child, 2, Some(key(&root)))).unwrap();
+    c.create_layer(spec(grand, 3, Some(key(&child)))).unwrap();
+    for (l, id) in [(&root, 11), (&child, 12), (&grand, 13)] {
+        show(&mut c, l, id, 4, 4);
+    }
+    assert_eq!(drawn(&c.on_frame(1)), [1, 2, 3]);
+    c.queue_transaction(tx(vec![reparent_state(&child, None)]));
+    let off = c.on_frame(2);
+    assert_eq!(drawn(&off), [1], "child and grandchild are offscreen");
+    assert_eq!(
+        c.layer_count(),
+        3,
+        "offscreen layers stay while their handles live"
+    );
+    assert!(
+        releases(&off.calls).is_empty(),
+        "an offscreen layer keeps its buffer"
+    );
+    assert_eq!(c.counters().layers_offscreen, 1);
+    c.queue_transaction(tx(vec![reparent_state(&child, Some(&root))]));
+    assert_eq!(
+        drawn(&c.on_frame(3)),
+        [1, 2, 3],
+        "re-attached under a drawn parent"
+    );
+}
+
+/// A reparent to a handle that names no live layer resolves to no parent (LayerLifecycleManager::linkLayer -> UNASSIGNED): offscreen, not a root.
+#[test]
+fn reparent_to_a_gone_layer_is_offscreen() {
+    let (root, layer, gone) = (local(1), local(2), local(3));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(root, 1, None)).unwrap();
+    c.create_layer(spec(layer, 2, Some(key(&root)))).unwrap();
+    show(&mut c, &root, 11, 4, 4);
+    show(&mut c, &layer, 12, 4, 4);
+    c.queue_transaction(tx(vec![reparent_state(&layer, Some(&gone))]));
+    assert_eq!(drawn(&c.on_frame(1)), [1]);
+    assert_eq!(c.counters().layers_offscreen, 1);
+}
+
+/// canBeDestroyed is unchanged by going offscreen: an offscreen layer whose handle dies goes at the next tick, its dead-handle child with it; its live-handle child stays, offscreen.
+#[test]
+fn an_offscreen_layer_goes_with_its_handle() {
+    let (root, off, dead, live) = (local(1), local(2), local(3), local(4));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(root, 1, None)).unwrap();
+    c.create_layer(spec(off, 2, Some(key(&root)))).unwrap();
+    c.create_layer(spec(dead, 3, Some(key(&off)))).unwrap();
+    c.create_layer(spec(live, 4, Some(key(&off)))).unwrap();
+    c.queue_transaction(tx(vec![reparent_state(&off, None)]));
+    c.on_frame(1);
+    c.handle_destroyed(key(&dead));
+    c.on_frame(2);
+    assert_eq!(
+        c.layer_count(),
+        4,
+        "a parented layer waits for its parent, offscreen or not"
+    );
+    c.handle_destroyed(key(&off));
+    c.on_frame(3);
+    assert_eq!(
+        c.layer_count(),
+        2,
+        "the offscreen layer and its dead-handle child go"
+    );
+    // the live child is offscreen now: reattaching it shows it
+    show(&mut c, &live, 14, 4, 4);
+    c.queue_transaction(tx(vec![reparent_state(&live, Some(&root))]));
+    assert_eq!(drawn(&c.on_frame(4)), [4]);
+}
+
+/// A layer relative to a destroyed layer stays relative but unreachable (RequestedLayerState::hasValidRelativeParent with relativeParentId UNASSIGNED): not drawn, though its parent is.
+/// An offscreen layer relative to a drawn one is reached through it and drawn. Order before: root (1) with `off` relative z 1 under it (4), then the second root `anchor` (2) with `rel` z 1 (3).
+#[test]
+fn relative_parent_decides_reachability() {
+    let (root, anchor, rel, off) = (local(1), local(2), local(3), local(4));
+    let mut c = Compositor::new(CompositorConfig::default());
+    c.create_layer(spec(root, 1, None)).unwrap();
+    c.create_layer(spec(anchor, 2, None)).unwrap();
+    c.create_layer(spec(rel, 3, Some(key(&root)))).unwrap();
+    c.create_layer(spec(off, 4, Some(key(&root)))).unwrap();
+    let mut to_anchor = LayerState::new();
+    to_anchor.surface = rel;
+    to_anchor.what = what::E_RELATIVE_LAYER_CHANGED;
+    to_anchor.z = 1;
+    to_anchor.relative_layer = Some(control(&anchor));
+    let mut off_to_root = to_anchor.clone();
+    off_to_root.surface = off;
+    off_to_root.relative_layer = Some(control(&root));
+    // the reparent to null goes first: it clears relative z
+    c.queue_transaction(tx(vec![to_anchor, reparent_state(&off, None), off_to_root]));
+    for (l, id) in [(&root, 11), (&anchor, 12), (&rel, 13), (&off, 14)] {
+        show(&mut c, l, id, 4, 4);
+    }
+    assert_eq!(drawn(&c.on_frame(1)), [1, 4, 2, 3]);
+    c.handle_destroyed(key(&anchor));
+    assert_eq!(
+        drawn(&c.on_frame(2)),
+        [1, 4],
+        "rel's relative parent went: unreachable"
+    );
+}
+
 /// Destination frame, buffer crop and ROT_90: the layer's rect is the destination frame, else the buffer crop's size, with width and height swapped under a 90 degree transform.
 #[test]
 fn quad_geometry_from_crop_destination_and_transform() {
