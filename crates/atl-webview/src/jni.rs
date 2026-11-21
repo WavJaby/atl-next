@@ -757,7 +757,8 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     let sink = move |ev| {
         let ev = match ev {
             WebEvent::PressNotCancelled => {
-                return atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
+                atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
+                return;
             }
             WebEvent::Prompt {
                 message,
