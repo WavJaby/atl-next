@@ -1495,7 +1495,8 @@ pub fn package_data_dirs(data_root: &Path, package: &str) -> [PathBuf; 3] {
 }
 
 /// `pm clear` of `package` on the persistent `data_root` (run-apk `--clear-data`): its user and device-protected data dirs and its external dirs ([`package_data_dirs`]).
-/// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine.
+/// Its code and every other package's state stay; the next launch makes the dirs again. Missing dirs are fine. Its component enabled state (atl_services::package_state) stays too: clearApplicationUserData
+/// resets it only for a manifest `resetEnabledSettingsOnAppDataCleared="true"` (PackageManagerService.java:4836-4839, :3515-3519), which ATL does not read: such an app keeps its overrides here.
 /// A name that is no package name, or a dir not strictly below `data_root`, is refused before anything is removed.
 pub fn clear_package_data(data_root: &Path, package: &str) -> Result<()> {
     ensure!(
@@ -2318,7 +2319,7 @@ mod tests {
         assert_eq!(of(PulseServer::Session), None);
     }
 
-    /// `pm clear` removes the package's three dirs and leaves its code and another package's dirs.
+    /// `pm clear` removes the package's three dirs and leaves its code, another package's dirs and the component enabled state (`system/package-state.json`: package-manager state, not app data).
     #[test]
     fn clear_package_data_removes_only_that_package() {
         let device = std::env::temp_dir().join(format!("atl-clear-data-{}", std::process::id()));
@@ -2329,6 +2330,7 @@ mod tests {
             "apps/a/external/data/y",
             "apps/a/apk/base.apk",
             "apps/b/data/files/keep.txt",
+            "system/package-state.json",
         ];
         for f in made {
             let p = device.join(f);
@@ -2339,7 +2341,11 @@ mod tests {
         for gone in ["apps/a/data", "apps/a/data_de", "apps/a/external"] {
             assert!(!device.join(gone).exists(), "{gone} should be cleared");
         }
-        for kept in ["apps/a/apk/base.apk", "apps/b/data/files/keep.txt"] {
+        for kept in [
+            "apps/a/apk/base.apk",
+            "apps/b/data/files/keep.txt",
+            "system/package-state.json",
+        ] {
             assert!(device.join(kept).is_file(), "{kept} should stay");
         }
         std::fs::remove_dir_all(&device).unwrap();

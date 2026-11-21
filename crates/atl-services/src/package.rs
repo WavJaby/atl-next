@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/pm/ComputerEngine.java, frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java, frameworks/base/services/core/java/com/android/server/pm/IPackageManagerBase.java, frameworks/base/services/core/java/com/android/server/pm/parsing/PackageInfoUtils.java
 //! IPackageManager, subset: getApplicationInfo, getPackageInfo, getActivityInfo, getServiceInfo, getProviderInfo, resolveContentProvider, hasSystemFeature, getSystemAvailableFeatures, getPackagesForUid, notifyDexLoad,
-//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent, requestPackageChecksums, getInstallerPackageName, getInstallSourceInfo. Every other method is counted unimplemented (counters).
+//! getInstrumentationInfoAsUser, queryInstrumentationAsUser, checkSignatures, queryIntentServices, queryIntentActivities, resolveIntent, requestPackageChecksums, getInstallerPackageName, getInstallSourceInfo,
+//! setComponentEnabledSetting, getComponentEnabledSetting, getApplicationEnabledSetting (user 0's state: crate::package_state). Every other method is counted unimplemented (counters).
 //! Every answer is a clone of the installer's PackageInfo (crate::packages) cut to the caller's flags: GET_META_DATA, MATCH_DISABLED_COMPONENTS, and getPackageInfo's GET_<component> / GET_PERMISSIONS.
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use atl_aidl::aidl::android::content::pm::IOnChecksumsReadyListener::IOnChecksumsReadyListener;
 use atl_aidl::aidl::android::content::pm::IPackageInstaller::IPackageInstaller;
@@ -27,7 +30,11 @@ use atl_parcelables::parts::{ComponentInfo, SharedLibraryInfo};
 use atl_services_types::system_config::Features;
 use binder::{ExceptionCode, Interface, Status, ThreadState};
 
-use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions, answer};
+use crate::package_state::{
+    COMPONENT_ENABLED_STATE_DEFAULT, COMPONENT_ENABLED_STATE_DISABLED,
+    COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED,
+};
+use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions};
 use atl_services_types::packages::LibraryNode;
 use atl_services_types::permission;
 
@@ -102,10 +109,10 @@ fn library_info(l: &LibraryNode) -> SharedLibraryInfo {
     }
 }
 
-/// A stored component answered for `flags`: [`answer`]'s filter, then its ApplicationInfo as getApplicationInfo builds it for the same flags (generate*Info takes the one generateApplicationInfo
-/// built); None when filtered out.
+/// A stored component answered for `flags`: [`Packages::answer`]'s filter, then its ApplicationInfo as getApplicationInfo builds it for the same flags (generate*Info takes the one
+/// generateApplicationInfo built); None when filtered out.
 fn cut(p: &PackageRecord, packages: &Packages, c: &mut ComponentInfo, flags: i64) -> Option<()> {
-    answer(c, flags).then_some(())?;
+    packages.answer(c, flags).then_some(())?;
     c.application_info = application_info(p, packages, flags);
     Some(())
 }
@@ -242,7 +249,7 @@ impl Component {
                 find_activity_info(p, packages, class, flags).map(Resolved::Activity)
             }
             Component::Service => {
-                let mut s = p.service_info(class, flags)?;
+                let mut s = packages.service_info(p, class, flags)?;
                 s.component.application_info = application_info(p, packages, flags);
                 Some(Resolved::Service(s))
             }
@@ -421,6 +428,8 @@ pub struct PackageManager {
     gl_es_version: i32,
     /// PackageManagerService.mInstallerService: getPackageInstaller's one answer (package_installer.rs)
     installer: binder::Strong<dyn IPackageInstaller>,
+    /// where setComponentEnabledSetting's broadcasts go, and the ones waiting (DONT_KILL_APP)
+    changes: ComponentChanges,
 }
 
 impl PackageManager {
@@ -436,6 +445,7 @@ impl PackageManager {
             permissions,
             features,
             gl_es_version,
+            changes: ComponentChanges::default(),
         }
     }
 
@@ -649,7 +659,7 @@ impl IPackageManager for PackageManager {
             return Ok(None);
         };
         Ok(self.visible(Some(&c.package), user).and_then(|p| {
-            let mut s = p.service_info(&c.class, flags)?;
+            let mut s = self.packages.service_info(p, &c.class, flags)?;
             s.component.application_info = application_info(p, &self.packages, flags);
             Some(s)
         }))
@@ -995,6 +1005,355 @@ impl IPackageManager for PackageManager {
         }
         Ok(())
     }
+
+    /// PMS.setComponentEnabledSetting:6070 -> setEnabledSettings:3859 for one component ([`PackageManager::set_component_enabled`]); a user that does not exist returns at once.
+    fn r#setComponentEnabledSetting(
+        &self,
+        component: Option<&ComponentName>,
+        new_state: i32,
+        flags: i32,
+        user: i32,
+        _calling_package: Option<&str>,
+    ) -> binder::Result<()> {
+        if user != USER_SYSTEM {
+            return Ok(());
+        }
+        // new ComponentEnabledSetting(componentName, ...) reads componentName.getPackageName()
+        let Some(c) = component else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("setComponentEnabledSetting: null componentName".to_owned()),
+            ));
+        };
+        self.set_component_enabled(
+            ThreadState::get_calling_pid(),
+            ThreadState::get_calling_uid(),
+            c,
+            new_state,
+            flags,
+        )
+    }
+
+    /// ComputerEngine.getComponentEnabledSetting:5286 -> getComponentEnabledSettingInternal:5295: DEFAULT for a null component, DISABLED for a user that does not exist, IllegalArgumentException
+    /// "Unknown component: ..." for a package the caller may not see, else the stored override (ENABLED / DISABLED) or DEFAULT. The class is not checked (Settings.getComponentEnabledSetting reads
+    /// the sets by name).
+    fn r#getComponentEnabledSetting(
+        &self,
+        component: Option<&ComponentName>,
+        user: i32,
+    ) -> binder::Result<i32> {
+        let Some(c) = component else {
+            return Ok(COMPONENT_ENABLED_STATE_DEFAULT);
+        };
+        if user != USER_SYSTEM {
+            return Ok(COMPONENT_ENABLED_STATE_DISABLED);
+        }
+        if self.visible(Some(&c.package), user).is_none() {
+            return Err(illegal_argument(format!(
+                "Unknown component: {}",
+                component_string(c)
+            )));
+        }
+        Ok(self.packages.user_state().component(&c.package, &c.class))
+    }
+
+    /// ComputerEngine.getApplicationEnabledSetting:5268: DISABLED for a user that does not exist, IllegalArgumentException "Unknown package: ..." for a package the caller may not see, else the app
+    /// state: always DEFAULT (setApplicationEnabledSetting is not served; package_state module doc).
+    fn r#getApplicationEnabledSetting(&self, name: Option<&str>, user: i32) -> binder::Result<i32> {
+        if user != USER_SYSTEM {
+            return Ok(COMPONENT_ENABLED_STATE_DISABLED);
+        }
+        if self.visible(name, user).is_none() {
+            return Err(illegal_argument(format!(
+                "Unknown package: {}",
+                name.unwrap_or("null")
+            )));
+        }
+        Ok(COMPONENT_ENABLED_STATE_DEFAULT)
+    }
+}
+
+/// ComponentName.toString: `ComponentInfo{<package>/<class>}`.
+fn component_string(c: &ComponentName) -> String {
+    format!("ComponentInfo{{{}/{}}}", c.package, c.class)
+}
+
+fn illegal_argument(msg: String) -> Status {
+    Status::new_exception_str(ExceptionCode::ILLEGAL_ARGUMENT, Some(msg))
+}
+
+/// Where the PackageManager's changes reach the activity service: AOSP's PMS sends ACTION_PACKAGE_CHANGED through AMS, and AMS kills the package on it unless EXTRA_DONT_KILL_APP
+/// (BroadcastController.java:1187-1253). system_services wires the ActivityManager in; without one (unit tests) nothing is sent.
+pub trait PackageEvents: Send + Sync {
+    /// `intent` sent as the system to the registered receivers, only those of `uid` when given (BroadcastHelper's targetPackage: the package itself and its shared-uid siblings).
+    fn broadcast_registered(&self, intent: &Intent, uid: Option<u32>);
+    /// killPackageProcessesLSP + cleanupDisabledPackageComponentsLocked: the package's processes stop.
+    fn force_stop(&self, package: &str);
+}
+
+impl PackageEvents for crate::activity::ActivityManager {
+    fn broadcast_registered(&self, intent: &Intent, uid: Option<u32>) {
+        self.broadcast_registered(intent, uid);
+    }
+
+    fn force_stop(&self, package: &str) {
+        self.force_stop_package(package);
+    }
+}
+
+/// PackageManagerService.BROADCAST_DELAY and BROADCAST_DELAY_DURING_STARTUP (:947-948), and mServiceStartWithDelay's 60 s (:2570): how long a DONT_KILL_APP change waits before its broadcast.
+const BROADCAST_DELAY: Duration = Duration::from_secs(1);
+const BROADCAST_DELAY_DURING_STARTUP: Duration = Duration::from_secs(10);
+const STARTUP: Duration = Duration::from_secs(60);
+
+/// PMS.mPendingBroadcasts: per package, the changed component names not yet broadcast; `scheduled` = a SEND_PENDING_BROADCAST is on its way.
+#[derive(Default)]
+struct Pending {
+    packages: BTreeMap<String, Vec<String>>,
+    scheduled: bool,
+}
+
+/// The PackageManager's side of setEnabledSettings: the events sink, PMS's start time (the broadcast delay) and the pending broadcasts.
+struct ComponentChanges {
+    events: Option<Arc<dyn PackageEvents>>,
+    started: Instant,
+    pending: Arc<Mutex<Pending>>,
+}
+
+impl Default for ComponentChanges {
+    fn default() -> Self {
+        ComponentChanges {
+            events: None,
+            started: Instant::now(),
+            pending: Arc::default(),
+        }
+    }
+}
+
+/// BroadcastHelper.sendPackageChangedBroadcastInternal (:351-437, reduce_broadcasts_for_component_state_changes ENABLED in the release config) for component changes of `p`: the not exported ones
+/// go only to the package's uid, the rest to every registered receiver. Each Intent is sendPackageChangedBroadcastWithPermissions + doSendBroadcast's: ACTION_PACKAGE_CHANGED, data `package:<p>`,
+/// extras changed_component_name (the first), changed_component_name_list, DONT_KILL_APP, UID, user_handle 0; FLAG_RECEIVER_REGISTERED_ONLY (no change names the whole package) |
+/// FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT. Not sent: the copy to `android` (the services are the system; [`PackageEvents::force_stop`] is AMS's half) and EXTRA_VISIBILITY_ALLOW_LIST.
+pub fn package_changed_sends(
+    p: &PackageRecord,
+    components: &[String],
+    dont_kill: bool,
+) -> Vec<(Intent, Option<u32>)> {
+    const ACTION_PACKAGE_CHANGED: &str = "android.intent.action.PACKAGE_CHANGED";
+    const FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT: i32 = 0x0400_0000;
+    let (not_exported, exported): (Vec<String>, Vec<String>) =
+        components.iter().cloned().partition(|c| p.not_exported(c));
+    let intent = |names: Vec<String>, package: Option<&str>| {
+        use atl_parcelables::android::os::Bundle;
+        use atl_parcelables::codecs::android::os::Bundle::Value;
+        let extras = Bundle::from_entries([
+            (
+                "android.intent.extra.changed_component_name".to_owned(),
+                Value::String(names.first().cloned()),
+            ),
+            (
+                "android.intent.extra.changed_component_name_list".to_owned(),
+                Value::StringArray(Some(names.into_iter().map(Some).collect())),
+            ),
+            (
+                "android.intent.extra.DONT_KILL_APP".to_owned(),
+                Value::Bool(dont_kill),
+            ),
+            (
+                "android.intent.extra.UID".to_owned(),
+                Value::Int(i32::try_from(p.uid).unwrap_or(i32::MAX)),
+            ),
+            (
+                "android.intent.extra.user_handle".to_owned(),
+                Value::Int(USER_SYSTEM),
+            ),
+        ]);
+        Intent {
+            action: Some(ACTION_PACKAGE_CHANGED.to_owned()),
+            data: Some(format!("package:{}", p.name())),
+            flags: broadcast::FLAG_RECEIVER_REGISTERED_ONLY
+                | FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT,
+            package: package.map(str::to_owned),
+            extras: Some(extras),
+            ..Intent::default()
+        }
+    };
+    let mut sends = Vec::new();
+    if !not_exported.is_empty() {
+        sends.push((intent(not_exported, Some(p.name())), Some(p.uid)));
+    }
+    if !exported.is_empty() {
+        sends.push((intent(exported, None), None));
+    }
+    sends
+}
+
+impl PackageManager {
+    /// These events receive the component-state changes' broadcasts and force stops (system_services: the ActivityManager).
+    pub fn with_events(mut self, events: Arc<dyn PackageEvents>) -> Self {
+        self.changes.events = Some(events);
+        self
+    }
+
+    /// setEnabledSettings (PackageManagerService.java:3859-4141) for one component, in AOSP's order: the state must be one of the five (IllegalArgumentException "Invalid new component state");
+    /// the caller must be the package's app or hold CHANGE_COMPONENT_ENABLED_STATE (SecurityException "Attempt to change component state; pid=, uid=, component="); the package must exist and be visible
+    /// (IllegalArgumentException "Unknown component"); AppDetailsActivity only with the permission; an undeclared class is IllegalArgumentException from targetSdk 16 (JELLY_BEAN) on, else ignored.
+    /// Then setEnabledSettingInternalLocked: nothing changed -> return. A change is saved before the call returns (PackageUserStates::save) and broadcast: at once with DONT_KILL_APP false, which
+    /// stops the package (AMS's half, [`PackageEvents::force_stop`]), or with DONT_KILL_APP after BROADCAST_DELAY, joined with the package's other pending changes. Not modelled: protected packages
+    /// and the shell uid's rules (no device owner, no shell caller of this method), SYNCHRONOUS (every change is written at once).
+    fn set_component_enabled(
+        &self,
+        pid: i32,
+        uid: u32,
+        c: &ComponentName,
+        new_state: i32,
+        flags: i32,
+    ) -> binder::Result<()> {
+        const DONT_KILL_APP: i32 = 0x1;
+        /// PackageManager.APP_DETAILS_ACTIVITY_CLASS_NAME (AppDetailsActivity.class.getName()).
+        const APP_DETAILS_ACTIVITY_CLASS_NAME: &str = "android.app.AppDetailsActivity";
+        /// Build.VERSION_CODES.JELLY_BEAN.
+        const JELLY_BEAN: i32 = 16;
+        if !(COMPONENT_ENABLED_STATE_DEFAULT..=COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED)
+            .contains(&new_state)
+        {
+            return Err(illegal_argument(format!(
+                "Invalid new component state: {new_state}"
+            )));
+        }
+        let allowed_by_permission = self
+            .permissions
+            .check(uid, Some(permission::CHANGE_COMPONENT_ENABLED_STATE));
+        let own = self.packages.is_same_app(&c.package, uid);
+        if !own && !allowed_by_permission {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "Attempt to change component state; pid={pid}, uid={uid}, component={}",
+                    component_string(c)
+                )),
+            ));
+        }
+        let Some(p) = self.packages.visible(uid, &c.package) else {
+            return Err(illegal_argument(format!(
+                "Unknown component: {}",
+                component_string(c)
+            )));
+        };
+        if !allowed_by_permission && c.class == APP_DETAILS_ACTIVITY_CLASS_NAME {
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some("Cannot disable a system-generated component".to_owned()),
+            ));
+        }
+        if !p.has_component(&c.class) {
+            if p.app().target_sdk_version >= JELLY_BEAN {
+                return Err(illegal_argument(format!(
+                    "Component class {} does not exist in {}",
+                    c.class, c.package
+                )));
+            }
+            crate::activity::log(format_args!(
+                "Failed setComponentEnabledSetting: component class {} does not exist in {}",
+                c.class, c.package
+            ));
+            return Ok(());
+        }
+        let state = self.packages.user_state();
+        if !state.set_component(&c.package, &c.class, new_state) {
+            atl_diag::answered("IPackageManager", "setComponentEnabledSetting (unchanged)");
+            return Ok(());
+        }
+        atl_diag::answered("IPackageManager", "setComponentEnabledSetting");
+        if let Err(e) = state.save() {
+            atl_diag::refused(
+                "IPackageManager",
+                "setComponentEnabledSetting: state not saved",
+            );
+            crate::activity::log(format_args!("package state not saved: {e}"));
+        }
+        if flags & DONT_KILL_APP == 0 {
+            self.changes.pending().packages.remove(&c.package);
+            send_package_changed(
+                self.changes.events.as_deref(),
+                p,
+                std::slice::from_ref(&c.class),
+                false,
+            );
+        } else {
+            self.changes.add_pending(&self.packages, p, &c.class);
+        }
+        Ok(())
+    }
+}
+
+/// [`package_changed_sends`] through `events`, then the force stop AMS does on a broadcast without DONT_KILL_APP.
+fn send_package_changed(
+    events: Option<&dyn PackageEvents>,
+    p: &PackageRecord,
+    components: &[String],
+    dont_kill: bool,
+) {
+    let Some(events) = events else {
+        return;
+    };
+    for (intent, uid) in package_changed_sends(p, components, dont_kill) {
+        events.broadcast_registered(&intent, uid);
+    }
+    if !dont_kill {
+        events.force_stop(p.name());
+    }
+}
+
+impl ComponentChanges {
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// mPendingBroadcasts.addComponent, then SEND_PENDING_BROADCAST unless one is on its way: after BROADCAST_DELAY, or BROADCAST_DELAY_DURING_STARTUP in PMS's first minute. The send is
+    /// sendPendingBroadcasts: each package's names in one broadcast with DONT_KILL_APP true.
+    fn add_pending(&self, packages: &Arc<Packages>, p: &PackageRecord, class: &str) {
+        {
+            let mut pending = self.pending();
+            let names = pending.packages.entry(p.name().to_owned()).or_default();
+            if !names.iter().any(|n| n == class) {
+                names.push(class.to_owned());
+            }
+            if pending.scheduled || self.events.is_none() {
+                return;
+            }
+            pending.scheduled = true;
+        }
+        let Some(events) = self.events.clone() else {
+            return;
+        };
+        let delay = if self.started.elapsed() > STARTUP {
+            BROADCAST_DELAY
+        } else {
+            BROADCAST_DELAY_DURING_STARTUP
+        };
+        let (pending, packages) = (Arc::clone(&self.pending), Arc::clone(packages));
+        let spawned = std::thread::Builder::new()
+            .name("pm-pending-broadcast".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                let due = {
+                    let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    p.scheduled = false;
+                    std::mem::take(&mut p.packages)
+                };
+                for (name, components) in due {
+                    // a package gone since (none is removed while the services run) has nothing to tell
+                    if let Some(p) = packages.by_name(&name) {
+                        send_package_changed(Some(events.as_ref()), p, &components, true);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            self.pending().scheduled = false;
+            crate::activity::log(format_args!("pending PACKAGE_CHANGED not scheduled: {e}"));
+        }
+    }
 }
 
 /// The signers of `d`: none for UNKNOWN (SigningDetails.UNKNOWN has null signatures).
@@ -1069,6 +1428,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::package_state::COMPONENT_ENABLED_STATE_ENABLED;
     use crate::packages::MATCH_DISABLED_COMPONENTS;
     use crate::packages::fixture::*;
     use atl_parcelables::android::os::Bundle;
@@ -1477,5 +1837,197 @@ mod tests {
         );
         assert_eq!(all[1].version, 1);
         assert_eq!(all[2].req_gl_es_version, 0x30002);
+    }
+
+    /// What a [`PackageEvents`] sink was given.
+    #[derive(Default)]
+    struct Recorded {
+        sends: Mutex<Vec<(Intent, Option<u32>)>>,
+        stopped: Mutex<Vec<String>>,
+    }
+
+    impl PackageEvents for Recorded {
+        fn broadcast_registered(&self, intent: &Intent, uid: Option<u32>) {
+            self.sends
+                .lock()
+                .expect("sends")
+                .push((intent.clone(), uid));
+        }
+        fn force_stop(&self, package: &str) {
+            self.stopped
+                .lock()
+                .expect("stopped")
+                .push(package.to_owned());
+        }
+    }
+
+    /// Package `a` (uid 10 001): receiver `a.R` (exported=false), receiver `a.Pub` (exported), receiver `a.Off` (`android:enabled="false"`); package `b` (uid 10 002) apart.
+    fn state_packages() -> Arc<Packages> {
+        let mut a = record("a");
+        let receiver = |class: &str, exported: bool, enabled: bool| {
+            let mut r = activity("a", class);
+            r.component.exported = exported;
+            r.component.enabled = enabled;
+            Some(r)
+        };
+        a.info.receivers = Some(vec![
+            receiver("a.R", false, true),
+            receiver("a.Pub", true, true),
+            receiver("a.Off", false, false),
+        ]);
+        let mut b = record("b");
+        b.uid = 10_002;
+        Arc::new(Packages::new(vec![a, b], BTreeMap::new()))
+    }
+
+    fn manager(packages: &Arc<Packages>) -> (PackageManager, Arc<Recorded>) {
+        let events = Arc::new(Recorded::default());
+        let pm = PackageManager::new(
+            Arc::clone(packages),
+            Arc::new(Permissions::new(packages, &[])),
+            Features::default(),
+            0,
+        )
+        .with_events(events.clone());
+        (pm, events)
+    }
+
+    fn name(package: &str, class: &str) -> ComponentName {
+        ComponentName {
+            package: package.to_owned(),
+            class: class.to_owned(),
+        }
+    }
+
+    fn exception(r: binder::Result<()>) -> Option<ExceptionCode> {
+        r.err().map(|s| s.exception_code())
+    }
+
+    /// setEnabledSettings' refusals in AOSP's order (PackageManagerService.java:3868-4004): state 5 -> IllegalArgumentException; b changing a's component -> SecurityException (no
+    /// CHANGE_COMPONENT_ENABLED_STATE); an unknown package -> SecurityException too (the caller is not its app: the ownership test comes first); an undeclared class of a (targetSdk 34 >= 16) ->
+    /// IllegalArgumentException. None of them changes the state.
+    #[test]
+    fn set_component_refusals() {
+        let packages = state_packages();
+        let (pm, events) = manager(&packages);
+        let set = |uid, c: &ComponentName, state| pm.set_component_enabled(1, uid, c, state, 1);
+        assert_eq!(
+            exception(set(10_001, &name("a", "a.R"), 5)),
+            Some(ExceptionCode::ILLEGAL_ARGUMENT)
+        );
+        assert_eq!(
+            exception(set(
+                10_002,
+                &name("a", "a.R"),
+                COMPONENT_ENABLED_STATE_DISABLED
+            )),
+            Some(ExceptionCode::SECURITY)
+        );
+        assert_eq!(
+            exception(set(
+                10_001,
+                &name("zz", "zz.R"),
+                COMPONENT_ENABLED_STATE_DISABLED
+            )),
+            Some(ExceptionCode::SECURITY)
+        );
+        assert_eq!(
+            exception(set(
+                10_001,
+                &name("a", "a.Missing"),
+                COMPONENT_ENABLED_STATE_DISABLED
+            )),
+            Some(ExceptionCode::ILLEGAL_ARGUMENT)
+        );
+        assert!(packages.user_state().is_empty());
+        assert!(events.sends.lock().expect("sends").is_empty());
+    }
+
+    /// The fixture row's sequence on the PackageManager: a's own receiver a.R DISABLED -> getReceiverInfo null (the one filter, Packages::answer), MATCH_DISABLED_COMPONENTS still finds it;
+    /// DEFAULT -> found; the manifest-disabled a.Off ENABLED -> found. A change without DONT_KILL_APP sends PACKAGE_CHANGED at once to a's uid only (a.R is not exported) and stops a; a repeat
+    /// changes nothing and sends nothing.
+    #[test]
+    fn set_component_changes_resolution() {
+        let packages = state_packages();
+        let (pm, events) = manager(&packages);
+        let p = packages.by_name("a").expect("a");
+        let receiver = |class: &str, flags: i64| {
+            p.receiver(class)
+                .cloned()
+                .filter(|r| packages.answer(&mut r.component.clone(), flags))
+                .is_some()
+        };
+        let set = |c: &str, state, flags| {
+            pm.set_component_enabled(1, 10_001, &name("a", c), state, flags)
+        };
+        assert!(receiver("a.R", 0) && !receiver("a.Off", 0));
+        set("a.R", COMPONENT_ENABLED_STATE_DISABLED, 0).expect("disable");
+        assert_eq!(
+            packages.user_state().component("a", "a.R"),
+            COMPONENT_ENABLED_STATE_DISABLED
+        );
+        assert!(!receiver("a.R", 0));
+        assert!(receiver("a.R", MATCH_DISABLED_COMPONENTS));
+        {
+            let sends = events.sends.lock().expect("sends");
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].1, Some(10_001));
+            assert_eq!(sends[0].0.package.as_deref(), Some("a"));
+        }
+        assert_eq!(*events.stopped.lock().expect("stopped"), ["a"]);
+        set("a.R", COMPONENT_ENABLED_STATE_DISABLED, 0).expect("repeat");
+        assert_eq!(events.sends.lock().expect("sends").len(), 1);
+        set("a.R", COMPONENT_ENABLED_STATE_DEFAULT, 1).expect("default");
+        assert!(receiver("a.R", 0));
+        set("a.Off", COMPONENT_ENABLED_STATE_ENABLED, 1).expect("enable");
+        assert!(receiver("a.Off", 0));
+        // DONT_KILL_APP: the broadcast waits (BROADCAST_DELAY_DURING_STARTUP), nothing stopped
+        assert_eq!(events.sends.lock().expect("sends").len(), 1);
+        assert_eq!(events.stopped.lock().expect("stopped").len(), 1);
+    }
+
+    /// sendPackageChangedBroadcastInternal's split (BroadcastHelper.java:351-437) and sendPackageChangedBroadcastWithPermissions' Intent (:439-470), doSendBroadcast's flags: a.R (not exported) ->
+    /// setPackage(a), a's uid only; a.Pub (exported) -> every registered receiver. FLAG_RECEIVER_REGISTERED_ONLY 0x40000000 | FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT 0x04000000 (Intent.java:7582,
+    /// :7640); data `package:a`; extras name the first component, the list, DONT_KILL_APP, a's uid and user 0.
+    #[test]
+    fn package_changed_intents() {
+        use atl_parcelables::codecs::android::os::Bundle::Value;
+        let packages = state_packages();
+        let p = packages.by_name("a").expect("a");
+        let sends = package_changed_sends(p, &["a.R".to_owned(), "a.Pub".to_owned()], true);
+        assert_eq!(sends.len(), 2);
+        let (own, uid) = &sends[0];
+        assert_eq!(*uid, Some(10_001));
+        assert_eq!(own.package.as_deref(), Some("a"));
+        assert_eq!(
+            own.action.as_deref(),
+            Some("android.intent.action.PACKAGE_CHANGED")
+        );
+        assert_eq!(own.data.as_deref(), Some("package:a"));
+        assert_eq!(own.flags, 0x4400_0000);
+        let extras = own
+            .extras
+            .as_ref()
+            .expect("extras")
+            .entries()
+            .expect("entries");
+        let get = |k: &str| extras.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("android.intent.extra.changed_component_name"),
+            Some(Value::String(Some("a.R".into())))
+        );
+        assert_eq!(
+            get("android.intent.extra.changed_component_name_list"),
+            Some(Value::StringArray(Some(vec![Some("a.R".into())])))
+        );
+        assert_eq!(
+            get("android.intent.extra.DONT_KILL_APP"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(get("android.intent.extra.UID"), Some(Value::Int(10_001)));
+        assert_eq!(get("android.intent.extra.user_handle"), Some(Value::Int(0)));
+        let (public, uid) = &sends[1];
+        assert_eq!(*uid, None);
+        assert_eq!(public.package, None);
     }
 }

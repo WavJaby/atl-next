@@ -709,6 +709,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "user: " + userProfile());
         Log.i("AtlTest", "zen: " + zen());
         Log.i("AtlTest", "receiver: " + receiverInfo());
+        Log.i("AtlTest", "componentstate: " + componentState());
         Log.i("AtlTest", "installer: " + installerSessions());
         Log.i("AtlTest", "audiodevices: " + audioDevices());
         Log.i("AtlTest", "telephony: " + telephony());
@@ -1630,6 +1631,61 @@ public class Main extends Activity {
             missing = t.getClass().getSimpleName();
         }
         return "own=" + own + " missing=" + missing;
+    }
+
+    /** True when getReceiverInfo finds the fixture's receiver `cls` for flags 0 (a disabled one is NameNotFoundException). */
+    private boolean resolves(Class<?> cls) {
+        try {
+            getPackageManager().getReceiverInfo(new android.content.ComponentName(this, cls), 0);
+            return true;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    /** The exception setComponentEnabledSetting(DISABLED, DONT_KILL_APP) throws for `c`, or `none`. */
+    private String setRefused(android.content.ComponentName c) {
+        try {
+            getPackageManager().setComponentEnabledSetting(c, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP);
+            return "none";
+        } catch (Throwable t) {
+            return t.getClass().getSimpleName();
+        }
+    }
+
+    /**
+     * PackageManager component state (app.rs LOG_LINES componentstate): AtlStateReceiver's state, DISABLED (DONT_KILL_APP) then resolved, an explicit broadcast sent to it (must not arrive: n=1),
+     * DEFAULT and resolved, a second broadcast (n=2, logged by AtlStateReceiver: componentstate-receive); the manifest-disabled AtlOffReceiver ENABLED and resolved, then DEFAULT; an undeclared class and
+     * another package's component refused. Every state ends DEFAULT, so a data root reused by the next run starts the same.
+     */
+    private String componentState() {
+        android.content.pm.PackageManager pm = getPackageManager();
+        android.content.ComponentName state = new android.content.ComponentName(this, AtlStateReceiver.class);
+        android.content.ComponentName off = new android.content.ComponentName(this, AtlOffReceiver.class);
+        int dontKill = android.content.pm.PackageManager.DONT_KILL_APP;
+        StringBuilder s = new StringBuilder();
+        try {
+            s.append("get0=").append(pm.getComponentEnabledSetting(state));
+            pm.setComponentEnabledSetting(state, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, dontKill);
+            s.append(" disable=").append(pm.getComponentEnabledSetting(state));
+            s.append(" resolve=").append(resolves(AtlStateReceiver.class) ? 1 : 0);
+            sendBroadcast(new Intent().setComponent(state).putExtra("n", 1));
+            pm.setComponentEnabledSetting(state, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DEFAULT, dontKill);
+            s.append(" default=").append(pm.getComponentEnabledSetting(state));
+            s.append(" resolve2=").append(resolves(AtlStateReceiver.class) ? 1 : 0);
+            sendBroadcast(new Intent().setComponent(state).putExtra("n", 2));
+            s.append(" off=").append(resolves(AtlOffReceiver.class) ? 1 : 0);
+            pm.setComponentEnabledSetting(off, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, dontKill);
+            s.append(" enable=").append(pm.getComponentEnabledSetting(off));
+            s.append(" offresolve=").append(resolves(AtlOffReceiver.class) ? 1 : 0);
+            pm.setComponentEnabledSetting(off, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DEFAULT, dontKill);
+            s.append(" offdefault=").append(resolves(AtlOffReceiver.class) ? 1 : 0);
+        } catch (Throwable t) {
+            s.append(" threw ").append(t);
+        }
+        s.append(" unknown=").append(setRefused(new android.content.ComponentName(this, "com.example.atltest.NoSuchReceiver")));
+        s.append(" other=").append(setRefused(new android.content.ComponentName("android", "com.android.internal.app.ResolverActivity")));
+        return s.toString();
     }
 
     /** PackageManager.getPackageInstaller's session queries with no install session on the device: getMySessions and getAllSessions empty, getSessionInfo(1) null. */

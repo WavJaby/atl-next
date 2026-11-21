@@ -4,7 +4,7 @@
 //!   `data_de` (device-protected `/data/user_de/0/<package>`), `external/{data,obb}` (`/storage/emulated/0/Android/{data,obb}/<package>`). System packages' data lives here like any package's.
 //! - `device/data/`: what is not yet per package: `system/` (SettingsProvider's /data/system), `dalvik-cache/`, `app/vmdl<session>.tmp` install staging (same filesystem as `apps/`, so commit is a rename).
 //!   Later slices move them (system state -> `system/`, regenerable state -> the XDG cache root).
-//! - `system/`: the services' own state, no Android path (atl-services `--system-dir`): `shortcut_service/`, user 0's shortcuts (atl_services::shortcut).
+//! - `system/`: the services' own state, no Android path (atl-services `--system-dir`): `shortcut_service/`, user 0's shortcuts (atl_services::shortcut); `package-state.json`, user 0's component enabled settings (atl_services::package_state).
 
 use std::path::{Path, PathBuf};
 

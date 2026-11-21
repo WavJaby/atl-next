@@ -238,7 +238,10 @@ impl Inner {
         let Some(p) = self.packages.by_name(&c.package) else {
             return Bound::NotFound;
         };
-        let Some(decl) = p.service(&c.class).filter(|s| s.component.enabled) else {
+        let Some(decl) = p
+            .service(&c.class)
+            .filter(|s| self.packages.enabled(&s.component, 0))
+        else {
             atl_diag::answered(AM, "bindService: no enabled <service>");
             return Bound::NotFound;
         };

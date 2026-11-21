@@ -20,10 +20,11 @@ use crate::activity_start::Declared;
 use crate::broadcast;
 use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
 use crate::installed::{ComponentIntents, Queries, UsesLibrary};
+use crate::package_state::{PackageUserStates, is_enabled};
 
-/// PackageManager.GET_META_DATA and MATCH_DISABLED_COMPONENTS (PackageManager.java).
+/// PackageManager.GET_META_DATA (PackageManager.java).
 pub const GET_META_DATA: i64 = 0x80;
-pub const MATCH_DISABLED_COMPONENTS: i64 = 0x200;
+pub use crate::package_state::MATCH_DISABLED_COMPONENTS;
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
 const ACTION_MANAGE_PERMISSIONS: &str = "android.intent.action.MANAGE_PERMISSIONS";
@@ -115,28 +116,6 @@ impl PackageRecord {
             .map_or(&[], |c| c.intents.as_slice())
     }
 
-    /// The launcher entry: the first enabled activity or alias, in manifest order, with a MAIN + LAUNCHER filter (PMS queryIntentActivities' order for the launcher's query; a disabled
-    /// component matches no query). The caller starts its `targetActivity` when set (an alias), keeping the alias as the component name.
-    pub fn launcher(&self) -> Option<&ActivityInfo> {
-        self.activities().filter(|a| a.component.enabled).find(|a| {
-            let name = a.component.item.name.as_deref().unwrap_or_default();
-            self.intents(Kind::ActivityIntents, name)
-                .iter()
-                .any(launches)
-        })
-    }
-
-    /// Whether `class` is an enabled activity or alias with a MAIN + LAUNCHER filter (ShortcutService.injectIsMainActivity's query).
-    pub fn is_launcher(&self, class: &str) -> bool {
-        self.activities().filter(|a| a.component.enabled).any(|a| {
-            named(&a.component, class)
-                && self
-                    .intents(Kind::ActivityIntents, class)
-                    .iter()
-                    .any(launches)
-        })
-    }
-
     pub fn activity(&self, class: &str) -> Option<&ActivityInfo> {
         self.activities().find(|a| named(&a.component, class))
     }
@@ -153,12 +132,23 @@ impl PackageRecord {
         self.providers().find(|p| named(&p.component, class))
     }
 
-    /// getServiceInfo's answer (ComputerEngine.getServiceInfo): the stored ServiceInfo filtered by `flags` ([`answer`]); None for a class the package does not declare or a disabled one without
-    /// MATCH_DISABLED_COMPONENTS.
-    pub fn service_info(&self, class: &str, flags: i64) -> Option<ServiceInfo> {
-        let s = self.service(class)?;
-        let mut out = s.clone();
-        answer(&mut out.component, flags).then_some(out)
+    /// The package declares a component (activity or alias, receiver, service or provider) named `class` (AndroidPackageUtils.hasComponentClassName).
+    pub fn has_component(&self, class: &str) -> bool {
+        self.activity(class).is_some()
+            || self.receiver(class).is_some()
+            || self.service(class).is_some()
+            || self.provider(class).is_some()
+    }
+
+    /// The component `class` is declared and not exported (BroadcastHelper.getAllNotExportedComponents' test; an undeclared name counts as exported there).
+    pub fn not_exported(&self, class: &str) -> bool {
+        let comps = self
+            .activity(class)
+            .map(|a| &a.component)
+            .or_else(|| self.receiver(class).map(|r| &r.component))
+            .or_else(|| self.service(class).map(|s| &s.component))
+            .or_else(|| self.provider(class).map(|p| &p.component));
+        comps.is_some_and(|c| !c.exported)
     }
 }
 
@@ -170,21 +160,24 @@ const PROTECTED_BROADCAST_PREFIXES: [&str; 4] = [
     "android.net.netmon.launchCaptivePortalApp",
 ];
 
-/// The installed packages and the shared libraries (SystemConfig `<library>`) they may use; one user (0).
-#[derive(Debug, Clone, Default)]
+/// The installed packages, the shared libraries (SystemConfig `<library>`) they may use, and user 0's package state over them ([`PackageUserStates`]); one user (0).
+#[derive(Debug, Default)]
 pub struct Packages {
     list: Vec<PackageRecord>,
     libraries: BTreeMap<String, Library>,
     /// framework-res's `<protected-broadcast>`s: package `android` is not scanned (atl-services-types system_packages), so its manifest's list comes as a services input ([`Self::with_platform_broadcasts`])
     platform_broadcasts: BTreeSet<String>,
+    user: PackageUserStates,
 }
 
 impl Packages {
+    /// The packages with an empty package state kept in memory only ([`Packages::with_user_state`] gives the saved one).
     pub fn new(list: Vec<PackageRecord>, libraries: BTreeMap<String, Library>) -> Self {
         Packages {
             list,
             libraries,
             platform_broadcasts: BTreeSet::new(),
+            user: PackageUserStates::default(),
         }
     }
 
@@ -209,6 +202,69 @@ impl Packages {
                 .any(|p| p.protected_broadcasts.iter().any(|a| a == action))
     }
 
+    /// These packages with `user` as user 0's package state (the services' start: [`PackageUserStates::load`]).
+    pub fn with_user_state(self, user: PackageUserStates) -> Self {
+        Packages { user, ..self }
+    }
+
+    /// User 0's package state (IPackageManager's component-state calls read and change it).
+    pub fn user_state(&self) -> &PackageUserStates {
+        &self.user
+    }
+
+    /// PackageUserStateUtils.isEnabled for the stored component `c` (its package and class names, its manifest `enabled` and its application's) against user 0's state: the one test every resolution
+    /// applies (queries through [`Packages::answer`], the launcher, starts, binds and broadcasts).
+    pub fn enabled(&self, c: &ComponentInfo, flags: i64) -> bool {
+        let package = c.item.package_name.as_deref().unwrap_or_default();
+        let class = c.item.name.as_deref().unwrap_or_default();
+        is_enabled(
+            c.application_info.enabled,
+            c.enabled,
+            self.user.component(package, class),
+            flags,
+        )
+    }
+
+    /// A stored component cut to the caller's `flags` (PackageInfoUtils.generate*Info): meta-data only with GET_META_DATA (the component's and its ApplicationInfo's); false = filtered out, a
+    /// component [`Packages::enabled`] rejects for `flags` (PackageStateUtils.isEnabledAndMatches).
+    pub fn answer(&self, c: &mut ComponentInfo, flags: i64) -> bool {
+        if !self.enabled(c, flags) {
+            return false;
+        }
+        if flags & GET_META_DATA == 0 {
+            c.item.meta_data = None;
+            c.application_info.item.meta_data = None;
+        }
+        true
+    }
+
+    /// The launcher entry of `p`: the first enabled activity or alias, in manifest order, with a MAIN + LAUNCHER filter (PMS queryIntentActivities' order for the launcher's query; a disabled
+    /// component matches no query). The caller starts its `targetActivity` when set (an alias), keeping the alias as the component name.
+    pub fn launcher<'a>(&self, p: &'a PackageRecord) -> Option<&'a ActivityInfo> {
+        p.activities()
+            .filter(|a| self.enabled(&a.component, 0))
+            .find(|a| {
+                let name = a.component.item.name.as_deref().unwrap_or_default();
+                p.intents(Kind::ActivityIntents, name).iter().any(launches)
+            })
+    }
+
+    /// Whether `class` of `p` is an enabled activity or alias with a MAIN + LAUNCHER filter (ShortcutService.injectIsMainActivity's query).
+    pub fn is_launcher(&self, p: &PackageRecord, class: &str) -> bool {
+        p.activities().any(|a| {
+            named(&a.component, class)
+                && self.enabled(&a.component, 0)
+                && p.intents(Kind::ActivityIntents, class).iter().any(launches)
+        })
+    }
+
+    /// getServiceInfo's answer (ComputerEngine.getServiceInfo): `p`'s stored ServiceInfo filtered by `flags` ([`Packages::answer`]); None for a class the package does not declare or a disabled one
+    /// without MATCH_DISABLED_COMPONENTS.
+    pub fn service_info(&self, p: &PackageRecord, class: &str, flags: i64) -> Option<ServiceInfo> {
+        let mut out = p.service(class)?.clone();
+        self.answer(&mut out.component, flags).then_some(out)
+    }
+
     /// getPermissionControllerPackageName: PMS.getRequiredPermissionControllerLPr (PackageManagerService.java:2700-2716) resolves ACTION_MANAGE_PERMISSIONS + CATEGORY_DEFAULT among system
     /// packages (MATCH_SYSTEM_ONLY: ApplicationInfo FLAG_SYSTEM) and wants exactly one match, a privileged app. AOSP throws at boot otherwise; here None = no controller installed (no package
     /// is a system package until runtime-permissions S4 installs PermissionController).
@@ -219,7 +275,7 @@ impl Packages {
             .filter(|p| p.app().flags & FLAG_SYSTEM != 0)
             .flat_map(|p| {
                 p.activities()
-                    .filter(|a| a.component.enabled)
+                    .filter(|a| self.enabled(&a.component, 0))
                     .filter(move |a| {
                         let name = a.component.item.name.as_deref().unwrap_or_default();
                         p.intents(Kind::ActivityIntents, name)
@@ -601,19 +657,6 @@ fn has(i: &ParsedIntentInfo, action: &str, category: &str) -> bool {
     })
 }
 
-/// A stored component cut to the caller's `flags` (PackageInfoUtils.generate*Info): meta-data only with GET_META_DATA (the component's and its ApplicationInfo's); false = filtered out, a disabled
-/// component without MATCH_DISABLED_COMPONENTS (PackageStateUtils.isEnabledAndMatches, reduced to the component's own state).
-pub fn answer(c: &mut ComponentInfo, flags: i64) -> bool {
-    if !c.enabled && flags & MATCH_DISABLED_COMPONENTS == 0 {
-        return false;
-    }
-    if flags & GET_META_DATA == 0 {
-        c.item.meta_data = None;
-        c.application_info.item.meta_data = None;
-    }
-    true
-}
-
 /// PMS's per-install fields (ScanPackageUtils / PackageInfoUtils.generateApplicationInfo for a non-system app on user 0): code and data paths, uid, native-library dirs; set on the package's
 /// ApplicationInfo and on every component's copy (generate shares one object, PackageInfoCommonUtils.generate:235; the decode gives each component its own).
 pub struct InstallFields<'a> {
@@ -790,6 +833,10 @@ pub mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
+    use crate::package_state::{
+        COMPONENT_ENABLED_STATE_DEFAULT, COMPONENT_ENABLED_STATE_DISABLED,
+        COMPONENT_ENABLED_STATE_ENABLED,
+    };
     use atl_parcelables::android::content::Intent;
     use atl_parcelables::android::os::Bundle;
     use atl_parcelables::parts::PackageItemInfo;
@@ -1107,7 +1154,8 @@ mod tests {
                 intents: vec![filter(MAIN, LAUNCHER)],
             });
         }
-        let l = r.launcher().expect("launcher");
+        let packages = Packages::default();
+        let l = packages.launcher(&r).expect("launcher");
         assert_eq!(
             l.component.item.name.as_deref(),
             Some("org.fossify.notes.activities.SplashActivity.Green")
@@ -1116,9 +1164,32 @@ mod tests {
             l.target_activity.as_deref(),
             Some("org.fossify.notes.activities.SplashActivity")
         );
+        // the user state: Green disabled -> no launcher (Red is disabled in the manifest); Red enabled -> Red, the first in manifest order; DEFAULT on both -> Green again
+        let state = packages.user_state();
+        let (red, green) = (
+            "org.fossify.notes.activities.SplashActivity.Red",
+            "org.fossify.notes.activities.SplashActivity.Green",
+        );
+        state.set_component(pkg, green, COMPONENT_ENABLED_STATE_DISABLED);
+        assert!(packages.launcher(&r).is_none());
+        state.set_component(pkg, red, COMPONENT_ENABLED_STATE_ENABLED);
+        assert_eq!(
+            packages
+                .launcher(&r)
+                .and_then(|l| l.component.item.name.as_deref()),
+            Some(red)
+        );
+        state.set_component(pkg, red, COMPONENT_ENABLED_STATE_DEFAULT);
+        state.set_component(pkg, green, COMPONENT_ENABLED_STATE_DEFAULT);
+        assert_eq!(
+            packages
+                .launcher(&r)
+                .and_then(|l| l.component.item.name.as_deref()),
+            Some(green)
+        );
         // break: without the filters nothing launches
         r.intents.clear();
-        assert!(r.launcher().is_none());
+        assert!(packages.launcher(&r).is_none());
     }
 
     /// getRequiredPermissionControllerLPr: exactly one system package with an enabled MANAGE_PERMISSIONS + DEFAULT activity, privileged. PermissionController's manifest declares that filter
@@ -1197,7 +1268,10 @@ mod tests {
             component: c,
             ..Default::default()
         })]);
-        let with = r.service_info(class, GET_META_DATA).expect("declared");
+        let packages = Packages::default();
+        let with = packages
+            .service_info(&r, class, GET_META_DATA)
+            .expect("declared");
         assert!(with.component.direct_boot_aware && !with.component.exported);
         let entries = with
             .component
@@ -1208,11 +1282,12 @@ mod tests {
             .expect("entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, keys[0]);
-        let without = r.service_info(class, 0).expect("declared");
+        let without = packages.service_info(&r, class, 0).expect("declared");
         assert!(without.component.item.meta_data.is_none());
         // break: a class the package does not declare is not found by name
         assert!(
-            r.service_info("com.google.firebase.components.Other", GET_META_DATA)
+            packages
+                .service_info(&r, "com.google.firebase.components.Other", GET_META_DATA)
                 .is_none()
         );
     }
@@ -1226,8 +1301,28 @@ mod tests {
             "androidx.work.impl.background.systemalarm.ConstraintProxyUpdateReceiver",
         );
         c.enabled = false;
-        assert!(!answer(&mut c.clone(), 0));
-        assert!(answer(&mut c, MATCH_DISABLED_COMPONENTS));
+        let packages = Packages::default();
+        assert!(!packages.answer(&mut c.clone(), 0));
+        assert!(packages.answer(&mut c.clone(), MATCH_DISABLED_COMPONENTS));
+        // setComponentEnabledSetting ENABLED overrides the manifest (PackageUserStateUtils.isEnabled: an explicit state before the manifest default); DEFAULT restores it
+        let (package, class) = (
+            "com.noodlecake.altosodyssey",
+            "androidx.work.impl.background.systemalarm.ConstraintProxyUpdateReceiver",
+        );
+        let state = packages.user_state();
+        state.set_component(package, class, COMPONENT_ENABLED_STATE_ENABLED);
+        assert!(packages.answer(&mut c.clone(), 0));
+        state.set_component(package, class, COMPONENT_ENABLED_STATE_DEFAULT);
+        assert!(!packages.answer(&mut c.clone(), 0));
+        // an enabled component disabled by the user state: filtered, answered with MATCH_DISABLED_COMPONENTS
+        c.enabled = true;
+        state.set_component(package, class, COMPONENT_ENABLED_STATE_DISABLED);
+        assert!(!packages.answer(&mut c.clone(), 0));
+        assert!(packages.answer(&mut c.clone(), MATCH_DISABLED_COMPONENTS));
+        // a disabled `<application>` disables its components whatever their state
+        state.set_component(package, class, COMPONENT_ENABLED_STATE_ENABLED);
+        c.application_info.enabled = false;
+        assert!(!packages.answer(&mut c, 0));
     }
 
     /// PMS's paths for package `a` with split `config.x86_64` installed on x86_64 (literal: `<code>/base.apk`, `split_<name>.apk`, `lib/<isa>`), on the app and a component's copy. The roots are arbitrary inputs, not the device layout.

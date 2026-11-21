@@ -28,6 +28,7 @@ pub mod focus;
 pub mod ime_bind;
 pub mod memory_levels;
 pub mod observer_rules;
+pub mod package_state;
 pub mod pattern_matcher;
 pub mod pending_intent_table;
 pub mod players;

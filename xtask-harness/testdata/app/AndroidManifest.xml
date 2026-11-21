@@ -45,5 +45,8 @@
         </service>
         <!-- Main.receiverInfo's receiver (app.rs SERVICE_LINES receiver) -->
         <receiver android:name=".AtlReceiver" android:exported="false" />
+        <!-- Main.componentState's receivers (app.rs LOG_LINES componentstate): one enabled, one disabled in the manifest -->
+        <receiver android:name=".AtlStateReceiver" android:exported="false" />
+        <receiver android:name=".AtlOffReceiver" android:enabled="false" android:exported="false" />
     </application>
 </manifest>

@@ -458,7 +458,7 @@ impl ShortcutService {
             let launcher = self
                 .packages
                 .by_name(&package)
-                .and_then(|p| p.launcher())
+                .and_then(|p| self.packages.launcher(p))
                 .and_then(|a| a.component.item.name.clone());
             let Some(class) = launcher else {
                 return Err(illegal_state(&format!(
@@ -483,7 +483,7 @@ impl ShortcutService {
             if !self
                 .packages
                 .by_name(&package)
-                .is_some_and(|p| p.is_launcher(&a.class))
+                .is_some_and(|p| self.packages.is_launcher(p, &a.class))
             {
                 return Err(illegal_state(&format!(
                     "Cannot publish shortcut: activity {name} is not main activity"

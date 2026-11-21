@@ -159,6 +159,9 @@ pub const BROADCAST_STICKY: &str = "android.permission.BROADCAST_STICKY";
 
 /// Manifest.permission.QUERY_ALL_PACKAGES: a holder sees every package (AppsFilterUtils.requestsQueryAllPackages, AppsFilterBase.shouldFilterApplicationInternal).
 pub const QUERY_ALL_PACKAGES: &str = "android.permission.QUERY_ALL_PACKAGES";
+/// Manifest.permission.CHANGE_COMPONENT_ENABLED_STATE: signature|privileged|role (core/res/AndroidManifest.xml:6402-6403); a holder may change other packages' component states (PMS.setEnabledSettings).
+pub const CHANGE_COMPONENT_ENABLED_STATE: &str =
+    "android.permission.CHANGE_COMPONENT_ENABLED_STATE";
 
 #[cfg(test)]
 mod tests {

@@ -2909,7 +2909,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     ]);
     // SystemConfig's permission files lie in the root's partitions: system (mounted for every process) and vendor (HOST_FEATURES_FILE and `--file` placements), by host path
     services_args.extend(["--partitions".into(), r.root.clone().into_os_string()]);
-    // the services' own state (shortcut_service), kept across runs in the data root and writable by them alone
+    // the services' own state (shortcut_service, package_state), kept across runs in the data root and writable by them alone
     let system_dir = host_layout::system_dir(&r.data_root);
     std::fs::create_dir_all(&system_dir)?;
     services_args.extend(["--system-dir".into(), system_dir.clone().into_os_string()]);

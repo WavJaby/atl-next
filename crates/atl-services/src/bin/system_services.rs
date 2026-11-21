@@ -24,6 +24,7 @@ use atl_services::activity::{ActivityManager, RootBack};
 use atl_services::app_id::AppIds;
 use atl_services::install;
 use atl_services::package::PackageManager;
+use atl_services::package_state::PackageUserStates;
 use atl_services::packages::{PackageRecord, Packages, Permissions};
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
@@ -50,7 +51,7 @@ struct Args {
     /// system packages' broadcasts are protected.
     #[arg(long)]
     platform_manifest: Option<PathBuf>,
-    /// The services' own state dir, writable (atld: `<data root>/system`): user 0's shortcuts (`shortcut_service/`, atl_services::shortcut) are read at start and written on each change.
+    /// The services' own state dir, writable (atld: `<data root>/system`): user 0's shortcuts (`shortcut_service/`, atl_services::shortcut) and package state (`package-state.json`, atl_services::package_state) are read at start and written on each change.
     /// Omitted: that state is kept in memory only and starts empty.
     #[arg(long)]
     system_dir: Option<PathBuf>,
@@ -255,9 +256,20 @@ fn main() -> Result<()> {
         Some(p) => read_json(p)?,
         None => PlatformManifest::default(),
     };
-    let packages = Arc::new(
-        Packages::new(list, libraries).with_platform_broadcasts(platform.protected_broadcasts),
-    );
+    let mut packages =
+        Packages::new(list, libraries).with_platform_broadcasts(platform.protected_broadcasts);
+    // user 0's package state (component enabled settings) as the last run left it, entries of packages no longer installed dropped
+    if let Some(dir) = &a.system_dir {
+        let state = PackageUserStates::load(dir, |name| packages.by_name(name).is_some());
+        writeln!(
+            std::io::stderr(),
+            "services: package state: {} component overrides from {}",
+            state.len(),
+            dir.display()
+        )?;
+        packages = packages.with_user_state(state);
+    }
+    let packages = Arc::new(packages);
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
     let permissions = Arc::new(Permissions::new(&packages, &platform.permissions));
     ProcessState::start_thread_pool();
@@ -311,7 +323,9 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(" ")
     )?;
-    let manager = PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es);
+    // component-state changes broadcast PACKAGE_CHANGED and stop the package through the activity manager, as PMS does through AMS
+    let manager = PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es)
+        .with_events(Arc::new(activity.clone()));
     let webview_package = match atl_services::webview_update::current_package(&packages, &manager) {
         Ok(p) => p,
         Err(why) => {
@@ -362,7 +376,7 @@ fn main() -> Result<()> {
         atl_services::audio::new_binder(
             Arc::clone(&permissions),
             Arc::new(move |uid, intent| {
-                volume_broadcasts.broadcast_to_uid(intent, uid);
+                volume_broadcasts.broadcast_registered(intent, Some(uid));
             }),
         ),
     )

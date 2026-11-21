@@ -738,7 +738,7 @@ impl ActivityManager {
             .packages
             .by_name(package)
             .ok_or_else(|| format!("no package {package}"))?;
-        if p.launcher().is_none() {
+        if self.inner.packages.launcher(p).is_none() {
             return Err(format!("{package} has no launcher activity"));
         }
         let mut st = self.inner.state();
@@ -775,7 +775,7 @@ impl ActivityManager {
     ) -> Result<i32, Status> {
         let p = component.and_then(|(package, _)| self.inner.packages.by_name(package));
         let launcher = p
-            .and_then(|p| p.launcher())
+            .and_then(|p| self.inner.packages.launcher(p))
             .and_then(|a| a.component.item.name.as_deref());
         let mut st = self.inner.state();
         let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name()));
@@ -839,18 +839,29 @@ impl ActivityManager {
         told
     }
 
-    /// A broadcast the services send as the system uid to the registered receivers of `uid` only (AudioService.sendBroadcastToAll's registered-receiver delivery, narrowed to one app by the
-    /// per-app volume deviation, audio.rs): each matching receiver of that uid passes BroadcastSkipPolicy as a system send and is queued for its process, as broadcastIntentWithFeature does
-    /// (result code Activity.RESULT_OK -1, ContextImpl.sendBroadcastAsUser). Returns the receivers queued.
-    pub fn broadcast_to_uid(&self, intent: &Intent, uid: u32) -> usize {
+    /// forceStopPackageLocked for a reason outside a binder call of this service (PMS's PACKAGE_CHANGED without DONT_KILL_APP): the package's processes leave the table and are killed.
+    pub fn force_stop_package(&self, package: &str) {
+        let pids = {
+            let mut st = self.inner.state();
+            self.inner.force_stop_package_locked(&mut st, package)
+        };
+        self.inner.kill(&pids);
+    }
+
+    /// A broadcast the services send as the system uid to the registered receivers, of `only_uid` alone when given (AudioService.sendBroadcastToAll's registered-receiver delivery, narrowed to one
+    /// app by the per-app volume deviation, audio.rs; PMS's PACKAGE_CHANGED, package.rs): each matching receiver passes BroadcastSkipPolicy as a system send and is queued for its process, as
+    /// broadcastIntentWithFeature does (result code Activity.RESULT_OK -1, ContextImpl.sendBroadcastAsUser). Returns the receivers queued.
+    pub fn broadcast_registered(&self, intent: &Intent, only_uid: Option<u32>) -> usize {
         const RESULT_OK: i32 = -1;
         let inner = &self.inner;
-        let user = i32::try_from(uid / permission::PER_USER_RANGE).unwrap_or(USER_SYSTEM);
+        let user = only_uid.map_or(USER_SYSTEM, |uid| {
+            i32::try_from(uid / permission::PER_USER_RANGE).unwrap_or(USER_SYSTEM)
+        });
         let key = intent_key(intent, None);
         let mut st = inner.state();
         let mut queued = 0;
         for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
-            if ruid != uid {
+            if only_uid.is_some_and(|uid| ruid != uid) {
                 continue;
             }
             if let Some(why) = broadcast::skip_registered(
@@ -1333,10 +1344,14 @@ impl Inner {
             rights: atl_broker::rights_of(self.permissions.granted_names(p.uid).as_slice()),
         })?;
         // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
-        let task = p.launcher().filter(|_| launch_activity).map(|a| {
-            let size = initial_size(&self.tasks.display(), &crate::packages::bounds_input(a));
-            self.tasks.new_task(p.uid, p.name(), size)
-        });
+        let task = self
+            .packages
+            .launcher(p)
+            .filter(|_| launch_activity)
+            .map(|a| {
+                let size = initial_size(&self.tasks.display(), &crate::packages::bounds_input(a));
+                self.tasks.new_task(p.uid, p.name(), size)
+            });
         st.processes.push(ProcessRecord {
             package: p.name().to_owned(),
             process_name: process_name.to_owned(),
@@ -1676,7 +1691,10 @@ impl Inner {
             );
             return;
         };
-        let Some(decl) = p.receiver(class).filter(|r| r.component.enabled) else {
+        let Some(decl) = p
+            .receiver(class)
+            .filter(|r| self.packages.enabled(&r.component, 0))
+        else {
             atl_diag::answered(
                 AM,
                 "broadcast to a component that is no enabled <receiver>: no receiver",
@@ -2143,7 +2161,7 @@ impl IActivityManager for ActivityManager {
         if launch
             && let Some(task) = task
             && let Some(p) = inner.packages.by_name(&package)
-            && let Some(activity) = p.launcher()
+            && let Some(activity) = inner.packages.launcher(p)
         {
             // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
             inner

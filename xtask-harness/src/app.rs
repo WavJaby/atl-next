@@ -808,7 +808,7 @@ struct Line {
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
 /// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
-const LOG_LINES: [Line; 26] = [
+const LOG_LINES: [Line; 28] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -880,6 +880,8 @@ const LOG_LINES: [Line; 26] = [
     WEBVIEW_SLOW_CALLBACK,
     WEBVIEW_LOOPER_THREAD,
     WEBVIEW_CLASSLOADER,
+    COMPONENT_STATE,
+    COMPONENT_STATE_RECEIVE,
 ];
 
 /// A [`SERVICE_LINES`] expectation: the fixed value, or this host's (None): [`connectivity_want`], [`battery_want`].
@@ -954,6 +956,28 @@ fn battery_want() -> String {
         "present={present} level={level} status={status} plugged={plugged} charging={charging} capacity={capacity} scale=100"
     )
 }
+
+/// Main.componentState (PackageManager component state, values from AOSP): AtlStateReceiver starts DEFAULT 0 (PackageSetting.getCurrentEnabledStateLPr with no override); DISABLED 2 reads back 2 and
+/// getReceiverInfo no longer finds it (PackageUserStateUtils.isEnabled: an explicit DISABLED); DEFAULT 0 reads back 0 and it resolves again (restoreComponentLPw, the manifest's enabled=true);
+/// the manifest-disabled AtlOffReceiver does not resolve, ENABLED 1 makes it resolve, DEFAULT hides it again; an undeclared class of the fixture (targetSdk 36 >= JELLY_BEAN) is
+/// IllegalArgumentException and another package's component SecurityException (PackageManagerService.setEnabledSettings :3913-4004: ownership first). Without the methods (UNKNOWN_TRANSACTION
+/// reads back no exception and 0) the row is `get0=0 disable=0 resolve=1 default=0 resolve2=1 off=0 enable=0 offresolve=0 offdefault=0 unknown=none other=none`.
+const COMPONENT_STATE: Line = Line {
+    row: "componentstate",
+    prefix: "AtlTest: componentstate: ",
+    want: Want::Exact(
+        "get0=0 disable=2 resolve=0 default=0 resolve2=1 off=0 enable=1 offresolve=1 offdefault=0 unknown=IllegalArgumentException other=SecurityException",
+    ),
+    timing: Timing::Create,
+};
+/// AtlStateReceiver's first onReceive: the explicit broadcast Main.componentState sent while it was DISABLED reaches nothing (BroadcastQueue resolves at send time; activity.rs
+/// deliver_to_component_locked asks Packages::enabled), so the first to arrive is the one sent after DEFAULT, n=2.
+const COMPONENT_STATE_RECEIVE: Line = Line {
+    row: "componentstate-receive",
+    prefix: "AtlTest: componentstate-receive: ",
+    want: Want::Exact("n=2"),
+    timing: Timing::Async,
+};
 
 /// The connectivity line (Main.connectivity) for this host, read with the host's own tools, not the platform layer's code: the default route's interface from iproute2 (`ip route show default`, IPv4 then IPv6, lowest metric);
 /// its kind from sysfs (`wireless` dir -> Wi-Fi agent "WIFI", else Ethernet agent "Ethernet"); the Internet verdict and metered flag as GIO's network monitor takes them from NetworkManager (`nmcli`: connectivity none -> offline,
