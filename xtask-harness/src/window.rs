@@ -35,6 +35,7 @@ use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 use atl_cpu_pressure::{Sampler, Samples, judge_window};
 
+mod aux_process;
 mod capture;
 mod dialog;
 mod gles1;
@@ -243,6 +244,8 @@ enum Stage {
     Suspended,
     /// UI mode with the portrait fixture (xtask-harness/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
     Portrait,
+    /// UI mode, two processes of one uid (window-aux): a `:aux` process registered before the window's first layout, killed, restarted, then a dialog; the main window's and the dialog's layers stay in the main process's compositor (xtask-harness/src/window/aux_process.rs).
+    AuxProcess,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
     AppId,
     /// UI mode: the window's `xdg_toplevel.set_title`s are the task's label as recents shows it, then the TaskDescription label the fixture sets ([`title_check`]).
@@ -278,6 +281,7 @@ impl Stage {
             Stage::Gles2 => "gles2",
             Stage::Gles1 => "gles1",
             Stage::Suspended => "suspended",
+            Stage::AuxProcess => "aux-process",
             Stage::Portrait => "portrait",
             Stage::AppId => "app-id",
             Stage::Title => "title",
@@ -313,6 +317,7 @@ impl Stage {
             | Stage::StartFinish
             | Stage::Move
             | Stage::Suspended => RESIZE_WINDOW_MS,
+            Stage::AuxProcess => aux_process::WINDOW_MS,
         }
     }
 }
@@ -320,8 +325,12 @@ impl Stage {
 /// The stages whose run ends when their probe is done, not at the watch's end: the ime probe kills the app and relaunches it, a cold start (8-20 s under load, 2026-11-21) the 12 s watch
 /// cut short, so the stop landed anywhere in the relaunch (its bind missing, the death counted from the exit summary, the relaunched process's half-started counters judged). LIMIT still bounds it.
 /// webview-overlay: its probe waits for every answer it judges (the last Esc's back line), so the rest of its 30 s watch was idle time (rows 49-55 s, 2026-11-21).
+/// aux-process: its probe waits for the dialog after a cold start of the new `:aux` process, as long as the ime relaunch.
 fn probe_ends_run(stage: Stage) -> bool {
-    matches!(stage, Stage::Ime | Stage::WebViewOverlay)
+    matches!(
+        stage,
+        Stage::Ime | Stage::WebViewOverlay | Stage::AuxProcess
+    )
 }
 
 /// The stages whose probe takes pictures of the window through [`capture::Probe`] (the harness route, not the composer's log).
@@ -480,6 +489,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::UiBlock
         | Stage::SlowDisplay
         | Stage::Suspended
+        | Stage::AuxProcess
         | Stage::MouseTouch => "AtlWindow: onResume reached",
         Stage::SurfaceView => surface_view::MARKER,
         Stage::WebView => webview::MARKER,
@@ -2107,6 +2117,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Gles2
         | Stage::Gles1
         | Stage::Suspended
+        | Stage::AuxProcess
         | Stage::MouseTouch => {
             // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
             if args.hold.is_some() {
@@ -2565,6 +2576,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
             }
             (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
             (Stage::Title, _, _) => drive_title(p, &log, &titles_seen),
+            (Stage::AuxProcess, _, _) => aux_process::drive(p, &log),
             (Stage::Splash, _, _) => splash::drive(p, &log),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
@@ -2749,6 +2761,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             dialog::checks(&app, &services, &liveness, &captured, ended.is_some())
         }
         (Stage::Gles2, Some(_)) => gles2::checks(&app, display, &liveness, &captured),
+        (Stage::AuxProcess, Some(_)) => aux_process::checks(&app, &services, &liveness),
         (Stage::Gles1, Some(_)) => gles1::checks(root, &app, display, &liveness, &captured),
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
@@ -3000,6 +3013,7 @@ fn fixture(stage: Stage) -> &'static str {
         Stage::Gles2 => gles2_fixture::FIXTURE,
         Stage::Gles1 => gles1::FIXTURE,
         Stage::Portrait => PORTRAIT_FIXTURE,
+        Stage::AuxProcess => aux_process::FIXTURE,
         _ => FIXTURE,
     }
 }

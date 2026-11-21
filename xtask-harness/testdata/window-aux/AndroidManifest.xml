@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage aux-process: two processes of one uid. The launcher (.AuxStart) binds .Aux in ":aux" and starts .AuxMain (window's quadrants) once it is
+     connected, so the second process registers its UI agent before the window's first layout; AuxMain then kills ":aux", binds a new one, and shows a dialog. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+
+    <application android:label="ATL window test">
+        <!-- not Theme.NoDisplay: that activity must finish before its resume, and AuxStart waits for the bind -->
+        <activity android:name=".AuxStart" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".AuxMain" android:exported="false" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
+        <service android:name=".Aux" android:exported="false" android:process=":aux" />
+    </application>
+</manifest>
