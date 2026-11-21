@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The api traits over the platform module's vtable (hand-written shims, owner O1): each method turns its arguments into `abi` views or callbacks, calls the module, and maps the status back to the trait's error. Each proxy owns one module handle and ends it on drop.
-//! Thread rules are the module objects': the session, windows, text inputs and audio objects hold raw handles, so they are neither Send nor Sync, as the GTK and PipeWire types they stand for; the invoker and the frame requester are Send + Sync like theirs.
+//! Thread rules are the module objects': windows, text inputs and audio objects hold raw handles, so they are neither Send nor Sync, as the GTK and PipeWire types they stand for; the session, the invoker and the frame requester are Send + Sync like theirs.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -18,7 +18,7 @@ use atl_platform_ui_api::{
     Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester,
     FrameTick, InputEvent, InputSource, Looper, LooperPoster, Monitor, Painted, PhysRect, PhysSize,
     PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput, TextInputEvent, Ui, UiError,
-    UiInvoker, Window, WindowAttributes,
+    DisplayInvoker, Window, WindowAttributes,
 };
 
 use crate::module::module;
@@ -28,6 +28,11 @@ pub struct PlatformUi {
     vt: &'static UiVtable,
     h: *mut UiHandle,
 }
+
+// SAFETY: the handle boxes the module's session, which is Send + Sync (the `Ui` trait's bound: plain data, no toolkit object); every vtable fn taking it either hops to the display thread (`ui_invoker`) or refuses off it (`window_create`: WrongThread), and `ui_drop` touches no toolkit object.
+unsafe impl Send for PlatformUi {}
+// SAFETY: as Send.
+unsafe impl Sync for PlatformUi {}
 
 impl Ui for PlatformUi {
     type Invoker = PlatformInvoker;
@@ -72,7 +77,7 @@ impl Drop for PlatformUi {
     }
 }
 
-/// Runs work on the UI thread, from any thread.
+/// Runs work on the display thread, from any thread.
 pub struct PlatformInvoker {
     vt: &'static UiVtable,
     h: *mut InvokerHandle,
@@ -83,10 +88,15 @@ unsafe impl Send for PlatformInvoker {}
 // SAFETY: as Send.
 unsafe impl Sync for PlatformInvoker {}
 
-impl UiInvoker for PlatformInvoker {
+impl DisplayInvoker for PlatformInvoker {
     fn invoke(&self, f: Box<dyn FnOnce() + Send>) {
         // SAFETY: a live invoker handle; the task's ownership passes to the module.
         unsafe { (self.vt.invoker_invoke)(self.h, Task::new(f)) }
+    }
+
+    fn call(&self, f: Box<dyn FnOnce() + Send>) -> bool {
+        // SAFETY: a live invoker handle; the task's ownership passes to the module, which returns once it ran or was dropped.
+        unsafe { (self.vt.invoker_call)(self.h, Task::new(f)) }
     }
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The in-app IInputMethod and IInputMethodSession (IME plan route R1, step 5): what IMMS-lite binds (atl-services ime_bind.rs) and the app's InputMethodManager talks to, served in the app
 //! process. Reference, the IME side of AOSP: core/java/android/inputmethodservice/IInputMethodWrapper.java (createSession -> callback.sessionCreated, startInput, unbindInput) and
-//! IInputMethodSessionWrapper.java (finishInput, invalidateInput). Calls arrive on binder threads; every one that touches the field goes to the UI thread through the invoker (field.rs).
+//! IInputMethodSessionWrapper.java (finishInput, invalidateInput). Calls arrive on binder threads; every one that touches the field goes to the display thread through the invoker (field.rs).
 //! Not served (answered UNKNOWN_TRANSACTION, logged): handwriting, inline suggestions, subtypes, extracted text, completions; show/hide are accepted and do nothing (no soft keyboard: the desktop input method shows its own UI).
 
 use std::sync::Arc;
@@ -28,14 +28,14 @@ use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::{
     FutureState, FutureValue,
 };
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
-use atl_platform_ui::UiInvoker;
+use atl_platform_ui::DisplayInvoker;
 use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::field::{self, Field};
 
-type Invoker = Arc<dyn UiInvoker>;
+type Invoker = Arc<dyn DisplayInvoker>;
 
-/// Queues a field start on the UI thread.
+/// Queues a field start on the display thread.
 fn start_field(
     invoker: &Invoker,
     connection: Option<&Strong<dyn IRemoteInputConnection>>,
@@ -58,7 +58,7 @@ fn start_field(
     }));
 }
 
-/// The pending side of a getSurroundingText AndroidFuture (AndroidFuture.writeToParcel's IAndroidFuture.Stub): the editor completes it with the done form; the value goes to the UI thread.
+/// The pending side of a getSurroundingText AndroidFuture (AndroidFuture.writeToParcel's IAndroidFuture.Stub): the editor completes it with the done form; the value goes to the display thread.
 struct SurroundingFuture {
     invoker: Invoker,
     session_id: i32,
@@ -235,7 +235,7 @@ impl IInputMethodSession for Session {
     }
 }
 
-/// The process's input method binder, its calls reaching the UI thread through `invoker` (the toolkit's).
-pub fn new_binder(invoker: Arc<dyn UiInvoker>) -> SpIBinder {
+/// The process's input method binder, its calls reaching the display thread through `invoker` (the toolkit's).
+pub fn new_binder(invoker: Arc<dyn DisplayInvoker>) -> SpIBinder {
     BnInputMethod::new_binder(InputMethod { invoker }, BinderFeatures::default()).as_binder()
 }

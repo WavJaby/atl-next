@@ -2,19 +2,20 @@
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. The compositor's clock thread publishes each scene into the [`Mailbox`] and
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
-//! GTK objects live on the UI thread only: the launcher's startup attaches the toolkit and [`open`]s the window there before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local on that thread and wires the window to the compositor; no other thread touches GTK.
+//! GTK objects live on the display thread only (today the thread that attached the toolkit, the app's main thread): the launcher's startup attaches the toolkit and [`open`]s the window before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local of the display thread and wires the window to the compositor. Both run their work there by `call`, so the caller holds only the Send [`OpenWindow`] token; no other thread touches GTK.
 //! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_reports.rs); the monitor is also this process's compositor display (Composer::set_display).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
-    Capture, FrameClock, FrameRequester, InputSource, LooperPoster, PlatformUi, PlatformWindow, Ui,
-    UiError, UiInvoker, Window, WindowAttributes,
+    Capture, DisplayInvoker, FrameClock, FrameRequester, InputSource, LooperPoster, PlatformUi,
+    PlatformWindow, Ui, UiError, Window, WindowAttributes,
 };
 
 use atl_services_types::compositor_registry::Splash;
@@ -26,7 +27,7 @@ use crate::input::{InputSender, Message};
 use crate::mailbox::Mailbox;
 use crate::task_reports::TaskReports;
 
-/// The UI thread's session: the toolkit (kept attached for the process), the compositor and its mailbox, the input thread and the window once wired.
+/// The display thread's session: the toolkit (kept attached for the process), the compositor and its mailbox, the input thread and the window once wired.
 struct Session {
     _ui: PlatformUi,
     composer: Arc<Composer>,
@@ -39,9 +40,11 @@ struct Session {
 
 thread_local! {
     static SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    /// The window [`open`] made, on the display thread, until [`install`] wires it into [`SESSION`].
+    static OPENED: RefCell<Option<Rc<PlatformWindow>>> = const { RefCell::new(None) };
 }
 
-/// The UI thread's invoker, set at install: other threads' calls into the window go through it.
+/// The display thread's invoker, set at install: other threads' calls into the window go through it.
 static INVOKER: OnceLock<<PlatformUi as Ui>::Invoker> = OnceLock::new();
 
 /// The outbox (outbox.rs), set at install with [`INVOKER`]: the binder calls the window's thread starts run there.
@@ -96,7 +99,7 @@ pub fn available() -> bool {
     INVOKER.get().is_some()
 }
 
-/// Serves one capture on the UI thread: presents the scene the clock published and not yet shown (if any), reads the window back, and calls `answer` with the picture (or why there is none) on the
+/// Serves one capture on the display thread: presents the scene the clock published and not yet shown (if any), reads the window back, and calls `answer` with the picture (or why there is none) on the
 /// outbox: the answer allocates a buffer and replies to the listener, binder calls the window's thread does not make (outbox.rs). The clock is not asked for a frame: the caller polls, and the next publish presents as usual.
 pub fn capture(answer: Box<dyn FnOnce(Result<Capture, UiError>) + Send>) {
     let (Some(invoker), Some(outbox)) = (INVOKER.get(), OUTBOX.get()) else {
@@ -126,25 +129,49 @@ pub fn capture(answer: Box<dyn FnOnce(Result<Capture, UiError>) + Send>) {
 }
 
 /// The Task's window, opened by the launcher before ART boots ([`open`]) and showing the starting window ([`Splash`]) until [`install`] hands it to the compositor and the app's first present replaces it.
+/// A Send token: the window itself stays on the display thread ([`OPENED`]); the caller holds only the session handle (Send + Sync, no toolkit object) and the splash's paint flag.
 pub struct OpenWindow {
-    ui: PlatformUi,
-    window: Rc<PlatformWindow>,
-    /// the splash's first paint has happened (or there is no splash to wait for)
-    painted: Rc<Cell<bool>>,
+    /// taken by [`install`]; Some until then
+    ui: Option<PlatformUi>,
+    /// the splash's first paint has happened (or there is no splash to wait for); set on the display thread
+    painted: Arc<AtomicBool>,
     /// the launcher's start: the origin of the `splash:` lines' `after=`
     started: Instant,
     splash: bool,
 }
 
+// The token crosses from the launcher's thread to the display thread, and the window must not: checked at compile time.
+const _: fn() = || {
+    fn send<T: Send>() {}
+    send::<OpenWindow>();
+    // compiles only while PlatformWindow is not Send (both impls would apply to a Send type, and the `_` would be ambiguous)
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    struct IsSend;
+    impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+    let _ = <PlatformWindow as AmbiguousIfSend<_>>::check;
+};
+
 impl OpenWindow {
     /// The splash has been painted, or there is none: the launcher's wait before ART boot ends.
     pub fn painted(&self) -> bool {
-        self.painted.get()
+        self.painted.load(Ordering::Acquire)
     }
 
-    /// The UI thread's invoker (the in-app input method's calls into the window).
-    pub(crate) fn invoker(&self) -> <PlatformUi as Ui>::Invoker {
-        self.ui.invoker()
+    /// The display thread's invoker (the in-app input method's calls into the window).
+    pub(crate) fn invoker(&self) -> Option<<PlatformUi as Ui>::Invoker> {
+        self.ui.as_ref().map(Ui::invoker)
+    }
+}
+
+/// A token dropped before [`install`] (the compositor failed to start) closes its window on the display thread, as dropping the window itself did.
+impl Drop for OpenWindow {
+    fn drop(&mut self) {
+        if let Some(ui) = &self.ui {
+            ui.invoker().invoke(Box::new(|| drop(OPENED.take())));
+        }
     }
 }
 
@@ -179,9 +206,23 @@ fn splash_scene(splash: Splash, size: atl_platform_ui::PhysSize) -> Scene {
 /// The splash quad's layer id: below every id the compositor hands out (its ids start at 1), so it names no app layer.
 const SPLASH_LAYER: i32 = 0;
 
-/// Opens the Task's window on the calling thread, the UI thread that attached `ui`, before the compositor exists, and presents the starting window into it. With no `splash` (`ro.atl.splash` unset)
+/// Opens the Task's window on the display thread of `ui` (by `call`, from any app thread), before the compositor exists, and presents the starting window into it. With no `splash` (`ro.atl.splash` unset)
 /// the window opens empty, logged `splash: none (no spec)` and counted. The window's frame clock is not wired to anything until [`install`].
 pub fn open(
+    ui: PlatformUi,
+    attributes: WindowAttributes,
+    splash: Option<Splash>,
+    started: Instant,
+) -> Result<OpenWindow, String> {
+    let invoker = ui.invoker();
+    atl_platform_ui::call(&invoker, move || {
+        open_on_display(ui, &attributes, splash, started)
+    })
+    .ok_or_else(|| "ui window: the display thread ended".to_owned())?
+}
+
+/// [`open`]'s work, on the display thread: the window goes to [`OPENED`], the token back to the caller.
+fn open_on_display(
     ui: PlatformUi,
     attributes: &WindowAttributes,
     splash: Option<Splash>,
@@ -190,15 +231,15 @@ pub fn open(
     tracing::info!("atl-composer: ui: opening the window");
     let window =
         Rc::new(PlatformWindow::create(&ui, attributes).map_err(|e| format!("ui window: {e}"))?);
-    let painted = Rc::new(Cell::new(splash.is_none()));
+    let painted = Arc::new(AtomicBool::new(splash.is_none()));
     match splash {
         Some(splash) => {
             window
                 .present(&splash_scene(splash, attributes.size))
                 .map_err(|e| format!("splash present: {e}"))?;
-            let done = Rc::clone(&painted);
+            let done = Arc::clone(&painted);
             window.on_painted(move |_| {
-                if !done.replace(true) {
+                if !done.swap(true, Ordering::AcqRel) {
                     tracing::info!(
                         "splash: shown after={} background={}",
                         after_ms(started),
@@ -213,16 +254,16 @@ pub fn open(
             tracing::info!("splash: none (no spec)");
         }
     }
+    OPENED.set(Some(window));
     Ok(OpenWindow {
-        ui,
-        window,
+        ui: Some(ui),
         painted,
         started,
         splash: splash.is_some(),
     })
 }
 
-/// Keeps the session on the calling thread, which must be the UI thread that opened `opened`, and wires the window to the compositor: from here the compositor's scenes replace the starting window.
+/// Keeps the session on the display thread that opened `opened` (by `call`, from any app thread: returns once it is installed, so the window is wired before the composer registers) and wires the window to the compositor: from here the compositor's scenes replace the starting window.
 pub fn install(
     opened: OpenWindow,
     composer: Arc<Composer>,
@@ -230,14 +271,37 @@ pub fn install(
     input: InputSender<Message>,
     reports: Arc<TaskReports>,
     outbox: Arc<dyn LooperPoster>,
+) -> Result<(), String> {
+    let Some(invoker) = opened.invoker() else {
+        return Err("ui window install: the window was installed before".to_owned());
+    };
+    let ran = invoker.call(Box::new(move || {
+        install_on_display(opened, composer, mailbox, input, reports, outbox)
+    }));
+    if ran {
+        Ok(())
+    } else {
+        Err("ui window install: the display thread ended".to_owned())
+    }
+}
+
+/// [`install`]'s work, on the display thread.
+fn install_on_display(
+    mut opened: OpenWindow,
+    composer: Arc<Composer>,
+    mailbox: Arc<Mailbox>,
+    input: InputSender<Message>,
+    reports: Arc<TaskReports>,
+    outbox: Arc<dyn LooperPoster>,
 ) {
-    let OpenWindow {
-        ui,
-        window,
-        started,
-        splash,
-        ..
-    } = opened;
+    let (Some(ui), started, splash) = (opened.ui.take(), opened.started, opened.splash) else {
+        return;
+    };
+    drop(opened);
+    let Some(window) = OPENED.take() else {
+        tracing::warn!("atl-composer: ui: install without an opened window on this thread");
+        return;
+    };
     // before the invoker: `available` reads the invoker, and `capture` needs both
     let _ = OUTBOX.set(outbox);
     let _ = INVOKER.set(ui.invoker());
@@ -254,7 +318,7 @@ pub fn install(
     wire(window, splash.then_some(started));
 }
 
-/// Connects the window to the session, once, on the UI thread. `splash_started`: the launcher's start when a splash is shown, for the `splash: replaced` line at the app's first present.
+/// Connects the window to the session, once, on the display thread. `splash_started`: the launcher's start when a splash is shown, for the `splash: replaced` line at the app's first present.
 fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
     SESSION.with(|cell| {
         let mut slot = cell.borrow_mut();

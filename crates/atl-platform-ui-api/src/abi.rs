@@ -333,7 +333,7 @@ unsafe extern "C" fn run_box<F: FnOnce()>(data: *mut c_void) {
     (unsafe { Box::from_raw(data.cast::<F>()) })()
 }
 
-/// An `FnOnce() + Send` closure ([`UiInvoker::invoke`](crate::UiInvoker::invoke)): run once, or dropped unrun.
+/// An `FnOnce() + Send` closure ([`DisplayInvoker::invoke`](crate::DisplayInvoker::invoke)): run once, or dropped unrun.
 #[repr(C)]
 pub struct Task {
     data: *mut c_void,
@@ -1055,7 +1055,7 @@ impl SceneView {
 pub struct UiHandle {
     _opaque: [u8; 0],
 }
-/// A `UiInvoker`, opaque; Send + Sync.
+/// A `DisplayInvoker`, opaque; Send + Sync.
 #[repr(C)]
 pub struct InvokerHandle {
     _opaque: [u8; 0],
@@ -1106,8 +1106,10 @@ pub struct UiVtable {
     pub ui_drop: unsafe extern "C" fn(ui: *mut UiHandle),
     /// `Ui::invoker`.
     pub ui_invoker: unsafe extern "C" fn(ui: *mut UiHandle) -> *mut InvokerHandle,
-    /// `UiInvoker::invoke`, any thread.
+    /// `DisplayInvoker::invoke`, any thread.
     pub invoker_invoke: unsafe extern "C" fn(invoker: *mut InvokerHandle, task: Task),
+    /// `DisplayInvoker::call`, any thread: returns once `task` ran on the display thread (true) or was dropped unrun (false); on the display thread runs it inline.
+    pub invoker_call: unsafe extern "C" fn(invoker: *mut InvokerHandle, task: Task) -> bool,
     /// Ends an invoker, any thread.
     pub invoker_drop: unsafe extern "C" fn(invoker: *mut InvokerHandle),
     /// `Window::create`.

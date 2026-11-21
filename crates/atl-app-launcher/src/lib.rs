@@ -142,7 +142,7 @@ fn start_compositor(_vm: &ffi::Vm, _window: Option<OpenWindow>) {}
 #[cfg(feature = "converter")]
 const SPLASH_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Step 1d. UI mode's window before ART boots: the toolkit (step 5b''), the Task's window with the starting window in it (atl-composer `open_window`), and the Looper polled until its first paint,
+/// Step 1d. UI mode's window before ART boots: the toolkit (step 5b''), the Task's window with the starting window in it (atl-composer `open_window`: the window stays on the display thread, this thread holds its Send token), and the Looper polled until the token's painted flag is set,
 /// since GTK runs only inside that poll and Java's MessageQueue polls it only after the VM, the framework and ActivityThread are up. During ART's boot the desktop keeps showing that frame.
 /// A process with no Task, or a window that fails to open, gets none (said on stderr) and runs as headless.
 #[cfg(feature = "converter")]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app-process half of the platform layer as traits (plan S1 `atl-platform-ui`; M3 slice 6).
-//! * [`Ui`]: the toolkit session. Thread-affine: the thread that attaches is the UI thread, which is also the Android Looper's thread (plan Q6, owner 2026-11-05). The Looper is the outer loop: its poll runs the toolkit's fds through the [`Looper`] seam, so a UI thread that stops polling answers no compositor ping and the desktop shows its own "not responding" dialog.
+//! * [`Ui`]: the toolkit session; [`DisplayInvoker`] reaches its thread, the display thread, from any other. The thread that attaches is the display thread, today also the UI thread, which is also the Android Looper's thread (plan Q6, owner 2026-11-05). The Looper is the outer loop: its poll runs the toolkit's fds through the [`Looper`] seam, so a UI thread that stops polling answers no compositor ping and the desktop shows its own "not responding" dialog.
 //! * [`Window`]: a toplevel the compositor's [`Scene`] is presented into; [`FrameClock`] and [`InputSource`] are the display's vsync and pointer events of that window.
 //! * [`audio`]: the PCM output (plan A0): [`audio::AudioHost`] connects to the audio server, [`audio::PcmOutput`] is one stream on it.
 //!
@@ -81,12 +81,13 @@ pub struct QuadRelease {
     pub release_fence: Option<OwnedFd>,
 }
 
-/// The toolkit session. Thread-affine: the thread that attaches is the UI thread.
-pub trait Ui: Sized {
-    /// The handle that runs work on the UI thread from any thread.
-    type Invoker: UiInvoker;
+/// The toolkit session. The thread that attaches is the display thread: the toolkit's objects live there, and every operation on them either hops there ([`DisplayInvoker`]) or is refused off it ([`UiError::WrongThread`]); the session handle itself is plain data, so it may move to and be shared with app threads.
+/// Today the display thread is the thread that attaches, the app's main thread (display-thread plan S5d moves it to its own thread).
+pub trait Ui: Sized + Send + Sync {
+    /// The handle that runs work on the display thread from any thread.
+    type Invoker: DisplayInvoker;
 
-    /// Starts the toolkit on the calling thread, which becomes the UI thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
+    /// Starts the toolkit on the calling thread, which becomes the display thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
     /// `looper` is the temporary seam display-thread S5 deletes, when the toolkit gets its own thread and loop.
     /// `liveness`: the app's main Looper, where the toolkit posts its liveness token: a compositor ping is answered only after that Looper ran the token (display-thread plan D3), so a blocked main thread answers none and the desktop shows its own "not responding" dialog.
     /// `buffer_device`: the run's gralloc node (st_rdev); every presented buffer must have been allocated there, others are refused by name. None (no gralloc in this process): every buffer is refused.
@@ -96,14 +97,33 @@ pub trait Ui: Sized {
         buffer_device: Option<DeviceNumber>,
     ) -> Result<Self, UiError>;
 
-    /// A handle that runs closures on this UI thread, from any thread.
+    /// A handle that runs closures on the display thread, from any thread.
     fn invoker(&self) -> Self::Invoker;
 }
 
-/// Runs work on the UI thread from another thread (a binder thread's call that must touch a window).
-pub trait UiInvoker: Send + Sync + 'static {
-    /// Queues `f`; it runs on the UI thread at its next main-loop pass, in queue order.
+/// The one way into the display thread (display-thread plan D2 "one seam"): from any thread, work queued ([`invoke`](DisplayInvoker::invoke)) or run and waited for ([`call`](DisplayInvoker::call); typed form [`call`](crate::call)).
+pub trait DisplayInvoker: Send + Sync + 'static {
+    /// Queues `f`; it runs on the display thread at its next main-loop pass, in queue order.
     fn invoke(&self, f: Box<dyn FnOnce() + Send>);
+
+    /// Runs `f` on the display thread and returns once it has run: from another thread it is queued as [`invoke`](DisplayInvoker::invoke) queues and waited for; on the display thread itself it runs inline (the module logs `display: call on display`).
+    /// False: `f` was dropped unrun (the display thread's loop ended). Never from a thread the display thread waits on (D2 rule B1: the display thread waits on no app thread, so an app thread may call).
+    fn call(&self, f: Box<dyn FnOnce() + Send>) -> bool;
+}
+
+/// [`DisplayInvoker::call`] with a result: `f`'s value, computed on the display thread; None when `f` was dropped unrun.
+pub fn call<R: Send + 'static>(
+    invoker: &(impl DisplayInvoker + ?Sized),
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let put = std::sync::Arc::clone(&slot);
+    let ran = invoker.call(Box::new(move || {
+        let value = f();
+        *put.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+    }));
+    let value = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    value.filter(|_| ran)
 }
 
 /// A pointer cursor, by the CSS cursor names desktop toolkits share (the set Android's pointer icon types name).
@@ -615,4 +635,42 @@ pub trait TextInput {
     fn set_cursor_rect(&self, rect: PhysRect);
     /// Sets the callback run for each input-method event, replacing the previous one.
     fn on_events<F: FnMut(TextInputEvent) + 'static>(&self, on_event: F);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisplayInvoker;
+
+    /// A display thread that runs each call on a thread of its own and waits for it (`run`), or drops it unrun (an ended loop).
+    struct Threaded {
+        run: bool,
+    }
+
+    impl DisplayInvoker for Threaded {
+        fn invoke(&self, f: Box<dyn FnOnce() + Send>) {
+            drop(f);
+        }
+
+        fn call(&self, f: Box<dyn FnOnce() + Send>) -> bool {
+            let run = self.run;
+            std::thread::spawn(move || if run { f() } else { drop(f) })
+                .join()
+                .expect("call thread");
+            run
+        }
+    }
+
+    #[test]
+    fn call_returns_the_value_computed_on_the_display_thread() {
+        let caller = std::thread::current().id();
+        let got = super::call(&Threaded { run: true }, move || {
+            std::thread::current().id() != caller
+        });
+        assert_eq!(got, Some(true));
+    }
+
+    #[test]
+    fn call_dropped_unrun_is_none() {
+        assert_eq!(super::call(&Threaded { run: false }, || 1), None);
+    }
 }

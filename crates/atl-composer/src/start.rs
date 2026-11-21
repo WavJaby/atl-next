@@ -148,12 +148,13 @@ pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow
         app_id: Some(atl_launch::app_id(&package).map_err(|e| e.to_string())?),
         size,
     };
-    ui_window::open(ui, &attributes, splash, started).map(Some)
+    // TASK_INFO above is a binder call: it stays on this app thread, never on the display thread (display-thread plan D2 rule B1); the window is made there by `call`
+    ui_window::open(ui, attributes, splash, started).map(Some)
 }
 
 /// Starts this process's compositor and registers it. Call it with libbinder's thread pool running (the registry's reply and libgui's calls arrive on its threads) and before anything uses libgui.
 /// The clock thread and the present thread come from `host` in both modes; the UI agent keeps it for the window title's label lookup. Headless (`window` None): scenes go to a report sink, and a scripted pointer goes in at the first frame. UI mode (`window`: the Task's window
-/// [`open_window`] opened on this UI thread): scenes go through a mailbox to it ([`ui_window`]), which takes the latest on its frame clock. The caller is the UI thread in UI mode.
+/// [`open_window`] opened): scenes go through a mailbox to it ([`ui_window`]), which takes the latest on its frame clock; the window's session is installed on the display thread (`call`) before the composer registers.
 pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Composer>, String> {
     let threads: &dyn VmHost = &*host;
     let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
@@ -193,7 +194,10 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
     let reports = if let Some(window) = window {
-        input_method = Some(atl_ime::new_binder(Arc::new(window.invoker())));
+        let invoker = window
+            .invoker()
+            .ok_or_else(|| "ui window: already installed".to_owned())?;
+        input_method = Some(atl_ime::new_binder(Arc::new(invoker)));
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))
@@ -207,7 +211,7 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
             input_tx.clone(),
             Arc::clone(&reports),
             outbox,
-        );
+        )?;
         Some(reports)
     } else {
         let first_frame = input_tx.clone();

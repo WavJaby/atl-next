@@ -34,7 +34,8 @@ compile_error!("atl-platform-ui has no implementation for this target OS");
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn implements_the_api() {
-    fn ui<T: Ui>() {}
+    fn ui<T: Ui<Invoker = PlatformInvoker>>() {}
+    fn invoker<T: DisplayInvoker>() {}
     fn window<
         T: Window<Ui = PlatformUi, TextInput = PlatformTextInput> + FrameClock + InputSource,
     >() {
@@ -43,6 +44,7 @@ fn implements_the_api() {
     fn audio_host<T: audio::AudioHost<Output = PlatformPcmOutput>>() {}
     fn pcm_output<T: audio::PcmOutput>() {}
     ui::<PlatformUi>();
+    invoker::<PlatformInvoker>();
     window::<PlatformWindow>();
     text_input::<PlatformTextInput>();
     audio_host::<PlatformAudioHost>();

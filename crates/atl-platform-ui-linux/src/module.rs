@@ -15,7 +15,7 @@ use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity, 
 use atl_platform_ui_api::{
     ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester, FrameTick,
     InputEvent, InputSource, PhysRect, PhysSize, PresentError, PresentTiming, Surrounding,
-    TextInput, Ui, UiInvoker, Window,
+    DisplayInvoker, TextInput, Ui, Window,
 };
 
 use crate::ui::GtkInvoker;
@@ -30,6 +30,7 @@ static VTABLE: UiVtable = UiVtable {
     ui_drop,
     ui_invoker,
     invoker_invoke,
+    invoker_call,
     invoker_drop,
     window_create,
     window_drop,
@@ -174,6 +175,11 @@ unsafe extern "C" fn ui_invoker(ui: *mut UiHandle) -> *mut InvokerHandle {
 unsafe extern "C" fn invoker_invoke(invoker: *mut InvokerHandle, task: Task) {
     // SAFETY: a live handle of `ui_invoker`; GtkInvoker is Send + Sync, so any thread may call.
     unsafe { obj::<_, GtkInvoker>(invoker) }.invoke(Box::new(move || task.run()));
+}
+
+unsafe extern "C" fn invoker_call(invoker: *mut InvokerHandle, task: Task) -> bool {
+    // SAFETY: a live handle of `ui_invoker`; GtkInvoker is Send + Sync, so any thread may call.
+    unsafe { obj::<_, GtkInvoker>(invoker) }.call(Box::new(move || task.run()))
 }
 
 unsafe extern "C" fn invoker_drop(invoker: *mut InvokerHandle) {
@@ -523,7 +529,7 @@ unsafe extern "C" fn pcm_underruns(p: *mut PcmHandle) -> u64 {
     unsafe { pcm(p) }.underruns()
 }
 
-/// The handles that cross threads box Send + Sync objects, as the traits require.
+/// The handles that cross threads box Send + Sync objects, as the traits require (the session's is the `Ui` trait's own bound).
 #[allow(dead_code)]
 fn crossing_threads() {
     fn send_sync<T: Send + Sync>() {}

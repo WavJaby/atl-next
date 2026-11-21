@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The focused field, on the UI thread: the desktop input method's events (the window's TextInput) as calls on the field's IRemoteInputConnection, the way an Android IME drives its
+//! The focused field, on the display thread (today the UI thread): the desktop input method's events (the window's TextInput) as calls on the field's IRemoteInputConnection, the way an Android IME drives its
 //! InputConnection (InputMethodService.getCurrentInputConnection -> RemoteInputConnection, core/java/android/inputmethodservice/RemoteInputConnection.java: one oneway call per edit,
-//! each with an InputConnectionCommandHeader of the session id). GTK objects and this state live on the UI thread only; binder threads reach it through the UI invoker (method.rs).
+//! each with an InputConnectionCommandHeader of the session id). GTK objects and this state live on the display thread only; binder threads reach it through the display invoker (method.rs).
 //! Mapping (IME study §7): preedit -> setComposingText(text, 1); preedit end / empty preedit -> setComposingText("", 1) (the composing text goes, a following commit replaces nothing);
 //! commit -> commitText(text, 1) (replaces the composing region, cursor after it); delete-surrounding -> deleteSurroundingTextInCodePoints (units.rs). newCursorPosition 1 = cursor right after the
 //! inserted text (InputConnection.setComposingText docs).
@@ -18,7 +18,9 @@ use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::Futur
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::InputConnectionCommandHeader;
 use atl_parcelables::java::lang::CharSequence;
-use atl_platform_ui::{PlatformWindow, Surrounding, TextInput, TextInputEvent, UiInvoker, Window};
+use atl_platform_ui::{
+    DisplayInvoker, PlatformWindow, Surrounding, TextInput, TextInputEvent, Window,
+};
 use binder::Strong;
 
 use crate::units;
@@ -29,7 +31,7 @@ pub(crate) struct Field {
     pub session_id: i32,
     pub input_type: i32,
     /// For the surrounding text's answer, which arrives on a binder thread (method.rs `SurroundingFuture`).
-    pub invoker: Arc<dyn UiInvoker>,
+    pub invoker: Arc<dyn DisplayInvoker>,
 }
 
 /// UTF-16 units of text asked for on each side of the selection. Text-input v3 caps set_surrounding_text at 4000 bytes (text-input-unstable-v3.xml); a UTF-16 unit is at most 3 UTF-8 bytes
@@ -46,7 +48,7 @@ thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
 }
 
-/// The process's window, on the UI thread once it exists: its TextInput's events go to the focused field from now on.
+/// The process's window, on the display thread once it exists: its TextInput's events go to the focused field from now on.
 pub fn attach(window: Rc<PlatformWindow>) {
     window.text_input().on_events(on_event);
     STATE.with_borrow_mut(|s| s.window = Some(window));

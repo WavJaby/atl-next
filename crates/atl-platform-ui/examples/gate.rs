@@ -12,6 +12,7 @@
 //!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
 //! 3. refusals + release: a handle whose pitch is shorter than a row and one with a fourcc the table does not have are refused (never a CPU fallback); a scene that replaces the frame buffer releases it at the next paint, with a read fence (`RELEASES`).
 //! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
+//!    Then (4b) `call` (`CALL`): from [`AppThread`] it returns the window's size read on the toolkit thread while that thread keeps polling (`app-on-toolkit`, `app-size`); on the toolkit thread it runs inline (`inline`), which the module logs as `display: call on display`.
 //! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the app's UI thread ([`AppThread`]) that long, printing `BLOCKING` when it starts (the harness's ping probe; the toolkit thread keeps running); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
 
 use std::cell::{Cell, RefCell};
@@ -553,6 +554,11 @@ impl AppThread {
     }
 }
 
+thread_local! {
+    /// The window on the toolkit thread, for phase 4b's closures: they are Send, so they reach it by the thread they run on, not by capture.
+    static WINDOW: RefCell<Option<Rc<PlatformWindow>>> = const { RefCell::new(None) };
+}
+
 /// Polls `looper` until `done` is true or `deadline` passes.
 fn spin(looper: &TestLooper, deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
     while !done() {
@@ -817,6 +823,46 @@ fn main() -> Result<()> {
         on_ui_thread.get()
     ));
     drop(watch);
+
+    // phase 4b: `call` (display-thread plan D2). From the app thread it returns a value computed on the toolkit thread, which keeps polling its Looper meanwhile; on the toolkit thread it runs inline (a queued call would wait on itself)
+    WINDOW.set(Some(Rc::clone(&window)));
+    let invoker = Arc::new(ui.invoker());
+    let toolkit = thread::current().id();
+    let on_toolkit = move || {
+        let size = WINDOW.with_borrow(|w| w.as_ref().map(|w| w.size()));
+        (thread::current().id() == toolkit, size)
+    };
+    // set once by the app thread: what its call returned (None: dropped unrun)
+    type AppCall = Option<(bool, Option<PhysSize>)>;
+    let from_app: Arc<Mutex<Option<AppCall>>> = Arc::default();
+    {
+        let (invoker, slot) = (Arc::clone(&invoker), Arc::clone(&from_app));
+        app.poster.post(Box::new(move || {
+            let got = atl_platform_ui::call(&*invoker, on_toolkit);
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(got);
+        }));
+    }
+    spin(&looper, deadline, "the app thread's call", || {
+        from_app
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    })?;
+    let app_call = from_app
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .flatten();
+    let inline = atl_platform_ui::call(&*invoker, move || thread::current().id() == toolkit);
+    let app_size = app_call
+        .and_then(|(_, s)| s)
+        .map_or("none".to_owned(), |s| format!("{}x{}", s.width, s.height));
+    emit(format_args!(
+        "CALL app-on-toolkit={} app-size={app_size} inline={}",
+        app_call.is_some_and(|(on, _)| on),
+        inline == Some(true)
+    ));
+    WINDOW.set(None);
 
     // the text input's events, one line each (phase 5 `ime-focus` enables it)
     window.text_input().on_events(|event| match event {

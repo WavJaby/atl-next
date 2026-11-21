@@ -5,6 +5,7 @@
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
 //! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
+//!    `call` (display-thread plan D2): from the app thread it returns a value computed on the toolkit thread (the window's size equals the size last asked for: the smaller probe size, or the configured one when maximized); on the toolkit thread it runs inline and the module logs `display: call on display` exactly once.
 //! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the app's UI thread is blocked (`block`) for the ping timeout plus a margin while the toolkit keeps running on its own thread: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
 //!    The ping hold (display-thread plan D3) makes that so: after the client exits, its module log must hold `display: ping hold armed`, `pings_held` at least the probe's pings and `pings_answered` equal to it. `--break-ping-hold` builds the module with its listener unwrapped: GDK pongs at once, so the blocked check and the hold checks fail.
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (the toolkit on one thread answers pings only after the app thread's Looper ran a token); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
@@ -482,6 +483,8 @@ impl Report {
 
 /// The module's line when its ping hold is armed (atl-platform-ui-linux ping.rs `report`).
 const HOLD_ARMED: &str = "display: ping hold armed";
+/// The module's line for a `call` made on the display thread itself (display-thread plan D2).
+const CALL_ON_DISPLAY: &str = "display: call on display";
 
 /// The last value the module logged for counter `key` (`atl-platform-ui: count <key> <n>`, count.rs).
 fn last_count(log: &str, key: &str) -> Option<u64> {
@@ -830,6 +833,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "watched fd callback ran on the UI thread inside the Looper poll",
         &fdwatch,
     );
+    // gate 3b: `call` (display-thread plan D2): an app thread gets a value computed on the toolkit thread, the window's size, which is the size the client last asked for (the smaller probe size; maximized: the configured one)
+    let call = client
+        .lines_with("CALL ")
+        .first()
+        .map(|l| l.to_string())
+        .unwrap_or_default();
+    let asked = if args.maximized {
+        fixed
+    } else {
+        Some((WIDTH - RESIZE_STEP, HEIGHT - RESIZE_STEP))
+    };
+    report.check(
+        field(&call, "app-on-toolkit") == Some("true")
+            && field(&call, "app-size").and_then(|s| size_of(s, "")) == asked,
+        "call from the app thread returns a value computed on the toolkit thread (the window's size, as asked)",
+        &format!("{call} (asked {asked:?})"),
+    );
 
     // gate 4: ping / pong
     let ping_timeout = Duration::from_millis(args.ping_timeout_ms);
@@ -1002,6 +1022,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .lines()
             .find(|l| l.contains("display: ping hold"))
             .unwrap_or("no ping hold line"),
+    );
+    // the client's one call on the toolkit thread ran inline: it returned (no deadlock) and the module logged it, once
+    let inline_calls = module_log
+        .lines()
+        .filter(|l| l.contains(CALL_ON_DISPLAY))
+        .count();
+    report.check(
+        field(&call, "inline") == Some("true") && inline_calls == 1,
+        "call on the toolkit thread runs inline, logged once",
+        &format!("{call}; `{CALL_ON_DISPLAY}` lines {inline_calls}"),
     );
     let held = last_count(&module_log, "pings_held");
     let answered = last_count(&module_log, "pings_answered");
