@@ -111,8 +111,8 @@ pub struct Args {
     /// Stage ime only: the fake input method leaves its commit_string out, so the commit sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_commit: bool,
-    /// Stage ime only: the composer's outbox runs each post inline on the poster's thread (atl-composer feature `break-outbox`), so the Task reports are sent from the window's thread and the
-    /// outbox sub-gate must fail.
+    /// Stage ime only: the composer's outbox runs each post inline on the poster's thread (atl-composer feature `break-outbox`), so the Task reports and the input method's sends are made on the
+    /// display thread and the outbox sub-gate must fail (an input method send there reaches the in-process editor with no JNIEnv: the app aborts, which fails the stage too).
     #[arg(long)]
     break_outbox: bool,
     /// Stage aux-process only: a queued transaction does not keep the layers it names (atl-composer feature `break-handle-hold`), so the fixture's transaction on a layer it released at once meets

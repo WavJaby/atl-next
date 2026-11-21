@@ -19,7 +19,7 @@ use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::InputConnectionCommandHeader;
 use atl_parcelables::java::lang::CharSequence;
 use atl_platform_ui::{
-    DisplayInvoker, PlatformWindow, Surrounding, TextInput, TextInputEvent, Window,
+    DisplayInvoker, LooperPoster, PlatformWindow, Surrounding, TextInput, TextInputEvent, Window,
 };
 use binder::Strong;
 
@@ -27,11 +27,66 @@ use crate::units;
 
 /// The editor's connection and the session id its calls carry (0 for a new connection, the invalidateInput id after one: RemoteInputConnectionImpl.java:496).
 pub(crate) struct Field {
-    pub connection: Strong<dyn IRemoteInputConnection>,
-    pub session_id: i32,
-    pub input_type: i32,
+    /// Some until drop, which hands it to the outbox.
+    connection: Option<Strong<dyn IRemoteInputConnection>>,
+    session_id: i32,
+    input_type: i32,
     /// For the surrounding text's answer, which arrives on a binder thread (method.rs `SurroundingFuture`).
-    pub invoker: Arc<dyn DisplayInvoker>,
+    invoker: Arc<dyn DisplayInvoker>,
+    /// Where every call on `connection` is sent from, and where it is released: an attached thread, in post order (display-thread rule B1: an in-process Java editor runs a call, and its
+    /// JavaBBinder's destructor, on the caller's thread, which needs a JNIEnv the display thread never has).
+    outbox: Arc<dyn LooperPoster>,
+}
+
+impl Field {
+    pub(crate) fn new(
+        connection: Strong<dyn IRemoteInputConnection>,
+        session_id: i32,
+        input_type: i32,
+        invoker: Arc<dyn DisplayInvoker>,
+        outbox: Arc<dyn LooperPoster>,
+    ) -> Self {
+        Field {
+            connection: Some(connection),
+            session_id,
+            input_type,
+            invoker,
+            outbox,
+        }
+    }
+}
+
+/// The display thread's reference goes to the outbox, after every send posted before it: the outbox's release is then the last one, never the display thread's.
+impl Drop for Field {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            self.outbox.post(Box::new(move || drop(connection)));
+        }
+    }
+}
+
+/// Sends `call` on `field`'s connection from the outbox, after every earlier send; `what` names it in the `atl-ime: sent` line, with the thread it ran on.
+fn send(
+    field: &Field,
+    what: String,
+    call: impl FnOnce(&dyn IRemoteInputConnection, &InputConnectionCommandHeader) -> binder::Result<()>
+    + Send
+    + 'static,
+) {
+    let Some(connection) = field.connection.clone() else {
+        return;
+    };
+    let header = InputConnectionCommandHeader {
+        session_id: field.session_id,
+    };
+    field.outbox.post(Box::new(move || {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("?");
+        match call(&*connection, &header) {
+            Ok(()) => tracing::info!("atl-ime: sent {what} thread={thread}"),
+            Err(e) => tracing::warn!("atl-ime: {what} not sent: {e:?} thread={thread}"),
+        }
+    }));
 }
 
 /// UTF-16 units of text asked for on each side of the selection. Text-input v3 caps set_surrounding_text at 4000 bytes (text-input-unstable-v3.xml); a UTF-16 unit is at most 3 UTF-8 bytes
@@ -76,20 +131,17 @@ pub(crate) fn start(field: Field) {
 
 /// Asks the editor for the text around its selection (IRemoteInputConnection.getSurroundingText, oneway): the answer completes a pending AndroidFuture on a binder thread, and nothing waits for it.
 fn request_surrounding(field: &Field) {
-    let header = InputConnectionCommandHeader {
-        session_id: field.session_id,
-    };
     let future = crate::method::surrounding_future(Arc::clone(&field.invoker), field.session_id);
-    let future = AndroidFuture::new(FutureState::Pending(Some(future)));
-    if let Err(e) = field.connection.r#getSurroundingText(
-        Some(&header),
-        SURROUNDING_UNITS,
-        SURROUNDING_UNITS,
-        0,
-        Some(&future),
-    ) {
-        tracing::warn!("atl-ime: getSurroundingText not sent: {e:?}");
-    }
+    send(field, "getSurroundingText".to_owned(), move |c, header| {
+        let future = AndroidFuture::new(FutureState::Pending(Some(future)));
+        c.r#getSurroundingText(
+            Some(header),
+            SURROUNDING_UNITS,
+            SURROUNDING_UNITS,
+            0,
+            Some(&future),
+        )
+    });
 }
 
 /// The editor's selection moved (IInputMethodSession.updateSelection): its surrounding text is asked for again. No copy of the editor's text is kept here; the editor is the only one.
@@ -155,38 +207,30 @@ fn on_event(event: TextInputEvent) {
             tracing::debug!("atl-ime: {event:?} with no field");
             return;
         };
-        let header = InputConnectionCommandHeader {
-            session_id: field.session_id,
-        };
-        let c = &field.connection;
-        let sent = match &event {
-            TextInputEvent::Preedit { text, .. } => {
-                c.r#setComposingText(Some(&header), Some(&CharSequence::new(text.as_str())), 1)
-            }
-            TextInputEvent::PreeditEnd => {
-                c.r#setComposingText(Some(&header), Some(&CharSequence::new("")), 1)
-            }
-            TextInputEvent::Commit(text) => {
-                c.r#commitText(Some(&header), Some(&CharSequence::new(text.as_str())), 1)
-            }
+        let what = format!("{event:?}");
+        match event {
+            TextInputEvent::Preedit { text, .. } => send(field, what, move |c, h| {
+                c.r#setComposingText(Some(h), Some(&CharSequence::new(text.as_str())), 1)
+            }),
+            TextInputEvent::PreeditEnd => send(field, what, |c, h| {
+                c.r#setComposingText(Some(h), Some(&CharSequence::new("")), 1)
+            }),
+            TextInputEvent::Commit(text) => send(field, what, move |c, h| {
+                c.r#commitText(Some(h), Some(&CharSequence::new(text.as_str())), 1)
+            }),
             TextInputEvent::DeleteSurrounding {
                 offset_chars,
                 n_chars,
-            } => match units::delete_to_code_points(*offset_chars, *n_chars) {
-                Some((before, after)) => c.r#deleteSurroundingTextInCodePoints(
-                    Some(&header),
-                    i32::try_from(before).unwrap_or(i32::MAX),
-                    i32::try_from(after).unwrap_or(i32::MAX),
-                ),
-                None => {
-                    tracing::warn!("atl-ime: delete-surrounding off the cursor: {event:?}");
-                    Ok(())
-                }
+            } => match units::delete_to_code_points(offset_chars, n_chars) {
+                Some((before, after)) => send(field, what, move |c, h| {
+                    c.r#deleteSurroundingTextInCodePoints(
+                        Some(h),
+                        i32::try_from(before).unwrap_or(i32::MAX),
+                        i32::try_from(after).unwrap_or(i32::MAX),
+                    )
+                }),
+                None => tracing::warn!("atl-ime: delete-surrounding off the cursor: {what}"),
             },
-        };
-        match sent {
-            Ok(()) => tracing::info!("atl-ime: sent {event:?}"),
-            Err(e) => tracing::warn!("atl-ime: {event:?} not sent: {e:?}"),
         }
     });
 }

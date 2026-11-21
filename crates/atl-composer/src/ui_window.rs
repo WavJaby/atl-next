@@ -450,8 +450,7 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
             monitors.submit_display(model);
         });
         window.request_frame();
-        // the in-app input method's desktop side: the window's TextInput. Its connection calls stay on this thread (display-thread S5e reshapes them): posting them makes the editor's
-        // surrounding answer arrive after GTK's `done` commit, and GTK only sends a surrounding from `retrieve-surrounding` inside its own state commit (needs a display-side copy)
+        // the in-app input method's desktop side: the window's TextInput (its calls on the editor's connection go to the outbox, atl-ime field.rs)
         atl_ime::attach(Rc::clone(&window));
         session.window = Some(window);
     });

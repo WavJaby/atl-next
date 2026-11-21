@@ -322,12 +322,22 @@ const SENT_LINE: &str = "task reports: sent ";
 /// The composer's outbox thread (atl-composer outbox.rs `THREAD`).
 const OUTBOX_THREAD: &str = "atl-outbox";
 
-/// Display-thread plan rule B1: binder sends the window's thread starts run on the outbox, so every Task report line names the outbox thread: want >= 1 (the window's first display and size) and
-/// 0 on any other thread. The IME's connection calls stay on the window's thread until S5 (atl-composer ui_window.rs `wire`).
+/// The input method's line for each call it sent on the editor's connection, then `<call> thread=<name>` (atl-ime field.rs `send`).
+const IME_SENT_LINE: &str = "atl-ime: sent ";
+
+/// Display-thread plan rule B1: binder sends the window's thread starts run on the outbox, so every Task report line and every input method send names the outbox thread: want >= 1 of each
+/// (the window's first display and size; the stage's preedit, commit and delete) and 0 on any other thread.
 fn outbox_check(app: &str) -> Result<String, String> {
+    let reports = on_outbox(app, SENT_LINE, "task reports")?;
+    let ime = on_outbox(app, IME_SENT_LINE, "input method sends")?;
+    Ok(format!("{reports}; {ime}"))
+}
+
+/// The `<marker>... thread=<name>` lines of `app`: >= 1, all on the outbox.
+fn on_outbox(app: &str, marker: &str, what: &str) -> Result<String, String> {
     let threads: Vec<&str> = app
         .lines()
-        .filter_map(|l| l.split_once(SENT_LINE).map(|(_, rest)| rest))
+        .filter_map(|l| l.split_once(marker).map(|(_, rest)| rest))
         .map(|rest| rest.rsplit_once(" thread=").map_or("", |(_, t)| t.trim()))
         .collect();
     let elsewhere: Vec<&str> = threads
@@ -336,10 +346,10 @@ fn outbox_check(app: &str) -> Result<String, String> {
         .filter(|t| *t != OUTBOX_THREAD)
         .collect();
     match (threads.len(), elsewhere.is_empty()) {
-        (0, _) => Err("no `task reports: sent` line".to_owned()),
-        (n, true) => Ok(format!("{n} task reports, all on {OUTBOX_THREAD}")),
+        (0, _) => Err(format!("no `{}` line", marker.trim())),
+        (n, true) => Ok(format!("{n} {what}, all on {OUTBOX_THREAD}")),
         (n, false) => Err(format!(
-            "{} of {n} task reports off {OUTBOX_THREAD}: {elsewhere:?}",
+            "{} of {n} {what} off {OUTBOX_THREAD}: {elsewhere:?}",
             elsewhere.len()
         )),
     }
@@ -411,30 +421,36 @@ mod outbox_tests {
     use super::*;
 
     /// The line shape is task_reports.rs `send`'s; a report from another thread (the break: the window's, unnamed = `?`; before S3: `atl-task-sender`) or a line without a thread fails.
+    /// An input method send, as field.rs `send` logs it.
+    const IME: &str = "INFO atl-ime: sent Commit(\"x\") thread=atl-outbox\n";
+
     #[test]
     fn every_sent_line_must_name_the_outbox() {
         let good = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=atl-outbox\n";
         assert_eq!(
-            outbox_check(good),
-            Ok("2 task reports, all on atl-outbox".to_owned())
+            outbox_check(&format!("{good}{IME}")),
+            Ok("2 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox".to_owned())
         );
-        let bad = format!("{good}INFO atl-composer: task reports: sent 1 thread=?\n");
+        let bad = format!("{good}{IME}INFO atl-composer: task reports: sent 1 thread=?\n");
         assert!(outbox_check(&bad).is_err());
-        assert!(outbox_check("INFO atl-composer: task reports: sent 1\n").is_err());
+        assert!(outbox_check(&format!("INFO atl-composer: task reports: sent 1\n{IME}")).is_err());
         assert!(outbox_check("").is_err());
+        // an input method send made on the display thread, or none at all
+        assert!(outbox_check(&format!("{good}INFO atl-ime: sent Commit(\"x\") thread=atl-display\n")).is_err());
+        assert!(outbox_check(good).is_err());
     }
 
     /// The run goes on through the relaunch, whose reports also land in the app log: the gate counts the first process's part only, so a red there stays red and the relaunch's lines are not counted.
     #[test]
     fn the_outbox_judges_the_first_process() {
-        let first = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nservices: died\n";
+        let first = format!("INFO atl-composer: task reports: sent 2 thread=atl-outbox\n{IME}services: died\n");
         let relaunch = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=?\n";
         let app = format!("{first}{relaunch}");
         assert_eq!(
             outbox_check(first_part(&app, Some(first.len()))),
-            Ok("1 task reports, all on atl-outbox".to_owned())
+            Ok("1 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox".to_owned())
         );
-        let red = "INFO atl-composer: task reports: sent 2 thread=?\n";
+        let red = format!("INFO atl-composer: task reports: sent 2 thread=?\n{IME}");
         let broken = format!("{red}{relaunch}");
         assert!(outbox_check(first_part(&broken, Some(red.len()))).is_err());
     }

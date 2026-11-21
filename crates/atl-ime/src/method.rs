@@ -28,16 +28,17 @@ use atl_parcelables::codecs::com::android::internal::infra::AndroidFuture::{
     FutureState, FutureValue,
 };
 use atl_parcelables::com::android::internal::infra::AndroidFuture;
-use atl_platform_ui::DisplayInvoker;
+use atl_platform_ui::{DisplayInvoker, LooperPoster};
 use binder::{BinderFeatures, Interface, SpIBinder, Strong};
 
 use crate::field::{self, Field};
 
 type Invoker = Arc<dyn DisplayInvoker>;
+type Outbox = Arc<dyn LooperPoster>;
 
 /// Queues a field start on the display thread.
 fn start_field(
-    invoker: &Invoker,
+    (invoker, outbox): (&Invoker, &Outbox),
     connection: Option<&Strong<dyn IRemoteInputConnection>>,
     editor: Option<&EditorInfo>,
     session_id: i32,
@@ -47,14 +48,11 @@ fn start_field(
         return;
     };
     let input_type = editor.map_or(0, |e| e.input_type);
-    let for_field = Arc::clone(invoker);
+    let (for_field, outbox) = (Arc::clone(invoker), Arc::clone(outbox));
     invoker.invoke(Box::new(move || {
-        field::start(Field {
-            connection,
-            session_id,
-            input_type,
-            invoker: for_field,
-        })
+        field::start(Field::new(
+            connection, session_id, input_type, for_field, outbox,
+        ))
     }));
 }
 
@@ -97,6 +95,7 @@ pub(crate) fn surrounding_future(invoker: Invoker, session_id: i32) -> SpIBinder
 
 struct InputMethod {
     invoker: Invoker,
+    outbox: Outbox,
 }
 
 impl Interface for InputMethod {}
@@ -124,7 +123,7 @@ impl IInputMethod for InputMethod {
             return Ok(());
         };
         start_field(
-            &self.invoker,
+            (&self.invoker, &self.outbox),
             params.remoteInputConnection.as_ref(),
             params.editorInfo.as_ref(),
             0,
@@ -144,6 +143,7 @@ impl IInputMethod for InputMethod {
         let session = BnInputMethodSession::new_binder(
             Session {
                 invoker: Arc::clone(&self.invoker),
+                outbox: Arc::clone(&self.outbox),
             },
             BinderFeatures::default(),
         );
@@ -183,6 +183,7 @@ impl IInputMethod for InputMethod {
 
 struct Session {
     invoker: Invoker,
+    outbox: Outbox,
 }
 
 impl Interface for Session {}
@@ -226,7 +227,7 @@ impl IInputMethodSession for Session {
         connection: Option<&Strong<dyn IRemoteInputConnection>>,
         session_id: i32,
     ) -> binder::Result<()> {
-        start_field(&self.invoker, connection, editor, session_id);
+        start_field((&self.invoker, &self.outbox), connection, editor, session_id);
         Ok(())
     }
 
@@ -235,7 +236,8 @@ impl IInputMethodSession for Session {
     }
 }
 
-/// The process's input method binder, its calls reaching the display thread through `invoker` (the toolkit's).
-pub fn new_binder(invoker: Arc<dyn DisplayInvoker>) -> SpIBinder {
-    BnInputMethod::new_binder(InputMethod { invoker }, BinderFeatures::default()).as_binder()
+/// The process's input method binder, its calls reaching the display thread through `invoker` (the toolkit's); the field's calls on the editor's connection go to `outbox`, an attached thread (display-thread rule B1: the display thread makes no binder call).
+pub fn new_binder(invoker: Arc<dyn DisplayInvoker>, outbox: Arc<dyn LooperPoster>) -> SpIBinder {
+    BnInputMethod::new_binder(InputMethod { invoker, outbox }, BinderFeatures::default())
+        .as_binder()
 }
