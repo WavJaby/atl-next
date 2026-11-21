@@ -25,12 +25,12 @@ import javax.microedition.khronos.opengles.GL10;
  * The WebView-over-a-game gate: `xtask test window --stage webview-overlay` (xtask-harness/src/window/webview_overlay.rs). The arrangement of an in-game survey (Angry Birds 2, owner 2026-11-18):
  * one activity whose content is an animating, focused GLSurfaceView; after its first frame a full-window WebView is added over it at runtime.
  * Page: one full-page button over 3 window heights of content (the survey is taller than the window); each click sets the title `tap<n>` and navigates to a fragment (a history entry), so the
- * WebView can go back; the first scroll sets the title `scrolled`; each viewport resize sets `viewport<innerWidth>x<innerHeight>` (CSS px, device-width viewport). Each key the page gets sets the title `key<n><key>`.
+ * WebView can go back; the first scroll sets the title `scrolled`; each viewport resize sets `viewport<innerWidth>x<innerHeight>` (CSS px, device-width viewport). Each key the page gets is reported through the bridge ({@link Keys}): `wvo page key <n><key>`.
  * Back (Activity.onBackPressed, as an SDK of this age overrides it): WebView can go back -> goBack, logs `wvo back page`; else the WebView is removed and destroyed, logs `wvo back dismissed`;
  * with no WebView logs `wvo back game`. The activity never finishes, so every row runs in one process.
  * The WebView gets one child of the app's (a consent SDK's loading indicator), removed with removeViewAt(0) at the first onPageFinished; `wvo web children <n>` logs the count just before.
  * Right after it, a second WebView is preloaded under an INVISIBLE parent and never shown (addPreload: Angry Birds 2's survey SDK).
- * Logs: `wvo focus <gl|web|none|class>` at every Android focus move, `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
+ * Logs: `wvo focus <gl|web|none|class>` at every Android focus move, `wvo gl frame` once, `wvo web added`, `wvo page finished`, `wvo title <t>`, `wvo page key <n><key>`, `wvo layout window=<w>x<h> web=<l,t,r,b>` at every layout change, `wvo gl key <code>` for a key the GL view gets.
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -40,13 +40,25 @@ public class Main extends Activity {
      */
     static final String PAGE_HTML = "<html><head><meta name=\"viewport\" content=\"width=device-width\"></head><body style=\"margin:0\"><button id=\"b\" style=\"width:100vw;height:100vh;font-size:40px\""
             + " onclick=\"window.n=(window.n||0)+1;location.hash='s'+window.n;document.title='tap'+window.n\">survey</button><div style=\"height:200vh\">more</div>"
-            + "<script>document.onkeydown=function(e){window.k=(window.k||0)+1;document.title='key'+window.k+e.key};"
+            + "<script>document.onkeydown=function(e){window.k=(window.k||0)+1;atl.key(window.k+e.key)};"
             + "window.onscroll=function(){if(!window.s){window.s=1;document.title='scrolled'}};"
             + "window.onresize=function(){document.title='viewport'+innerWidth+'x'+innerHeight}</script></body></html>";
     /** The hidden preload's page ({@link #addPreload}): a full-page button whose click sets the title `ptap`. */
     static final String PRELOAD_HTML = "<html><body style=\"margin:0\"><button style=\"width:100vw;height:100vh\" onclick=\"document.title='ptap'\">preload</button></body></html>";
     /** After the GL view's first frame, before the WebView comes: the game is running when the survey opens. */
     static final long WEB_DELAY_MS = 500;
+
+    /**
+     * The page's key report (`atl`): a bridge call returns before the page's keydown handler does (WebView.addJavascriptInterface methods are synchronous for the page), so the line is in the log
+     * before the key's unhandled answer and any back it causes. Not the title: onReceivedTitle is posted on its own path, unordered with onUnhandledKeyEvent, and the dismissal's destroy() drops a
+     * title still on its way (measured 2026-11-21: Esc 2's title lost in 6 of 20 runs).
+     */
+    static final class Keys {
+        @android.webkit.JavascriptInterface
+        public void key(String k) {
+            Log.i(TAG, "wvo page key " + k);
+        }
+    }
 
     private FrameLayout root;
     private WebView web;
@@ -124,6 +136,7 @@ public class Main extends Activity {
     private void addWeb() {
         WebView w = new WebView(this);
         w.getSettings().setJavaScriptEnabled(true);
+        w.addJavascriptInterface(new Keys(), "atl");
         // a consent SDK's loading indicator (Battle Cats TW, owner 2026-11-17): a child the app adds to the WebView (an AbsoluteLayout), removed by index when the page has loaded
         w.addView(new View(this), new FrameLayout.LayoutParams(1, 1));
         w.setWebViewClient(new WebViewClient() {

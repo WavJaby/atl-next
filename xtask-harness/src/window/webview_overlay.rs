@@ -45,6 +45,9 @@ const BACK_PAGE: &str = "AtlWindow: wvo back page";
 const BACK_DISMISSED: &str = "AtlWindow: wvo back dismissed";
 const BACK_GAME: &str = "AtlWindow: wvo back game";
 const GL_KEY: &str = "AtlWindow: wvo gl key ";
+/// Main.java's bridge line for each key the page's keydown gets: logged before the handler returns, so before the key's unhandled answer and the back it causes. Not the page title: onReceivedTitle
+/// is unordered with that answer, and the dismissal's destroy() drops a title still on its way (Esc 2's count lost in 6 of 20 runs, 2026-11-21).
+const PAGE_KEY: &str = "AtlWindow: wvo page key ";
 /// Main.java's line at every Android focus move: `gl`, `web`, `none` or the View's class.
 const FOCUS: &str = "AtlWindow: wvo focus ";
 /// Main.java's count of the WebView's children before it removes its indicator: 1 = the app's own child only (AOSP: the WebView's rendering adds no View child).
@@ -241,7 +244,7 @@ pub fn checks(app: &str, esc_back: bool, focused: bool) -> Vec<Sub> {
         (no_back(), no_back(), no_back())
     };
     let keys = (
-        app.matches(&format!("{TITLE}key")).count(),
+        app.matches(PAGE_KEY).count(),
         app.matches(&format!("{GL_KEY}111")).count(),
     );
     let want = esc_targets(esc_back, focused);
@@ -426,7 +429,7 @@ mod tests {
         let ok = "x AtlWindow: wvo web children 1\nx AtlWindow: wvo page finished\nx AtlWindow: wvo layout window=720x520 web=0,0,720,520\n\
                   y atl-platform-ui: sideband [1, 5] placed dst=0,0,720,520 clip=0,0,720,520 alpha=1\n\
                   x AtlWindow: wvo focus gl\nx AtlWindow: wvo title viewport360x260\nx AtlWindow: wvo focus web\nx AtlWindow: wvo title tap1\nx AtlWindow: wvo title scrolled\n\
-                  x AtlWindow: wvo title key1Escape\nx AtlWindow: wvo back page\nx AtlWindow: wvo title key2Escape\nx AtlWindow: wvo focus gl\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo back game\n\
+                  x AtlWindow: wvo page key 1Escape\nx AtlWindow: wvo back page\nx AtlWindow: wvo page key 2Escape\nx AtlWindow: wvo focus gl\nx AtlWindow: wvo back dismissed\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo back game\n\
                   x AtlWindow: wvo preload finished\nx AtlWindow: wvo swlayer web=40,40,200,160\n\
                   y atl-platform-ui: sideband [1, 7] placed dst=40,40,200,160 clip=40,40,200,160 alpha=1\n";
         assert!(checks(ok, true, true).iter().all(|(_, r)| r.is_ok()));
@@ -466,6 +469,15 @@ mod tests {
         assert!(sub(&no_back, true, true, "esc-page-back").is_err());
         let no_scroll = ok.replace("wvo title scrolled", "");
         assert!(sub(&no_scroll, true, true, "page-scroll").is_err());
+        // esc-keys counts the page's bridge lines only: one missing fails; a key title (the old signal, unordered with the dismissal's destroy) neither adds nor replaces one
+        let one_key = ok.replacen("x AtlWindow: wvo page key 2Escape\n", "", 1);
+        assert!(sub(&one_key, true, true, "esc-keys").is_err());
+        let titled = one_key.replacen(
+            "x AtlWindow: wvo back page\n",
+            "x AtlWindow: wvo back page\nx AtlWindow: wvo title key2Escape\n",
+            1,
+        );
+        assert!(sub(&titled, true, true, "esc-keys").is_err());
         // without the adaptation the same backs fail
         assert!(sub(ok, false, true, "esc-page-back").is_err());
         // the origin's break: a mouse run judged by the touch rule fails tap-focus and esc-keys
