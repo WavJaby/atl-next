@@ -79,6 +79,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["sles-bridge"], false, true),
     Row::new(&["window", "--stage", "surface-view"], true, true),
     Row::new(&["window", "--stage", "ime"], true, true),
+    // a GPU-starved host makes its backpressure verdict `undecided`: still red, the verdict line says so
     Row::new(&["window", "--stage", "slow-display"], true, true),
 ];
 
