@@ -40,6 +40,8 @@ pub mod volume;
 pub mod window_layout;
 
 #[cfg(feature = "converter")]
+pub mod account;
+#[cfg(feature = "converter")]
 pub mod activity;
 #[cfg(feature = "converter")]
 pub mod activity_task;
@@ -59,6 +61,8 @@ pub mod clipboard;
 pub mod connectivity;
 #[cfg(feature = "converter")]
 pub mod content;
+#[cfg(feature = "converter")]
+pub mod device_idle;
 #[cfg(feature = "converter")]
 pub mod display;
 #[cfg(feature = "converter")]

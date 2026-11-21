@@ -121,6 +121,8 @@ types = [
     "android.os.IBatteryPropertiesRegistrar",
     # the netstats service (netstats.rs): TrafficStats.init in every app process
     "android.net.INetworkStatsService",
+    "android.accounts.IAccountManager", # the account service (account.rs)
+    "android.os.IDeviceIdleController", # the deviceidle service (device_idle.rs): PowerExemptionManager / DeviceIdleManager
     # test only (atl-aidl-probe --enforce): the smallest framework interface with @EnforcePermission methods
     "android.hardware.ISerialManager",
 ]

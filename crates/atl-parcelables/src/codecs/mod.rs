@@ -4,6 +4,9 @@
 #![allow(non_snake_case)]
 
 pub mod android {
+    pub mod accounts {
+        pub mod Account;
+    }
     pub mod app {
         pub mod ActivityManager_MemoryInfo;
         pub mod ActivityManager_PendingIntentInfo;

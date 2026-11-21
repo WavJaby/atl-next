@@ -21,6 +21,7 @@ extern crate gui_aidl_types_rs;
 mod capture;
 mod compositor;
 
+use atl_parcelables::android::accounts::Account;
 use atl_parcelables::android::app::ActivityManager_MemoryInfo;
 use atl_parcelables::android::app::ActivityManager_PendingIntentInfo;
 use atl_parcelables::android::app::ActivityManager_RunningAppProcessInfo;
@@ -383,6 +384,7 @@ fn round_trip(class: &str, input: &[u8], mode: i32) -> Result<Vec<u8>, String> {
         }
         "android.os.storage.StorageVolume" => round_trip_as::<StorageVolume>(input, mode),
         "android.os.LocaleList" => round_trip_as::<LocaleList>(input, mode),
+        "android.accounts.Account" => round_trip_as::<Account>(input, mode),
         "android.view.WindowManager$LayoutParams" => {
             round_trip_as::<WindowManager_LayoutParams>(input, mode)
         }

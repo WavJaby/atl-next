@@ -379,6 +379,8 @@ public class ParcelTruth {
         check("LocaleList", LocaleList.forLanguageTags("zh-TW,en-US"), LocaleList.CREATOR);
         check("LocaleList:one", LocaleList.forLanguageTags("en-US"), LocaleList.CREATOR);
         check("LocaleList:empty", LocaleList.getEmptyLocaleList(), LocaleList.CREATOR);
+        // an app's own Account argument to the account service (atl-services account.rs: addAccountExplicitly, getPassword, ...); accessId null
+        check("Account", new android.accounts.Account("atl", "com.example.atltest"), android.accounts.Account.CREATOR);
         checkInputChannel("InputChannel");
         check("PointerIcon", systemIcon(PointerIcon.TYPE_ARROW), PointerIcon.CREATOR);
         // TYPE_CUSTOM as AOSP writes it into a Parcel: in place (768 B), ashmem (16 KB > 12 KB), with a gainmap, and a nested gainmap (refused)

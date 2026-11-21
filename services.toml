@@ -506,3 +506,29 @@ src = [
 ]
 mirrors = []
 reason = "ATL's own interface (ICompositorRegistry): registers each app's in-process SurfaceFlinger and UI agent (plan C3); AOSP has no counterpart, its one SurfaceFlinger is a separate process"
+
+[account]
+src = ["crates/atl-services/src/account.rs", "crates/atl-parcelables/src/codecs/android/accounts/Account.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getAccountsAsUser",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getAccountsByTypeForPackage",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getAccountsForPackage",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getAuthenticatorTypes",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#addAccountExplicitlyWithVisibility",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#removeAccountExplicitly",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getPassword",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getUserData",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#registerAccountListener",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#unregisterAccountListener",
+    "frameworks/base/services/core/java/com/android/server/accounts/AccountManagerService.java#getTypesForCaller",
+    "frameworks/base/core/java/android/accounts/Account.java#writeToParcel",
+]
+
+[deviceidle]
+src = ["crates/atl-services/src/device_idle.rs"]
+mirrors = [
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java#BinderService",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java#addPowerSaveTempAllowlistAppChecked",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java#isPowerSaveWhitelistAppInternal",
+    "frameworks/base/apex/jobscheduler/service/java/com/android/server/DeviceIdleController.java#isPowerSaveWhitelistExceptIdleAppInternal",
+]

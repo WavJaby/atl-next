@@ -699,6 +699,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "power: " + power());
         Log.i("AtlTest", "battery: " + battery());
         Log.i("AtlTest", "netstats: " + netstats());
+        Log.i("AtlTest", "account: " + accounts());
+        Log.i("AtlTest", "deviceidle: " + deviceIdle());
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "locale: " + locales());
         Log.i("AtlTest", "keyguard: " + keyguard());
@@ -1217,6 +1219,39 @@ public class Main extends Activity {
                     + " charging=" + bm.isCharging()
                     + " capacity=" + bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
                     + " scale=" + sticky.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -100);
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** AccountManager on a device with no accounts: the fixture's own type, every type, the authenticator list; adding an account of a type it has no authenticator for is refused. "absent" when the manager is null. */
+    private String accounts() {
+        try {
+            android.accounts.AccountManager am = (android.accounts.AccountManager) getSystemService(ACCOUNT_SERVICE);
+            if (am == null) {
+                return "absent";
+            }
+            String add;
+            try {
+                add = "" + am.addAccountExplicitly(new android.accounts.Account("atl", getPackageName()), null, null);
+            } catch (SecurityException e) {
+                add = "SecurityException";
+            }
+            return "byType=" + am.getAccountsByType(getPackageName()).length + " all=" + am.getAccounts().length
+                    + " types=" + am.getAuthenticatorTypes().length + " add=" + add;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** PowerManager.isIgnoringBatteryOptimizations for the fixture itself (PowerExemptionManager over the deviceidle service). "absent" when DeviceIdleManager is null (service not published). */
+    private String deviceIdle() {
+        try {
+            if (getSystemService("deviceidle") == null) {
+                return "absent";
+            }
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            return "ignoring=" + pm.isIgnoringBatteryOptimizations(getPackageName());
         } catch (Throwable t) {
             return "threw " + t;
         }

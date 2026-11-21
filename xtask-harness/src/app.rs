@@ -229,7 +229,21 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// Without the registry the register NPEs. A Wi-Fi tablet's SIM_STATE_ABSENT needs the device declared modem-less (zero modems) first: not modelled.
 /// batterystats: [`battery_want`] (the sticky ACTION_BATTERY_CHANGED read with a null receiver, isCharging, getIntProperty(CAPACITY)).
 /// netstats: Main.netstats: TrafficStats for the app's uid and the device total read null stats (NetworkStatsService's native-null answer, netstats.rs) -> UNSUPPORTED -1 (TrafficStats.java:1343-1345).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 18] = [
+/// account: Main.accounts on a device with no accounts: getAccountsByType / getAccounts -> AccountManagerService.getAccountsAsUser (:4584) empty; getAuthenticatorTypes (:1685) empty (no
+/// authenticator installed); the fixture declares no authenticator service, so addAccountExplicitly fails isAccountManagedByCaller -> SecurityException (:504-508).
+/// deviceidle: Main.deviceIdle: isIgnoringBatteryOptimizations (PowerManager.java:2701) -> isPowerSaveWhitelistApp (DeviceIdleController.java:2253-2259): no sysconfig allow-in-power-save entry and
+/// no user allowlist -> false.
+const SERVICE_LINES: [(&str, &str, Option<&str>); 20] = [
+    (
+        "account",
+        "AtlTest: account: ",
+        Some("byType=0 all=0 types=0 add=SecurityException"),
+    ),
+    (
+        "deviceidle",
+        "AtlTest: deviceidle: ",
+        Some("ignoring=false"),
+    ),
     ("batterystats", "AtlTest: battery: ", None),
     ("netstats", "AtlTest: netstats: ", Some("uid=-1 total=-1")),
     (
@@ -355,7 +369,13 @@ const NOTIFY_ATLD_LINES: [&str; 3] = [
 /// notification (zen): a missing getZenMode reads back as 0 = ZEN_MODE_OFF too; only the count tells them apart.
 /// locale: Main.locales' own getApplicationLocales: the empty list is also what a reply without a LocaleList would make of an app that sets none, so the count shows the service answered.
 /// netstats: a missing getUidStats / getTotalStats reads back as null stats = UNSUPPORTED -1 too; only the count tells them apart.
-const SERVICE_CALLS: [(&str, &str); 15] = [
+/// account / deviceidle: a missing getAccountsAsUser / isPowerSaveWhitelistApp reads back as an empty array / false too; only the count tells them apart.
+const SERVICE_CALLS: [(&str, &str); 17] = [
+    ("account", "IAccountManager.getAccountsAsUser (no accounts)"),
+    (
+        "deviceidle",
+        "IDeviceIdleController.isPowerSaveWhitelistApp (empty allowlist)",
+    ),
     (
         "netstats",
         "INetworkStatsService.getUidStats (null: no per-app accounting)",

@@ -93,7 +93,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`appops`, `batterystats` (with `batteryproperties`), `connectivity`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`account`, `appops`, `batterystats` (with `batteryproperties`), `connectivity`, `deviceidle`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -158,6 +158,8 @@ const TRUST: &str = "trust";
 const TELEPHONY_REGISTRY: &str = "telephony.registry";
 /// Context.NETWORK_STATS_SERVICE (NetworkStatsManager; TrafficStats.init in every app process).
 const NETSTATS: &str = "netstats";
+const ACCOUNT: &str = "account";
+const DEVICE_IDLE: &str = "deviceidle";
 /// BatteryStats.SERVICE_NAME and BatteryService's registrar name: BatteryManager needs both (SystemServiceRegistry.java:507); `--omit-service batterystats` omits both.
 const BATTERY_STATS: &str = "batterystats";
 const BATTERY_PROPERTIES: &str = "batteryproperties";
@@ -443,6 +445,21 @@ fn main() -> Result<()> {
             ),
         )
         .context("addService telephony.registry")?;
+    }
+    // Context.ACCOUNT_SERVICE / Context.DEVICE_IDLE_CONTROLLER: published on every device (SystemServer.java:1619, DeviceIdleController.java:2696)
+    if !a.omit_service.iter().any(|s| s == ACCOUNT) {
+        binder::add_service(
+            ACCOUNT,
+            atl_services::account::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
+        )
+        .context("addService account")?;
+    }
+    if !a.omit_service.iter().any(|s| s == DEVICE_IDLE) {
+        binder::add_service(
+            DEVICE_IDLE,
+            atl_services::device_idle::new_binder(Arc::clone(&permissions)),
+        )
+        .context("addService deviceidle")?;
     }
     if !a.omit_service.iter().any(|s| s == NETSTATS) {
         binder::add_service(NETSTATS, atl_services::netstats::new_binder())
