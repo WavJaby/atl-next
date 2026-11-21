@@ -141,10 +141,11 @@ fn until_done(
                 wire::read_word(&body, 4).unwrap_or(0)
             ));
         }
-        if object == registry && opcode == wire::GLOBAL {
-            if let Some(i) = wire::read_string(&body, 4) {
-                global(i);
-            }
+        if object == registry
+            && opcode == wire::GLOBAL
+            && let Some(i) = wire::read_string(&body, 4)
+        {
+            global(i);
         }
         if object == callback && opcode == wire::DONE {
             return Ok("ok".to_owned());
