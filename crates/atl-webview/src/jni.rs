@@ -603,14 +603,20 @@ impl<T: Send> std::ops::Deref for OnViewThread<T> {
 /// The calling thread's Looper poster: one per thread for its life (atl-looper registers each Poster for the thread's life), so every view of the thread posts through one FIFO. None on a
 /// thread without a Looper, or when libandroid's Looper API is missing (the reason logged once per thread).
 fn view_poster() -> Option<Poster> {
+    thread_poster()
+        .inspect_err(|e| tracing::error!("webview: no Looper poster: {e}"))
+        .ok()
+}
+
+/// [`view_poster`] without the log, for callers to whom a Looper-less thread is normal (a cookie callback from a worker).
+fn thread_poster() -> Result<Poster, String> {
     static API: OnceLock<Result<LooperApi, String>> = OnceLock::new();
     thread_local! {
-        static POSTER: OnceCell<Option<Poster>> = const { OnceCell::new() };
+        static POSTER: OnceCell<Result<Poster, String>> = const { OnceCell::new() };
     }
     POSTER.with(|p| {
         p.get_or_init(|| {
-            let made = API
-                .get_or_init(|| LooperApi::load().map_err(|e| e.to_string()))
+            API.get_or_init(|| LooperApi::load().map_err(|e| e.to_string()))
                 .as_ref()
                 .map_err(Clone::clone)
                 .and_then(|api| {
@@ -618,9 +624,7 @@ fn view_poster() -> Option<Poster> {
                         .thread_looper()
                         .ok_or_else(|| "the thread has no Looper".to_owned())?;
                     Poster::attach(&looper).map_err(|e| e.to_string())
-                });
-            made.inspect_err(|e| tracing::error!("webview: no Looper poster: {e}"))
-                .ok()
+                })
         })
         .clone()
     })
@@ -2085,16 +2089,62 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     *COOKIE_MANAGER.get_or_init(|| global) as Obj
 }
 
-/// A CookieReply (global ref) as a done callback: `post(value)` on the thread the engine answers on (the display thread), which the reply hands to the caller's Looper.
+/// A CookieReply (global ref) as a done callback, called on the thread the engine answers on (the display thread, which is never VM-attached and makes no JNI call: display-thread rule B1).
+/// The reply's `post(value)` runs on the caller's Looper, taken here at the call (CookieManager.java: the callback runs on the current thread's Looper); a Looper-less caller's on the main
+/// Looper ([`post_to_main`]), where CookieReply's Handler sends it anyway.
 fn cookie_reply(env: Env, reply: Obj) -> Box<dyn FnOnce(bool) + Send> {
     let g = (!reply.is_null()).then(|| jni_call!(env, NewGlobalRef, reply) as usize);
+    let caller = g.and_then(|_| thread_poster().ok());
     Box::new(move |ok| {
         let Some(g) = g else { return };
-        let Some(env) = env_now() else { return };
-        call_void(env, g as Obj, c"post", c"(Z)V", &[jvalue { z: ok as u8 }]);
-        raise_uncaught(env);
-        jni_call!(env, DeleteGlobalRef, g as Obj);
+        let deliver: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let Some(env) = env_now() else {
+                tracing::error!("webview: cookie reply on a thread without a JNIEnv: dropped");
+                return;
+            };
+            call_void(env, g as Obj, c"post", c"(Z)V", &[jvalue { z: ok as u8 }]);
+            raise_uncaught(env);
+            jni_call!(env, DeleteGlobalRef, g as Obj);
+        });
+        match caller {
+            Some(p) => p.post(deliver),
+            None => post_to_main(deliver),
+        }
     })
+}
+
+/// The main Looper's poster, handed over by CookieManagerImpl's constructor from the main thread ([`Java_com_android_webview_chromium_CookieManagerImpl_onMainLooper`]); work posted before
+/// that waits here and runs there, in order.
+enum MainLooper {
+    Waiting(Vec<Box<dyn FnOnce() + Send>>),
+    Ready(Poster),
+}
+
+static MAIN_LOOPER: Mutex<MainLooper> = Mutex::new(MainLooper::Waiting(Vec::new()));
+
+/// Runs `f` on the main Looper's thread.
+fn post_to_main(f: Box<dyn FnOnce() + Send>) {
+    match &mut *MAIN_LOOPER.lock().unwrap_or_else(|p| p.into_inner()) {
+        MainLooper::Ready(p) => p.post(f),
+        MainLooper::Waiting(queue) => queue.push(f),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_onMainLooper(
+    _env: Env,
+    _class: Obj,
+) {
+    let Some(poster) = view_poster() else {
+        return;
+    };
+    let waiting = std::mem::replace(
+        &mut *MAIN_LOOPER.lock().unwrap_or_else(|p| p.into_inner()),
+        MainLooper::Ready(poster),
+    );
+    if let MainLooper::Waiting(queue) = waiting {
+        queue.into_iter().for_each(|f| f());
+    }
 }
 
 /// The provider of `web_view` (WebView.getWebViewProvider), as its native view.

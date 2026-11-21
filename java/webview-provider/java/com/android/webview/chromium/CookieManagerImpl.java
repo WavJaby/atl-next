@@ -11,8 +11,14 @@ import android.webkit.WebView;
  * javadoc defines them.
  */
 final class CookieManagerImpl extends CookieManager {
-    // called by the native getCookieManager
-    private CookieManagerImpl() {}
+    // called by the native getCookieManager, on any thread: the main Looper's poster is handed to the natives from the main thread (a Looper-less caller's callbacks go there, CookieReply)
+    private CookieManagerImpl() {
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            @Override public void run() { onMainLooper(); }
+        });
+    }
+
+    private static native void onMainLooper();
 
     @Override public native void setAcceptCookie(boolean accept);
     @Override public native boolean acceptCookie();
