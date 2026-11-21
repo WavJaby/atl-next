@@ -82,7 +82,12 @@ public class Main extends Activity {
             // what clearChildSurfacePackage / Transaction.remove do (SurfaceView.java, SurfaceControl.java): reparent to null, the handle kept alive by SurfaceView -> offscreen, not composed
             SurfaceControl.Transaction t = new SurfaceControl.Transaction();
             t.reparent(b.getSurfaceControl(), null);
-            t.addTransactionCommittedListener(getMainExecutor(), () -> Log.i(TAG, "sv b offscreen committed"));
+            t.addTransactionCommittedListener(getMainExecutor(), new SurfaceControl.TransactionCommittedListener() {
+                @Override
+                public void onTransactionCommitted() {
+                    Log.i(TAG, "sv b offscreen committed");
+                }
+            });
             t.apply();
             return true;
         }
