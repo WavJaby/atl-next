@@ -428,55 +428,77 @@ pub const DISPLAY_PROBE_LINE: &str = "display-probe: ";
 /// The display probe's bound: one Wayland roundtrip after the binary loads.
 const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
 
-/// Moves the target's Hyprland session to an empty workspace for the run and back after it (owner decision D1, 2026-11-18: a remote window gate may open its window on the live desktop, on an empty
-/// workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one running instance (`hyprctl
-/// instances`) whose Wayland socket is the run's `$WL` -- `$WL_DIR/hypr` keeps dirs of ended sessions (7 on the laptop, 2026-11-18), so a dir count is no answer; anything else logs why and runs in
-/// place. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). The switch: the classic dispatcher (`workspace N`), and where the session did not move,
-/// the Lua one Hyprland 0.57's Lua config takes (`hl.dsp.focus({ workspace = N })`; the classic form is a Lua syntax error there). Lines go to stderr (the transcript): `workspace: ...`.
-fn workspace_script() -> String {
-    const SCRIPT: &str = r#"WS_PREV=""
-WS_SIG=""
-command -v hyprctl >/dev/null 2>&1 && WS_SIG=$(XDG_RUNTIME_DIR="$WL_DIR" hyprctl instances 2>/dev/null | awk -v wl="$WL" '/^instance /{sig=$2; sub(/:$/, "", sig)} $1 == "wl" && $2 == "socket:" && $3 == wl {print sig}')
-WS_N=$(printf '%s' "$WS_SIG" | grep -c .)
+/// Moves the target's Hyprland session to an empty workspace for a run that maps a window on the session display, and back after it (owner decision D1, 2026-11-18: a remote test window only on
+/// an empty workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one running instance
+/// (`hyprctl instances`) whose Wayland socket is the run's `$WL` -- `$WL_DIR/hypr` keeps dirs of ended sessions (7 on the laptop, 2026-11-18), so a dir count is no answer. No switch possible
+/// (no hyprctl, not one instance, no active workspace, or the session did not move) -> the run is refused before anything starts: `workspace: refused (...)`, exit [`WS_REFUSED_RC`]; a window
+/// on the owner's active workspace is the one outcome D1 rules out. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). The switch: the classic
+/// dispatcher (`workspace N`), and where the session did not move, the Lua one Hyprland 0.57's Lua config takes (`hl.dsp.focus({ workspace = N })`; the classic form is a Lua syntax error there).
+/// Restore, two routes, both on the target: the EXIT trap (normal end, failure, HUP/INT/TERM/PIPE) and a guardian started before the switch, detached from the ssh channel, that restores once the
+/// run script is gone without the trap having run (SIGKILL, a dropped ssh the shell died of). `$WS_MARK` (`$WL_DIR/atl-ws-<pid>`) exists while the guardian lives; the trap's restore writes it
+/// non-empty so the guardian does not repeat it. Lines go to stderr (the transcript): `workspace: ...`.
+fn workspace_script(tag: &str) -> String {
+    const SCRIPT: &str = r#"WS_REFUSE=""
 if ! command -v hyprctl >/dev/null 2>&1; then
-  echo "workspace: no hyprctl, no workspace switch: running in place" >&2
-elif [ "$WS_N" -ne 1 ]; then
-  echo "workspace: $WS_N Hyprland instances on $WL, want 1: running in place" >&2
+  WS_REFUSE="no hyprctl on PATH: no workspace switch on this compositor"
 else
-  export XDG_RUNTIME_DIR="$WL_DIR"
-  export HYPRLAND_INSTANCE_SIGNATURE="$WS_SIG"
-  WS_PREV=$(hyprctl activeworkspace | @ID@ | head -n 1)
-  [ -n "$WS_PREV" ] || echo "workspace: hyprctl named no active workspace: running in place" >&2
+  WS_SIG=$(XDG_RUNTIME_DIR="$WL_DIR" hyprctl instances 2>/dev/null | awk -v wl="$WL" '/^instance /{sig=$2; sub(/:$/, "", sig)} $1 == "wl" && $2 == "socket:" && $3 == wl {print sig}')
+  WS_N=$(printf '%s' "$WS_SIG" | grep -c .)
+  if [ "$WS_N" -ne 1 ]; then
+    WS_REFUSE="$WS_N Hyprland instances on $WL, want 1"
+  else
+    export XDG_RUNTIME_DIR="$WL_DIR"
+    export HYPRLAND_INSTANCE_SIGNATURE="$WS_SIG"
+    ws_id() { hyprctl activeworkspace | @ID@ | head -n 1; }
+    WS_PREV=$(ws_id)
+    [ -n "$WS_PREV" ] || WS_REFUSE="hyprctl named no active workspace"
+  fi
 fi
-if [ -n "$WS_PREV" ]; then
-  WS_USED=$(hyprctl workspaces | @ID@)
-  WS_RUN=1
-  while printf '%s\n' $WS_USED | grep -qx "$WS_RUN"; do WS_RUN=$((WS_RUN + 1)); done
-  ws_id() { hyprctl activeworkspace | @ID@ | head -n 1; }
-  ws_go() {
-    hyprctl dispatch workspace "$1" >/dev/null 2>&1
-    [ "$(ws_id)" = "$1" ] || hyprctl dispatch "hl.dsp.focus({ workspace = $1 })" >/dev/null 2>&1
-  }
-  ws_back() {
-    [ -n "$WS_PREV" ] || return 0
-    ws_go "$WS_PREV"
-    echo "workspace: after=$(ws_id) (restored $WS_PREV)" >&2
-    WS_PREV=""
-  }
-  trap ws_back EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  ws_go "$WS_RUN"
-  echo "workspace: before=$WS_PREV during=$(ws_id) (empty $WS_RUN)" >&2
-fi
+[ -z "$WS_REFUSE" ] || { echo "workspace: refused ($WS_REFUSE): remote run @TAG@ maps no window on the active workspace" >&2; exit @RC@; }
+WS_USED=$(hyprctl workspaces | @ID@)
+WS_RUN=1
+while printf '%s\n' $WS_USED | grep -qx "$WS_RUN"; do WS_RUN=$((WS_RUN + 1)); done
+ws_go() {
+  hyprctl dispatch workspace "$1" >/dev/null 2>&1
+  [ "$(ws_id)" = "$1" ] || hyprctl dispatch "hl.dsp.focus({ workspace = $1 })" >/dev/null 2>&1
+}
+WS_MARK="$WL_DIR/atl-ws-$$"
+: > "$WS_MARK"
+ws_back() {
+  [ -s "$WS_MARK" ] && return 0
+  ws_go "$WS_PREV"
+  echo restored > "$WS_MARK"
+  echo "workspace: after=$(ws_id) (restored $WS_PREV)" >&2
+}
+WS_OWNER=$$
+(
+  trap '' HUP INT TERM PIPE
+  while kill -0 "$WS_OWNER" 2>/dev/null; do sleep 1; done
+  [ -s "$WS_MARK" ] || ws_go "$WS_PREV"
+  rm -f "$WS_MARK"
+) < /dev/null > /dev/null 2>&1 &
+trap ws_back EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 141' PIPE
+trap 'exit 143' TERM
+ws_go "$WS_RUN"
+WS_NOW=$(ws_id)
+[ "$WS_NOW" = "$WS_RUN" ] || { echo "workspace: refused (the session stayed on $WS_NOW, not empty $WS_RUN): remote run @TAG@ maps no window on the active workspace" >&2; exit @RC@; }
+echo "workspace: before=$WS_PREV during=$WS_NOW (empty $WS_RUN)" >&2
 "#;
     // `hyprctl activeworkspace` / `workspaces` text: `workspace <n> (<name>) on monitor ...` (the laptop's 2026-11-18 build), `workspace ID <n> (<name>) ...` in other releases
-    SCRIPT.replace(
-        "@ID@",
-        r"sed -n 's/^workspace \(ID \)\{0,1\}\(-\{0,1\}[0-9][0-9]*\) (.*/\2/p'",
-    )
+    SCRIPT
+        .replace(
+            "@ID@",
+            r"sed -n 's/^workspace \(ID \)\{0,1\}\(-\{0,1\}[0-9][0-9]*\) (.*/\2/p'",
+        )
+        .replace("@TAG@", &dq(tag))
+        .replace("@RC@", &WS_REFUSED_RC.to_string())
 }
+
+/// The run script's exit when [`workspace_script`] refuses: the run never started (5 = no display, 4 = no program).
+pub const WS_REFUSED_RC: i32 = 6;
 
 /// Where a remote run's Wayland display comes from: the capability the target has, probed before the run ([`Target::probe_display`]), never named by host.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -704,6 +726,12 @@ fn session_env_script(name: &str) -> String {
 }
 
 impl Plan {
+    /// Whether atld maps a window on the target's session display: every session run but an agent's without a proxy (the window gate's frames stage: no `--ui`, the socket only for the
+    /// renderer probe). Those runs go through [`workspace_script`] (D1).
+    fn maps_window(&self) -> bool {
+        self.display == Display::Session && self.agent.as_ref().is_none_or(|a| a.proxy)
+    }
+
     /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, in the background so its process group can be ended after it; then its logs and end record (`atld.rc`: the exit code, `end.ms`: the end's time on the target's clock) as a tar on stdout. The script's exit is the tar's.
     fn script(&self, base: &str) -> String {
         let mut s = format!(
@@ -735,7 +763,12 @@ impl Plan {
         let labwc_log = format!("{}/labwc.log", self.scratch);
         match self.display {
             Display::Headless => {}
-            Display::Session => s.push_str(&session_script(&self.tag)),
+            Display::Session => {
+                s.push_str(&session_script(&self.tag));
+                if self.maps_window() {
+                    s.push_str(&workspace_script(&self.tag));
+                }
+            }
             Display::NestedX11 => s.push_str(&nested_script(
                 &self.tag,
                 &word(&out_path(&format!("{}/labwc", self.scratch))),
@@ -754,9 +787,6 @@ impl Plan {
         // the agent first: its proxy socket must exist before atld connects to it
         let proxied = self.agent.as_ref().is_some_and(|a| a.proxy);
         if let Some(agent) = &self.agent {
-            if proxied && self.display == Display::Session {
-                s.push_str(&workspace_script());
-            }
             s.push_str("GATE_SOCK=\"/run/user/$(id -u)/atl-gate-$$.sock\"\n");
             let args: Vec<String> = agent.args.iter().map(|a| word(a)).collect();
             let window: Vec<String> = agent.window.iter().map(|a| word(a)).collect();
@@ -2824,6 +2854,210 @@ mod tests {
         };
         let s = session.script("b");
         assert!(!s.contains("labwc") && !s.contains("/proc/[0-9]"), "{s}");
+        // a plain session run (run-apk, no agent) maps its window: the D1 switch comes before atld, like the proxied agent's
+        let switch = s.find("\nws_go \"$WS_RUN\"\n").expect(&s);
+        let atld = s
+            .find(" WAYLAND_DISPLAY=\"$WL\" timeout -k 10 60 ")
+            .expect(&s);
+        assert!(
+            s.find("trap ws_back EXIT\n").expect(&s) < switch && switch < atld,
+            "{s}"
+        );
+    }
+
+    /// A fake `hyprctl` for [`workspace_script`] under `sh`: state files in `dir` (`active`, `used`, `instances`, `form` = the printf format of one workspace block), `lua` = the classic
+    /// dispatcher fails as under Hyprland 0.57's Lua config, `frozen` = no dispatch moves the session. Each call is appended to `calls`.
+    fn fake_hypr(tag: &str, form: &str, active: u32, used: &[u32]) -> PathBuf {
+        let dir = temp(&format!("ws-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let bin = dir.join("bin/hyprctl");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+d="$FAKE_HYPR"
+echo "$*" >> "$d/calls"
+block() { printf "$(cat "$d/form")\n\n" "$1" "$1"; }
+case "$1" in
+instances) cat "$d/instances" ;;
+activeworkspace) block "$(cat "$d/active")" ;;
+workspaces) for n in $(cat "$d/used") $(cat "$d/active"); do block "$n"; done ;;
+dispatch)
+  [ -e "$d/frozen" ] && exit 0
+  case "$2" in
+  workspace) [ -e "$d/lua" ] && { echo "config error: syntax"; exit 1; }; echo "$3" > "$d/active" ;;
+  hl.dsp.focus*) echo "$2" | tr -cd '0-9' > "$d/active" ;;
+  esac ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("form"), form).unwrap();
+        std::fs::write(dir.join("active"), format!("{active}\n")).unwrap();
+        let used: Vec<String> = used.iter().map(u32::to_string).collect();
+        std::fs::write(dir.join("used"), used.join("\n")).unwrap();
+        // `hyprctl instances` as Hyprland prints it: one block per live instance; the run's socket is wayland-1, the other instance is not this session's
+        std::fs::write(
+            dir.join("instances"),
+            "instance 9958d297641b5c84dcff93f9b1d6c5dd2c3a7a19_1763590000_1234567890:\n\ttime: 1763590000\n\tpid: 1234\n\twl socket: wayland-1\n\ninstance 0aa1_1763500000_42:\n\ttime: 1763500000\n\tpid: 999\n\twl socket: wayland-2\n\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    /// `hyprctl activeworkspace`/`workspaces` block forms: Hyprland 0.57.2 (the laptop, recorded 2026-11-22; title replaced) prints `workspace <n> (<name>) on monitor ...`, other releases
+    /// `workspace ID <n> (<name>) ...`. The title line holds a decoy: a window title is free text.
+    const WS_FORMS: [&str; 2] = [
+        "workspace %s (%s) on monitor eDP-1:\n\tmonitorID: 0\n\twindows: 2\n\thasfullscreen: 0\n\tlastwindow: 0x55c231a7a420\n\tlastwindowtitle: workspace 9 (9) notes\n\tispersistent: 0\n\ttiledLayout: dwindle\n",
+        "workspace ID %s (%s) on monitor eDP-1:\n\tmonitorID: 0\n\twindows: 2\n\thasfullscreen: 0\n\tlastwindow: 0x55d0c0a1b2c0\n\tlastwindowtitle: foot\n\n",
+    ];
+
+    /// [`workspace_script`] then `body` under `sh`, against the fake in `dir`; the run's socket is `wayland-1`.
+    fn run_ws(dir: &Path, body: &str) -> Output {
+        let script = format!(
+            "WL_DIR={}\nWL=wayland-1\n{}{body}\n",
+            sh_quote(&dir.display().to_string()),
+            workspace_script("t")
+        );
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            )
+            .env("FAKE_HYPR", dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn active(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("active"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    /// Waits up to 5 s for the guardian (1 s polls) to have finished: its marker `atl-ws-<pid>` lives until it has restored (or seen the trap's restore).
+    fn guardian_done(dir: &Path) {
+        for _ in 0..50 {
+            let left = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("atl-ws-"));
+            if !left {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "the workspace guardian left its marker in {}",
+            dir.display()
+        );
+    }
+
+    /// Failure after the switch: the run was on the lowest unused workspace (used 1, 2; active 2 -> 3) and the trap restores 2; in both recorded forms.
+    #[test]
+    fn workspace_switch_restores_after_failure() {
+        for (i, form) in WS_FORMS.iter().enumerate() {
+            let dir = fake_hypr(&format!("fail{i}"), form, 2, &[1, 2]);
+            let out = run_ws(
+                &dir,
+                "echo \"body on $(cat \"$FAKE_HYPR/active\")\" >&2\nexit 3",
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(3), "{err}");
+            assert!(
+                err.contains("workspace: before=2 during=3 (empty 3)\nbody on 3\n"),
+                "{err}"
+            );
+            assert!(err.contains("workspace: after=2 (restored 2)"), "{err}");
+            assert_eq!(active(&dir), "2");
+            guardian_done(&dir);
+            assert_eq!(
+                active(&dir),
+                "2",
+                "the guardian must not move the session again"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// SIGKILL of the run script (no trap runs; a dropped ssh the shell died of looks the same): the guardian restores.
+    #[test]
+    fn workspace_guardian_restores_after_kill() {
+        let dir = fake_hypr("kill", WS_FORMS[0], 1, &[1]);
+        let out = run_ws(&dir, "kill -KILL $$");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("during=2 (empty 2)") && !err.contains("after="),
+            "{err}"
+        );
+        guardian_done(&dir);
+        assert_eq!(active(&dir), "1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hyprland 0.57's Lua config: the classic dispatcher fails, the Lua one moves the session, both ways.
+    #[test]
+    fn workspace_switch_takes_the_lua_dispatcher() {
+        let dir = fake_hypr("lua", WS_FORMS[0], 1, &[1, 2]);
+        std::fs::write(dir.join("lua"), "").unwrap();
+        let out = run_ws(&dir, "true");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{err}");
+        assert!(
+            err.contains("during=3 (empty 3)") && err.contains("after=1 (restored 1)"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No switch possible -> refused before the body (atld) runs, exit [`WS_REFUSED_RC`], the session untouched: no Hyprland instance on the run's socket; a session that does not move.
+    #[test]
+    fn workspace_switch_refuses_rather_than_run_in_place() {
+        let body = "touch \"$FAKE_HYPR/ran\"";
+        let dir = fake_hypr("none", WS_FORMS[0], 2, &[2]);
+        std::fs::write(
+            dir.join("instances"),
+            "instance x_1_2:\n\ttime: 1\n\tpid: 2\n\twl socket: wayland-2\n\n",
+        )
+        .unwrap();
+        let out = run_ws(&dir, body);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(WS_REFUSED_RC), "{err}");
+        assert!(
+            err.contains("workspace: refused (0 Hyprland instances on wayland-1, want 1)"),
+            "{err}"
+        );
+        assert!(!dir.join("ran").exists() && active(&dir) == "2");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert!(!calls.contains("dispatch"), "{calls}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = fake_hypr("frozen", WS_FORMS[1], 2, &[2]);
+        std::fs::write(dir.join("frozen"), "").unwrap();
+        let out = run_ws(&dir, body);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(WS_REFUSED_RC), "{err}");
+        assert!(
+            err.contains("workspace: refused (the session stayed on 2, not empty 1)"),
+            "{err}"
+        );
+        assert!(!dir.join("ran").exists() && active(&dir) == "2");
+        guardian_done(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A window agent run on the session display: the workspace switch (its restore trapped on exit) and the agent come before atld, the run waits for the agent's socket, atld's display is that
@@ -2857,7 +3091,7 @@ mod tests {
         };
         let session = at("[ \"$WL_N\" -eq 1 ] ||");
         let trap = at("trap ws_back EXIT\n");
-        let switch = at("  ws_go \"$WS_RUN\"\n");
+        let switch = at("\nws_go \"$WS_RUN\"\n");
         let agent = at(
             " timeout -k 10 300 \"$BASE/out/cargo/debug/xtask-harness\" \"window-live\" --upstream \"$WL_DIR/$WL\" --listen \"$GATE_SOCK\" -- \"--stage\" \"widgets\" < /dev/null > \"$BASE/out/window/scratch/agent.log\" 2>&1 &\nAG=$!\n",
         );

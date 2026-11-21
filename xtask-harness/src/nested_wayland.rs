@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The automated gates' own Wayland compositor: a headless labwc per gate run, so no test window maps on the owner's desktop and the owner's pointer cannot reach one (owner, 2026-11-05); this holds for every local gate and for `check`. `--hold` runs keep the desktop's compositor ($WAYLAND_DISPLAY): the owner watches those.
-//! One exception (owner, 2026-11-18): an explicitly invoked `remote test window` maps its window on the target's session display and injects input there (the hardware-vsync tier exists only on a real compositor) -- never from `check` or automatically, and on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`; where no switch exists the run logs it and runs in place).
+//! One exception (owner, 2026-11-18): an explicitly invoked remote run (`remote test window`, `remote run-apk`, ...) maps its window on the target's session display and may inject input there (the hardware-vsync tier exists only on a real compositor) -- never from `check` or automatically, and on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`; where no switch exists the run is refused).
 //! Test-environment setup only: the product reads WAYLAND_DISPLAY as it would on any desktop; nothing in a product crate knows about this.
 //!
 //! Why labwc (measured 2026-11-06, all headless, pixman renderer):
