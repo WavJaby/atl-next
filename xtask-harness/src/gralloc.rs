@@ -202,7 +202,7 @@ fn spawn_probe(
     cmd.arg(role)
         .args(["--sock", PROBE_SOCK_FD])
         .envs(env.iter().cloned());
-    let mut s = binder::spawn_of(&cmd, AID_APP)?;
+    let mut s = binder::spawn_of(&cmd, AID_APP, atl_sepolicy::domains::UNTRUSTED_APP)?;
     s.stdin = Some(sock);
     (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
     b.spawn(s).context("spawning the probe")
@@ -225,7 +225,7 @@ pub fn start_allocator(
     }
     cmd.arg("--allocator-tier").arg(tier.name());
     cmd.envs(env.iter().cloned());
-    let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
+    let mut s = binder::spawn_of(&cmd, AID_SYSTEM, atl_sepolicy::domains::GRAPHICS_ALLOCATOR)?;
     (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
     // the DRM nodes it allocates on (the sandbox's /dev is otherwise minimal), and a --drm-node elsewhere
     s.devices = std::iter::once(PathBuf::from(DRM_DIR))
@@ -298,8 +298,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     append_lib_path(&mut env, &mapper_dir);
 
     let (broker, mut binderd) = binder::start_binderd(root, &out, &test_root.join("binderd.log"))?;
-    let (mut sm, found) =
-        binder::start_servicemanager(&broker, &test_root, &servicemanager, &service, &env)?;
+    let (mut sm, found) = binder::start_servicemanager(
+        &broker,
+        &out,
+        &test_root,
+        "",
+        &servicemanager,
+        &service,
+        &env,
+    )?;
     // (failures, the host's reason when the udmabuf tier was asked for and the allocator fell back)
     let result = (|| -> Result<(Vec<String>, Option<String>)> {
         ensure!(

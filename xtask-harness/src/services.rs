@@ -75,9 +75,15 @@ fn wait(child: &mut Child, limit: Duration) -> Result<Option<std::process::ExitS
     }
 }
 
-/// `cmd` as a binder process of `uid`, output to `log`; killed after `limit`.
-fn run(b: &Broker, cmd: Command, uid: u32, log: &Path, limit: Duration) -> Result<Run> {
-    let mut p = binder::spawn_logged(b, &cmd, uid, log)?;
+/// `cmd` as a binder process of `uid` in `context`, output to `log`; killed after `limit`.
+fn run(
+    b: &Broker,
+    cmd: Command,
+    (uid, context): (u32, &str),
+    log: &Path,
+    limit: Duration,
+) -> Result<Run> {
+    let mut p = binder::spawn_logged(b, &cmd, uid, context, log)?;
     let status = wait(&mut p.child, limit)?;
     let text = std::fs::read_to_string(log)?;
     Ok(match status {
@@ -178,7 +184,8 @@ pub fn stage(
         .arg(&keychars)
         .args(["--launch", APP])
         .envs(env.iter().cloned());
-    let mut services_spawn = binder::spawn_of(&cmd, AID_SYSTEM)?;
+    let mut services_spawn =
+        binder::spawn_of(&cmd, AID_SYSTEM, atl_sepolicy::domains::SYSTEM_SERVER)?;
     // what the services read by path, read-only at their own paths: the installer's frames and the keyboard maps (--keychars)
     services_spawn
         .mounts
@@ -220,7 +227,13 @@ pub fn stage(
                     "--start-seq",
                     &seq,
                 ]);
-                match binder::spawn_logged(b, &app, start.uid, &client_log) {
+                match binder::spawn_logged(
+                    b,
+                    &app,
+                    start.uid,
+                    atl_sepolicy::domains::UNTRUSTED_APP,
+                    &client_log,
+                ) {
                     Ok(p) => {
                         // the tag binderd reports, as atld answers
                         let pid = p.host_pid;
@@ -328,10 +341,11 @@ pub fn stage(
         };
         let mut system = Command::new(&client);
         system.envs(env.iter().cloned()).arg("system");
+        // a system uid client that is not system_server: atld's system_app
         let system = run(
             b,
             system,
-            AID_SYSTEM,
+            (AID_SYSTEM, atl_sepolicy::domains::SYSTEM_APP),
             &test_root.join("client-system.log"),
             CLIENT_LIMIT,
         )?;
@@ -347,7 +361,13 @@ pub fn stage(
                 // `--`: service parses options with getopt, which would take the argument -1 for one
                 .args(["--", "call", "package", &c])
                 .args(args);
-            run(b, cmd, AID_SHELL, &test_root.join(log), CLIENT_LIMIT)
+            run(
+                b,
+                cmd,
+                (AID_SHELL, atl_sepolicy::domains::SHELL),
+                &test_root.join(log),
+                CLIENT_LIMIT,
+            )
         };
         // hasSystemFeature(String name = null, int version = 0); getApplicationInfo(String packageName = null, long flags = 0, int userId = 0)
         let feature = call(

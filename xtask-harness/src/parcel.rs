@@ -419,7 +419,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the sandbox shows only what is mounted: the build dir read-only at its own path (boot jars, ART root, launcher, fixture dex, runtime, keymap, property area: the launcher
     // refuses to start without the area its variable names), ANDROID_DATA writable inside it, as native_load runs its launcher
     let run = (|| -> Result<_> {
-        let mut s = binder::spawn_of(&cmd, AID_APP_START)?;
+        let mut s = binder::spawn_of(&cmd, AID_APP_START, atl_sepolicy::domains::UNTRUSTED_APP)?;
         s.stdout = std::process::Stdio::piped();
         s.stderr = std::process::Stdio::piped();
         s.mounts.push(atl_broker::Mount {
@@ -442,15 +442,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the permission hook (atl-aidl-probe --enforce), a binder process too
     let mut enforce_cmd = Command::new(&probe);
     enforce_cmd.arg(ENFORCE).envs(stage.iter().cloned());
-    let enforce = binder::spawn_piped(&broker, &enforce_cmd, AID_APP_START)
-        .and_then(|p| Ok(p.child.wait_with_output()?));
+    let enforce = binder::spawn_piped(
+        &broker,
+        &enforce_cmd,
+        AID_APP_START,
+        atl_sepolicy::domains::UNTRUSTED_APP,
+    )
+    .and_then(|p| Ok(p.child.wait_with_output()?));
     // the reply hook (atl-aidl-probe --outcomes), a binder process too: interface tokens reach IPCThreadState
     let mut outcomes_cmd = Command::new(&probe);
     outcomes_cmd
         .args([OUTCOMES_FLAG, &outcome_arg()])
         .envs(stage.iter().cloned());
-    let outcomes = binder::spawn_piped(&broker, &outcomes_cmd, AID_APP_START)
-        .and_then(|p| Ok(p.child.wait_with_output()?));
+    let outcomes = binder::spawn_piped(
+        &broker,
+        &outcomes_cmd,
+        AID_APP_START,
+        atl_sepolicy::domains::UNTRUSTED_APP,
+    )
+    .and_then(|p| Ok(p.child.wait_with_output()?));
     drop(broker);
     binderd.child.wait()?;
     let run = run?;

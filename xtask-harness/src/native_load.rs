@@ -622,7 +622,9 @@ impl Env {
             crate::binder::start_binderd(&self.root, &self.out, &test_root.join("binderd.log"))?;
         let (mut sm, found) = crate::binder::start_servicemanager(
             &broker,
+            &self.out,
             &test_root,
+            "",
             &servicemanager,
             &service,
             &lib_env,
@@ -668,22 +670,28 @@ impl Env {
                 writable: true,
             });
         }
-        let run =
-            crate::binder::spawn_piped_with(&broker, &cmd, AID_APP_START, mounts).and_then(|p| {
-                // Kills the sandbox (kill_sandbox, as atld stops one), not bwrap: a hung run ends at MEDIA_LIMIT with SIGKILL, and a finished one cancels the timer.
-                let (done, ended) = std::sync::mpsc::channel::<()>();
-                let host_pid = p.host_pid;
-                std::thread::spawn(move || {
-                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-                        ended.recv_timeout(MEDIA_LIMIT)
-                    {
-                        let _ = atl_broker::kill_sandbox(host_pid);
-                    }
-                });
-                let run = self.host.finish(&what, p.child);
-                drop(done);
-                run
+        let run = crate::binder::spawn_piped_with(
+            &broker,
+            &cmd,
+            AID_APP_START,
+            atl_sepolicy::domains::UNTRUSTED_APP,
+            mounts,
+        )
+        .and_then(|p| {
+            // Kills the sandbox (kill_sandbox, as atld stops one), not bwrap: a hung run ends at MEDIA_LIMIT with SIGKILL, and a finished one cancels the timer.
+            let (done, ended) = std::sync::mpsc::channel::<()>();
+            let host_pid = p.host_pid;
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    ended.recv_timeout(MEDIA_LIMIT)
+                {
+                    let _ = atl_broker::kill_sandbox(host_pid);
+                }
             });
+            let run = self.host.finish(&what, p.child);
+            drop(done);
+            run
+        });
         let _ = alloc.kill();
         alloc.wait()?;
         let _ = sm.child.kill();

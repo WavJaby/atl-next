@@ -1450,10 +1450,18 @@ impl Host {
     /// The context of a process [`Host::app_spawn`] starts, keyed on what the process hosts: an app uid's from plat_seapp_contexts ([`atl_sepolicy::Seapp::app_context`]; seinfo `default`);
     /// the system uid's process named [`SYSTEM_PROCESS`] (SettingsProvider's `android:process="system"`) is system_server's own process on AOSP -> `system_server`; any other system uid package
     /// process (shared user android.uid.system, platform-signed) `system_app` (`user=system seinfo=platform domain=system_app`); the shell's commands (`--run-class` as AID_SHELL) `shell`.
-    fn app_context(&self, uid: u32, name: &str, package: Option<&str>, target_sdk: i32) -> Result<String> {
+    fn app_context(
+        &self,
+        uid: u32,
+        name: &str,
+        package: Option<&str>,
+        target_sdk: i32,
+    ) -> Result<String> {
         match atl_services_types::permission::app_id(uid) {
-            AID_SYSTEM if name == SYSTEM_PROCESS => Ok(atl_sepolicy::domains::SYSTEM_SERVER.to_owned()),
-            AID_SYSTEM => Ok("u:r:system_app:s0".to_owned()),
+            AID_SYSTEM if name == SYSTEM_PROCESS => {
+                Ok(atl_sepolicy::domains::SYSTEM_SERVER.to_owned())
+            }
+            AID_SYSTEM => Ok(atl_sepolicy::domains::SYSTEM_APP.to_owned()),
             AID_SHELL => Ok(atl_sepolicy::domains::SHELL.to_owned()),
             _ => self
                 .seapp

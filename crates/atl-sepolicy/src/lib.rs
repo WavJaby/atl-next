@@ -26,6 +26,9 @@ pub mod domains {
     pub const HEALTH: &str = "u:r:hal_health_default:s0";
     /// atl-am and the shell's commands (`private/shell.te`).
     pub const SHELL: &str = "u:r:shell:s0";
+    /// SurfaceFlinger (`private/surfaceflinger.te`: the only domain that may add `surfaceflinger_service`). atld starts none (each app process runs its own compositor, registered with
+    /// atl.compositor_registry); the compositor gate's driver registers the stand-in SurfaceFlinger names libgui waits for, so it runs here.
+    pub const SURFACEFLINGER: &str = "u:r:surfaceflinger:s0";
     /// Every spawn domain above: the table tool queries each besides the seapp domains.
     pub const SPAWNED: &[&str] = &[
         SERVICEMANAGER,
@@ -35,7 +38,13 @@ pub mod domains {
         KEYSTORE,
         HEALTH,
         SHELL,
+        SURFACEFLINGER,
     ];
+    /// plat_seapp_contexts' domain of a system uid package process (`user=system seinfo=platform domain=system_app`); a seapp domain, so not in [`SPAWNED`].
+    pub const SYSTEM_APP: &str = "u:r:system_app:s0";
+    /// plat_seapp_contexts' domain of an app uid at the current target SDK (`user=_app ... domain=untrusted_app`), without the per-app categories (the service access table is type-level);
+    /// a seapp domain, so not in [`SPAWNED`].
+    pub const UNTRUSTED_APP: &str = "u:r:untrusted_app:s0";
 }
 
 /// The type field of a context `user:role:type:level` (the level may hold more colons: `s0:c512,c768`).

@@ -200,8 +200,7 @@ where
             src.get_data_size()
         ));
     }
-    dst.write(&v)
-        .map_err(|e| format!("encode refused: {e:?}"))
+    dst.write(&v).map_err(|e| format!("encode refused: {e:?}"))
 }
 
 /// The codec of `class` over Java parcels (see `Java_ParcelTruth_roundTripParcel`).

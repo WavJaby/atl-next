@@ -113,7 +113,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let env = crate::stage_env::lib_env(&out)?;
     let (broker, mut binderd) = binder::start_binderd(root, &out, &sm_root.join("binderd.log"))?;
     let (mut sm, found) =
-        binder::start_servicemanager(&broker, &sm_root, &servicemanager, &service, &env)?;
+        binder::start_servicemanager(&broker, &out, &sm_root, "", &servicemanager, &service, &env)?;
     ensure!(
         found.0,
         "servicemanager did not come up: {}",
@@ -123,7 +123,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let what = format!("{cmd:?}");
     // the sandbox shows only what is mounted (binder::spawn_of): the build dir read-only at its own path, so the launcher finds the property area its variable names; ANDROID_DATA and --golden writable (parcel.rs does the same)
     let run = (|| -> Result<_> {
-        let mut s = binder::spawn_of(&cmd, AID_SYSTEM)?;
+        // registers the stand-in SurfaceFlinger services: SurfaceFlinger's uid and domain, as on a device
+        let mut s = binder::spawn_of(&cmd, AID_SYSTEM, atl_sepolicy::domains::SURFACEFLINGER)?;
         s.stdout = std::process::Stdio::piped();
         s.stderr = std::process::Stdio::piped();
         s.mounts.push(atl_broker::Mount {

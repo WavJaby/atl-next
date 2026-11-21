@@ -616,7 +616,8 @@ impl Gate<'_> {
         cmd.arg(format!("-Djava.class.path={}", self.api_impl.display()))
             .arg(dir)
             .arg(lib_root);
-        let mut spawn = binder::spawn_of(&cmd, INSTALLER_UID)?;
+        let mut spawn =
+            binder::spawn_of(&cmd, INSTALLER_UID, atl_sepolicy::domains::SYSTEM_SERVER)?;
         spawn.mounts.extend(self.view(dir, lib_root, show)?);
         spawn.property_area = Some(area.to_path_buf());
         let stem = lib_root
@@ -760,7 +761,8 @@ impl Gate<'_> {
             .arg(file("net-fonts-sibling.conf"))
             .arg("/sys/devices/system/cpu/online")
             .arg("/sys/devices/system/cpu/online");
-        let mut spawn = binder::spawn_of(&cmd, INSTALLER_UID)?;
+        let mut spawn =
+            binder::spawn_of(&cmd, INSTALLER_UID, atl_sepolicy::domains::SYSTEM_SERVER)?;
         let log = self.work.join("net-probe.log");
         (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
         let before = seccomp_records();

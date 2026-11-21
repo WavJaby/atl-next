@@ -271,7 +271,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (b, mut binderd) = crate::binder::start_binderd(root, &out, &test.join("binderd.log"))?;
     let mut cmd = Command::new(&adbd);
     cmd.envs(lib_env(&out)?).envs(INIT_ENV.iter().copied());
-    let mut s: Spawn = spawn_of(&cmd, adb::AID_SHELL)?;
+    // atld spawns adbd in shell's domain too (spawn_adbd)
+    let mut s: Spawn = spawn_of(&cmd, adb::AID_SHELL, atl_sepolicy::domains::SHELL)?;
     for d in ["system", "data"] {
         s.mounts.push(Mount {
             host: view.join(d),

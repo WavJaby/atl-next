@@ -208,8 +208,8 @@ pub(crate) fn platform_rows(out: &Path, aosp: &Path) -> Result<Vec<(PathBuf, Str
 }
 
 /// The compiled policy's files (converter goal atl-sepolicy, `<out>/gen/sepolicy`) where a device installs them (atl_android_paths): atld picks every app process's context from plat_seapp_contexts.
-/// Every [`Runtime`] places them; not in [`platform_rows`], whose native-load layout builds without the policy.
-fn sepolicy_rows(out: &Path) -> Result<Vec<(PathBuf, String)>> {
+/// Every [`Runtime`] places them, and every gate's servicemanager (binder.rs place_policy); not in [`platform_rows`], whose native-load layout builds without the policy.
+pub(crate) fn sepolicy_rows(out: &Path) -> Result<Vec<(PathBuf, String)>> {
     use atl_android_paths as paths;
     let gen_dir = out.join("gen/sepolicy");
     let rows: Vec<(PathBuf, String)> = [

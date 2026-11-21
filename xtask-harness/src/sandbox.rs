@@ -248,7 +248,7 @@ fn probe_once(
         .arg(&ui.sysfs)
         .arg(SYS_OTHER)
         .arg(RESOLV_CONF);
-    let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+    let mut spawn = binder::spawn_of(&cmd, APP_UID, atl_sepolicy::domains::UNTRUSTED_APP)?;
     spawn.env.push((EXPLICIT_ENV.into(), "1".into()));
     spawn.mounts.push(Mount {
         host: host_own,
@@ -516,7 +516,7 @@ fn wayland_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(String, V
         .arg(name.to_string())
         .arg(target)
         .arg(version.to_string());
-    let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+    let mut spawn = binder::spawn_of(&cmd, APP_UID, atl_sepolicy::domains::UNTRUSTED_APP)?;
     spawn.mounts.push(Mount {
         host: ctx.socket().to_path_buf(),
         at: nested.socket.clone(),
@@ -608,7 +608,7 @@ fn pipewire_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(Vec<Stri
             .arg(sink.name())
             .arg(if mic { source.name() } else { "-" })
             .arg(&pulse);
-        let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+        let mut spawn = binder::spawn_of(&cmd, APP_UID, atl_sepolicy::domains::UNTRUSTED_APP)?;
         spawn.mounts.push(Mount {
             host: ctx
                 .as_ref()

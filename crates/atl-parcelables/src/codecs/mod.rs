@@ -125,6 +125,7 @@ pub mod java {
     pub mod util {
         pub mod List;
         pub mod Map;
+        pub mod TypedMap;
     }
 }
 

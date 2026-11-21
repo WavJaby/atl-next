@@ -2,8 +2,9 @@
 //! `xtask test binder`: AOSP's servicemanager and `service` command, built by the converter on libbinder's driver seam (patches/aosp/frameworks/native 0002), talking through binderd.
 //!
 //! Every process goes through atl-broker as atld's do: `Broker::start` runs `atl-binderd` in its BinderDaemon sandbox, `Broker::spawn` each binder process in the app sandbox, registered with binderd tagged {uid, host pid}; so this gate runs on the argv the broker emits.
-//! servicemanager: uid 1000 (AID_SYSTEM), the one process allowed to become context manager, with the test layout's /system, /vendor, /odm (empty VINTF manifests) mounted.
-//! `service`: uid 2000 (AID_SHELL). Gate: `service list` lists `manager` (servicemanager registers itself, main.cpp), `service check manager` finds it, `service check <absent>` does not; binderd's counters show the driver paths that must fire on this workload: the context manager's TXN_SECURITY_CTX flag (ignored) and libbinder's oneway-spam ioctl (unsupported).
+//! servicemanager: uid 1000 (AID_SYSTEM), domain servicemanager, the one process allowed to become context manager, with the test layout's /system, /system_ext, /vendor, /odm mounted (empty VINTF
+//! manifests, the build's policy files: it decides every add / find / list by the service access table). Each process takes the domain of the work it does, as atld gives it.
+//! `service`: uid 2000 (AID_SHELL), domain shell. Gate: `service list` lists `manager` (servicemanager registers itself, main.cpp), `service check manager` finds it, `service check <absent>` does not; binderd's counters show the driver path that must fire on this workload: libbinder's oneway-spam ioctl (unsupported).
 //! Then stage `services` (services.rs): the M2 Rust services registered with that servicemanager and called through binderd. Needs `xtask native` to have built crate atl-services.
 
 use std::ffi::OsStr;
@@ -15,6 +16,7 @@ use crate::installer::{new_records, seccomp_records};
 use crate::stage_env::lib_env;
 use anyhow::{Context, Result, ensure};
 use atl_broker::{Broker, Mount, Process, Spawn, to_log};
+use atl_sepolicy::domains;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -50,9 +52,14 @@ const STARTUP: Duration = Duration::from_secs(60);
 const MUST_FIRE: &[&str] = &["binderd: fault UnsupportedIoctl(40046210) "];
 /// Every fault line not in MUST_FIRE fails the gate.
 const FAULT_PREFIX: &str = "binderd: fault ";
+/// The sweep's test-only service_contexts row (appended to the layout's system_ext_service_contexts, never the product's): ATL's own registry type, `app_api_service` + `system_server_service`,
+/// so the server (system_server) may add `atl.sweep` and the client (untrusted_app) find it, without borrowing an AOSP service's label.
+const SWEEP_CONTEXT_ROW: &str = "atl.sweep    u:object_r:atl_compositor_registry_service:s0\n";
 
-/// The test /system, /vendor, /odm under `root`: an empty framework manifest (/system/etc/vintf/manifest.xml) and device manifests (/vendor, /odm), libvintf's default paths (system/libvintf/include/vintf/constants.h). /vendor declares `vendor_hals`.
+/// The test /system, /system_ext, /vendor, /odm under `root`: an empty framework manifest (/system/etc/vintf/manifest.xml) and device manifests (/vendor, /odm), libvintf's default paths (system/libvintf/include/vintf/constants.h). /vendor declares `vendor_hals`.
+/// /system_ext starts empty: [`start_servicemanager`] places the policy files.
 fn layout(root: &Path, vendor_hals: &str) -> Result<()> {
+    std::fs::create_dir_all(root.join("system_ext"))?;
     for (dir, kind) in [
         ("system", "framework"),
         ("vendor", "device"),
@@ -85,7 +92,7 @@ pub(crate) fn link_rows(root: &Path, rows: &[(PathBuf, String)]) -> Result<()> {
 /// `root`'s system, vendor, odm, read-only at their Android paths: servicemanager's VINTF manifests, and the /system rows an app process reads (`link_rows`), with the host files those rows link to at their own paths (`atl_broker::tree_mounts`), which the sandbox otherwise does not show.
 pub(crate) fn layout_mounts(root: &Path) -> Result<Vec<Mount>> {
     let mut mounts = Vec::new();
-    for d in ["system", "vendor", "odm"] {
+    for d in ["system", "system_ext", "vendor", "odm"] {
         let dir = root.join(d);
         mounts.push(Mount {
             host: dir.clone(),
@@ -98,9 +105,10 @@ pub(crate) fn layout_mounts(root: &Path) -> Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid`: read-only mounts of the LD_LIBRARY_PATH dirs at their own paths (the runtime's shared host paths, as atld mounts them), no devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
+/// `cmd` (program, arguments, variables set on it, working directory) as the broker's [`Spawn`] of a binder process tagged `uid` in SELinux `context` (the domain of the work it does, as atld
+/// gives it: servicemanager decides by it): read-only mounts of the LD_LIBRARY_PATH dirs at their own paths (the runtime's shared host paths, as atld mounts them), no devices or property area, stdin /dev/null, output dropped; the caller sets what it needs.
 /// Variables `cmd` removes are not expressible (the sandbox inherits the broker's environment): an error.
-pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
+pub(crate) fn spawn_of(cmd: &Command, uid: u32, context: &str) -> Result<Spawn> {
     let mut env = Vec::new();
     for (k, v) in cmd.get_envs() {
         let v = v.with_context(|| format!("{k:?}: a removed variable has no Spawn form"))?;
@@ -118,8 +126,7 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
         context_manager: false,
         // the gate's processes see the host's pids, as before sandbox tags existed: its checks read sender pids as host pids
         binder_pids: atl_broker::BinderPids::Host,
-        // a gate's binder clients and servicemanager alike: any context serves while servicemanager decides by uid (the sweep's own domain comes with the policy decision)
-        context: atl_sepolicy::domains::SHELL.to_owned(),
+        context: context.to_owned(),
         mounts,
         links: vec![],
         devices: vec![],
@@ -137,16 +144,22 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32) -> Result<Spawn> {
 }
 
 /// [`spawn_of`] with stdout + stderr to the file `log`, started.
-pub(crate) fn spawn_logged(b: &Broker, cmd: &Command, uid: u32, log: &Path) -> Result<Process> {
-    let mut s = spawn_of(cmd, uid)?;
+pub(crate) fn spawn_logged(
+    b: &Broker,
+    cmd: &Command,
+    uid: u32,
+    context: &str,
+    log: &Path,
+) -> Result<Process> {
+    let mut s = spawn_of(cmd, uid, context)?;
     (s.stdout, s.stderr) = to_log(std::fs::File::create(log)?)?;
     b.spawn(s)
         .with_context(|| format!("spawning {}", cmd.get_program().display()))
 }
 
 /// [`spawn_of`] with stdout and stderr piped (read through `Process::child`, e.g. `wait_with_output`), started.
-pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32) -> Result<Process> {
-    spawn_piped_with(b, cmd, uid, Vec::new())
+pub(crate) fn spawn_piped(b: &Broker, cmd: &Command, uid: u32, context: &str) -> Result<Process> {
+    spawn_piped_with(b, cmd, uid, context, Vec::new())
 }
 
 /// [`spawn_piped`] with `mounts` added to [`spawn_of`]'s (e.g. `layout_mounts`: the test layout's /system, /vendor, /odm).
@@ -154,9 +167,10 @@ pub(crate) fn spawn_piped_with(
     b: &Broker,
     cmd: &Command,
     uid: u32,
+    context: &str,
     mounts: Vec<Mount>,
 ) -> Result<Process> {
-    let mut s = spawn_of(cmd, uid)?;
+    let mut s = spawn_of(cmd, uid, context)?;
     s.mounts.extend(mounts);
     s.stdout = Stdio::piped();
     s.stderr = Stdio::piped();
@@ -212,7 +226,7 @@ fn service_limited(
 ) -> Result<(bool, String)> {
     let mut cmd = Command::new(service);
     cmd.args(args).envs(env.iter().cloned());
-    let mut p = spawn_logged(b, &cmd, AID_SHELL, log)?;
+    let mut p = spawn_logged(b, &cmd, AID_SHELL, domains::SHELL, log)?;
     let status = wait_limited(&mut p.child, limit)?;
     let text = std::fs::read_to_string(log)?;
     Ok(match status {
@@ -281,17 +295,38 @@ fn verdict(
     fails
 }
 
-/// servicemanager as the context manager (uid 1000) in the test layout under `test_root` (which `layout` filled), and the result of its first `service check manager`, polled until it answers, exits or `STARTUP` passes.
+/// The build's policy files (converter goal atl-sepolicy in `out`) below `root` where a device installs them, as every atld run places them (`atld_run::sepolicy_rows`): servicemanager labels each name
+/// through the service_contexts files and decides by the service access table. `test_rows`, if any, are a gate's own service_contexts rows, appended to a copy of system_ext_service_contexts.
+fn place_policy(root: &Path, out: &Path, test_rows: &str) -> Result<()> {
+    let mut rows = crate::atld_run::sepolicy_rows(out)?;
+    if !test_rows.is_empty() {
+        let at = atl_android_paths::SYSTEM_EXT_SERVICE_CONTEXTS;
+        let row = rows
+            .iter_mut()
+            .find(|(_, a)| a == at)
+            .context("sepolicy rows lack system_ext_service_contexts")?;
+        let copy = root.join("system_ext_service_contexts.test");
+        std::fs::write(&copy, std::fs::read_to_string(&row.0)? + test_rows)?;
+        row.0 = copy;
+    }
+    link_rows(root, &rows)
+}
+
+/// servicemanager as the context manager (uid 1000, domain servicemanager) in the test layout under `test_root` (which `layout` filled; the build's policy files from `out` are placed here, with
+/// `test_rows`, see [`place_policy`]), and the result of its first `service check manager`, polled until it answers, exits or `STARTUP` passes.
 pub(crate) fn start_servicemanager(
     b: &Broker,
+    out: &Path,
     test_root: &Path,
+    test_rows: &str,
     servicemanager: &Path,
     service: &Path,
     env: &[(String, String)],
 ) -> Result<(Process, (bool, String))> {
+    place_policy(test_root, out, test_rows)?;
     let mut cmd = Command::new(servicemanager);
     cmd.envs(env.iter().cloned());
-    let mut s = spawn_of(&cmd, AID_SYSTEM)?;
+    let mut s = spawn_of(&cmd, AID_SYSTEM, domains::SERVICEMANAGER)?;
     s.context_manager = true;
     s.mounts.extend(layout_mounts(test_root)?);
     (s.stdout, s.stderr) = to_log(std::fs::File::create(test_root.join("servicemanager.log"))?)?;
@@ -304,7 +339,7 @@ pub(crate) fn start_servicemanager(
     let mut cmd = Command::new(service);
     cmd.args(["check", MANAGER]).envs(env.iter().cloned());
     let found = 'checks: loop {
-        let mut check = spawn_logged(b, &cmd, AID_SHELL, &log)?;
+        let mut check = spawn_logged(b, &cmd, AID_SHELL, domains::SHELL, &log)?;
         loop {
             let sm_exit = sm.child.try_wait()?;
             let done = match check.child.try_wait()? {
@@ -388,9 +423,15 @@ fn sweep_stage(
     let mut client = Command::new(&bin);
     client.envs(env.iter().cloned()).arg("client");
     let before = seccomp_records();
-    let mut srv = spawn_logged(b, &server, AID_SYSTEM, &test_root.join("sweep-server.log"))?;
+    let mut srv = spawn_logged(
+        b,
+        &server,
+        AID_SYSTEM,
+        domains::SYSTEM_SERVER,
+        &test_root.join("sweep-server.log"),
+    )?;
     let log = test_root.join("sweep-client.log");
-    let mut cli = spawn_logged(b, &client, AID_APP, &log)?;
+    let mut cli = spawn_logged(b, &client, AID_APP, domains::UNTRUSTED_APP, &log)?;
     let status = wait_limited(&mut cli.child, SWEEP_LIMIT)?;
     let _ = srv.child.kill();
     let _ = srv.child.wait();
@@ -445,7 +486,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
     let sm_log_path = test_root.join("servicemanager.log");
     let log = |n: &str| test_root.join(format!("service-{n}.log"));
-    let (mut sm, found) = start_servicemanager(&b, &test_root, &servicemanager, &service, &env)?;
+    let (mut sm, found) = start_servicemanager(
+        &b,
+        &out,
+        &test_root,
+        SWEEP_CONTEXT_ROW,
+        &servicemanager,
+        &service,
+        &env,
+    )?;
     let list = self::service(&b, &service, &env, &["list"], &log("list"))?;
     let absent = self::service(&b, &service, &env, &["check", ABSENT], &log("absent"))?;
     let services_fails = crate::services::stage(
