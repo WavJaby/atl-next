@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # ATL's service names that AOSP's private/service_contexts lacks, compiled with the platform policy in the role of SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS (tools/bp2ninja sepolicy.go).
-# Every row's type is declared in atl.te with the reason it exists. Names AOSP already labels are never relabelled here.
+# A row takes AOSP's type where AOSP has one for the role (device rows, which a device puts in its vendor service_contexts), else a type declared in atl.te with the reason it exists. Names AOSP already labels are never relabelled here.
 
 # atld's compositor registry (services.toml atl.compositor_registry): each app process registers its SurfaceFlinger and UI agent with it; served by atl-system-services
 atl.compositor_registry    u:object_r:atl_compositor_registry_service:s0
+
+# ATL's IMapper v5 instance (atl-gralloc vintf.rs MAPPER_SUFFIX), which libui's openDeclaredPassthroughHal checks with isDeclared: a device row (public/service.te hal_graphics_mapper_service); found by hal_graphics_allocator_client, which non-isolated apps are (private/technical_debt.cil)
+mapper/atl                 u:object_r:hal_graphics_mapper_service:s0
