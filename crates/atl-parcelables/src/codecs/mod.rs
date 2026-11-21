@@ -45,6 +45,7 @@ pub mod android {
             pub mod ProviderInfoList;
             pub mod ResolveInfo;
             pub mod ServiceInfo;
+            pub mod ShortcutInfo;
             pub mod UserInfo;
         }
         pub mod res {

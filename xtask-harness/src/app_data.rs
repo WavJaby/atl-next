@@ -4,6 +4,9 @@
 //! 2. the next launch reads it back: `AtlData: data: read save-v1`, and the file is on the host under each of `apps/<package>/{data,data_de,external}`;
 //! 3. `--clear-data` (`pm clear`) empties the package's data first, so the app writes again: `AtlData: data: wrote`.
 //!
+//! Shortcuts follow the same life (ShortcutService persists them per package; handlePackageDataCleared drops them on pm clear): `AtlData: shortcut:` lists the dynamic shortcuts at start, `-` at launch 1
+//! (it then publishes `keep`), `keep` at launch 2 (a new atld + services read it back from the state dir), `-` at launch 3.
+//!
 //! Every launch: the app sees AOSP's paths (`AtlData: paths ...`: getFilesDir, the device-protected getFilesDir, getExternalFilesDir, sourceDir), whatever the host layout; and another package (a system
 //! package the run scans) has its own host data dir holding none of the fixture's files.
 //! Each launch is run-apk's own run (`run_apk::run`), so its window verdict must pass too. `--break-keep` empties the data before launch 2 (a device that forgets): the gate must fail.
@@ -41,6 +44,8 @@ const VALUE: &str = "save-v1";
 const DATA_LINE: &str = "AtlData: data: ";
 /// The fixture's log line before the dirs it sees: `AtlData: paths files=... de=... external=... source=...`.
 const PATHS_LINE: &str = "AtlData: paths ";
+/// The fixture's log line before the dynamic shortcut ids it found at start (`-` for none; DataMain.shortcut).
+const SHORTCUT_LINE: &str = "AtlData: shortcut: ";
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = Runtime::new(
@@ -83,11 +88,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     clear_package_data(&data_root, &package)?;
     let mut whys = Vec::new();
     let launches = [
-        (1, false, "wrote".to_owned(), "empty data"),
-        (2, args.break_keep, format!("read {VALUE}"), "data kept"),
-        (3, true, "wrote".to_owned(), "--clear-data"),
+        (1, false, "wrote".to_owned(), "-", "empty data"),
+        (
+            2,
+            args.break_keep,
+            format!("read {VALUE}"),
+            "keep",
+            "data kept",
+        ),
+        (3, true, "wrote".to_owned(), "-", "--clear-data"),
     ];
-    for (n, clear, want, what) in launches {
+    for (n, clear, want, want_shortcut, what) in launches {
         let launch = run_apk::Args::driven(
             &apk,
             &args.host,
@@ -102,6 +113,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         let state = data_state(&text, &files_dir);
         let paths = line_after(&text, PATHS_LINE);
+        let shortcut = line_after(&text, SHORTCUT_LINE);
+        println!(
+            "app-data: launch {n} ({what}): shortcuts at start {shortcut:?} (want {want_shortcut:?})"
+        );
+        if shortcut.as_deref() != Some(want_shortcut) {
+            whys.push(format!(
+                "launch {n} ({what}): shortcuts at start {shortcut:?}, want {want_shortcut:?}"
+            ));
+        }
         let missing: Vec<&PathBuf> = saved
             .iter()
             .filter(|f| std::fs::read_to_string(f).ok().as_deref() != Some(VALUE))

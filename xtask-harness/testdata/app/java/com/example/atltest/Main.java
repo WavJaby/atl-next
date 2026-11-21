@@ -704,6 +704,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "deviceidle: " + deviceIdle());
         Log.i("AtlTest", "uimode: " + uiMode());
         Log.i("AtlTest", "locale: " + locales());
+        Log.i("AtlTest", "shortcut: " + shortcuts());
         Log.i("AtlTest", "keyguard: " + keyguard());
         Log.i("AtlTest", "user: " + userProfile());
         Log.i("AtlTest", "zen: " + zen());
@@ -1522,6 +1523,71 @@ public class Main extends Activity {
         } catch (Throwable t) {
             return "threw " + t;
         }
+    }
+
+    /**
+     * ShortcutManager: limits (max per activity; icon "dp96" when it is 96 dp at this display's density, else the px; whether rate limiting is active = no calls left), pinning support, then set [a, b], add [c], the dynamic list as
+     * id:rank in the order returned, the pinned list's size, removeDynamicShortcuts [b] and the list again, 16 shortcuts set at once (what it threw), the service asked for package "android"'s shortcuts
+     * (what it threw), requestPinShortcut, removeAllDynamicShortcuts and the count left. "absent" when getSystemService returns null; else what it threw.
+     */
+    private String shortcuts() {
+        try {
+            android.content.pm.ShortcutManager sm = getSystemService(android.content.pm.ShortcutManager.class);
+            if (sm == null) {
+                return "absent";
+            }
+            int icon = sm.getIconMaxWidth();
+            String iconText = icon == (int) (96 * getResources().getDisplayMetrics().density) ? "dp96" : Integer.toString(icon);
+            String head = "max=" + sm.getMaxShortcutCountPerActivity() + " icon=" + iconText + " limited=" + sm.isRateLimitingActive()
+                    + " pinSupported=" + sm.isRequestPinShortcutSupported();
+            boolean set = sm.setDynamicShortcuts(java.util.Arrays.asList(shortcut("a"), shortcut("b")));
+            boolean add = sm.addDynamicShortcuts(java.util.Collections.singletonList(shortcut("c")));
+            String dyn = shortcutIds(sm.getDynamicShortcuts());
+            int pinned = sm.getPinnedShortcuts().size();
+            sm.removeDynamicShortcuts(java.util.Collections.singletonList("b"));
+            String afterRemove = shortcutIds(sm.getShortcuts(android.content.pm.ShortcutManager.FLAG_MATCH_DYNAMIC));
+            String over;
+            try {
+                java.util.List<android.content.pm.ShortcutInfo> many = new java.util.ArrayList<>();
+                for (int i = 0; i < 16; i++) {
+                    many.add(shortcut("m" + i));
+                }
+                over = "returned " + sm.setDynamicShortcuts(many);
+            } catch (Throwable t) {
+                over = t.getClass().getSimpleName();
+            }
+            String other;
+            try {
+                // ShortcutManager only names the context's own package, so the service is asked directly: IShortcutService.getShortcuts("android", FLAG_MATCH_DYNAMIC, user 0)
+                android.os.IBinder b = (android.os.IBinder) Class.forName("android.os.ServiceManager").getMethod("getService", String.class).invoke(null, "shortcut");
+                Object svc = Class.forName("android.content.pm.IShortcutService$Stub").getMethod("asInterface", android.os.IBinder.class).invoke(null, b);
+                other = "returned " + svc.getClass().getMethod("getShortcuts", String.class, int.class, int.class).invoke(svc, "android", android.content.pm.ShortcutManager.FLAG_MATCH_DYNAMIC, 0);
+            } catch (java.lang.reflect.InvocationTargetException t) {
+                other = t.getCause().getClass().getSimpleName();
+            } catch (Throwable t) {
+                other = t.getClass().getSimpleName();
+            }
+            boolean pin = sm.requestPinShortcut(shortcut("p"), null);
+            sm.removeAllDynamicShortcuts();
+            int left = sm.getDynamicShortcuts().size();
+            return head + " set=" + set + " add=" + add + " dynamic=" + dyn + " pinned=" + pinned + " removed=" + afterRemove + " over=" + over + " other=" + other + " pin=" + pin + " removeAll=" + left;
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
+    }
+
+    /** A dynamic shortcut `id` to this activity: label and intent, no rank, no icon. */
+    private android.content.pm.ShortcutInfo shortcut(String id) {
+        return new android.content.pm.ShortcutInfo.Builder(this, id).setShortLabel("label " + id).setIntent(new android.content.Intent(android.content.Intent.ACTION_VIEW).setClass(this, Main.class)).build();
+    }
+
+    /** "id:rank,..." in list order; "-" for an empty list. */
+    private static String shortcutIds(java.util.List<android.content.pm.ShortcutInfo> list) {
+        StringBuilder b = new StringBuilder();
+        for (android.content.pm.ShortcutInfo s : list) {
+            b.append(b.length() == 0 ? "" : ",").append(s.getId()).append(':').append(s.getRank());
+        }
+        return b.length() == 0 ? "-" : b.toString();
     }
 
     /** getApplicationLocales(package): "[tags]", else the simple name of what it threw. */

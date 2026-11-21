@@ -11,6 +11,7 @@ use super::FeatureInfo::FeatureInfo;
 use super::InstrumentationInfo::InstrumentationInfo;
 use super::PackageInfo::PackageInfo;
 use super::ResolveInfo::ResolveInfo;
+use super::ShortcutInfo::ShortcutInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
 use crate::codecs::android::app::job::JobInfo::JobInfo;
 use crate::parcel::*;
@@ -84,6 +85,8 @@ elements! {
     NotificationChannel => "android.app.NotificationChannel",
     // IJobScheduler.getAllPendingJobs / getAllPendingJobsInNamespace
     JobInfo => "android.app.job.JobInfo",
+    // IShortcutService.setDynamicShortcuts / addDynamicShortcuts / updateShortcuts / getShortcuts
+    ShortcutInfo => "android.content.pm.ShortcutInfo",
 }
 
 /// AIDL names it raw (`ParceledListSlice`) and typed (`ParceledListSlice<ApplicationStartInfo>`) alike, so the type parameter is only a marker (default `()`, as `opaque!` does for the generic ones): the

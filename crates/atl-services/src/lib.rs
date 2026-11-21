@@ -35,6 +35,7 @@ pub mod process_control;
 pub mod running_processes;
 pub mod sensor;
 pub mod shared_memory;
+pub mod state_file;
 pub mod tasks;
 pub mod volume;
 pub mod window_layout;
@@ -105,6 +106,8 @@ pub mod process_info;
 pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod sensor_wire;
+#[cfg(feature = "converter")]
+pub mod shortcut;
 #[cfg(feature = "converter")]
 pub mod storage;
 #[cfg(feature = "converter")]

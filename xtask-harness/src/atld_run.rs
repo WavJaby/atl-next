@@ -1515,6 +1515,14 @@ pub fn clear_package_data(data_root: &Path, package: &str) -> Result<()> {
             std::fs::remove_dir_all(&dir).with_context(|| format!("clearing {}", dir.display()))?;
         }
     }
+    // ShortcutService.handlePackageDataCleared drops the package's shortcuts: its file in the services' state dir (atld host_layout::system_dir, atl_services::shortcut::package_file)
+    let shortcuts = data_root
+        .join("system/shortcut_service/packages")
+        .join(format!("{package}.json"));
+    if shortcuts.exists() {
+        std::fs::remove_file(&shortcuts)
+            .with_context(|| format!("clearing {}", shortcuts.display()))?;
+    }
     Ok(())
 }
 

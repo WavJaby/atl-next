@@ -2909,6 +2909,10 @@ fn run(a: &Args) -> Result<ExitCode> {
     ]);
     // SystemConfig's permission files lie in the root's partitions: system (mounted for every process) and vendor (HOST_FEATURES_FILE and `--file` placements), by host path
     services_args.extend(["--partitions".into(), r.root.clone().into_os_string()]);
+    // the services' own state (shortcut_service), kept across runs in the data root and writable by them alone
+    let system_dir = host_layout::system_dir(&r.data_root);
+    std::fs::create_dir_all(&system_dir)?;
+    services_args.extend(["--system-dir".into(), system_dir.clone().into_os_string()]);
     let mut services_spawn = system_spawn(
         "services",
         &a.services,
@@ -2920,6 +2924,11 @@ fn run(a: &Args) -> Result<ExitCode> {
     // what the install reads by host path: the sessions' manifests and the installer's frames, the platform's permission definitions
     services_spawn.mounts.push(ro_at_own_path(&install_dir));
     services_spawn.mounts.push(ro_at_own_path(&r.vendor()));
+    services_spawn.mounts.push(Mount {
+        host: system_dir.clone(),
+        at: system_dir,
+        writable: true,
+    });
     // the system scan lists the package partitions' priv-app/ and app/ dirs (atl-services-types system_packages) where they lie in the root
     for (host, _) in r.package_partitions() {
         services_spawn.mounts.push(ro_at_own_path(&host));

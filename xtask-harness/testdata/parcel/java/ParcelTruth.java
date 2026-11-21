@@ -284,6 +284,12 @@ public class ParcelTruth {
         check("ParceledListSlice", new ParceledListSlice<>(Arrays.asList(instrumentationInfo(ai), instrumentationInfo(ai))), ParceledListSlice.CREATOR);
         // IPackageManager.getSystemAvailableFeatures' reply: named features, then the GL ES entry (name null, PackageManagerService :5398)
         check("ParceledListSlice:features", new ParceledListSlice<>(Arrays.asList(featureInfo("android.hardware.touchscreen", 0), featureInfo("android.hardware.vulkan.level", 1), glEsFeature())), ParceledListSlice.CREATOR);
+        // the shortcut service (atl-services shortcut.rs): what ShortcutManager sends (Builder: label, intent with extras -> persistable extras, rank, categories, resource icon, long-lived), the key-only
+        // form (clone CLONE_REMOVE_NON_KEY_INFO), a conversation shortcut (persons, locus id, uri icon), and getShortcuts' list
+        check("ShortcutInfo", shortcutInfo("a"), android.content.pm.ShortcutInfo.CREATOR);
+        check("ShortcutInfo:key", shortcutInfo("a").clone(android.content.pm.ShortcutInfo.CLONE_REMOVE_NON_KEY_INFO), android.content.pm.ShortcutInfo.CREATOR);
+        check("ShortcutInfo:person", conversationShortcut(), android.content.pm.ShortcutInfo.CREATOR);
+        check("ParceledListSlice:shortcuts", new ParceledListSlice<>(Arrays.asList(shortcutInfo("a"), shortcutInfo("b"))), ParceledListSlice.CREATOR);
         check("NotificationChannel", notificationChannel("atl"), NotificationChannel.CREATOR);
         check("NotificationChannel:pattern", patternChannel(), NotificationChannel.CREATOR);
         // INotificationManager.createNotificationChannels' argument / getNotificationChannels' reply: the element class picks the codec
@@ -1509,6 +1515,39 @@ public class ParcelTruth {
         f.version = version;
         f.flags = FeatureInfo.FLAG_REQUIRED;
         return f;
+    }
+
+    /// The package and user ShortcutInfo.Builder reads from its Context (ShortcutInfo(Builder): getPackageName, getUserId); nothing else of it is used.
+    static android.content.Context shortcutContext() {
+        return new android.content.ContextWrapper(null) {
+            @Override
+            public String getPackageName() {
+                return "com.example.app";
+            }
+
+            @Override
+            public int getUserId() {
+                return 0;
+            }
+        };
+    }
+
+    /// A dynamic shortcut as an app builds it: label, long label, intent with an extra, rank, a category, a resource icon, long-lived.
+    static android.content.pm.ShortcutInfo shortcutInfo(String id) {
+        Intent intent = new Intent(Intent.ACTION_VIEW).setClassName("com.example.app", "com.example.app.Main").putExtra("chat", 42);
+        return new android.content.pm.ShortcutInfo.Builder(shortcutContext(), id).setShortLabel("label " + id).setLongLabel("long " + id).setIntent(intent).setRank(2)
+                .setCategories(new android.util.ArraySet<>(Arrays.asList("android.shortcut.conversation"))).setIcon(android.graphics.drawable.Icon.createWithResource("com.example.app", 0x7f010001))
+                .setLongLived(true).build();
+    }
+
+    /// A conversation shortcut: two persons (one with a uri icon, one a bot), a locus id, an adaptive uri icon, an activity.
+    static android.content.pm.ShortcutInfo conversationShortcut() {
+        android.app.Person alice = new android.app.Person.Builder().setName("Alice").setKey("alice").setUri("tel:0").setImportant(true)
+                .setIcon(android.graphics.drawable.Icon.createWithContentUri("content://com.example.app/alice")).build();
+        android.app.Person bot = new android.app.Person.Builder().setName("Bot").setBot(true).build();
+        return new android.content.pm.ShortcutInfo.Builder(shortcutContext(), "chat").setShortLabel("Alice").setIntents(new Intent[] {new Intent(Intent.ACTION_VIEW)})
+                .setActivity(new ComponentName("com.example.app", "com.example.app.Main")).setPersons(new android.app.Person[] {alice, bot}).setLocusId(new android.content.LocusId("chat-1"))
+                .setIcon(android.graphics.drawable.Icon.createWithAdaptiveBitmapContentUri("content://com.example.app/chat")).build();
     }
 
     /// getSystemAvailableFeatures' last entry: only reqGlEsVersion (ES 3.2).

@@ -50,6 +50,10 @@ struct Args {
     /// system packages' broadcasts are protected.
     #[arg(long)]
     platform_manifest: Option<PathBuf>,
+    /// The services' own state dir, writable (atld: `<data root>/system`): user 0's shortcuts (`shortcut_service/`, atl_services::shortcut) are read at start and written on each change.
+    /// Omitted: that state is kept in memory only and starts empty.
+    #[arg(long)]
+    system_dir: Option<PathBuf>,
     /// A shared library an app may `<uses-library>`: `<name>=<jar path as the app processes see it>[,<dependency name>...]` (repeat). SystemConfig's `<library name file dependency>`.
     #[arg(long = "shared-library", value_parser = Library::parse_arg)]
     shared_libraries: Vec<(String, Library)>,
@@ -94,7 +98,7 @@ struct Args {
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
-    /// Test only: this service (`account`, `appops`, `batterystats` (with `batteryproperties`), `connectivity`, `deviceidle`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `telephony.registry`, `thermalservice`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
+    /// Test only: this service (`account`, `appops`, `batterystats` (with `batteryproperties`), `connectivity`, `deviceidle`, `jobscheduler`, `locale`, `netstats`, `permissionmgr`, `power`, `shortcut`, `telephony.registry`, `thermalservice`, `uimode`, `webviewupdate`) is not registered (repeat), the deliberate break of the app gate's line for it (its manager is then null).
     #[arg(long)]
     omit_service: Vec<String>,
     /// Start `sensorservice` in HAL bypass data injection mode with this package allow-listed (AOSP `dumpsys sensorservice hal_bypass_replay_data_injection <package>`); a real accelerometer is then replaced by the injected one for every app of this instance. atld `--tilt-keys` sets it.
@@ -161,6 +165,8 @@ const TELEPHONY_REGISTRY: &str = "telephony.registry";
 const NETSTATS: &str = "netstats";
 const ACCOUNT: &str = "account";
 const DEVICE_IDLE: &str = "deviceidle";
+/// Context.SHORTCUT_SERVICE (ShortcutManager's constructor looks IShortcutService up by it).
+const SHORTCUT: &str = "shortcut";
 /// BatteryStats.SERVICE_NAME and BatteryService's registrar name: BatteryManager needs both (SystemServiceRegistry.java:507); `--omit-service batterystats` omits both.
 const BATTERY_STATS: &str = "batterystats";
 const BATTERY_PROPERTIES: &str = "batteryproperties";
@@ -472,6 +478,18 @@ fn main() -> Result<()> {
     if !a.omit_service.iter().any(|s| s == NETSTATS) {
         binder::add_service(NETSTATS, atl_services::netstats::new_binder())
             .context("addService netstats")?;
+    }
+    if !a.omit_service.iter().any(|s| s == SHORTCUT) {
+        binder::add_service(
+            SHORTCUT,
+            atl_services::shortcut::new_binder(
+                Arc::clone(&packages),
+                Arc::clone(&permissions),
+                Arc::clone(&tasks),
+                a.system_dir.clone(),
+            ),
+        )
+        .context("addService shortcut")?;
     }
     if !a.omit_service.iter().any(|s| s == BATTERY_STATS) {
         // BatteryService's constructor waits for the declared health HAL (HealthServiceWrapperAidl); undeclared = atld ran without `--health`: no battery services, said so

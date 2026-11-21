@@ -206,6 +206,9 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// locale: Main.locales: no per-app locale is stored, so the fixture's own are LocaleManagerService.getApplicationLocales' empty list (:450-460, "[]"); getSystemLocales (:534-554) is the global
 /// configuration's list, the same the app's Configuration holds (`config`); `android` is not the caller's package and the fixture lacks READ_APP_SPECIFIC_LOCALES -> SecurityException; an unknown package
 /// fails isPackageOwnedByCaller (:363) -> IllegalArgumentException.
+/// shortcut: Main.shortcuts against ShortcutService (svc/pm/ShortcutService.java): max 15 per activity (DEFAULT_MAX_SHORTCUTS_PER_ACTIVITY :182), icon 96 dp (:188), not rate-limited = calls left (the fixture is in front: getApiCallCount resets for a foreground uid, ShortcutPackage :695), no launcher to pin -> pinSupported false; set [a, b] + add [c] answer true; ids come out in ArrayMap order
+/// (String.hashCode "a" 97 < "b" 98 < "c" 99) with ranks 0..2 by adjustRanks (set's implicit ranks, then the added one last); nothing pinned; removing b re-ranks c to 1; 16 at once exceed 15 for the
+/// one activity (enforceMaxActivityShortcuts :1805) -> IllegalArgumentException; package `android` is not the caller's (verifyCaller :1740) -> SecurityException; requestPinShortcut false; removeAll -> 0.
 /// trust: Main.keyguard: KeyguardManager's constructor needs `trust` (getServiceOrThrow) and the window service's keyguard calls; with no lock-screen credential the manager is non-null and isDeviceLocked, isKeyguardLocked, isDeviceSecure, isKeyguardSecure are all false.
 /// jobscheduler: Main.jobs: each enqueue answers RESULT_SUCCESS (1); the second, of an equal JobInfo, joins the first job (JobSchedulerService.scheduleAsPackage), so one job is pending; cancel removes it;
 /// a job whose service is an activity fails enforceValidJobRequest ("non-existent component") -> IllegalArgumentException.
@@ -236,7 +239,7 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// thermalservice: Main.thermal on a device with no thermal HAL (ThermalManagerService.onActivityManagerReady leaves mHalReady false, mStatus THROTTLING_NONE): status 0; the status listener is
 /// called once with 0 on register (postStatusListenerLocked); getThermalHeadroom NaN (HAL not ready); getThermalHeadroomThresholds IllegalStateException; registerThermalHeadroomListener false ->
 /// PowerManager's RuntimeException; the status listener's remove finds it. Without the methods the status-listener add throws RuntimeException (WeChat's death).
-const SERVICE_LINES: [(&str, &str, Option<&str>); 21] = [
+const SERVICE_LINES: [(&str, &str, Option<&str>); 22] = [
     (
         "account",
         "AtlTest: account: ",
@@ -309,6 +312,13 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 21] = [
         "uimode",
         "AtlTest: uimode: ",
         Some("type=1 night=1 config=17"),
+    ),
+    (
+        "shortcut",
+        "AtlTest: shortcut: ",
+        Some(
+            "max=15 icon=dp96 limited=false pinSupported=false set=true add=true dynamic=a:0,b:1,c:2 pinned=0 removed=a:0,c:1 over=IllegalArgumentException other=SecurityException pin=false removeAll=0",
+        ),
     ),
     (
         "locale",

@@ -44,9 +44,32 @@ public class DataMain extends Activity {
             state = "failed " + e;
         }
         Log.i("AtlData", "data: " + state + " dir=" + files.getAbsolutePath());
+        Log.i("AtlData", "shortcut: " + shortcut());
         TextView view = new TextView(this);
         view.setText(state);
         setContentView(view);
+    }
+
+    /** The dynamic shortcut ids the service kept from an earlier launch ("-" for none); with none, shortcut `keep` is published for the next launch to find. */
+    private String shortcut() {
+        try {
+            android.content.pm.ShortcutManager sm = getSystemService(android.content.pm.ShortcutManager.class);
+            if (sm == null) {
+                return "absent";
+            }
+            StringBuilder ids = new StringBuilder();
+            for (android.content.pm.ShortcutInfo s : sm.getDynamicShortcuts()) {
+                ids.append(ids.length() == 0 ? "" : ",").append(s.getId());
+            }
+            if (ids.length() == 0) {
+                sm.setDynamicShortcuts(java.util.Collections.singletonList(new android.content.pm.ShortcutInfo.Builder(this, "keep").setShortLabel("keep")
+                        .setIntent(new android.content.Intent(android.content.Intent.ACTION_VIEW).setClass(this, DataMain.class)).build()));
+                return "-";
+            }
+            return ids.toString();
+        } catch (Throwable t) {
+            return "threw " + t;
+        }
     }
 
     private static void writeText(File file, String text) throws IOException {

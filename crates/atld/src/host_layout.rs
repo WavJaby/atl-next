@@ -4,6 +4,7 @@
 //!   `data_de` (device-protected `/data/user_de/0/<package>`), `external/{data,obb}` (`/storage/emulated/0/Android/{data,obb}/<package>`). System packages' data lives here like any package's.
 //! - `device/data/`: what is not yet per package: `system/` (SettingsProvider's /data/system), `dalvik-cache/`, `app/vmdl<session>.tmp` install staging (same filesystem as `apps/`, so commit is a rename).
 //!   Later slices move them (system state -> `system/`, regenerable state -> the XDG cache root).
+//! - `system/`: the services' own state, no Android path (atl-services `--system-dir`): `shortcut_service/`, user 0's shortcuts (atl_services::shortcut).
 
 use std::path::{Path, PathBuf};
 
@@ -50,6 +51,11 @@ pub fn package_dir(data_root: &Path, package: &str, item: Item) -> PathBuf {
 /// The tree not yet split per package: `device/data`, Android's /data minus the packages' dirs.
 pub fn device_data(data_root: &Path) -> PathBuf {
     data_root.join("device").join("data")
+}
+
+/// `system`: the services' state dir (`--system-dir`), seen by no app.
+pub fn system_dir(data_root: &Path) -> PathBuf {
+    data_root.join("system")
 }
 
 /// What [`migrate`] did: per package, the items moved, and the packages refused because an item exists in both trees.

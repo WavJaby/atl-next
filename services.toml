@@ -430,6 +430,50 @@ mirrors = [
     "packages/modules/Connectivity/service-t/src/com/android/server/net/NetworkStatsService.java#getRateLimitCacheConfig",
 ]
 
+[shortcut]
+src = ["crates/atl-services/src/shortcut.rs", "crates/atl-services/src/state_file.rs", "crates/atl-parcelables/src/codecs/android/content/pm/ShortcutInfo.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#verifyCaller",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#verifyShortcutInfoPackage",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#fixUpIncomingShortcutInfo",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#fillInDefaultActivity",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#saveIconAndFixUpShortcutLocked",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#updateTimesLocked",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#isUidForegroundLocked",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#setDynamicShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#addDynamicShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#pushDynamicShortcut",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#updateShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#removeDynamicShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#removeAllDynamicShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#removeLongLivedShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#disableShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#enableShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#getShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#getMaxShortcutCountPerActivity",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#getRemainingCallCount",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#getRateLimitResetTime",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#getIconMaxDimensions",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#reportShortcutUsed",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#isRequestPinItemSupported",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#requestPinShortcut",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#createShortcutResultIntent",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutService.java#handlePackageDataCleared",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#addOrReplaceDynamicShortcut",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#pushDynamicShortcut",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#deleteAllDynamicShortcuts",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#deleteOrDisableWithId",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#getApiCallCount",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#tryApiCall",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#enforceShortcutCountsBeforeOperation",
+    "frameworks/base/services/core/java/com/android/server/pm/ShortcutPackage.java#adjustRanks",
+    "frameworks/base/core/java/android/content/pm/ShortcutInfo.java#writeToParcel",
+    "frameworks/base/core/java/android/content/pm/ShortcutInfo.java#enforceMandatoryFields",
+    "frameworks/base/core/java/android/content/pm/ShortcutInfo.java#copyNonNullFieldsFrom",
+    "frameworks/base/graphics/java/android/graphics/drawable/Icon.java#writeToParcel",
+    "frameworks/base/core/java/android/app/Person.java#writeToParcel",
+]
+
 ["telephony.registry"]
 src = ["crates/atl-services/src/telephony_registry.rs"]
 mirrors = [

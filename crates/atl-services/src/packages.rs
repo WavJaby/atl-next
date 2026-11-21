@@ -126,6 +126,17 @@ impl PackageRecord {
         })
     }
 
+    /// Whether `class` is an enabled activity or alias with a MAIN + LAUNCHER filter (ShortcutService.injectIsMainActivity's query).
+    pub fn is_launcher(&self, class: &str) -> bool {
+        self.activities().filter(|a| a.component.enabled).any(|a| {
+            named(&a.component, class)
+                && self
+                    .intents(Kind::ActivityIntents, class)
+                    .iter()
+                    .any(launches)
+        })
+    }
+
     pub fn activity(&self, class: &str) -> Option<&ActivityInfo> {
         self.activities().find(|a| named(&a.component, class))
     }
