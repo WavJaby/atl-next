@@ -27,6 +27,7 @@ pub mod codec2_store;
 pub mod converter;
 pub mod cross;
 pub mod cts_table;
+pub mod delta;
 pub mod deps;
 pub mod diag_shape;
 pub mod disk_floor;

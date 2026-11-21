@@ -34,7 +34,7 @@ pub const KEEP_BASES: usize = 2;
 /// A checkout's cargo target dir: a link to its build dir's `target/`.
 const TARGET: &str = "target";
 /// In a build dir: the commit of the base it was copied from.
-const BASE_FILE: &str = ".base";
+pub(crate) const BASE_FILE: &str = ".base";
 /// A build dir's bootstrap-gate target (bootstrap_gate.rs). Its cargo units key on the checkout path: refresh keeps it (out_prune::DIR_ROOTS), publish leaves it out.
 pub const BOOTSTRAP_DIR: &str = "bootstrap";
 /// Per-checkout driver probe dirs `<ws>/out/<family>/<checkout id>` (harness vk_driver.rs, egl_driver.rs): outside the pool, so `out prune` sweeps the children of gone checkouts here too.
@@ -68,6 +68,17 @@ pub enum Out {
         #[arg(long, value_name = "DAYS", default_value_t = out_prune::PRUNE_AFTER_DAYS)]
         older_than: u64,
         /// Delete (default: print the plan only).
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Remakes this checkout's build dir on delta tier `ram` or `pool` (delta.rs), dropping the current dir (dry run unless --execute).
+    ///
+    /// Build commands choose the tier when they make a dir: `ram` for a child when `delta.ram_store` is RAM-backed and its build class fits, else `pool`; a dir keeps its tier after that. `pool` is the baseline. Refused while a command of the checkout runs.
+    Tier {
+        /// `ram` or `pool`.
+        #[arg(value_parser = ["ram", "pool"])]
+        tier: String,
+        /// Drop and remake (default: print the plan only).
         #[arg(long)]
         execute: bool,
     },
@@ -194,22 +205,20 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     let id = checkout_id(root)?;
     let dir = dir_of(&ws, &id);
     if present(&dir)? {
+        unmounted_ram(&dir, &id)?;
         return Ok((id, dir));
     }
     let _lock = build_pool::lock_dir(&ws, &id, || {
         eprintln!("out: ws/{id} is being made or deleted by another process, waiting")
     })?;
     if present(&dir)? {
+        unmounted_ram(&dir, &id)?;
         return Ok((id, dir));
     }
     let parent = dir.parent().context("build dir has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let bases = bases(&ws)?;
-    let pick = bases
-        .iter()
-        .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok())
-        .or(bases.first());
-    let line = match pick {
+    let pick = pick_base(root, &ws)?;
+    let line = match pick.as_ref() {
         Some(c) => {
             let tier = copy_tree(&base_of(&ws, c), &dir, Some(c), &[])?;
             count_tier(&ws, tier);
@@ -241,11 +250,30 @@ fn make(root: &Path, restore: bool) -> Result<(String, PathBuf)> {
     Ok((id, dir))
 }
 
+/// The base a new dir of the checkout at `root` starts from: the newest base that is an ancestor of HEAD, else the newest; None without bases.
+pub(crate) fn pick_base(root: &Path, ws: &Path) -> Result<Option<String>> {
+    let bases = bases(ws)?;
+    let pick = bases
+        .iter()
+        .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok())
+        .or(bases.first());
+    Ok(pick.cloned())
+}
+
+/// Refuses a ram dir (delta.rs) seen outside its namespace: there it is the empty mount point, and a build would write the pool under the overlay's place.
+fn unmounted_ram(dir: &Path, id: &str) -> Result<()> {
+    ensure!(
+        crate::delta::stage().is_some() || !dir.join(crate::delta::RECORD).exists(),
+        "ws/{id} is a ram delta (delta.rs): reachable only inside its namespace, which build commands enter; this command runs outside it"
+    );
+    Ok(())
+}
+
 /// Deletes, in the cargo roots of build dir `dir` (out_prune::DIR_ROOTS), the fingerprint of every test or bin unit whose rustc dep-info records an `env!` value under `builder` (the checkout the base was built in), so cargo rebuilds it. Returns how many.
 /// Why: a unit's key leaves out the checkout path, so a base's units are fresh in any checkout; an executable reading `env!("CARGO_MANIFEST_DIR" | "OUT_DIR" | "CARGO_TARGET_TMPDIR")` at run time then reads the land checkout and `ws/land` (2026-11-17: atl-bionic tests/shape.rs failed 3 tests while ws/land was remade).
 /// Executables only: they are leaves (rebuilding one rebuilds nothing else); libs take those values at compile time (`include!`) from outputs equal to the copy's. A lib reading one at run time would need adding here.
 /// Retired when cargo runs at one canonical checkout and target path, as native's out dir already does ([`CANONICAL`]): base units are then valid as they are.
-fn forget_runs_reading(dir: &Path, builder: &Path) -> Result<usize> {
+pub(crate) fn forget_runs_reading(dir: &Path, builder: &Path) -> Result<usize> {
     let needle = format!("={}/", builder.display());
     let mut n = 0;
     for root in out_prune::DIR_ROOTS {
@@ -323,7 +351,7 @@ fn fingerprint_dirs(target: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// The checkout at `root` gets `base`'s recorded mtimes where its content is the recorded one, now elsewhere. Returns the line part. A base published before stamps existed restores nothing: every path gets now.
-fn restore_stamps(root: &Path, base: &Path) -> Result<String> {
+pub(crate) fn restore_stamps(root: &Path, base: &Path) -> Result<String> {
     let file = base.join(crate::checkout_stamps::FILE);
     let Ok(text) = std::fs::read_to_string(&file) else {
         crate::checkout_stamps::restore(root, "")?;
@@ -345,7 +373,7 @@ pub fn ensure_held(root: &Path) -> Result<(String, PathBuf)> {
 }
 
 /// Whether `path` exists as a dir or a link; a link is not followed.
-fn present(path: &Path) -> Result<bool> {
+pub(crate) fn present(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -480,7 +508,7 @@ fn count_tier(ws: &Path, tier: Tier) {
 }
 
 /// Adds one to counter `<pool>/<name>.count`.
-fn count(ws: &Path, name: &str) {
+pub(crate) fn count(ws: &Path, name: &str) {
     let file = pool(ws).join(format!("{name}.count"));
     let n: u64 = std::fs::read_to_string(&file)
         .ok()
@@ -796,8 +824,10 @@ pub fn cargo_target_dir(root: &Path) -> PathBuf {
 
 /// Links the checkout's `target/` to its build dir's, when the dir exists. Run by the outermost xtask process as it ends (cli): the running binary may live in the real `target/` this removes, and the namespace re-exec still needs it.
 /// Only while no other xtask process holds the dir (its exclusive lock, not waited for): a concurrent build may run its xtask from that `target/` (2026-11-15: `out prune` beside a `native` removed the running binary's dir). Busy: left for a later command.
+/// A ram dir (delta.rs) keeps the link at its boot target: cargo's bootstrap of xtask runs outside the namespace, where the dir is an empty mount point; its builds get the dir's target as `CARGO_TARGET_DIR` ([`pending_target`]).
 pub fn settle_target(root: &Path) -> Result<()> {
-    if std::env::var_os(crate::tree::ENV).is_some() {
+    // the outermost process settles: inside a namespace the ram record is covered by the overlay
+    if std::env::var_os(crate::tree::ENV).is_some() || crate::delta::stage().is_some() {
         return Ok(());
     }
     let ws = Layout::of(root)?.workspace().to_owned();
@@ -806,7 +836,11 @@ pub fn settle_target(root: &Path) -> Result<()> {
     if !present(&dir)? {
         return Ok(());
     }
-    let want = target_of(&dir);
+    let want = if dir.join(crate::delta::RECORD).exists() {
+        boot_of(&target_of(&dir)).context("build dir path has no boot target")?
+    } else {
+        target_of(&dir)
+    };
     if link_steps(&root.join(TARGET), &want)?.is_empty() {
         return Ok(());
     }
@@ -942,8 +976,17 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
                 dir.display()
             );
         };
-        remove_build_dir(&dir)?;
-        removed.push(dir.display().to_string());
+        if let Some(rec) = crate::delta::record(&dir)? {
+            crate::delta::drop_ram(ws, &id, &rec)?;
+            removed.push(format!(
+                "{} (ram delta {})",
+                dir.display(),
+                rec.dir(&id).display()
+            ));
+        } else {
+            remove_build_dir(&dir)?;
+            removed.push(dir.display().to_string());
+        }
     }
     Ok(if removed.is_empty() {
         "no build dir".to_owned()
@@ -1060,12 +1103,19 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
         Entry::Absent => return Ok(None),
         _ => return Ok(Some(format!("out: keep ws/{id}: not a dir of its own"))),
     }
-    let Ok(cur) = std::fs::read_to_string(dir.join(BASE_FILE)) else {
-        return Ok(Some(format!(
-            "out: keep ws/{id}: built from zero (no {BASE_FILE})"
-        )));
+    // a ram dir (delta.rs) names its base in its record; its .base is in the upper, covered outside
+    let ram = crate::delta::record(&dir)?;
+    let cur = match &ram {
+        Some(r) => r.base.clone(),
+        None => {
+            let Ok(cur) = std::fs::read_to_string(dir.join(BASE_FILE)) else {
+                return Ok(Some(format!(
+                    "out: keep ws/{id}: built from zero (no {BASE_FILE})"
+                )));
+            };
+            cur.trim().to_owned()
+        }
     };
-    let cur = cur.trim().to_owned();
     let bases = bases(&ws)?;
     let Some(pick) = bases
         .iter()
@@ -1089,6 +1139,10 @@ pub fn refresh(root: &Path) -> Result<Option<String>> {
         return Ok(Some(format!(
             "out: keep ws/{id} on base/{cur}: {changed} upstream input files changed to base/{pick}, under build.refresh_min_upstream_files {min}"
         )));
+    }
+    if let Some(r) = &ram {
+        let why = format!("{changed} upstream input files changed");
+        return crate::delta::refresh(root, &ws, &id, r, pick, &why).map(Some);
     }
     let Some(_lock) = build_pool::try_lock_dir(&ws, &id)? else {
         return Ok(Some(format!(
@@ -1188,18 +1242,24 @@ fn build_dirs(ws: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// `(id, path)` of build dirs.
 type Dirs = Vec<(String, PathBuf)>;
 
-/// What `out prune` deletes: build dirs whose id no live checkout has (temp leftovers included) and bases beyond the newest [`KEEP_BASES`].
-fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>)> {
-    let dirs = build_dirs(ws)?
+/// What `out prune` deletes: build dirs whose id no live checkout has (temp leftovers included) and bases beyond the newest [`KEEP_BASES`] that no live ram dir lays its delta over (delta.rs: a lower must not vanish under an upper). Also returns the pinned bases.
+fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BTreeSet<String>)> {
+    let (dirs, kept): (Dirs, Dirs) = build_dirs(ws)?
         .into_iter()
-        .filter(|(id, _)| !live.contains(id))
-        .collect();
+        .partition(|(id, _)| !live.contains(id));
+    let mut pinned = BTreeSet::new();
+    for (_, path) in &kept {
+        if let Some(rec) = crate::delta::record(path)? {
+            pinned.insert(rec.base);
+        }
+    }
     let old = bases(ws)?
         .into_iter()
         .skip(KEEP_BASES)
+        .filter(|c| !pinned.contains(c))
         .map(|c| base_of(ws, &c))
         .collect();
-    Ok((dirs, old))
+    Ok((dirs, old, pinned))
 }
 
 /// Driver probe dirs (`out/<family>/<id>`, [`FAMILIES`]) whose id no live checkout has: `(family/id, path)`, sorted.
@@ -1293,16 +1353,47 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
         Out::Show => {
             let id = checkout_id(root)?;
             let dir = dir_of(&ws, &id);
-            if present(&dir)? {
+            if let Some(rec) = crate::delta::record(&dir)? {
+                println!(
+                    "out: ws/{id}: {} (tier ram: overlay of base/{} + {}; outside build commands the dir is its empty mount point)",
+                    dir.display(),
+                    rec.base,
+                    rec.dir(&id).join("upper").display()
+                );
+                let boot = boot_of(&target_of(&dir)).unwrap_or_default();
+                println!(
+                    "target: {}",
+                    describe_entry(&entry(&root.join(TARGET))?, &boot)
+                );
+            } else if present(&dir)? {
                 let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
                 let base = std::fs::read_to_string(dir.join(BASE_FILE))
                     .map_or("no base".to_owned(), |c| format!("from base/{}", c.trim()));
-                println!("out: ws/{id}: {} ({base})", real.display());
+                println!("out: ws/{id}: {} (tier pool, {base})", real.display());
                 let state = describe_entry(&entry(&root.join(TARGET))?, &target_of(&dir));
                 println!("target: {state}");
             } else {
                 println!("out: ws/{id}: not made yet: the next build command makes it");
             }
+            let cfg = crate::ws_config::load(&ws)?;
+            let store = &cfg.delta.ram_store;
+            match crate::delta::probe(&store.value, &cfg.delta)? {
+                Ok(s) => println!("delta store {}: {}", store.value.display(), s.line()),
+                Err(why) => println!("delta store {}: unusable: {why}", store.value.display()),
+            }
+            for c in crate::delta::Class::ALL {
+                print!(
+                    "{}{} {:.1} GiB",
+                    if c == crate::delta::Class::Small {
+                        "delta peaks: "
+                    } else {
+                        ", "
+                    },
+                    c.name(),
+                    c.peak(&cfg.delta) as f64 / 1_073_741_824.0
+                );
+            }
+            println!();
             let p = pool(&ws);
             match free_bytes(&p) {
                 Ok(b) => println!(
@@ -1327,9 +1418,24 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             }
             for (id, path) in build_dirs(&ws)? {
                 let state = if live.contains(&id) { "live" } else { "orphan" };
-                println!("ws/{id}: {state}, {}", age(&path));
+                let tier = if path.join(crate::delta::RECORD).exists() {
+                    "ram"
+                } else {
+                    "pool"
+                };
+                println!("ws/{id}: {state}, {tier}, {}", age(&path));
             }
+            for name in ["ram", "pool", "wait", "refused", "lost"] {
+                let n = std::fs::read_to_string(p.join(format!("delta-{name}.count")))
+                    .map_or("0".to_owned(), |t| t.trim().to_owned());
+                print!(
+                    "{}delta-{name} {n}",
+                    if name == "ram" { "counts: " } else { ", " }
+                );
+            }
+            println!();
         }
+        Out::Tier { tier, execute } => return set_tier(root, &ws, tier == "ram", *execute),
         Out::Prune {
             tasks: true,
             execute,
@@ -1361,6 +1467,55 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `out tier`: drops the checkout's build dir and makes it again on tier `ram` (delta.rs make_ram) or `pool` ([`ensure`]); dry run unless `execute`.
+fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode> {
+    let id = checkout_id(root)?;
+    let dir = dir_of(ws, &id);
+    let rec = crate::delta::record(&dir)?;
+    let now = match (&rec, present(&dir)?) {
+        (Some(_), _) => "ram",
+        (None, true) => "pool",
+        (None, false) => "not made",
+    };
+    let want = if ram { "ram" } else { "pool" };
+    let cfg = crate::ws_config::load(ws)?;
+    if ram {
+        if let Some(why) = crate::delta::role_reason(&id) {
+            bail!("ws/{id} stays on the pool tier: {why}");
+        }
+        if let Err(why) = crate::delta::probe(&cfg.delta.ram_store.value, &cfg.delta)? {
+            bail!("no ram tier for ws/{id}: {why}");
+        }
+    }
+    if now == want {
+        println!("out tier: ws/{id} is on tier {want} already");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !execute {
+        println!(
+            "out tier: would drop ws/{id} ({now}) and make it on tier {want} (dry run; add --execute)"
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    {
+        let Some(_lock) = build_pool::try_lock_dir(ws, &id)? else {
+            bail!("ws/{id} is held by a running command: not changed");
+        };
+        match &rec {
+            Some(r) => crate::delta::drop_ram(ws, &id, r)?,
+            None if present(&dir)? => remove_build_dir(&dir)?,
+            None => {}
+        }
+    }
+    if ram {
+        crate::delta::make_ram(root, ws, &id, &cfg.delta.ram_store.value)?;
+    } else {
+        make(root, true)?;
+    }
+    println!("out tier: ws/{id} now on tier {want}");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, and bases beyond the keep rule; lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
 /// Also `land`'s cleanup child, after the landed worktree is gone (all of this is under the owner's standing approval).
 pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
@@ -1375,7 +1530,12 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
     for (line, _) in &rows {
         println!("{line}");
     }
-    let (mut dirs, mut old) = orphans(ws, live)?;
+    // held to the end: a ram dir made meanwhile cannot record a base this prune is deleting
+    let _pins = crate::delta::bases_lock(ws)?;
+    let (mut dirs, mut old, pinned) = orphans(ws, live)?;
+    for c in &pinned {
+        println!("base/{c}: kept: a ram delta lies over it");
+    }
     let counts = if rows.iter().any(|(_, short)| *short) {
         println!(
             "out prune: a pool row is short: candidates ranked most paths first (a copy's metadata scales with its paths)"
@@ -1394,9 +1554,13 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             );
             continue;
         }
+        let gone = |path: &Path| match crate::delta::record(path)? {
+            Some(rec) => crate::delta::drop_ram(ws, id, &rec),
+            None => remove_build_dir(path),
+        };
         match build_pool::try_lock_dir(ws, id)? {
             None => println!("orphan ws/{id}: busy, skipped: a process holds it"),
-            Some(_lock) => match remove_build_dir(path) {
+            Some(_lock) => match gone(path) {
                 Ok(()) => println!("orphan ws/{id}: removed"),
                 Err(e) => {
                     failed += 1;
@@ -1426,6 +1590,25 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             }
         }
     }
+    // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
+    let store = crate::ws_config::load(ws)?.delta.ram_store.value;
+    let mut keep = live.clone();
+    keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
+    let strays = crate::delta::orphan_store_dirs(&store, &keep);
+    for (id, path) in &strays {
+        if !execute {
+            println!("orphan ram delta {id}: {} (checkout gone)", path.display());
+            continue;
+        }
+        match crate::delta::remove_orphan_store(ws, id, path) {
+            Ok(true) => println!("orphan ram delta {id}: removed"),
+            Ok(false) => println!("orphan ram delta {id}: busy, skipped: mounted"),
+            Err(e) => {
+                failed += 1;
+                println!("orphan ram delta {id}: FAILED: {e:#}");
+            }
+        }
+    }
     for path in &old {
         if !execute {
             println!("old base {}{}", path.display(), paths_note(&counts, path));
@@ -1445,9 +1628,10 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan driver probe dir(s) and {} old base(s)",
+        "out prune: {verb} {} orphan build dir(s), {} orphan driver probe dir(s), {} orphan ram delta(s) and {} old base(s)",
         dirs.len(),
         family.len(),
+        strays.len(),
         old.len()
     );
     Ok(failed)
@@ -1836,11 +2020,26 @@ mod tests {
                 .expect("mtime");
         }
         let live = BTreeSet::from(["repo".to_owned(), "live".to_owned()]);
-        let (dirs, old) = orphans(&ws, &live).expect("orphans");
+        let (dirs, old, pinned) = orphans(&ws, &live).expect("orphans");
         let ids: Vec<&str> = dirs.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec![".x.tmp-1", "gone"]);
         assert_eq!(old, vec![base_of(&ws, "c1")]);
+        assert!(pinned.is_empty());
         assert_eq!(bases(&ws).expect("bases"), vec!["c3", "c2", "c1"]);
+        // a live ram dir over c1 keeps it; a gone checkout's ram dir pins nothing
+        std::fs::write(
+            dir_of(&ws, "live").join(crate::delta::RECORD),
+            "base=c1\nstore=/s\n",
+        )
+        .expect("record");
+        std::fs::write(
+            dir_of(&ws, "gone").join(crate::delta::RECORD),
+            "base=c2\nstore=/s\n",
+        )
+        .expect("record");
+        let (_, old, pinned) = orphans(&ws, &live).expect("orphans");
+        assert!(old.is_empty(), "{old:?}");
+        assert_eq!(pinned, BTreeSet::from(["c1".to_owned()]));
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 

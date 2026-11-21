@@ -35,7 +35,7 @@ pub struct Args {
     for_gates: Vec<String>,
     /// The host arch (an arches.toml row with `[host]`); also Soong's arch name. An arch other than the build machine's is cross-built with its row's clang, sysroot and isa.
     #[arg(long)]
-    host: String,
+    pub host: String,
     /// Guest arch of the native bridge side (an arches.toml row with `[guest]`): first builds its LLVM runtimes (runtimes.rs) against bionic's `libc_headers`, then converts `nb:` goals against bionic into `<out>/nb/<arch>`, or for a guest other than the host's into its own graph dir (`graph_dir`).
     #[arg(long)]
     native_bridge: Option<String>,

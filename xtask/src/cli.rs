@@ -148,9 +148,25 @@ pub fn main() -> Result<ExitCode> {
         // before the bind: the refresh replaces the dir the namespace would bind; inside the namespace (the re-exec) the dir is bound and stays
         if matches!(cli.command, Command::Native(_))
             && tree::bound(crate::out::CANONICAL).is_none()
+            && crate::delta::stage().is_none()
             && let Some(line) = crate::out::refresh(&root)?
         {
             println!("{line}");
+        }
+        // the dir's delta tier (delta.rs): a ram dir runs the rest of the command inside its mounted namespace; the outer process only settles `target/`
+        let outer = std::env::var_os(tree::ENV).is_none() && crate::delta::stage().is_none();
+        let class = match &cli.command {
+            _ if !outer => crate::delta::Class::Small,
+            Command::Check(_) => crate::delta::Class::Check,
+            Command::Native(a) => crate::delta::class_for_native(&root, &a.host)?,
+            Command::Cross(_) => crate::delta::Class::Cross,
+            _ => crate::delta::Class::Small,
+        };
+        if let Some(code) = crate::delta::enter(&root, class)? {
+            if let Err(e) = crate::out::settle_target(&root) {
+                eprintln!("out: target: {e:#}");
+            }
+            return Ok(code);
         }
         let overlays = tree::binds_of(&root)?;
         // what the build scripts' resolution reads (atl-layout resolution_input), written into the dir about to be bound, before any build in it

@@ -23,6 +23,14 @@
 //! pool_metadata_min_free = 1  # build-dir pool: btrfs metadata headroom (btrfs_space)
 //! pool_backing = "/mnt/e/WSL/atl-pool.vhdx"  # file backing the pool's filesystem, as seen in the guest; absent = growth check skipped
 //! pool_backing_margin = 2      # host drive under pool_backing must keep this much past the file's worst-case growth
+//! [delta]              # RAM tier of build-dir deltas (delta.rs)
+//! ram_store = "/mnt/atl-zram"  # filesystem holding children's overlay uppers; used only when RAM-backed (zram or tmpfs)
+//! ram_margin_gib = 1   # store RAM kept free past every reservation
+//! ratio_default = 1.95 # raw/RAM ratio assumed while the zram device holds < 1 GiB
+//! peak_small_gib = 2   # per build class: upper growth reserved before the build starts
+//! peak_check_gib = 4.8
+//! peak_native_gib = 9
+//! peak_cross_gib = 20
 //! ```
 
 use std::collections::BTreeMap;
@@ -95,6 +103,26 @@ pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
 /// `disk.pool_backing_margin` (GiB): what the host drive under `disk.pool_backing` keeps past the backing file's worst-case growth (`disk_floor::backing_row`).
 /// Covers the dynamic vhdx's own metadata (BAT + sector bitmaps, well under 1% of a 90 GiB disk = <1 GiB) and other Windows writers to that drive while a build runs (~1 GiB) [est].
 pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
+
+/// `delta.ram_store`: the owner's boot unit mounts the zram-backed ext4 there (plan ram-delta D7); absent or not RAM-backed -> every child gets the pool tier, one logged reason per build.
+pub const DEFAULT_RAM_STORE: &str = "/mnt/atl-zram";
+/// `delta.ram_margin_gib`: zram reports `mem_limit` as an I/O error in ext4, not ENOSPC, so admission stops short of it by this much (~one small build's RAM at lzo-rle, 2 GiB x 0.54).
+pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
+/// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
+pub const DEFAULT_RATIO_MILLI: u64 = 1950;
+/// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
+pub const DEFAULT_PEAK_MIB: [u64; 4] = [2048, 4915, 9216, 20480];
+
+/// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaConfig {
+    pub ram_store: Setting<PathBuf>,
+    pub ram_margin_gib: Setting<u64>,
+    /// Thousandths: 1950 = 1.95 raw bytes per RAM byte.
+    pub ratio_milli: Setting<u64>,
+    /// MiB per `delta::Class`, in `Class::ALL` order.
+    pub peak_mib: [Setting<u64>; 4],
+}
 
 /// `[disk]`: free-space floors in GiB (`disk_floor`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +205,8 @@ pub struct WsConfig {
     pub fetch_for: Setting<Vec<String>>,
     /// `[disk]` floors.
     pub disk: DiskFloors,
+    /// `[delta]`: the RAM tier.
+    pub delta: DeltaConfig,
 }
 
 impl WsConfig {
@@ -263,6 +293,12 @@ fn defaults(path: PathBuf) -> WsConfig {
             pool_backing: Setting::default(None),
             pool_backing_margin: Setting::default(DEFAULT_POOL_BACKING_MARGIN),
         },
+        delta: DeltaConfig {
+            ram_store: Setting::default(PathBuf::from(DEFAULT_RAM_STORE)),
+            ram_margin_gib: Setting::default(DEFAULT_RAM_MARGIN_GIB),
+            ratio_milli: Setting::default(DEFAULT_RATIO_MILLI),
+            peak_mib: DEFAULT_PEAK_MIB.map(Setting::default),
+        },
     }
 }
 
@@ -278,7 +314,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
     for (name, section) in &table {
         let toml::Value::Table(section) = section else {
             bail!(
-                "{shown}: `{name}` must be a table ([build], [cache], [fetch], [disk] or [pool])"
+                "{shown}: `{name}` must be a table ([build], [cache], [fetch], [disk], [delta] or [pool])"
             );
         };
         for (key, value) in section {
@@ -328,8 +364,31 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("disk", "pool_backing_margin") => {
                     cfg.disk.pool_backing_margin = Setting::file(gib(value, &at)?);
                 }
+                ("delta", "ram_store") => {
+                    let toml::Value::String(p) = value else {
+                        bail!("{at} must be an absolute path string, not {value}");
+                    };
+                    if !Path::new(p).is_absolute() {
+                        bail!("{at} must be an absolute path, not {p:?}");
+                    }
+                    cfg.delta.ram_store = Setting::file(PathBuf::from(p));
+                }
+                ("delta", "ram_margin_gib") => {
+                    cfg.delta.ram_margin_gib = Setting::file(gib(value, &at)?);
+                }
+                ("delta", "ratio_default") => {
+                    let milli = thousandths(value, &at)?;
+                    ensure!(milli >= 1000, "{at} must be at least 1.0, not {value}");
+                    cfg.delta.ratio_milli = Setting::file(milli);
+                }
+                ("delta", k) if crate::delta::Class::from_key(k).is_some() => {
+                    let class = crate::delta::Class::from_key(k).context("checked above")?;
+                    let mib = thousandths(value, &at)? * 1024 / 1000;
+                    ensure!(mib > 0, "{at} must be above 0, not {value}");
+                    cfg.delta.peak_mib[class as usize] = Setting::file(mib);
+                }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.peak_{{small,check,native,cross}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
@@ -403,6 +462,20 @@ fn gib(value: &toml::Value, at: &str) -> Result<u64> {
         bail!("{at} must be a whole number of GiB, not {value}");
     };
     u64::try_from(*n).with_context(|| format!("{at} must be a whole number of GiB, not {value}"))
+}
+
+/// A non-negative number (integer or float) in thousandths: 4.8 -> 4800.
+fn thousandths(value: &toml::Value, at: &str) -> Result<u64> {
+    let x = match value {
+        toml::Value::Integer(n) => *n as f64,
+        toml::Value::Float(f) => *f,
+        _ => bail!("{at} must be a number, not {value}"),
+    };
+    ensure!(
+        x.is_finite() && x >= 0.0,
+        "{at} must be a non-negative number, not {value}"
+    );
+    Ok((x * 1000.0).round() as u64)
 }
 
 /// A list of distinct `--for` values (gate names, `all-gates`).
