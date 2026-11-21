@@ -27,6 +27,8 @@ pub const FD_ENV: &str = "ATL_WEBSPAWN_FD";
 /// Where every app sandbox shows the shim: a directory of its own on the app's PATH ([`APP_PATH`]), since WebKit runs `flatpak-spawn` by name.
 pub const SHIM_DIR: &str = "/.atl-bin";
 pub const SHIM_AT: &str = "/.atl-bin/flatpak-spawn";
+/// What the shim writes to its stderr (the app's log) before the reason, and only when it exits 1: a refused or failed start, or a probe without a channel. The app gate fails on any such line.
+pub const SHIM_FAILED: &str = "flatpak-spawn: ";
 /// The app's PATH: GLib's search path when PATH is unset (`/bin:/usr/bin:.`, gspawn.c) without the cwd, then [`SHIM_DIR`]; every name found before keeps resolving as before.
 pub const APP_PATH: &str = "/bin:/usr/bin:/.atl-bin";
 /// The file whose existence switches WebKit to the Flatpak route (wtf/glib Sandbox.cpp `isInsideFlatpak`); empty: nothing reads its content on this route.

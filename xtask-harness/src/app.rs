@@ -1944,6 +1944,19 @@ fn missing_service_failures(app: &str) -> Vec<String> {
     }
 }
 
+/// The web-process row: no line of the shim's failure (atl_broker::webspawn::SHIM_FAILED, written to the app's stderr = the app log) -> None; else how many and the first, which carries the broker's reason.
+fn web_spawn_failure(app: &str) -> Option<String> {
+    let mut failed = app.lines().filter_map(|l| {
+        l.find(atl_broker::webspawn::SHIM_FAILED)
+            .map(|i| l[i..].to_owned())
+    });
+    let first = failed.next()?;
+    Some(format!(
+        "web-process starts: {} failed, first {first:?}",
+        1 + failed.count()
+    ))
+}
+
 /// Each line atl-diag reads a missing service from is in the pinned source that writes it, in MISSING_SERVICE_LINES order, as (file, literal with the name's place).
 #[cfg(test)]
 const MISSING_SERVICE_SOURCES: [(&str, &str); 3] = [
@@ -2636,6 +2649,10 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         .find_map(|l| l.split_once(SOUNDPOOL).map(|(_, r)| r.to_owned()));
     if passed && soundpool.as_deref() != Some("constructed") {
         whys.push(format!("soundpool: want constructed, got {soundpool:?}"));
+    }
+    // every web-process start WebKit asks for must start: a failed one leaves its view's load waiting with no callback, and a webview row shows it only when WebKit has no other process to use
+    if let Some(why) = web_spawn_failure(&app) {
+        whys.push(why);
     }
     // a host-derived want (connectivity) is this host's: a remote run skips it (REMOTE_UI_SKIPPED)
     for (service, prefix, want) in SERVICE_LINES
@@ -3759,6 +3776,23 @@ mod tests {
         assert!(missing_service_failures(&line(MISSING_JAVA)).is_empty());
         assert_eq!(missing_service_failures(&line("netstats")).len(), 1);
         assert_eq!(missing_service_failures("").len(), 1);
+    }
+
+    /// The shim's failure line fails the row wherever stderr interleaving puts it on the line (seen mid-line in a run log); a log without one passes.
+    #[test]
+    fn web_spawn_failure_reads_the_shims_line() {
+        let ok =
+            "1700000000.100 5.000 2 2 I liblog/AtlTest: webview-page: events=started,finished,\n";
+        assert_eq!(web_spawn_failure(ok), None);
+        let bad = format!(
+            "{ok}flatpak-spawn: failed: pidfd of sandbox 147: No such process (os error 3)\naudio-mix: requested=flatpak-spawn: failed: x\n"
+        );
+        assert_eq!(
+            web_spawn_failure(&bad).as_deref(),
+            Some(
+                "web-process starts: 2 failed, first \"flatpak-spawn: failed: pidfd of sandbox 147: No such process (os error 3)\""
+            )
+        );
     }
 
     #[test]

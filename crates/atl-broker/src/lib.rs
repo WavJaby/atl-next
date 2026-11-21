@@ -813,10 +813,8 @@ fn other(what: impl std::fmt::Display) -> io::Error {
     io::Error::other(what.to_string())
 }
 
-/// One bwrap run: its arguments up to `--`, then the program; `env` its whole environment (bwrap adds PWD); `inherit` = the fds the child alone gets (cleared close-on-exec just before the spawn, closed right after it). Returns bwrap and the host pid it reports on `info_r`.
+/// One bwrap run ([`launch`], [`run_bwrap`]): its arguments up to `--`, then the program; `env` its whole environment (bwrap adds PWD); `inherit` = the fds the child alone gets (cleared close-on-exec just before the spawn, closed right after it).
 struct Launch<'a> {
-    /// A stage that runs bwrap for us (atl-sandbox-join and its options, up to its `--`); None: bwrap is the broker's child.
-    via: Option<Vec<OsString>>,
     bwrap_args: Vec<OsString>,
     program: &'a Path,
     args: &'a [OsString],
@@ -826,7 +824,35 @@ struct Launch<'a> {
     stderr: Stdio,
 }
 
+/// A sandbox bwrap runs as the broker's child: [`run_bwrap`] with no stage, so the pid bwrap reports is a host pid, and its pidfd is opened at once (the init runs: it waits for its child).
 fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::Result<Process> {
+    let (mut child, host_pid) = run_bwrap(None, l, info_r, inherit)?;
+    let opened = Pid::from_raw(host_pid)
+        .ok_or_else(|| other(format!("{host_pid}: not a process id")))
+        .and_then(|p| pidfd_open(p, PidfdFlags::empty()).map_err(io::Error::from));
+    match opened {
+        Ok(pidfd) => Ok(Process {
+            child,
+            host_pid,
+            pidfd,
+        }),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(other(format!("pidfd of sandbox {host_pid}: {e}")))
+        }
+    }
+}
+
+/// Runs `l`: bwrap itself, or `via` (a stage that runs bwrap for us: atl-sandbox-join and its options, up to its `--`). Returns the spawned child and the pid bwrap reports on `info_r`, which is
+/// a pid of the pid namespace bwrap runs in: the host's without `via`; with atl-sandbox-join the app's, which no host call may take as a host pid (pidfd_open of it fails with ESRCH or names an
+/// unrelated host process), so a staged run is never a [`Process`].
+fn run_bwrap(
+    via: Option<Vec<OsString>>,
+    l: Launch<'_>,
+    info_r: io::PipeReader,
+    inherit: Vec<OwnedFd>,
+) -> io::Result<(Child, i32)> {
     for fd in &inherit {
         fcntl_setfd(fd, FdFlags::empty())?;
     }
@@ -843,7 +869,7 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
         clippy::disallowed_types,
         reason = "the one launcher of the runtime: every process atld starts is a bwrap run built here"
     )]
-    let mut cmd = match l.via {
+    let mut cmd = match via {
         Some(via) => {
             let (stage, opts) = via.split_first().ok_or_else(|| other("empty via"))?;
             let mut c = std::process::Command::new(stage);
@@ -864,23 +890,7 @@ fn launch(l: Launch<'_>, info_r: io::PipeReader, inherit: Vec<OwnedFd>) -> io::R
     drop(inherit);
     let mut child = child.map_err(|e| other(format!("starting {BWRAP}: {e}")))?;
     match read_info(info_r) {
-        Ok(host_pid) => {
-            let opened = Pid::from_raw(host_pid)
-                .ok_or_else(|| other(format!("{host_pid}: not a process id")))
-                .and_then(|p| pidfd_open(p, PidfdFlags::empty()).map_err(io::Error::from));
-            match opened {
-                Ok(pidfd) => Ok(Process {
-                    child,
-                    host_pid,
-                    pidfd,
-                }),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    Err(other(format!("pidfd of sandbox {host_pid}: {e}")))
-                }
-            }
-        }
+        Ok(pid) => Ok((child, pid)),
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -926,7 +936,6 @@ impl Broker {
         let args = stub_args(&grants, false, program);
         let process = launch(
             Launch {
-                via: None,
                 bwrap_args,
                 program: stub,
                 args: &args,
@@ -1068,7 +1077,6 @@ impl Broker {
             pidfd,
         } = launch(
             Launch {
-                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
@@ -1220,13 +1228,9 @@ impl WebSpawner {
         ];
         let mut inherit: Vec<OwnedFd> = vec![socket, info_w.into(), pidns, mntns, info];
         inherit.extend(seccomp);
-        let Process {
-            mut child,
-            host_pid,
-            ..
-        } = launch(
+        let (mut child, app_pid) = run_bwrap(
+            Some(via),
             Launch {
-                via: Some(via),
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
@@ -1240,11 +1244,11 @@ impl WebSpawner {
         )?;
         // atl-sandbox-join waits for bwrap, which ends with the web process (its socket closed, or the app's pid namespace gone)
         std::thread::Builder::new()
-            .name(format!("webproc-{host_pid}"))
+            .name(format!("webproc-{app_pid}"))
             .spawn(move || {
                 let _ = child.wait();
             })?;
-        Ok(host_pid)
+        Ok(app_pid)
     }
 }
 
@@ -1276,7 +1280,6 @@ impl Broker {
             pidfd,
         } = launch(
             Launch {
-                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,
@@ -1325,7 +1328,6 @@ impl Broker {
         args.extend(spawn.args.iter().cloned());
         let process = launch(
             Launch {
-                via: None,
                 bwrap_args,
                 program: Path::new(SANDBOX_STUB_AT),
                 args: &args,

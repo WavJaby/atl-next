@@ -11,7 +11,7 @@ use std::io::Write;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::process::ExitCode;
 
-use atl_broker::webspawn::{Expose, FD_ENV, Reply, Request, read_reply, send_request};
+use atl_broker::webspawn::{Expose, FD_ENV, Reply, Request, SHIM_FAILED, read_reply, send_request};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 /// A parsed line: the request, or None for a probe line (no `--forward-fd`).
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "flatpak-spawn: {e}");
+            let _ = writeln!(std::io::stderr(), "{SHIM_FAILED}{e}");
             ExitCode::from(1)
         }
     }
