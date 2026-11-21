@@ -132,14 +132,12 @@ fn layers_check(app: &str) -> Result<String, String> {
         .collect();
     let before = counters
         .iter()
-        .filter(|(t, _)| *t < kill)
-        .last()
+        .rfind(|(t, _)| *t < kill)
         .ok_or("no composer counters line before the kill")?
         .1;
     let after = counters
         .iter()
-        .filter(|(t, _)| *t >= drawn)
-        .last()
+        .rfind(|(t, _)| *t >= drawn)
         .ok_or("no composer counters line after the dialog's draw")?
         .1;
     let n = |line: &str, key: &str| word(line, key).and_then(|v| v.parse::<u64>().ok());
