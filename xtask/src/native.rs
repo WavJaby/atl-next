@@ -1591,23 +1591,39 @@ fn build_crates<'a>(
     cross: Option<&crate::cross::CargoTarget>,
     phases: &mut Phases,
 ) -> Result<BTreeMap<&'a str, Provided>> {
-    let crates: BTreeSet<&str> = providers::crates(providers)
+    let rows = providers::crates(providers);
+    let crates: BTreeSet<&str> = rows.iter().map(|(_, krate)| *krate).collect();
+    // A `srcs` row's crate takes the replaced files' place inside the module: a static archive the converter links whole into it (bp2ninja cc.go), so the module itself defines its symbols and
+    // its version script exports them, as the dropped objects did (a shared object would leave them undefined there: lld refuses the version script, dependents cannot link them).
+    // A whole module's crate stays a shared object its dependents link. One crate serves one of the two roles.
+    let partial: BTreeSet<&str> = providers::partial(providers)
         .into_iter()
-        .map(|(_, krate)| krate)
+        .filter_map(|(_, row)| row.provider.as_deref()?.strip_prefix("crate:"))
         .collect();
+    for (module, krate) in &rows {
+        ensure!(
+            !partial.contains(krate) || !providers[*module].srcs.is_empty(),
+            "providers.toml: crate {krate} provides `srcs` rows and the whole module {module}: one crate is linked into modules or linked by dependents, not both"
+        );
+    }
     let mut built = BTreeMap::new();
     for krate in crates {
         let prefix = out.join("crates").join(krate);
         let include = out.join("gen").join(krate).join("include");
         let dest = out.join("cinstall").join(krate);
         remove_path(&dest)?;
+        let (library_type, suffix) = if partial.contains(krate) {
+            ("staticlib", "a")
+        } else {
+            ("cdylib", "so")
+        };
         let mut cargo = Command::new("cargo");
         cargo.args([
             "cinstall",
             "--profile",
             crate::build_state::NATIVE_PROFILE,
             "--library-type",
-            "cdylib",
+            library_type,
             "-p",
             krate,
         ]);
@@ -1650,7 +1666,7 @@ fn build_crates<'a>(
         // cargo's library name: the package name with `-` as `_`
         let lib = prefix
             .join("lib")
-            .join(format!("lib{}.so", krate.replace('-', "_")));
+            .join(format!("lib{}.{suffix}", krate.replace('-', "_")));
         ensure!(
             lib.is_file(),
             "{} missing after cargo cinstall",
@@ -2083,12 +2099,13 @@ fn licence_gate(out: &Path, built: bool, verbose: bool) -> Result<Option<String>
 /// Prints a licence gate report under `label`; its first problem, None when it passes.
 fn licence_report(label: &str, report: &licence_gate::Report, verbose: bool) -> Option<String> {
     println!(
-        "native: {label}: {} artifacts ({} test-only skipped), {} files checked, not checked: {} generated, {} system; {} licences denied, {} files unresolved",
+        "native: {label}: {} artifacts ({} test-only skipped), {} files checked, not checked: {} generated, {} system, {} crate archive members; {} licences denied, {} files unresolved",
         report.artifacts,
         report.test_only,
         report.checked,
         report.generated,
         report.system,
+        report.crates,
         report.denied.len(),
         report.unresolved.len()
     );

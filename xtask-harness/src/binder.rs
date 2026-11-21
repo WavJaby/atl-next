@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test binder`: AOSP's servicemanager and `service` command, built by the converter on libbinder's driver seam (patches/aosp/frameworks/native 0003), talking through binderd.
+//! `xtask test binder`: AOSP's servicemanager and `service` command, built by the converter on libbinder's driver seam (patches/aosp/frameworks/native 0002), talking through binderd.
 //!
 //! Every process goes through atl-broker as atld's do: `Broker::start` runs `atl-binderd` in its BinderDaemon sandbox, `Broker::spawn` each binder process in the app sandbox, registered with binderd tagged {uid, host pid}; so this gate runs on the argv the broker emits.
 //! servicemanager: uid 1000 (AID_SYSTEM), the one process allowed to become context manager, with the test layout's /system, /vendor, /odm (empty VINTF manifests) mounted.

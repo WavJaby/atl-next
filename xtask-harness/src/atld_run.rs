@@ -1212,6 +1212,14 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Red control: `host` as the image's service access table instead of the build's (keystore gate `--break-allow-all`).
+    pub fn with_service_access(mut self, host: PathBuf) -> Self {
+        let at = atl_android_paths::SERVICE_ACCESS;
+        self.platform_files.retain(|(_, a)| a != at);
+        self.platform_files.push((host, at.to_owned()));
+        self
+    }
+
     /// Places a gate's fixture file `host` at `at` (a /system or /vendor path) in every app sandbox.
     pub fn with_fixture_file(mut self, host: PathBuf, at: &str) -> Self {
         self.fixture_files.push((host, at.to_owned()));

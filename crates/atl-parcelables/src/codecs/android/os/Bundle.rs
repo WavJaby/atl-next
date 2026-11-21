@@ -4,7 +4,7 @@
 //! The body is kept as a sub-Parcel: BaseBundle.writeToParcelInner appends mParcelledData (`parcel.appendFrom(mParcelledData, 0, length)`), readFromParcelInner appends the range into a scratch parcel, so a body holds its binder and file descriptor objects
 //! as AOSP's Bundles do (androidx puts a binder in broadcast extras). The codec copies the range with `append_from` (Parcel::appendFrom: bytes and object table entries, descriptors dup'd) and writes it back the same way: byte- and object-exact, never parsed.
 //! Descriptors are not refused here. AOSP refuses them where it takes a Bundle from an app (`hasFileDescriptors()` in ActivityManagerService / BroadcastController: [`Bundle::has_file_descriptors`]); the services do the same at those call sites.
-//! `entries` / `put_all` need the body as bytes and refuse (counted) a body with objects (Parcel::marshal, patches/aosp/frameworks/native/0004); `Bundle` has no `PartialEq`: a body with objects has no bytes to compare.
+//! `entries` / `put_all` need the body as bytes and refuse (counted) a body with objects (Parcel::marshal, patches/aosp/frameworks/native/0003); `Bundle` has no `PartialEq`: a body with objects has no bytes to compare.
 
 use std::sync::{Mutex, MutexGuard};
 

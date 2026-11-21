@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Generates with atl-bridgegen, from libbinder's `BinderDriver.h` (patches/aosp/frameworks/native 0003), `OUT_DIR/driver.rs`: the check that each `binder_driver_*` export of `crate::exports` has the header's signature (bridge control 1 + 2: shells from the header, layouts from the header).
+//! Generates with atl-bridgegen, from libbinder's `BinderDriver.h` (patches/aosp/frameworks/native 0002), `OUT_DIR/driver.rs`: the check that each `binder_driver_*` export of `crate::exports` has the header's signature (bridge control 1 + 2: shells from the header, layouts from the header).
 //! No header is installed: libbinder includes its own.
 
 use anyhow::Result;

@@ -780,9 +780,14 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 	}
 	files = append(files, g.ccAidlLibs(n)...)
 	// a provided shared object links shared, and first, whichever list names it (static_libs, whole_static_libs included); a provided archive stays where it is named
-	var provided []*Node
+	// a `srcs` row's provider archive stands in for the dropped objects: linked whole into n, so n defines (and its version script exports) their symbols; a shared one is linked first, as above
+	var provided, partialWhole []*Node
 	if p := g.partialProvider(n); p != nil {
-		provided = append(provided, p)
+		if p.kind == Static {
+			partialWhole = append(partialWhole, p)
+		} else {
+			provided = append(provided, p)
+		}
 	}
 	dep := func(refs []string, want Kind) []*Node {
 		var out []*Node
@@ -799,7 +804,7 @@ func (g *Graph) treeNode(ref string, side Side, want Kind, from string) *Node {
 		return out
 	}
 	// cc_object modules named in srcs (srcFiles) are linked whole, as Soong links their object
-	n.deps.whole = append(dep(n.props.strs("whole_static_libs"), Static), n.objSrcs...)
+	n.deps.whole = append(append(partialWhole, dep(n.props.strs("whole_static_libs"), Static)...), n.objSrcs...)
 	// cc/linker.go linkerDeps: use_version_lib whole-links libbuildversion (its <build/version.h> and soong_build_number)
 	if n.props.boolean("use_version_lib", false) {
 		n.deps.whole = append(n.deps.whole, dep([]string{"libbuildversion"}, Static)...)

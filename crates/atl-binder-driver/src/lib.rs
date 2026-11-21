@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! libbinder_driver for binderd: libbinder's binder driver I/O (`BinderDriver.h`, patches/aosp/frameworks/native 0003) over binderd's socket protocol (`atl_binder_wire::proto`), instead of the kernel's `/dev/binder` (providers.toml `libbinder_driver`).
+//! libbinder_driver for binderd: libbinder's binder driver I/O (`BinderDriver.h`, patches/aosp/frameworks/native 0002) over binderd's socket protocol (`atl_binder_wire::proto`), instead of the kernel's `/dev/binder` (providers.toml `libbinder_driver`).
 //!
 //! - `binder_driver_open("/dev/binder")`: the process's control connection, inherited as fd `ATL_BINDER_FD`, is handshaken once; each open returns a dup of it. Other paths (`/dev/vndbinder`, `/dev/hwbinder`): ENOENT.
 //! - `binder_driver_mmap`: an anonymous region local to the process; binderd learns its size and alone allocates offsets in it.

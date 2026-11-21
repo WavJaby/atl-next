@@ -92,28 +92,48 @@ fn missing_service(line: &str) -> Option<(u64, &str)> {
     })
 }
 
-/// Every `diag:` line of `log`, in log order, and each [`MISSING_SERVICE_LINES`] line as a `missing-service <name>` event whose count is the lines so far: every miss writes one, so it is exact.
+/// The denied permissions and the target type of a logcat line holding libselinux's denial (avc.c `avc_audit`: `avc:  denied  { <perm>... } for <callback text> scontext=<s> tcontext=<t>
+/// tclass=<c> permissive=<0|1>`), with the line's stamp. A granted (auditallow) line is none.
+pub fn avc_denial(line: &str) -> Option<(u64, Vec<&str>, &str)> {
+    let at_ms = parse_stamp(line.split(' ').next()?)?;
+    let (_, rest) = line.split_once("avc:  denied  { ")?;
+    let (perms, rest) = rest.split_once(" } for ")?;
+    let tcontext = rest.split(' ').find_map(|w| w.strip_prefix("tcontext="))?;
+    let ty = tcontext.split(':').nth(2).filter(|t| !t.is_empty())?;
+    Some((at_ms, perms.split(' ').collect(), ty))
+}
+
+/// Every `diag:` line of `log`, in log order; each [`MISSING_SERVICE_LINES`] line as a `missing-service <name>` event and each [`avc_denial`] line as one `denied <perm> <type>` event per
+/// permission, whose count is the lines so far: every miss / denial writes one, so it is exact.
 pub fn events(log: &str) -> Vec<Event> {
-    let mut misses = std::collections::BTreeMap::<&str, u64>::new();
-    log.lines()
-        .filter_map(|line| {
-            parse(line).or_else(|| {
-                let (at_ms, name) = missing_service(line)?;
-                let n = misses.entry(name).or_default();
-                *n += 1;
-                Some(Event {
-                    at_ms,
-                    counter: Counter {
-                        outcome: crate::MISSING_SERVICE.to_owned(),
-                        api: name.to_owned(),
-                        count: *n,
-                        exact: true,
-                    },
-                    cause: None,
-                })
-            })
-        })
-        .collect()
+    let mut seen = std::collections::BTreeMap::<(&str, String), u64>::new();
+    let mut upstream = |at_ms, outcome: &'static str, api: String| {
+        let n = seen.entry((outcome, api.clone())).or_default();
+        *n += 1;
+        Event {
+            at_ms,
+            counter: Counter {
+                outcome: outcome.to_owned(),
+                api,
+                count: *n,
+                exact: true,
+            },
+            cause: None,
+        }
+    };
+    let mut out = Vec::new();
+    for line in log.lines() {
+        if let Some(e) = parse(line) {
+            out.push(e);
+        } else if let Some((at_ms, name)) = missing_service(line) {
+            out.push(upstream(at_ms, crate::MISSING_SERVICE, name.to_owned()));
+        } else if let Some((at_ms, perms, ty)) = avc_denial(line) {
+            for p in perms {
+                out.push(upstream(at_ms, crate::DENIED, format!("{p} {ty}")));
+            }
+        }
+    }
+    out
 }
 
 /// Each (outcome, api) key's count among `events`: its total line's if one was written, else the highest count seen. Key order.
@@ -343,6 +363,28 @@ mod tests {
                 "missing-service atl.none x2 +0.100s",
                 "missing-service atl.n x1 +6.000s",
                 "missing-service legacy_permission x1 +8.000s"
+            ]
+        );
+    }
+
+    /// avc.c avc_audit's line (`"%s:  %s "` prefix + avc_dump_av's ` { p }` + ` for ` + servicemanager's audit callback text + avc_dump_query + ` permissive=`), as servicemanager's kernel log
+    /// shows it: one `denied <perm> <tcontext type>` count per permission per line; a granted line is none.
+    #[test]
+    fn avc_denials_count_per_permission() {
+        let log = "\
+1700000000.100 5.000   7   7 E kmsg/SELinux: avc:  denied  { find } for pid=9 uid=10000 name=android.hardware.security.keymint.IKeyMintDevice/default scontext=u:r:untrusted_app:s0:c0,c256,c512,c768 tcontext=u:object_r:hal_keymint_service:s0 tclass=service_manager permissive=0\n\
+1700000000.200 5.100   7   7 E kmsg/SELinux: avc:  denied  { find } for pid=9 uid=10000 name=android.hardware.security.keymint.IKeyMintDevice/default scontext=u:r:untrusted_app:s0:c0,c256,c512,c768 tcontext=u:object_r:hal_keymint_service:s0 tclass=service_manager permissive=0\n\
+1700000000.300 5.200   7   7 E kmsg/SELinux: avc:  denied  { add find } for pid=9 uid=10000 name=x scontext=u:r:untrusted_app:s0 tcontext=u:object_r:default_android_service:s0 tclass=service_manager permissive=0\n\
+1700000000.400 5.300   7   7 I kmsg/SELinux: avc:  granted  { find } for pid=9 uid=10000 name=y scontext=u:r:untrusted_app:s0 tcontext=u:object_r:activity_service:s0 tclass=service_manager\n";
+        let mut c = counters(log);
+        c.sort_by(|a, b| a.api.cmp(&b.api));
+        let shown: Vec<String> = c.iter().map(show).collect();
+        assert_eq!(
+            shown,
+            [
+                "denied add default_android_service x1",
+                "denied find default_android_service x1",
+                "denied find hal_keymint_service x2"
             ]
         );
     }

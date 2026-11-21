@@ -722,6 +722,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-selinux"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-android-paths",
+ "atl-bridgegen",
+ "atl-sepolicy",
+ "bindgen",
+ "libc",
+]
+
+[[package]]
 name = "atl-sepolicy"
 version = "0.0.0"
 dependencies = [

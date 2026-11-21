@@ -11,7 +11,7 @@
 //!
 //! - A member of an archive no edge of this build makes (built by an upstream's own CMake/ninja build: `xtask runtimes`, providers.toml `upstream:`) is mapped to its object through that build's edges and deps log (`external_build`).
 //!
-//! Not checked, only counted: files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr`, `/lib*` and the fetched sysroots (toolchain, distro headers and libraries: the platform's, not ours to ship; `Places`).
+//! Not checked, only counted: members of a providers.toml crate's archive (`Report::crates`: workspace code under steps `deny` and `spdx`); files generated into a build dir (aidl, protobuf, sysprop, genrule outputs, our crates' generated headers; their generators' inputs are not followed) -- except staged copies of sources (`Staged`), judged as the source they copy; system files under `/usr`, `/lib*` and the fetched sysroots (toolchain, distro headers and libraries: the platform's, not ours to ship; `Places`).
 //! A file anywhere else fails: nothing passes because the gate cannot place it.
 //! Not in the depfile: build.ninja and the deps logs. An archive's members or an object's headers change only through an edit to an input already listed (a source, a header, a blueprint) or a relinked artifact, and a regenerated build.ninja alone would rerun the whole gate.
 
@@ -75,6 +75,10 @@ pub struct Report {
     pub checked: usize,
     pub generated: usize,
     pub system: usize,
+    /// Members loaded from a providers.toml crate's archive (`<out>/crates/<crate>/lib/*.a`, cargo-c, linked whole into a `srcs` module): workspace code, whose licences step `deny`
+    /// (cargo-deny, the crate's dependency closure) and step `spdx` (our own sources) check, as for the crates provided as shared objects; counted, not followed.
+    #[serde(default)]
+    pub crates: usize,
     /// Licence expression -> files under it (as resolved: key-relative) -> the first artifact reaching it.
     pub denied: BTreeMap<String, BTreeMap<String, String>>,
     /// Files with no licence the rules can name, or that the gate cannot place.
@@ -267,6 +271,8 @@ pub fn check(
         let Some(objs) = archive_inputs.get(archive) else {
             if places.is_system(archive) {
                 report.system += 1;
+            } else if archive.starts_with(out.join("crates")) {
+                report.crates += 1;
             } else if let Some(b) = external_build(archive, out) {
                 external
                     .entry(b)

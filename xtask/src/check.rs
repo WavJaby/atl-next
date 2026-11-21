@@ -50,7 +50,7 @@ enum Step {
     Bootstrap,
     /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
     Drift,
-    /// libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0003), in the tree this checkout builds
+    /// libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0002), in the tree this checkout builds
     Seam,
     /// Android path literals (`/system`, `/data`, ...) only in crate atl-android-paths, others allowed by android-paths.toml with a reason
     AndroidPaths,

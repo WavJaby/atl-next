@@ -117,10 +117,12 @@ crates = ["atl-diag"]
 exports = ["atl-diag"]
 
 # the SELinux decisions ATL makes in the kernel's place (service-access plan): the service access table derived from the compiled pinned policy, the context file formats, the AOSP domains of atld's spawns;
-# atl-sepolicy-av: the build-time tool that queries the binary policy through libsepol and writes the table (converter goal atl-sepolicy)
+# atl-sepolicy-av: the build-time tool that queries the binary policy through libsepol and writes the table (converter goal atl-sepolicy); atl-selinux: libselinux's kernel-interface files
+# (providers.toml `libselinux` srcs) answered from that table and the broker's per-sandbox context file
 [sepolicy]
-crates = ["atl-sepolicy", "atl-sepolicy-av"]
+crates = ["atl-sepolicy", "atl-sepolicy-av", "atl-selinux"]
 exports = ["atl-sepolicy"]
+uses = ["android-paths", "generators"]
 
 # Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it), and the Rust types of the Java-only parcelables they pass (a converter rust_library)
 [aidl]

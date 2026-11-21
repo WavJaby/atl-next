@@ -5,7 +5,10 @@
 //! - `getKeyEntry` of an absent alias in Domain::APP fails with ResponseCode KEY_NOT_FOUND (keystore2 answers it before any permission check, so it passes without the cfg too);
 //! - an EC P-256 signing key generated through that security level (the app's keystore2_key permissions pass: patches/aosp/system/security 0001, cfg `atl_no_selinux`) has a SOFTWARE ORIGIN authorization, the level KeyInfo.getSecurityLevel reports (patches/aosp/hardware/interfaces 0001);
 //!   KeyMetadata.keySecurityLevel stays the TEE slot keystore2 called, as on a device; the key deletes; the HAL is reached only through keystore2, as an app on a device (sepolicy keeps apps from finding hal_keymint_service);
-//! - `/data/misc/keystore`, keystore2's database, is not in the app's sandbox.
+//! - `/data/misc/keystore`, keystore2's database, is not in the app's sandbox;
+//! - servicemanager decides service access from the compiled pinned policy (service-access plan S1): the app cannot find the KeyMint HAL (checkService / getService null, isDeclared
+//!   SecurityException) but finds `activity` and the allocator HAL, listServices names everything, and each denial is one avc line in servicemanager's log that atl-diag counts as `denied`.
+//!   Red control `--break-allow-all`: the image's service access table grants everything, so the HAL checks fail.
 //!
 //!
 //! App stage (plan keystore S2): AesActivity launched as an app (the launcher installs AndroidKeyStoreProvider as zygote's preload did) generates an AES-256-GCM key, round-trips, reports KeyInfo
@@ -38,6 +41,24 @@ pub struct Args {
     /// Red control: empty keystore2's database dir between the two app runs (a device that lost its keys); the restart check must fail with "restart key absent".
     #[arg(long)]
     break_wipe: bool,
+    /// Red control: the image's service access table grants every permission to every domain on every type (servicemanager then allows everything); the HAL checks must fail.
+    #[arg(long)]
+    break_allow_all: bool,
+}
+
+/// [`Args::break_allow_all`]'s table: `table` with every permission of every class granted from each of its domains to each of its targets.
+fn allow_all(table: &atl_sepolicy::Table) -> atl_sepolicy::Table {
+    let mut open = atl_sepolicy::Table::new(table.domains().clone(), table.targets().clone());
+    for d in table.domains() {
+        for t in table.targets() {
+            for (class, perms) in atl_sepolicy::CLASSES {
+                for p in *perms {
+                    open.grant(d, t, class, p);
+                }
+            }
+        }
+    }
+    open
 }
 
 const FIXTURE: &str = "xtask-harness/testdata/keystore";
@@ -88,9 +109,42 @@ const PERMISSION_DENIED: i32 = 6;
 /// android.hardware.security.keymint.SecurityLevel.SOFTWARE (SecurityLevel.aidl).
 const SOFTWARE: i32 = 0;
 
+/// The probe's lookups of the KeyMint HAL's name (checkService, getService, isDeclared): each asks servicemanager's canFind once, so each denial writes one avc line.
+const HAL_LOOKUPS: u64 = 3;
+/// The KeyMint HAL's service_contexts type (`private/service_contexts` `android.hardware.security.keymint.IKeyMintDevice/default`).
+const HAL_TYPE: &str = "hal_keymint_service";
+
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 7] {
+fn checks() -> [(&'static str, String); 13] {
     [
+        // servicemanager decides from the compiled pinned policy (Access over libselinux, atl-selinux's table): untrusted_app may not find hal_keymint_service (private/app_neverallows.te:254,
+        // public/service.te:336: no allow), so checkService / getService answer null (ServiceManager.cpp tryGetService) and isDeclared fails EX_SECURITY (ServiceManager.cpp:716-733)
+        (
+            "an app's checkService of the KeyMint HAL: null",
+            "AtlKeystore: hal-check null".to_owned(),
+        ),
+        (
+            "an app's getService of the KeyMint HAL: null",
+            "AtlKeystore: hal-get null".to_owned(),
+        ),
+        (
+            "an app's isDeclared of the KeyMint HAL: SecurityException",
+            "AtlKeystore: hal-declared threw java.lang.SecurityException".to_owned(),
+        ),
+        // untrusted_app_all.te:99 (find app_api_service: activity_service), technical_debt.cil hal_graphics_allocator_client (find hal_graphics_allocator_service)
+        (
+            "an app's checkService(activity): a binder",
+            "AtlKeystore: activity binder".to_owned(),
+        ),
+        (
+            "an app's checkService of the allocator HAL: a binder",
+            "AtlKeystore: allocator binder".to_owned(),
+        ),
+        // untrusted_app_all.te:88 (list servicemanager): listServices is not filtered by find
+        (
+            "an app's listServices names the KeyMint HAL",
+            "AtlKeystore: list-has-hal true".to_owned(),
+        ),
         // service.rs get_key_descriptor_for_lookup: GetInfo on wifi_key denied (app.te:164 grants untrusted_app only keystore:keystore2_key), then KeystorePerm::List denied
         // (untrusted_app has no keystore2 grant) -> error.rs:240 PERMISSION_DENIED; the generate check after it shows keystore2 still serves
         (
@@ -136,6 +190,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     .with_gralloc(root)?
     .with_gl_driver(root)?;
     let work = rt.out.join("keystore");
+    std::fs::create_dir_all(&work).with_context(|| work.display().to_string())?;
+    let rt = if args.break_allow_all {
+        let built = rt.out.join("gen/sepolicy/service_access");
+        let text = std::fs::read_to_string(&built).with_context(|| built.display().to_string())?;
+        let open = work.join("service_access.allow-all");
+        std::fs::write(
+            &open,
+            allow_all(&atl_sepolicy::Table::parse(&text)?)
+                .to_text("keystore gate --break-allow-all: every permission granted"),
+        )?;
+        println!("keystore: --break-allow-all: the image's service access table grants everything");
+        rt.with_service_access(open)
+    } else {
+        rt
+    };
     // the gate's own data root, kept across its three runs (keystore2's database: the restart check) and made fresh at each gate start
     let data_root = work.join("data-root");
     if data_root.exists() {
@@ -186,6 +255,25 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             failed.push(what.to_owned());
         }
     }
+    // libselinux's avc line per denial (avc.c avc_audit), through servicemanager's SELINUX_CB_LOG into its kernel log (atld kernel_log_to_log); atl-diag counts them as `denied`
+    let sm_log = read(&run.log("servicemanager"));
+    let denials = atl_diag::summary::totals(&atl_diag::summary::events(&sm_log))
+        .into_iter()
+        .find(|c| c.outcome == atl_diag::DENIED && c.api == format!("find {HAL_TYPE}"))
+        .map_or(0, |c| c.count);
+    let ok = denials == HAL_LOOKUPS;
+    println!(
+        "keystore: {} servicemanager's log: one avc denial of find {HAL_TYPE} per probe lookup, counted by atl-diag ({denials} of {HAL_LOOKUPS})",
+        if ok { "pass" } else { "FAIL" }
+    );
+    let avc_lines: Vec<String> = sm_log
+        .lines()
+        .filter(|l| l.contains("avc:"))
+        .map(|l| format!("servicemanager: {l}"))
+        .collect();
+    if !ok {
+        failed.push(format!("avc denials of find {HAL_TYPE}"));
+    }
     if let Err(e) = &ended {
         println!("keystore: FAIL atld's end: {e:#}");
         failed.push("atld's end".to_owned());
@@ -198,7 +286,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(l) = ks_log.lines().find(|l| l.contains("calling_sid")) {
         lines.push(format!("keystore2: {l}"));
     }
-    let mut count = checks().len();
+    lines.extend(avc_lines);
+    let mut count = checks().len() + 1;
     // the app stage: AesActivity in an app process (the launcher's zygote-child start installs the provider), two atld runs on one data root
     for n in [1, 2] {
         if n == 2 && args.break_wipe {

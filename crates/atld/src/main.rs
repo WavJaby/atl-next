@@ -2290,16 +2290,18 @@ fn run(a: &Args) -> Result<ExitCode> {
             binder_pids: BinderPids::Host,
             // system_server's: atl-system-services and the probes doing system_server's work (ABI choice, WebView provider); a HAL or daemon sets its own domain, as it sets its uid
             context: atl_sepolicy::domains::SYSTEM_SERVER.to_owned(),
-            // the VINTF manifests are servicemanager's alone to read; the others reach HALs through it
+            // the VINTF manifests and every partition's service_contexts (libselinux android.c: /system, /system_ext, /product, /vendor) are servicemanager's alone to read; the others
+            // reach HALs and services through it
             mounts: shared_ro
                 .iter()
                 .cloned()
                 .chain(if cm {
-                    [("system", r.system()), ("vendor", r.vendor())]
+                    [(SYSTEM, r.system()), (VENDOR, r.vendor())]
                         .into_iter()
+                        .chain(r.package_partitions().map(|(host, at)| (at, host)))
                         .map(|(at, host)| Mount {
                             host,
-                            at: PathBuf::from("/").join(at),
+                            at: PathBuf::from(at),
                             writable: false,
                         })
                         .collect::<Vec<Mount>>()

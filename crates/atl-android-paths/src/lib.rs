@@ -25,6 +25,9 @@ pub const SEAPP_CONTEXTS: &str = "/system/etc/selinux/plat_seapp_contexts";
 pub const PLAT_SERVICE_CONTEXTS: &str = "/system/etc/selinux/plat_service_contexts";
 pub const SYSTEM_EXT_SERVICE_CONTEXTS: &str = "/system_ext/etc/selinux/system_ext_service_contexts";
 pub const SERVICE_ACCESS: &str = "/system/etc/selinux/service_access";
+/// The process's own SELinux context (`u:r:<domain>:<level>`), read-only, where a device's kernel answers `/proc/self/attr/current` (the host's procattr holds its own LSM's label, AppArmor on
+/// Debian): the broker places it in every sandbox it starts; atl-selinux's getcon reads it.
+pub const SELINUX_CONTEXT: &str = "/dev/atl/selinux_context";
 
 /// Guest native libraries of native-bridge ISA `isa` at guest pointer width `pointer_bits`: Soong installs a `native_bridge_supported` module's bridge variant under
 /// `lib<bits>/<NativeBridgeRelativePath>` by the module's own width (`lib` for 32-bit, `lib64` for 64-bit), whatever the host's: the guest linker's default search path.

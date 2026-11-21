@@ -38,7 +38,7 @@ func (g *Graph) providedCrate(n *Node) *ProvidedCrate {
 	return g.providedOn(n.side)[n.mod.Name].Crate
 }
 
-// Partial is a providers.toml row with `srcs`: the module is built from the tree without those sources, and links the provider's artifact (nil for `none`) first, as a provided shared library, for the symbols they defined.
+// Partial is a providers.toml row with `srcs`: the module is built from the tree without those sources, and links the provider's artifact (nil for `none`) for the symbols they defined: an archive (a crate's) whole, so the module defines them; a shared library first.
 type Partial struct {
 	Srcs     []string  `json:"srcs"` // relative to the module's directory, as its Android.bp writes them
 	Provider *Provided `json:"provider"`

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step `seam`: a static scan of libbinder's sources (patches/aosp/frameworks/native 0003) -- every driver call goes through `BinderDriver.h`. Text only; the runtime side is `xtask test binder` (binder.rs).
+//! `xtask check` step `seam`: a static scan of libbinder's sources (patches/aosp/frameworks/native 0002) -- every driver call goes through `BinderDriver.h`. Text only; the runtime side is `xtask test binder` (binder.rs).
 
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
 
-/// libbinder's files holding the driver I/O (patches/aosp/frameworks/native 0003), relative to `src/`.
+/// libbinder's files holding the driver I/O (patches/aosp/frameworks/native 0002), relative to `src/`.
 const SEAM_FILES: &[&str] = &[
     "aosp/frameworks/native/libs/binder/ProcessState.cpp",
     "aosp/frameworks/native/libs/binder/IPCThreadState.cpp",

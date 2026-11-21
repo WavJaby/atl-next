@@ -1022,6 +1022,7 @@ impl Broker {
             info_w.as_raw_fd(),
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
+        let context = context_file(&mut bwrap_args, &mut grants, &spawn.context)?;
         // the web-process channel: the app's end, and /.flatpak-info (empty, from a memfd) spliced before bwrap's `--`
         let channel = match &self.webspawn {
             Some(_) => {
@@ -1048,7 +1049,7 @@ impl Broker {
         let mut env = app_env::forwarded(|k| std::env::var_os(k));
         env.extend(spawn.env);
         env.push((CONTROL_ENV.into(), theirs.as_raw_fd().to_string().into()));
-        let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into()];
+        let mut inherit: Vec<OwnedFd> = vec![theirs, info_w.into(), context];
         inherit.extend(seccomp);
         let mut broker_end = None;
         if let Some((ours, app_end, info)) = channel {
@@ -1270,7 +1271,7 @@ impl Broker {
         complete_mounts(&mut spawn)?;
         let (info_r, info_w) = io::pipe()?;
         let seccomp = seccomp_memfd(Profile::Installer)?;
-        let (bwrap_args, grants) = bwrap_args(
+        let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::Installer,
             &host_root()?,
@@ -1278,6 +1279,7 @@ impl Broker {
             info_w.as_raw_fd(),
             Some(seccomp.as_raw_fd()),
         );
+        let context = context_file(&mut bwrap_args, &mut grants, &spawn.context)?;
         // no rights: TCP is left handled (refused) by the stub, and the namespace has no network anyway
         let mut args = stub_args(&grants, false, &spawn.program);
         args.extend(spawn.args.iter().cloned());
@@ -1296,7 +1298,7 @@ impl Broker {
                 stderr: spawn.stderr,
             },
             info_r,
-            vec![info_w.into(), seccomp],
+            vec![info_w.into(), seccomp, context],
         )?;
         Ok(Process {
             child,
@@ -1320,7 +1322,7 @@ impl Broker {
         let (info_r, info_w) = io::pipe()?;
         let (block_r, mut block_w) = io::pipe()?;
         let seccomp = seccomp_memfd(Profile::Adb)?;
-        let (mut bwrap_args, grants) = bwrap_args(
+        let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::Adb,
             &host_root()?,
@@ -1328,6 +1330,7 @@ impl Broker {
             info_w.as_raw_fd(),
             Some(seccomp.as_raw_fd()),
         );
+        let context = context_file(&mut bwrap_args, &mut grants, &spawn.context)?;
         let mut block = bwrap::Args::new();
         block.userns_block_fd(block_r.as_raw_fd());
         bwrap_args.splice(0..0, block.options());
@@ -1344,7 +1347,7 @@ impl Broker {
                 stderr: spawn.stderr,
             },
             info_r,
-            vec![info_w.into(), block_r.into(), seccomp],
+            vec![info_w.into(), block_r.into(), seccomp, context],
         )?;
         if let Err(e) = adb::write_maps(process.host_pid, maps) {
             let _ = kill_sandbox(process.host_pid);
@@ -1490,6 +1493,24 @@ fn flatpak_info(
     let at = bwrap_args.len() - 1;
     bwrap_args.splice(at..at, data.options());
     Ok(info)
+}
+
+/// The sandbox's SELinux context file (`atl_android_paths::SELINUX_CONTEXT`, read by atl-selinux's getcon): `context` in a memfd, rewound, bound read-only by `--ro-bind-data` spliced before
+/// bwrap's `--`, its grant added. Every Android process the broker starts gets one, as every process on a device has a context.
+fn context_file(
+    bwrap_args: &mut Vec<OsString>,
+    grants: &mut Vec<(Access, PathBuf)>,
+    context: &str,
+) -> io::Result<OwnedFd> {
+    let mut file = File::from(memfd_create("atl-selinux-context", MemfdFlags::CLOEXEC)?);
+    writeln!(file, "{context}")?;
+    file.rewind()?;
+    let mut data = bwrap::Args::new();
+    data.ro_bind_data(file.as_raw_fd(), atl_android_paths::SELINUX_CONTEXT);
+    grants.extend(data.grants().iter().cloned());
+    let at = bwrap_args.len() - 1;
+    bwrap_args.splice(at..at, data.options());
+    Ok(file.into())
 }
 
 /// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`.

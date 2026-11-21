@@ -116,9 +116,42 @@ public final class Probe {
         }
     }
 
+    private static String present(Object binder) {
+        return binder == null ? "null" : "binder";
+    }
+
+    /**
+     * What servicemanager decides for an app (its Access over libselinux, the compiled pinned policy): the KeyMint HAL is not findable (checkService and getService null, isDeclared a
+     * SecurityException: Java's ServiceManager.isDeclared swallows it, so the raw IServiceManager is asked), app-facing services are, and listServices names everything.
+     */
+    private static void serviceAccess() throws Exception {
+        Class<?> sm = Class.forName("android.os.ServiceManager");
+        Method check = sm.getMethod("checkService", String.class);
+        String hal = KM + "IKeyMintDevice/default";
+        line("hal-check " + present(check.invoke(null, hal)));
+        line("hal-get " + present(sm.getMethod("getService", String.class).invoke(null, hal)));
+        Method raw = sm.getDeclaredMethod("getIServiceManager");
+        raw.setAccessible(true);
+        Object ism = raw.invoke(null);
+        try {
+            line("hal-declared " + ism.getClass().getMethod("isDeclared", String.class).invoke(ism, hal));
+        } catch (Throwable t) {
+            line("hal-declared threw " + cause(t).getClass().getName());
+        }
+        line("activity " + present(check.invoke(null, "activity")));
+        line("allocator " + present(check.invoke(null, "android.hardware.graphics.allocator.IAllocator/default")));
+        String[] all = (String[]) sm.getMethod("listServices").invoke(null);
+        line("list-has-hal " + (all != null && java.util.Arrays.asList(all).contains(hal)));
+    }
+
     public static void main(String[] args) {
         line("start uid " + android.os.Process.myUid());
         line("keystore-dir " + (new File("/data/misc/keystore").exists() ? "visible" : "absent"));
+        try {
+            serviceAccess();
+        } catch (Throwable t) {
+            line("service-access failed " + t);
+        }
         try {
             IBinder b = (IBinder) Class.forName("android.os.ServiceManager").getMethod("checkService", String.class).invoke(null, KEYSTORE);
             line("keystore " + (b == null ? "missing" : "found"));
