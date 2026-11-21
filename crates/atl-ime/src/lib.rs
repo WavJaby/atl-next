@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The app process's in-app input method (IME plan route R1): IMMS-lite binds the Rust `IInputMethod` this crate serves (`new_binder`, handed out by the app's UI agent), and its session drives
 //! the focused field's `InputConnection` from the desktop's input method (`atl-platform-ui` TextInput, `attach`).
-//! Modules: `method` (the binder servers, binder threads), `field` (display thread: TextInput events -> IRemoteInputConnection), [`content`] (EditorInfo -> purpose/hints), [`units`] (index units).
+//! Modules: `method` (the binder servers, binder threads), `field` (display thread: TextInput events -> IRemoteInputConnection), [`editor_text`] (the field's copy of the editor's text, which
+//! answers the toolkit's surrounding), [`content`] (EditorInfo -> purpose/hints), [`units`] (index units).
 #![forbid(unsafe_code)]
 
 // the converter's rlibs, on the crate search path build.rs sets (no cargo dependency names them)
@@ -11,6 +12,7 @@ extern crate atl_parcelables;
 extern crate binder;
 
 pub mod content;
+pub mod editor_text;
 pub mod units;
 
 #[cfg(feature = "converter")]

@@ -21,7 +21,7 @@ pub struct GtkTextInput {
     context: gtk4::IMMulticontext,
     /// For the content's scale: the cursor rect arrives in physical pixels, GTK wants the widget's logical ones.
     view: SceneView,
-    /// The last surrounding set; GTK asks for it again (`retrieve-surrounding`) whenever its IM module wants it.
+    /// The last surrounding set; GTK asks for it again (`retrieve-surrounding`) whenever its IM module wants it, e.g. inside a commit's `done` right after the commit handler (which may set it).
     surrounding: Rc<RefCell<Surrounding>>,
     on_event: Rc<Slot<dyn FnMut(TextInputEvent)>>,
 }

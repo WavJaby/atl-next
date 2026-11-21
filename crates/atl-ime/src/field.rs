@@ -5,8 +5,10 @@
 //! Mapping (IME study §7): preedit -> setComposingText(text, 1); preedit end / empty preedit -> setComposingText("", 1) (the composing text goes, a following commit replaces nothing);
 //! commit -> commitText(text, 1) (replaces the composing region, cursor after it); delete-surrounding -> deleteSurroundingTextInCodePoints (units.rs). newCursorPosition 1 = cursor right after the
 //! inserted text (InputConnection.setComposingText docs).
-//! Surrounding text (plan step 6): on start and on each updateSelection, getSurroundingText with a pending AndroidFuture; its completion (binder thread) comes back here and goes to
-//! TextInput.set_surrounding. Never a local copy of the editor's text: a mirror built from EditorInfo + own edits goes wrong as soon as keys or the app edit the field.
+//! Surrounding text: the field's [`EditorText`] copy answers the toolkit synchronously (editor_text.rs: GTK reads it inside the same `done` that delivered the edit, before any editor answer
+//! could arrive over the outbox). Each edit is applied to the copy before it is sent; EditorInfo's initial surrounding text and each getSurroundingText answer (asked for on every updateSelection)
+//! replace it. An answer to a request older than the last edit is stale and dropped; an adopted answer that disagrees with a predicted copy is a divergence, logged and counted
+//! (`atl-ime: editor text diverged n=`), an agreeing one `confirmed n=`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,10 +21,11 @@ use atl_parcelables::com::android::internal::infra::AndroidFuture;
 use atl_parcelables::com::android::internal::inputmethod::InputConnectionCommandHeader;
 use atl_parcelables::java::lang::CharSequence;
 use atl_platform_ui::{
-    DisplayInvoker, LooperPoster, PlatformWindow, Surrounding, TextInput, TextInputEvent, Window,
+    DisplayInvoker, LooperPoster, PlatformWindow, TextInput, TextInputEvent, Window,
 };
 use binder::Strong;
 
+use crate::editor_text::EditorText;
 use crate::units;
 
 /// The editor's connection and the session id its calls carry (0 for a new connection, the invalidateInput id after one: RemoteInputConnectionImpl.java:496).
@@ -36,6 +39,12 @@ pub(crate) struct Field {
     /// Where every call on `connection` is sent from, and where it is released: an attached thread, in post order (display-thread rule B1: an in-process Java editor runs a call, and its
     /// JavaBBinder's destructor, on the caller's thread, which needs a JNIEnv the display thread never has).
     outbox: Arc<dyn LooperPoster>,
+    /// The copy of the editor's text; `None` until the editor first reports it (a password field's EditorInfo carries none).
+    text: Option<EditorText>,
+    /// Edits sent so far: a getSurroundingText answer is current only when no edit was sent after its request.
+    edits: u64,
+    /// The copy holds edits the editor has not reported back yet.
+    predicted: bool,
 }
 
 impl Field {
@@ -52,6 +61,9 @@ impl Field {
             input_type,
             invoker,
             outbox,
+            text: None,
+            edits: 0,
+            predicted: false,
         }
     }
 }
@@ -97,6 +109,9 @@ const SURROUNDING_UNITS: i32 = 600;
 struct State {
     window: Option<Rc<PlatformWindow>>,
     field: Option<Field>,
+    /// Adopted answers that agreed with a predicted copy / disagreed with it, over the process's life.
+    confirmed: u64,
+    diverged: u64,
 }
 
 thread_local! {
@@ -109,29 +124,67 @@ pub fn attach(window: Rc<PlatformWindow>) {
     STATE.with_borrow_mut(|s| s.window = Some(window));
 }
 
-/// A field gained input (IInputMethod.startInput, IInputMethodSession.invalidateInput): the desktop input method starts composing for it.
-pub(crate) fn start(field: Field) {
+/// The copy, in the toolkit's units, as the TextInput's surrounding: what GTK's next retrieve-surrounding reads.
+fn show(window: Option<&Rc<PlatformWindow>>, text: Option<&EditorText>) {
+    let (Some(window), Some(text)) = (window, text) else {
+        return;
+    };
+    match text.surrounding() {
+        Some(s) => window.text_input().set_surrounding(&s),
+        None => tracing::warn!("atl-ime: editor text has no UTF-8 form: {}", text.shape()),
+    }
+}
+
+/// A field gained input (IInputMethod.startInput, IInputMethodSession.invalidateInput): the copy starts from EditorInfo's initial surrounding text (TextView.onCreateInputConnection
+/// setInitialSurroundingText), shown before the focus so the desktop input method's first read has it; without one the editor is asked.
+pub(crate) fn start(mut field: Field, initial: Option<SurroundingText>) {
+    field.text = initial.and_then(|t| report(&t, None));
+    let ask = field.text.is_none();
     STATE.with_borrow_mut(|s| {
         let (purpose, hints) = crate::content::content(field.input_type);
         tracing::info!(
-            "atl-ime: start input_type=0x{:x} session={} purpose={purpose:?}",
+            "atl-ime: start input_type=0x{:x} session={} purpose={purpose:?} initial text {}",
             field.input_type,
-            field.session_id
+            field.session_id,
+            field.text.as_ref().map_or("none".to_owned(), EditorText::shape)
         );
         s.field = Some(field);
         if let Some(window) = &s.window {
             let input = window.text_input();
             input.set_content(purpose, hints);
+            show(s.window.as_ref(), s.field.as_ref().and_then(|f| f.text.as_ref()));
             input.focus_in();
         }
     });
     // outside the mutable borrow: the in-process editor may answer (and reach `surrounding`) before the call returns
-    selection_changed();
+    if ask {
+        selection_changed(None);
+    }
+}
+
+/// `text` as a copy; `None` (logged) when its selection does not fit it.
+fn report(text: &SurroundingText, composing: Option<(i32, i32)>) -> Option<EditorText> {
+    let content = text.text.as_deref().unwrap_or_default();
+    EditorText::from_report(
+        content,
+        text.selection_start,
+        text.selection_end,
+        text.offset,
+        composing,
+    )
+    .inspect_err(|e| tracing::warn!("atl-ime: editor text report unusable: {e:?}"))
+    .ok()
 }
 
 /// Asks the editor for the text around its selection (IRemoteInputConnection.getSurroundingText, oneway): the answer completes a pending AndroidFuture on a binder thread, and nothing waits for it.
-fn request_surrounding(field: &Field) {
-    let future = crate::method::surrounding_future(Arc::clone(&field.invoker), field.session_id);
+/// The future carries the edit count at the request and `composing` (the reporting updateSelection's candidates), which the answer's SurroundingText lacks.
+fn request_surrounding(field: &Field, composing: Option<(i32, i32)>) {
+    let future = crate::method::surrounding_future(
+        Arc::clone(&field.invoker),
+        field.session_id,
+        field.edits,
+        composing,
+    );
     send(field, "getSurroundingText".to_owned(), move |c, header| {
         let future = AndroidFuture::new(FutureState::Pending(Some(future)));
         c.r#getSurroundingText(
@@ -144,48 +197,65 @@ fn request_surrounding(field: &Field) {
     });
 }
 
-/// The editor's selection moved (IInputMethodSession.updateSelection): its surrounding text is asked for again. No copy of the editor's text is kept here; the editor is the only one.
-pub(crate) fn selection_changed() {
+/// The editor's selection or composing span changed (IInputMethodSession.updateSelection; `composing` = its candidates, absolute): its text is asked for again, to confirm or correct the copy.
+pub(crate) fn selection_changed(composing: Option<(i32, i32)>) {
     STATE.with_borrow(|s| {
         if let Some(field) = &s.field {
-            request_surrounding(field);
+            request_surrounding(field, composing);
         }
     });
 }
 
-/// The editor's answer for session `session_id`: the window's TextInput gets it in the toolkit's units. An answer for an older session (the field restarted meanwhile) is dropped.
-pub(crate) fn surrounding(session_id: i32, text: SurroundingText) {
-    STATE.with_borrow(|s| {
-        let (Some(field), Some(window)) = (&s.field, &s.window) else {
+/// The editor's answer for session `session_id`, asked for after `edits` edits: it replaces the copy unless an edit was sent since (the editor answered before it had that edit: stale, and the
+/// edit's own updateSelection asks again). An answer for an older session (the field restarted meanwhile) is dropped.
+pub(crate) fn surrounding(
+    session_id: i32,
+    edits: u64,
+    composing: Option<(i32, i32)>,
+    text: SurroundingText,
+) {
+    STATE.with_borrow_mut(|s| {
+        let State {
+            window,
+            field,
+            confirmed,
+            diverged,
+        } = s;
+        let Some(field) = field.as_mut() else {
             return;
         };
         if field.session_id != session_id {
             return;
         }
-        let content = text.text.unwrap_or_default();
-        let index = |i: i32| usize::try_from(i).ok();
-        let bytes = index(text.selection_start)
-            .zip(index(text.selection_end))
-            .map(|(start, end)| units::selection_to_bytes(&content, start, end));
-        match bytes {
-            Some(Ok((cursor_byte, anchor_byte))) => {
-                tracing::info!(
-                    "atl-ime: surrounding {} bytes cursor {cursor_byte} anchor {anchor_byte}",
-                    content.len()
-                );
-                window.text_input().set_surrounding(&Surrounding {
-                    text: content,
-                    cursor_byte,
-                    anchor_byte,
-                });
-            }
-            other => tracing::warn!(
-                "atl-ime: surrounding selection {}..{} unusable in {} units: {other:?}",
-                text.selection_start,
-                text.selection_end,
-                content.encode_utf16().count()
-            ),
+        if field.edits != edits {
+            tracing::debug!(
+                "atl-ime: editor text stale: asked after {edits} edits, {} sent",
+                field.edits
+            );
+            return;
         }
+        let Some(new) = report(&text, composing) else {
+            return;
+        };
+        match (&field.text, field.predicted) {
+            (Some(copy), true) if copy.agrees(&new) => {
+                *confirmed += 1;
+                tracing::info!("atl-ime: editor text confirmed n={confirmed}: {}", new.shape());
+            }
+            (Some(copy), true) => {
+                *diverged += 1;
+                tracing::warn!(
+                    "atl-ime: editor text diverged n={diverged}: copy {} editor {}",
+                    copy.shape(),
+                    new.shape()
+                );
+            }
+            // the copy came from the editor: a difference is the editor's own change
+            _ => tracing::info!("atl-ime: editor text {}", new.shape()),
+        }
+        field.text = Some(new);
+        field.predicted = false;
+        show(window.as_ref(), field.text.as_ref());
     });
 }
 
@@ -201,36 +271,60 @@ pub(crate) fn finish() {
     });
 }
 
+/// One edit: applied to the copy and shown (GTK reads it before this signal's `done` ends), then sent.
 fn on_event(event: TextInputEvent) {
-    STATE.with_borrow(|s| {
-        let Some(field) = &s.field else {
+    STATE.with_borrow_mut(|s| {
+        let State { window, field, .. } = s;
+        let Some(field) = field.as_mut() else {
             tracing::debug!("atl-ime: {event:?} with no field");
             return;
         };
         let what = format!("{event:?}");
-        match event {
-            TextInputEvent::Preedit { text, .. } => send(field, what, move |c, h| {
-                c.r#setComposingText(Some(h), Some(&CharSequence::new(text.as_str())), 1)
-            }),
-            TextInputEvent::PreeditEnd => send(field, what, |c, h| {
-                c.r#setComposingText(Some(h), Some(&CharSequence::new("")), 1)
-            }),
-            TextInputEvent::Commit(text) => send(field, what, move |c, h| {
-                c.r#commitText(Some(h), Some(&CharSequence::new(text.as_str())), 1)
-            }),
+        let edit = match event {
+            TextInputEvent::Preedit { text, .. } => Edit::Compose(text),
+            TextInputEvent::PreeditEnd => Edit::Compose(String::new()),
+            TextInputEvent::Commit(text) => Edit::Commit(text),
             TextInputEvent::DeleteSurrounding {
                 offset_chars,
                 n_chars,
             } => match units::delete_to_code_points(offset_chars, n_chars) {
-                Some((before, after)) => send(field, what, move |c, h| {
-                    c.r#deleteSurroundingTextInCodePoints(
-                        Some(h),
-                        i32::try_from(before).unwrap_or(i32::MAX),
-                        i32::try_from(after).unwrap_or(i32::MAX),
-                    )
-                }),
-                None => tracing::warn!("atl-ime: delete-surrounding off the cursor: {what}"),
+                Some((before, after)) => Edit::Delete(before, after),
+                None => {
+                    tracing::warn!("atl-ime: delete-surrounding off the cursor: {what}");
+                    return;
+                }
             },
+        };
+        if let Some(text) = field.text.as_mut() {
+            match &edit {
+                Edit::Compose(new) => text.replace(new, true),
+                Edit::Commit(new) => text.replace(new, false),
+                Edit::Delete(before, after) => text.delete_code_points(*before, *after),
+            }
+            field.predicted = true;
         }
+        field.edits += 1;
+        show(window.as_ref(), field.text.as_ref());
+        send(field, what, move |c, h| match edit {
+            Edit::Compose(new) => {
+                c.r#setComposingText(Some(h), Some(&CharSequence::new(new.as_str())), 1)
+            }
+            Edit::Commit(new) => c.r#commitText(Some(h), Some(&CharSequence::new(new.as_str())), 1),
+            Edit::Delete(before, after) => c.r#deleteSurroundingTextInCodePoints(
+                Some(h),
+                i32::try_from(before).unwrap_or(i32::MAX),
+                i32::try_from(after).unwrap_or(i32::MAX),
+            ),
+        });
     });
+}
+
+/// A TextInput event as the InputConnection edit it becomes.
+enum Edit {
+    /// setComposingText(text, 1); "" ends composing.
+    Compose(String),
+    /// commitText(text, 1).
+    Commit(String),
+    /// deleteSurroundingTextInCodePoints(before, after).
+    Delete(u32, u32),
 }

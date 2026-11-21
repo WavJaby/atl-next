@@ -3,8 +3,8 @@
 //! window has closed, Main's EditText holds the focus and the in-app input method (atl-ime) has started input for it, so the desktop input method is activated. The fake IME then sends a
 //! preedit, a commit and a delete-surrounding; the fixture logs each edit (`text input=<text> composing=<start>,<end>`, its TextWatcher).
 //! Sub-gates: activate (the IME was activated), preedit (the text holds the preedit as a composing span), commit (the commit replaced it, no composing span left), surrounding (after the commit the IME
-//! holds the editor's text with the cursor at its end, in text-input v3 bytes: the getSurroundingText path, IME plan step 6), delete (the last char of the commit is gone: GTK turns the IME's byte
-//! count into chars against that surrounding).
+//! holds the editor's text with the cursor at its end, in text-input v3 bytes: GTK reads it inside the commit's `done`, from the display thread's copy of the editor's text), delete (the last char of
+//! the commit is gone: GTK turns the IME's byte count into chars against that surrounding), copy (the editor's getSurroundingText answers confirm that copy, none diverges).
 //! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail. `--break-ime-delete` sends the delete's byte count as after_length (after the cursor, where nothing is): the delete
 //! sub-gate must fail.
 //! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
@@ -314,7 +314,23 @@ pub fn checks(
         ("relaunch", relaunch_check(services)),
         // the relaunch reports too; judge the process the stage drove, as the composer sub-checks do
         ("outbox", outbox_check(first_process(app))),
+        ("copy", copy_check(first_process(app))),
     ]
+}
+
+/// The input method's lines when an editor answer meets a copy holding its own edits (atl-ime field.rs `surrounding`).
+const COPY_CONFIRMED: &str = "atl-ime: editor text confirmed n=";
+const COPY_DIVERGED: &str = "atl-ime: editor text diverged n=";
+
+/// The display thread answers GTK from its copy of the editor's text, which applies each edit before the editor does (atl-ime editor_text.rs): the editor's later answers must agree with it.
+/// Want >= 1 confirmed (the comparison ran: the preedit's and the commit's answers) and 0 diverged.
+fn copy_check(app: &str) -> Result<String, String> {
+    let count = |marker: &str| app.lines().filter(|l| l.contains(marker)).count();
+    match (count(COPY_CONFIRMED), count(COPY_DIVERGED)) {
+        (0, d) => Err(format!("no `{}` line ({d} diverged)", COPY_CONFIRMED.trim_end_matches(" n="))),
+        (c, 0) => Ok(format!("{c} editor answers confirmed the copy, 0 diverged")),
+        (c, d) => Err(format!("{d} editor answers diverged from the copy ({c} confirmed)")),
+    }
 }
 
 /// The composer's line for each Task report it sent, then `<code> thread=<name>` (atl-composer task_reports.rs `send`).
@@ -438,6 +454,17 @@ mod outbox_tests {
         // an input method send made on the display thread, or none at all
         assert!(outbox_check(&format!("{good}INFO atl-ime: sent Commit(\"x\") thread=atl-display\n")).is_err());
         assert!(outbox_check(good).is_err());
+    }
+
+    /// field.rs `surrounding`'s line shapes: confirmed lines alone pass; any diverged line, or no confirmed line (the comparison never ran), fails.
+    #[test]
+    fn the_copy_must_be_confirmed_and_never_diverge() {
+        let ok = "INFO atl-ime: editor text confirmed n=1: 17 units at 0 selection 17..17 composing Some((15, 17))\n";
+        let bad = "WARN atl-ime: editor text diverged n=1: copy 17 units at 0 ... editor 15 units at 0 ...\n";
+        assert!(copy_check(ok).is_ok());
+        assert!(copy_check(&format!("{ok}{bad}")).is_err());
+        assert!(copy_check(bad).is_err());
+        assert!(copy_check("INFO atl-ime: editor text 15 units at 0 selection 15..15 composing None\n").is_err());
     }
 
     /// The run goes on through the relaunch, whose reports also land in the app log: the gate counts the first process's part only, so a red there stays red and the relaunch's lines are not counted.

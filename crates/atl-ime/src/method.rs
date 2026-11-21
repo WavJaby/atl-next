@@ -48,18 +48,23 @@ fn start_field(
         return;
     };
     let input_type = editor.map_or(0, |e| e.input_type);
+    let initial = editor.and_then(|e| e.initial_surrounding_text.clone());
     let (for_field, outbox) = (Arc::clone(invoker), Arc::clone(outbox));
     invoker.invoke(Box::new(move || {
-        field::start(Field::new(
-            connection, session_id, input_type, for_field, outbox,
-        ))
+        field::start(
+            Field::new(connection, session_id, input_type, for_field, outbox),
+            initial,
+        )
     }));
 }
 
-/// The pending side of a getSurroundingText AndroidFuture (AndroidFuture.writeToParcel's IAndroidFuture.Stub): the editor completes it with the done form; the value goes to the display thread.
+/// The pending side of a getSurroundingText AndroidFuture (AndroidFuture.writeToParcel's IAndroidFuture.Stub): the editor completes it with the done form; the value goes to the display thread,
+/// with what the request knew (field.rs `surrounding`).
 struct SurroundingFuture {
     invoker: Invoker,
     session_id: i32,
+    edits: u64,
+    composing: Option<(i32, i32)>,
 }
 
 impl Interface for SurroundingFuture {}
@@ -68,9 +73,11 @@ impl IAndroidFuture for SurroundingFuture {
     fn r#complete(&self, result: Option<&AndroidFuture>) -> binder::Result<()> {
         match result.map(|f| &f.state) {
             Some(FutureState::Done(FutureValue::SurroundingText(text))) => {
-                let (text, session_id) = (text.clone(), self.session_id);
-                self.invoker
-                    .invoke(Box::new(move || field::surrounding(session_id, text)));
+                let (text, session_id, edits, composing) =
+                    (text.clone(), self.session_id, self.edits, self.composing);
+                self.invoker.invoke(Box::new(move || {
+                    field::surrounding(session_id, edits, composing, text)
+                }));
             }
             // RemoteInputConnectionImpl completes with null when the connection is inactive or the editor returns none
             other => {
@@ -81,12 +88,19 @@ impl IAndroidFuture for SurroundingFuture {
     }
 }
 
-/// A new pending future for session `session_id`'s surrounding text, as the binder an AndroidFuture carries.
-pub(crate) fn surrounding_future(invoker: Invoker, session_id: i32) -> SpIBinder {
+/// A new pending future for session `session_id`'s surrounding text, asked for after `edits` edits with the reported `composing` span, as the binder an AndroidFuture carries.
+pub(crate) fn surrounding_future(
+    invoker: Invoker,
+    session_id: i32,
+    edits: u64,
+    composing: Option<(i32, i32)>,
+) -> SpIBinder {
     BnAndroidFuture::new_binder(
         SurroundingFuture {
             invoker,
             session_id,
+            edits,
+            composing,
         },
         BinderFeatures::default(),
     )
@@ -189,7 +203,8 @@ struct Session {
 impl Interface for Session {}
 
 impl IInputMethodSession for Session {
-    /// The editor's selection moved: the desktop input method's surrounding text is refreshed from the editor (field.rs).
+    /// The editor's selection or composing span changed (InputMethodManager.updateSelection sends only a change): the field's copy is checked against the editor's text (field.rs). Candidates
+    /// -1 = no composing span.
     fn r#updateSelection(
         &self,
         _old_start: i32,
@@ -202,7 +217,10 @@ impl IInputMethodSession for Session {
         tracing::debug!(
             "atl-ime: updateSelection {new_start}..{new_end} composing {candidates_start}..{candidates_end}"
         );
-        self.invoker.invoke(Box::new(field::selection_changed));
+        let composing = (candidates_start >= 0 && candidates_end >= 0)
+            .then_some((candidates_start, candidates_end));
+        self.invoker
+            .invoke(Box::new(move || field::selection_changed(composing)));
         Ok(())
     }
 
