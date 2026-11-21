@@ -129,7 +129,9 @@ impl EditorText {
         }
         let lo = self.offset.max(other.offset);
         let hi = (self.offset + self.text.len()).min(other.offset + other.text.len());
-        lo >= hi || self.text[lo - self.offset..hi - self.offset] == other.text[lo - other.offset..hi - other.offset]
+        lo >= hi
+            || self.text[lo - self.offset..hi - self.offset]
+                == other.text[lo - other.offset..hi - other.offset]
     }
 
     /// The window's length and the absolute selection, for log lines (never the text: a field may hold a password).
@@ -141,7 +143,8 @@ impl EditorText {
             self.offset,
             s + self.offset,
             e + self.offset,
-            self.composing.map(|(s, e)| (s + self.offset, e + self.offset))
+            self.composing
+                .map(|(s, e)| (s + self.offset, e + self.offset))
         )
     }
 }
@@ -280,12 +283,16 @@ mod tests {
         );
         // window "cd" at 2; composing 0..1 lies before it
         assert_eq!(
-            EditorText::from_report("cd", 0, 0, 2, Some((0, 1))).unwrap().composing,
+            EditorText::from_report("cd", 0, 0, 2, Some((0, 1)))
+                .unwrap()
+                .composing,
             None
         );
         assert_eq!(report("ab", 1, Some((-1, -1))).composing, None);
         assert_eq!(
-            EditorText::from_report("cd", 0, 0, 2, Some((3, 2))).unwrap().composing,
+            EditorText::from_report("cd", 0, 0, 2, Some((3, 2)))
+                .unwrap()
+                .composing,
             Some((0, 1))
         );
     }

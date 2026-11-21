@@ -17,8 +17,7 @@ use atl_libgui_parcel::state::FloatRect;
 use crate::audio::AudioError;
 use crate::webview::{CookiePolicy, WebSetting};
 use crate::{
-    LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale,
-    TextInputEvent, UiError,
+    LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent, UiError,
 };
 
 /// The module's file name, found by the dynamic loader's search path (the runtime library dir the process's `LD_LIBRARY_PATH` names, as for the GL driver).

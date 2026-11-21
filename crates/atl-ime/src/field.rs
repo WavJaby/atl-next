@@ -146,13 +146,19 @@ pub(crate) fn start(mut field: Field, initial: Option<SurroundingText>) {
             "atl-ime: start input_type=0x{:x} session={} purpose={purpose:?} initial text {}",
             field.input_type,
             field.session_id,
-            field.text.as_ref().map_or("none".to_owned(), EditorText::shape)
+            field
+                .text
+                .as_ref()
+                .map_or("none".to_owned(), EditorText::shape)
         );
         s.field = Some(field);
         if let Some(window) = &s.window {
             let input = window.text_input();
             input.set_content(purpose, hints);
-            show(s.window.as_ref(), s.field.as_ref().and_then(|f| f.text.as_ref()));
+            show(
+                s.window.as_ref(),
+                s.field.as_ref().and_then(|f| f.text.as_ref()),
+            );
             input.focus_in();
         }
     });
@@ -240,7 +246,10 @@ pub(crate) fn surrounding(
         match (&field.text, field.predicted) {
             (Some(copy), true) if copy.agrees(&new) => {
                 *confirmed += 1;
-                tracing::info!("atl-ime: editor text confirmed n={confirmed}: {}", new.shape());
+                tracing::info!(
+                    "atl-ime: editor text confirmed n={confirmed}: {}",
+                    new.shape()
+                );
             }
             (Some(copy), true) => {
                 *diverged += 1;

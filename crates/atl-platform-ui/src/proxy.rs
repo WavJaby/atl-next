@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use std::path::Path;
 
 use atl_platform_ui_api::abi::{
-    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, MonitorView,
-    PaintedView, PcmHandle, PosterAbi, QuadView, RequesterHandle, SceneView, SendCallback, Str,
+    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, MonitorView, PaintedView,
+    PcmHandle, PosterAbi, QuadView, RequesterHandle, SceneView, SendCallback, Str,
     StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
     WindowAttributesView, WindowHandle,
 };
@@ -16,9 +16,9 @@ use atl_platform_ui_api::audio::{
 };
 use atl_platform_ui_api::{
     Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, DisplayInvoker, FrameClock,
-    FrameRequester, FrameTick, InputEvent, InputSource, LooperPoster, Monitor, Painted,
-    PhysRect, PhysSize, PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput,
-    TextInputEvent, Ui, UiError, Window, WindowAttributes,
+    FrameRequester, FrameTick, InputEvent, InputSource, LooperPoster, Monitor, Painted, PhysRect,
+    PhysSize, PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput, TextInputEvent,
+    Ui, UiError, Window, WindowAttributes,
 };
 
 use crate::module::module;

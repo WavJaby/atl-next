@@ -90,7 +90,13 @@ impl Phases {
     }
 
     fn count(&self, (lo, hi): (f64, f64), open: bool) -> u64 {
-        let within = |t: f64| if open { t > lo && t < hi } else { t >= lo && t <= hi };
+        let within = |t: f64| {
+            if open {
+                t > lo && t < hi
+            } else {
+                t >= lo && t <= hi
+            }
+        };
         self.commits_ms.iter().filter(|t| within(**t)).count() as u64
     }
 
@@ -131,7 +137,11 @@ fn commits_check(phases: &Phases) -> Result<String, String> {
         phases.edge,
         phases.commits_ms.len()
     );
-    if inside >= want { Ok(summary) } else { Err(summary) }
+    if inside >= want {
+        Ok(summary)
+    } else {
+        Err(summary)
+    }
 }
 
 /// The producer posted at least once per window commit during the block, less [`SLACK`] (module docs).
@@ -143,7 +153,11 @@ fn posts_check(app: &str, phases: &Phases) -> Result<String, String> {
     let summary = format!(
         "{during} frames posted during the block (want >= {want}: {commits} window commits in it), longest gap {gap} ms"
     );
-    if during >= want { Ok(summary) } else { Err(summary) }
+    if during >= want {
+        Ok(summary)
+    } else {
+        Err(summary)
+    }
 }
 
 /// The sub-gates; `refresh_hz`: the run's display (the block's edges); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock): commits and posts are then not judged.
@@ -190,7 +204,10 @@ mod tests {
 
     /// Commits every `step_ms` from `from` to `to` ms (inclusive start, exclusive end).
     fn every(from: u64, to: u64, step_ms: u64) -> Vec<u64> {
-        (from..to).step_by(step_ms as usize).map(|t| t * MS).collect()
+        (from..to)
+            .step_by(step_ms as usize)
+            .map(|t| t * MS)
+            .collect()
     }
 
     fn phases(during: u64, commits: &[u64]) -> Phases {

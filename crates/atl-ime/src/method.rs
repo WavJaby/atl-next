@@ -245,7 +245,12 @@ impl IInputMethodSession for Session {
         connection: Option<&Strong<dyn IRemoteInputConnection>>,
         session_id: i32,
     ) -> binder::Result<()> {
-        start_field((&self.invoker, &self.outbox), connection, editor, session_id);
+        start_field(
+            (&self.invoker, &self.outbox),
+            connection,
+            editor,
+            session_id,
+        );
         Ok(())
     }
 

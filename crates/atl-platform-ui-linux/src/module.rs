@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use atl_platform_ui_api::abi::{
-    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, MonitorView,
-    PaintedView, PcmHandle, PosterAbi, RequesterHandle, SceneView, SendCallback, Status, Str,
+    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, MonitorView, PaintedView,
+    PcmHandle, PosterAbi, RequesterHandle, SceneView, SendCallback, Status, Str,
     StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
     WindowAttributesView, WindowHandle,
 };

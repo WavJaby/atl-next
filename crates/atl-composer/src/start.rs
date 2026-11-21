@@ -200,10 +200,7 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
             .ok_or_else(|| "ui window: already installed".to_owned())?;
         // the outbox first: the input method's connection calls are sent there (display-thread rule B1)
         let outbox: Arc<dyn LooperPoster> = Arc::new(Outbox::spawn(threads)?);
-        input_method = Some(atl_ime::new_binder(
-            Arc::new(invoker),
-            Arc::clone(&outbox),
-        ));
+        input_method = Some(atl_ime::new_binder(Arc::new(invoker), Arc::clone(&outbox)));
         let mailbox = Arc::new(Mailbox::default());
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))

@@ -327,9 +327,14 @@ const COPY_DIVERGED: &str = "atl-ime: editor text diverged n=";
 fn copy_check(app: &str) -> Result<String, String> {
     let count = |marker: &str| app.lines().filter(|l| l.contains(marker)).count();
     match (count(COPY_CONFIRMED), count(COPY_DIVERGED)) {
-        (0, d) => Err(format!("no `{}` line ({d} diverged)", COPY_CONFIRMED.trim_end_matches(" n="))),
+        (0, d) => Err(format!(
+            "no `{}` line ({d} diverged)",
+            COPY_CONFIRMED.trim_end_matches(" n=")
+        )),
         (c, 0) => Ok(format!("{c} editor answers confirmed the copy, 0 diverged")),
-        (c, d) => Err(format!("{d} editor answers diverged from the copy ({c} confirmed)")),
+        (c, d) => Err(format!(
+            "{d} editor answers diverged from the copy ({c} confirmed)"
+        )),
     }
 }
 
@@ -445,14 +450,22 @@ mod outbox_tests {
         let good = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=atl-outbox\n";
         assert_eq!(
             outbox_check(&format!("{good}{IME}")),
-            Ok("2 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox".to_owned())
+            Ok(
+                "2 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox"
+                    .to_owned()
+            )
         );
         let bad = format!("{good}{IME}INFO atl-composer: task reports: sent 1 thread=?\n");
         assert!(outbox_check(&bad).is_err());
         assert!(outbox_check(&format!("INFO atl-composer: task reports: sent 1\n{IME}")).is_err());
         assert!(outbox_check("").is_err());
         // an input method send made on the display thread, or none at all
-        assert!(outbox_check(&format!("{good}INFO atl-ime: sent Commit(\"x\") thread=atl-display\n")).is_err());
+        assert!(
+            outbox_check(&format!(
+                "{good}INFO atl-ime: sent Commit(\"x\") thread=atl-display\n"
+            ))
+            .is_err()
+        );
         assert!(outbox_check(good).is_err());
     }
 
@@ -464,18 +477,26 @@ mod outbox_tests {
         assert!(copy_check(ok).is_ok());
         assert!(copy_check(&format!("{ok}{bad}")).is_err());
         assert!(copy_check(bad).is_err());
-        assert!(copy_check("INFO atl-ime: editor text 15 units at 0 selection 15..15 composing None\n").is_err());
+        assert!(
+            copy_check("INFO atl-ime: editor text 15 units at 0 selection 15..15 composing None\n")
+                .is_err()
+        );
     }
 
     /// The run goes on through the relaunch, whose reports also land in the app log: the gate counts the first process's part only, so a red there stays red and the relaunch's lines are not counted.
     #[test]
     fn the_outbox_judges_the_first_process() {
-        let first = format!("INFO atl-composer: task reports: sent 2 thread=atl-outbox\n{IME}services: died\n");
+        let first = format!(
+            "INFO atl-composer: task reports: sent 2 thread=atl-outbox\n{IME}services: died\n"
+        );
         let relaunch = "INFO atl-composer: task reports: sent 2 thread=atl-outbox\nINFO atl-composer: task reports: sent 1 thread=?\n";
         let app = format!("{first}{relaunch}");
         assert_eq!(
             outbox_check(first_part(&app, Some(first.len()))),
-            Ok("1 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox".to_owned())
+            Ok(
+                "1 task reports, all on atl-outbox; 1 input method sends, all on atl-outbox"
+                    .to_owned()
+            )
         );
         let red = format!("INFO atl-composer: task reports: sent 2 thread=?\n{IME}");
         let broken = format!("{red}{relaunch}");
