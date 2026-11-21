@@ -587,10 +587,19 @@ fn font_layout(a: &Args, r: &Root) -> Result<Vec<PathBuf>> {
 }
 
 /// fontconfig's paths a UI app reads (atl_platform_host::app_access), read-only at their own paths.
-fn desktop_mounts() -> Result<Vec<Mount>> {
+fn font_mounts() -> Result<Vec<Mount>> {
     Ok(atl_platform_host::app_access::fontconfig_paths()?
         .iter()
         .map(|p| ro_at_own_path(p))
+        .collect())
+}
+
+/// What atld's own display probes (atl-egl-probe, before any app) read from the desktop: the compositor socket as-is and [`font_mounts`]; no app code runs in them, so no security context. No compositor socket is an error.
+fn desktop_mounts() -> Result<Vec<Mount>> {
+    let socket = atl_platform_host::app_access::wayland_socket()
+        .context("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)")?;
+    Ok(std::iter::once(ro_at_own_path(&socket))
+        .chain(font_mounts()?)
         .collect())
 }
 
@@ -2620,7 +2629,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         screencap: a.screencap.clone(),
         shared_ro: shared_ro.clone(),
         desktop_ro: if a.ui.is_some() {
-            desktop_mounts()?
+            font_mounts()?
         } else {
             vec![]
         },
