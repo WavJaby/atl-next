@@ -1374,9 +1374,11 @@ mod identity_tests {
     #[test]
     fn a_32_bit_process_reports_the_32_bit_list() {
         let lists = "abis=x86_64,arm64-v8a,armeabi-v7a,armeabi abis32=armeabi-v7a,armeabi abis64=x86_64,arm64-v8a libdir=/data/app/p/lib/arm primary=armeabi-v7a os.arch=x86_64";
-        let good = format!("I AtlTest: identity is64=false cpu_abi=armeabi-v7a cpu_abi2=armeabi {lists}");
+        let good =
+            format!("I AtlTest: identity is64=false cpu_abi=armeabi-v7a cpu_abi2=armeabi {lists}");
         assert!(identity_failures(&good, "arm", 32, "armeabi-v7a").is_empty());
-        let host = format!("I AtlTest: identity is64=true cpu_abi=x86_64 cpu_abi2=arm64-v8a {lists}");
+        let host =
+            format!("I AtlTest: identity is64=true cpu_abi=x86_64 cpu_abi2=arm64-v8a {lists}");
         assert_eq!(identity_failures(&host, "arm", 32, "armeabi-v7a").len(), 3);
         assert_eq!(identity_failures("", "arm", 32, "armeabi-v7a").len(), 1);
     }

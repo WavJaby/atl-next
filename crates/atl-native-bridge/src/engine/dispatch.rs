@@ -1401,7 +1401,10 @@ mod aapcs32_tests {
             0xffff_ffff
         );
         assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before);
-        assert_eq!(ilp32_narrow(AAPCS32, Class::Ptr, 0, None, a(0x1_0000_0000)).x0, 0);
+        assert_eq!(
+            ilp32_narrow(AAPCS32, Class::Ptr, 0, None, a(0x1_0000_0000)).x0,
+            0
+        );
         assert_eq!(ILP32_REFUSED.load(Ordering::Relaxed), before + 1);
         assert_eq!(
             ilp32_narrow(AAPCS64, Class::Ptr, 0, None, a(0x1_0000_0000)).x0,

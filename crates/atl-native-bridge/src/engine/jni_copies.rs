@@ -57,7 +57,12 @@ fn to_guest(what: &str, obj: usize, host: usize, len: usize) -> usize {
         .get_or_insert_with(HashMap::new)
         .entry(at)
         .or_default()
-        .push(Held { host, obj, len, window });
+        .push(Held {
+            host,
+            obj,
+            len,
+            window,
+        });
     at
 }
 
@@ -91,7 +96,9 @@ fn to_host(
     let Some(h) = found else {
         super::dispatch::report_refused(
             super::dispatch::REFUSED_ARG,
-            &format!("JNI {what}: {guest:#x} was not handed out for this object (never, already released, or another object's)"),
+            &format!(
+                "JNI {what}: {guest:#x} was not handed out for this object (never, already released, or another object's)"
+            ),
         );
         return None;
     };
@@ -324,7 +331,10 @@ mod tests {
         assert_eq!(art, [1, 2, 3, 4], "no copy-back through a refused release");
         assert_eq!(refused(), before + 2);
         // a second reference to the same array (IsSameObject true) releases it
-        assert_eq!(to_host("t", w, B, 0, true, |a, b| a == A && b == B), Some(host));
+        assert_eq!(
+            to_host("t", w, B, 0, true, |a, b| a == A && b == B),
+            Some(host)
+        );
         assert_eq!(art, [9, 2, 3, 4]);
         assert_eq!(rel(w, A, 0), None, "second release");
         assert_eq!(refused(), before + 3);
@@ -377,6 +387,9 @@ mod tests {
     fn every_buffer_pair_is_special() {
         let s = specials();
         assert_eq!(s.len(), 22);
-        assert!(s.iter().any(|&(slot, _)| slot == env::ReleaseStringCritical));
+        assert!(
+            s.iter()
+                .any(|&(slot, _)| slot == env::ReleaseStringCritical)
+        );
     }
 }
