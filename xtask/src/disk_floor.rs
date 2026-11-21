@@ -98,12 +98,12 @@ pub fn check(ws: &Path, cfg: &WsConfig) -> Result<()> {
             ),
             cfg.disk.host_min_free.value,
         ));
-        if h.free < cfg.disk.host_compact_below.value * GIB {
+        if h.free < cfg.disk.host_shrink_below.value * GIB {
             println!(
-                "native: host drive {} has {} GiB free, under {} GiB: compact the vhdx soon",
+                "native: host drive {} has {} GiB free, under {} GiB: shrink the vhdx soon",
                 h.mount.display(),
                 h.free / GIB,
-                cfg.disk.host_compact_below.value
+                cfg.disk.host_shrink_below.value
             );
         }
     }
@@ -187,7 +187,7 @@ struct Backing<'a> {
 }
 
 /// Host-drive row: short when `host_free < (fs_size - backed) + margin`.
-/// Why that bound and not btrfs unallocated: the file grows on the first write to any unbacked block, and btrfs writes unbacked blocks inside allocated chunks too (space trimmed then compacted away: 2026-11-19 allocated 49 GiB, file 44.3 GiB).
+/// Why that bound and not btrfs unallocated: the file grows on the first write to any unbacked block, and btrfs writes unbacked blocks inside allocated chunks too (space trimmed then shrunk out of the file: 2026-11-19 allocated 49 GiB, file 44.3 GiB).
 /// So only `fs_size - backed` bounds the growth; with it every admitted build can write until the pool is full without the host drive running out (incident 2026-11-20: E: hit 0 B, btrfs went read-only).
 fn backing_row(b: &Backing) -> (String, bool) {
     let growth = b.fs_size.saturating_sub(b.backed);
@@ -204,7 +204,7 @@ fn backing_row(b: &Backing) -> (String, bool) {
     );
     if short {
         line.push_str(&format!(
-            "; short {:.1} GiB: `cargo xtask out prune --execute`, then with no build running `btrfs balance start -dusage=70 -musage=70 <pool>` (root) + compact the file (scripts/env/wsl-tool.ps1 compact, then start), or free the host drive",
+            "; short {:.1} GiB: `cargo xtask out prune --execute`, then with no build running `btrfs balance start -dusage=70 -musage=70 <pool>` (root) + shrink the file (scripts/env/wsl-tool.ps1 shrink, then start), or free the host drive",
             gib(need - b.host_free)
         ));
     }
@@ -350,7 +350,7 @@ mod tests {
         assert!(e.contains("headroom 0.02 GiB"), "{e}");
     }
 
-    /// Pool filesystem 90 GiB (df). Numbers from the 2026-11-19/20 pool (memory M7): after balance + compact the file was 47.6 GB with E: 49.6 GB free; at the incident it was 87.8 GB with E: 0 B.
+    /// Pool filesystem 90 GiB (df). Numbers from the 2026-11-19/20 pool (memory M7): after balance + shrink the file was 47.6 GB with E: 49.6 GB free; at the incident it was 87.8 GB with E: 0 B.
     #[test]
     fn backing_growth_must_fit_the_host_drive() {
         const GB: u64 = 1_000_000_000;
@@ -374,7 +374,7 @@ mod tests {
         let (line, short) = at(878 * GB / 10, 0, 2);
         assert!(short, "{line}");
         assert!(
-            line.contains("out prune --execute") && line.contains("compact"),
+            line.contains("out prune --execute") && line.contains("wsl-tool.ps1 shrink"),
             "{line}"
         );
         // margin edge: free == growth + margin admits, one byte less refuses

@@ -17,7 +17,7 @@
 //! for = ["cts"]        # gates whose sources.toml [aosp.needed_by] projects fetch checks out (`native --for` names, `all-gates`); absent = core only
 //! [disk]               # free-space floors in GiB, checked before `native` (disk_floor)
 //! host_min_free = 6    # Windows drive holding the WSL vhdx
-//! host_compact_below = 30
+//! host_shrink_below = 30
 //! workspace_min_free = 6
 //! pool_min_free = 5    # build-dir pool
 //! pool_metadata_min_free = 1  # build-dir pool: btrfs metadata headroom (btrfs_space)
@@ -83,8 +83,8 @@ fn default_cpu_slots() -> u32 {
 
 /// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: owner's hard stop 6.
 pub const DEFAULT_HOST_MIN_FREE: u64 = 6;
-/// `disk.host_compact_below` (GiB): under it, a note asks to compact the vhdx (owner: compact when C: < 30 GB). A note, never a refusal.
-pub const DEFAULT_HOST_COMPACT_BELOW: u64 = 30;
+/// `disk.host_shrink_below` (GiB): under it, a note asks to shrink the vhdx (owner: shrink when C: < 30 GB). A note, never a refusal.
+pub const DEFAULT_HOST_SHRINK_BELOW: u64 = 30;
 /// `disk.workspace_min_free` (GiB): the filesystem holding the workspace (src/, cache/, out/ logs; WSL `/`, filled to 0 B twice on 2026-11-15). One build can grow sccache from empty to its cap ([`DEFAULT_SCCACHE_SIZE`] 5 GiB) + 1 GiB for logs, cargo's registry and /tmp.
 pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
 /// `disk.pool_min_free` (GiB): the filesystem holding the build-dir pool. One child build that rewrites its whole copy writes ~4.2 GB on disk (measured 2026-11-15: 8.0 GB logical base at zstd:1 ~2x) + margin.
@@ -100,7 +100,7 @@ pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskFloors {
     pub host_min_free: Setting<u64>,
-    pub host_compact_below: Setting<u64>,
+    pub host_shrink_below: Setting<u64>,
     pub workspace_min_free: Setting<u64>,
     pub pool_min_free: Setting<u64>,
     pub pool_metadata_min_free: Setting<u64>,
@@ -256,7 +256,7 @@ fn defaults(path: PathBuf) -> WsConfig {
         fetch_for: Setting::default(Vec::new()),
         disk: DiskFloors {
             host_min_free: Setting::default(DEFAULT_HOST_MIN_FREE),
-            host_compact_below: Setting::default(DEFAULT_HOST_COMPACT_BELOW),
+            host_shrink_below: Setting::default(DEFAULT_HOST_SHRINK_BELOW),
             workspace_min_free: Setting::default(DEFAULT_WORKSPACE_MIN_FREE),
             pool_min_free: Setting::default(DEFAULT_POOL_MIN_FREE),
             pool_metadata_min_free: Setting::default(DEFAULT_POOL_METADATA_MIN_FREE),
@@ -304,8 +304,8 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("disk", "host_min_free") => {
                     cfg.disk.host_min_free = Setting::file(gib(value, &at)?);
                 }
-                ("disk", "host_compact_below") => {
-                    cfg.disk.host_compact_below = Setting::file(gib(value, &at)?);
+                ("disk", "host_shrink_below") => {
+                    cfg.disk.host_shrink_below = Setting::file(gib(value, &at)?);
                 }
                 ("disk", "workspace_min_free") => {
                     cfg.disk.workspace_min_free = Setting::file(gib(value, &at)?);
@@ -329,7 +329,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.disk.pool_backing_margin = Setting::file(gib(value, &at)?);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_compact_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
@@ -671,7 +671,7 @@ mod tests {
     fn disk_floors() {
         let d = parse("", path()).unwrap().disk;
         assert_eq!(d.host_min_free, Setting::default(6));
-        assert_eq!(d.host_compact_below, Setting::default(30));
+        assert_eq!(d.host_shrink_below, Setting::default(30));
         assert_eq!(d.workspace_min_free, Setting::default(6));
         assert_eq!(d.pool_min_free, Setting::default(5));
         let d = parse(
