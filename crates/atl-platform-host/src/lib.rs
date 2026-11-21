@@ -20,6 +20,9 @@ pub use atl_platform_host_linux::IioSensors as PlatformSensors;
 /// What an app process's UI side reads from the desktop, as host paths the broker shows read-only at their own place: `wayland_socket()` (the compositor's) and `fontconfig_paths()` (config file + font dirs).
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::app_access;
+/// Per-app-process PipeWire security contexts + atld as their permission manager; probed into tiers (enforced / write-restricted), `Probe::Unavailable` without SecurityContext.
+#[cfg(target_os = "linux")]
+pub use atl_platform_host_linux::pipewire_context;
 /// The desktop's time zone id as a native program resolves it: `TZ`, else the zone `/etc/localtime` links to; `None` where it names none.
 #[cfg(target_os = "linux")]
 pub use atl_platform_host_linux::time_zone;

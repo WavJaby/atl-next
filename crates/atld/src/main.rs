@@ -40,12 +40,19 @@ use atl_android_paths::{
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 use atl_broker::{
-    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Spawn, gpu, kill_sandbox,
-    seccomp_death, to_log, tree_mounts,
+    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Right, Spawn, gpu,
+    kill_sandbox, seccomp_death, to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, AllocatorTier, NodeSource, UDMABUF_DEVICE};
 use atl_gralloc::vintf;
+use atl_platform_host::pipewire_context;
 use atl_platform_host::wayland_context::{self, AppContext};
+
+/// A process's desktop contexts ([`Host::app_spawn`]), held until it is reaped ([`Host::start`]): the compositor and PipeWire serve its sockets exactly while it lives.
+type Held = (Option<AppContext>, Option<pipewire_context::AppContext>);
+
+/// PipeWire contexts made this run (the `contexts=<n>` counter of `pipewire: security context applied`).
+static PIPEWIRE_CONTEXTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use atl_platform_host::{
     DesktopNotification, Notifications, PlatformNotifications, Posted, Urgency,
 };
@@ -680,6 +687,41 @@ impl Wayland {
     }
 }
 
+/// The desktop's PipeWire as apps reach it: its socket (atl_platform_host::app_access::pipewire_socket) and, where PipeWire offers SecurityContext, atld's permission manager: each app process
+/// gets its own context socket at the PipeWire socket's path, never the socket itself (pipewire_context module doc: tiers enforced / write-restricted).
+struct PipeWire {
+    socket: PathBuf,
+    manager: Option<pipewire_context::Manager>,
+}
+
+impl PipeWire {
+    /// Probes PipeWire once; logs `pipewire: security context available tier=<tier> (...)|unavailable (<reason>)`. None: no PipeWire socket (apps' tracks fail).
+    fn probe() -> Option<Self> {
+        let socket = atl_platform_host::app_access::pipewire_socket()?;
+        let manager = match pipewire_context::Manager::start(&socket) {
+            pipewire_context::Probe::Available(m) => {
+                match m.tier() {
+                    pipewire_context::Tier::Enforced => log(format_args!(
+                        "pipewire: security context available tier=enforced (session manager grants context clients nothing; atld grants own objects, sinks, sources by RECORD_AUDIO/CAMERA)"
+                    )),
+                    pipewire_context::Tier::WriteRestricted => log(format_args!(
+                        "pipewire: security context available tier=write-restricted (session manager gave the probe client {:o}; apps use pipewire.access=restricted: no write/metadata, capture not restricted)",
+                        m.probe_default()
+                    )),
+                }
+                Some(m)
+            }
+            pipewire_context::Probe::Unavailable(why) => {
+                log(format_args!(
+                    "pipewire: security context unavailable ({why}): apps get the PipeWire socket as-is (whole graph, capture, write)"
+                ));
+                None
+            }
+        };
+        Some(Self { socket, manager })
+    }
+}
+
 /// /system/framework/<name> of each boot jar, the boot classpath as the sandbox sees it; /system's CA store from the distro bundle.
 fn system_layout(a: &Args, r: &Root) -> Result<Vec<String>> {
     let framework = r.system().join("framework");
@@ -1223,8 +1265,9 @@ struct Host {
     desktop_ro: Vec<Mount>,
     /// With `--ui`: the compositor an app's GTK side connects to. Headless: None.
     wayland: Option<Wayland>,
-    /// The desktop's PipeWire socket (atl_platform_host::app_access::pipewire_socket): every app process gets it read-only at its own path and names it to its launcher (`--pipewire-socket`). None: no server, and the apps' tracks fail.
-    pipewire: Option<PathBuf>,
+    /// The desktop's PipeWire ([`PipeWire`]): every app process gets its context socket (or, without SecurityContext, the socket as-is) read-only at the socket's path and names that path to its launcher
+    /// (`--pipewire-socket`). None: no server, and the apps' tracks fail.
+    pipewire: Option<PipeWire>,
     /// The device nodes each app process may open: the run's GPU's class and the heap tier's heap (`run`).
     app_devices: Vec<PathBuf>,
     /// Variables only app processes get, after the runtime's own: the chosen render path's ([`choose_render_path`]), then `--app-env` (later wins). Never the allocator's or the services'.
@@ -1382,6 +1425,7 @@ impl Host {
     /// the runtime's own ISA. `package`: the app's, whose data dir ([`app_data_dir`]) ART's native bridge gets as zygote's specialization hands it (`-Xnative-bridge-app-data-dir`, patches/aosp/art 0004: its code cache there, no
     /// mount namespace or cpuinfo mount of ART's own; the sandbox gives both); ignored by ART when no bridge is loaded.
     /// With `--ui` the sandbox shows the compositor socket's path; where the compositor has security contexts, that path is this process's own context socket, returned for [`Host::start`] to hold.
+    /// Likewise the PipeWire socket's path shows this process's PipeWire context where PipeWire has SecurityContext; `rights` (the process's [`Right`]s) decide its audio / video source grants.
     #[allow(clippy::too_many_arguments)]
     fn app_spawn(
         &self,
@@ -1393,8 +1437,44 @@ impl Host {
         boot: &[String],
         class: &str,
         args: &[String],
-    ) -> Result<(Spawn, Option<AppContext>)> {
+        rights: &[Right],
+    ) -> Result<(Spawn, Held)> {
         let app_id = package.map(atl_launch::app_id).transpose()?;
+        let (pipewire_mount, pipewire) = match &self.pipewire {
+            None => (None, None),
+            Some(PipeWire {
+                socket,
+                manager: None,
+            }) => (Some(ro_at_own_path(socket)), None),
+            Some(PipeWire {
+                socket,
+                manager: Some(m),
+            }) => {
+                let grants = pipewire_context::Grants {
+                    record_audio: rights.contains(&Right::RecordAudio),
+                    camera: rights.contains(&Right::Camera),
+                };
+                let ctx = m
+                    .create(app_id.as_deref(), grants)
+                    .with_context(|| format!("{name}: PipeWire security context"))?;
+                let n = PIPEWIRE_CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                match m.tier() {
+                    pipewire_context::Tier::Enforced => log(format_args!(
+                        "pipewire: security context applied tier=enforced ({name}: record_audio={} camera={}) contexts={n}",
+                        grants.record_audio, grants.camera
+                    )),
+                    pipewire_context::Tier::WriteRestricted => log(format_args!(
+                        "pipewire: security context applied tier=write-restricted (capture not restricted: session manager grants read to restricted clients) ({name}) contexts={n}"
+                    )),
+                }
+                let m = Mount {
+                    host: ctx.socket().to_path_buf(),
+                    at: socket.clone(),
+                    writable: false,
+                };
+                (Some(m), Some(ctx))
+            }
+        };
         let (wayland_mount, wayland) = match &self.wayland {
             None => (None, None),
             Some(Wayland {
@@ -1426,7 +1506,7 @@ impl Host {
                 .chain(
                     self.pipewire
                         .iter()
-                        .map(|p| format!("--pipewire-socket={}", p.display())),
+                        .map(|p| format!("--pipewire-socket={}", p.socket.display())),
                 )
                 .chain(
                     self.no_audio_service
@@ -1484,7 +1564,7 @@ impl Host {
             .chain(self.shared_ro.iter().cloned())
             .chain(self.desktop_ro.iter().cloned())
             .chain(wayland_mount)
-            .chain(self.pipewire.iter().map(|p| ro_at_own_path(p)))
+            .chain(pipewire_mount)
             // a translated app's host readers see the guest's CPU, as on a device (libnativebridge MountCpuinfo); the broker binds it after the fresh /proc
             .chain(cpuinfo_mount(&self.cpuinfo, instruction_set))
             .collect(),
@@ -1505,7 +1585,7 @@ impl Host {
                 stdout,
                 stderr,
             },
-            wayland,
+            (wayland, pipewire),
         ))
     }
 
@@ -1548,12 +1628,12 @@ impl Host {
         });
     }
 
-    /// Starts `spawn`; a thread reaps it. `wayland`: the process's security context ([`Host::app_spawn`]), held until the process is reaped, so the compositor serves its socket exactly while it lives.
+    /// Starts `spawn`; a thread reaps it. `held`: the process's security contexts ([`Host::app_spawn`]), held until the process is reaped, so the compositor and PipeWire serve its sockets exactly while it lives.
     /// `main`: the `--run-class` command, whose end is the run's (`done`).
     fn start(
         self: &Arc<Self>,
         spawn: Spawn,
-        wayland: Option<AppContext>,
+        held: Held,
         main: bool,
         controlled: bool,
     ) -> Result<i32> {
@@ -1573,7 +1653,7 @@ impl Host {
             .name(format!("reap-{host_pid}"))
             .spawn(move || {
                 let status = child.wait();
-                drop(wayland);
+                drop(held);
                 host.controlled
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1625,7 +1705,7 @@ impl Host {
             req.package,
             self.root.data_root.display()
         );
-        let (mut spawn, wayland) = self.app_spawn(
+        let (mut spawn, held) = self.app_spawn(
             req.uid,
             &req.process_name,
             req.target_sdk,
@@ -1634,6 +1714,7 @@ impl Host {
             &self.boot,
             &req.entry_point,
             &req.args,
+            &req.rights,
         )?;
         self.external_storage(&mut spawn, &req.package);
         spawn
@@ -1651,7 +1732,7 @@ impl Host {
             });
         }
         spawn.rights = req.rights.clone();
-        let pid = self.start(spawn, wayland, false, true)?;
+        let pid = self.start(spawn, held, false, true)?;
         let _ = self.first_app_ms.set(wall_ms());
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -2684,7 +2765,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             vec![]
         },
         wayland: a.ui.is_some().then(Wayland::probe).transpose()?,
-        pipewire: atl_platform_host::app_access::pipewire_socket(),
+        pipewire: PipeWire::probe(),
         first_app_ms: OnceLock::new(),
         log_limits: log_limits(a),
         app_logs: Mutex::new(Vec::new()),
@@ -2870,7 +2951,7 @@ fn run(a: &Args) -> Result<ExitCode> {
 
     if let (Some(class), Some(uid), Some(name)) = (&a.run_class, a.run_uid, &a.run_name) {
         let boot: Vec<String> = host.boot.iter().cloned().chain(run_boot).collect();
-        let (spawn, wayland) = host.app_spawn(
+        let (spawn, held) = host.app_spawn(
             uid,
             name,
             PLATFORM_SDK,
@@ -2879,8 +2960,9 @@ fn run(a: &Args) -> Result<ExitCode> {
             &boot,
             class,
             &a.run_args,
+            &[],
         )?;
-        let pid = host.start(spawn, wayland, true, false)?;
+        let pid = host.start(spawn, held, true, false)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }
     // the control socket is up once everything above is: a `start` reaches running services

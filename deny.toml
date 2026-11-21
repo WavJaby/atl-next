@@ -50,7 +50,7 @@ deny = [
     { crate = "gdk4-sys", reason = "platform layer only", wrappers = ["gdk4", "gsk4-sys", "gtk4-sys", "gdk4-wayland-sys", "webkit6-sys"] },
     { crate = "gsk4", reason = "platform layer only", wrappers = ["gtk4"] },
     { crate = "gsk4-sys", reason = "platform layer only", wrappers = ["gsk4", "gtk4-sys"] },
-    { crate = "pipewire", reason = "platform layer only", wrappers = ["atl-platform-ui-linux"] },
+    { crate = "pipewire", reason = "platform layer only", wrappers = ["atl-platform-ui-linux", "atl-platform-host-linux"] },
     { crate = "pipewire-sys", reason = "platform layer only", wrappers = ["pipewire"] },
     { crate = "libspa", reason = "platform layer only", wrappers = ["pipewire"] },
     { crate = "libspa-sys", reason = "platform layer only", wrappers = ["libspa", "pipewire", "pipewire-sys"] },

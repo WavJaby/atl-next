@@ -426,7 +426,12 @@ pub fn stub_args(grants: &[(Access, PathBuf)], net: bool, program: &Path) -> Vec
 }
 
 /// One row per manifest permission: what it gives the app process. Landlock restricts exactly the rights a ruleset handles, so `Net` is the only network row: TCP left unhandled (ABI >= 4), not a port list.
-pub const PERMISSION_RIGHTS: &[(&str, Right)] = &[("android.permission.INTERNET", Right::Net)];
+/// `RecordAudio` / `Camera` are not the broker's: atld's PipeWire permission manager grants the process's PipeWire client the audio / video sources (atl-platform-host-linux pipewire_context).
+pub const PERMISSION_RIGHTS: &[(&str, Right)] = &[
+    ("android.permission.INTERNET", Right::Net),
+    ("android.permission.RECORD_AUDIO", Right::RecordAudio),
+    ("android.permission.CAMERA", Right::Camera),
+];
 
 /// What a process's permissions give (PERMISSION_RIGHTS rows, in table order).
 pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
@@ -443,6 +448,10 @@ pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
 pub enum Right {
     /// TCP bind and connect on any port: the Landlock network rights are left unhandled.
     Net,
+    /// The desktop's audio sources through the process's PipeWire security context (atld grants them).
+    RecordAudio,
+    /// The desktop's video sources through the process's PipeWire security context (atld grants them).
+    Camera,
 }
 
 /// The files `program` needs to start: itself, its interpreter (PT_INTERP, at the path it names), and every DT_NEEDED library, transitively, found in the interpreter's canonical directory (the loader's default search path holds it; no other is consulted).
