@@ -31,6 +31,9 @@ const CATEGORY_DEFAULT: &str = "android.intent.category.DEFAULT";
 /// Build.VERSION_CODES.R: FILTER_APPLICATION_QUERY is enabled from R on (PackageManager.java:5684-5686), so an app below it sees every package.
 const VERSION_CODES_R: i32 = 30;
 pub(crate) use atl_services_types::system_packages::{FLAG_SYSTEM, PRIVATE_FLAG_PRIVILEGED};
+/// (package, app id) of the platform packages a device image installs but ATL ships no APK for, as getPackageUid answers them there. com.android.shell: frameworks/base/packages/Shell
+/// AndroidManifest.xml sharedUserId android.uid.shell = SHELL_UID; `am start` (atl-am) names it as its calling package (ActivityManagerShellCommand SHELL_PACKAGE_NAME).
+const PLATFORM_PACKAGES: [(&str, u32); 1] = [("com.android.shell", permission::SHELL_UID)];
 
 /// One installed package.
 #[derive(Debug, Clone)]
@@ -194,10 +197,12 @@ impl Packages {
             .filter(move |p| permission::app_id(p.uid) == app_id)
     }
 
-    /// isSameApp (PackageManagerInternal): `package` runs under `uid`'s app id, shared uids included.
+    /// isSameApp (PackageManagerInternal, PackageManagerService.java:7204-7216): getPackageUid(`package`) has `uid`'s app id, shared uids included; the platform packages ATL ships no APK for
+    /// ([`PLATFORM_PACKAGES`]) answer their system image uid.
     pub fn is_same_app(&self, package: &str, uid: u32) -> bool {
-        self.by_app_id(permission::app_id(uid))
-            .any(|p| p.name() == package)
+        let app_id = permission::app_id(uid);
+        PLATFORM_PACKAGES.contains(&(package, app_id))
+            || self.by_app_id(app_id).any(|p| p.name() == package)
     }
 
     /// Every package, in install order.

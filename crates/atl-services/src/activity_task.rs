@@ -1156,6 +1156,17 @@ mod tests {
         }
     }
 
+    /// `am start` (atl-am): the shell uid names com.android.shell, which a device has installed under sharedUserId android.uid.shell, so isSameApp passes as there; an app naming it does not.
+    #[test]
+    fn shell_start_passes_as_the_shell_package() {
+        const SHELL: &str = "com.android.shell";
+        let atm = fixture_atm();
+        let shell_uid = atl_services_types::permission::SHELL_UID;
+        assert!(assert_package_matches_calling_uid(&atm.packages, shell_uid, SHELL).is_ok());
+        assert!(assert_package_matches_calling_uid(&atm.packages, shell_uid, PACKAGE).is_err());
+        assert!(assert_package_matches_calling_uid(&atm.packages, UID, SHELL).is_err());
+    }
+
     /// The launcher record, pushed and launched as finishAttachApplication does it; returns its token.
     fn attach_launcher(atm: &ActivityTasks, thread: &Strong<dyn IApplicationThread>) -> SpIBinder {
         let task = atm.tasks.new_task(
