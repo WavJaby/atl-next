@@ -115,8 +115,8 @@ fn death_check(services: &str) -> Result<String, String> {
 /// The main process's compositor, at the last counters line before the kill (`before`) and the last after the dialog's draw (`after`):
 /// - before: at least [`MIN_LAYERS_BEFORE_KILL`] layers created: AuxStart's window and AuxMain's, whose first layout came after `:aux` registered;
 /// - after: the dialog's layer created since `before`, at least [`MIN_LAYERS`] alive, and `unknown_layer` unchanged since `before`.
-/// `unknown_layer` is judged as growth across the sibling's death and re-registration, not from 0: AuxStart's finish can leave a few (0 and 5 measured, 2026-11-21) when the app's transactions on
-/// its window's layer land after the window service removed the layer, a single-process race of layer lifetime this stage does not test.
+///
+/// `unknown_layer` is judged as growth across the sibling's death and re-registration, not from 0: AuxStart's finish can leave a few (0 and 5 measured, 2026-11-21) when the app's transactions on its window's layer land after the window service removed the layer, a single-process race of layer lifetime this stage does not test.
 fn layers_check(app: &str) -> Result<String, String> {
     let stamp_of = |needle: &str| {
         app.lines()
