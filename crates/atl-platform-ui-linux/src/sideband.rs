@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! Sideband widgets (webview plan S2.2 amended): toolkit widgets registered as the content of a sideband stream `[SIDEBAND_WEB_VIEW, key]` (WebKit's view), drawn by `SceneView`, and the input gate.
 //! Input: Android's dispatch decides which View gets an event (OnTouchListener, onInterceptTouchEvent, per-pixel overlap), so a toolkit event aimed at the widget is held, not delivered:
-//! the window's controllers (capture phase) publish it to Android as every event and record the monotonic time they stamped it with ([`stamp`]); the gate on the widget (capture phase) holds it;
+//! the window's controllers (capture phase) record the monotonic time they stamp it with, and a press's origin, then publish it to Android as every event ([`publish`]); the gate on the widget (capture phase) holds it;
 //! when the provider's View receives the matching MotionEvent / KeyEvent it claims by that time ([`claim`]) and the held events are put back on the display's queue (`gdk_display_put_event`,
 //! deprecated since GTK 4.10 with no replacement: the one call site), marked so the window's controllers skip them and the gate lets them through to the widget.
-//! Everything here runs on the UI thread; the statics are statics, not thread-locals (module rule: no module object in the process's thread-local teardown).
+//! Threads: everything touching GTK runs on the display thread (the GLib default context's owner); [`claim`] and [`focus`] may be called from any thread and invoke their GTK part there.
+//! A claim's synchronous answer (the press origin) reads only [`ORIGINS`], written before the event is published -> the caller never waits on the display thread for input.
+//! The statics are statics, not thread-locals (module rule: no module object in the process's thread-local teardown).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -20,8 +22,10 @@ const MAX_HELD: usize = 512;
 /// Recent (event, stamp) pairs and replay marks kept: the events of one dispatch at most a few, so 64 only bounds a mark whose replay never reached a gate.
 const MAX_MARKS: usize = 64;
 
-/// One held event: `event`, the monotonic ns Android got it at, whether it is a key, a press (a gesture's start) or a release (its end), and whether a press came from a mouse button
-/// (a toolkit button press, not a touch contact: what the page itself is given, whatever MotionEvent the desktop adaptation made of it).
+/// Press origins kept: presses are rare beside motion, so 64 is many gestures past the oldest Down a claim can still be on its way for.
+const MAX_ORIGINS: usize = 64;
+
+/// One held event: `event`, the monotonic ns Android got it at, whether it is a key, a press (a gesture's start) or a release (its end).
 #[derive(Debug)]
 pub struct Held<E> {
     pub event: E,
@@ -29,7 +33,63 @@ pub struct Held<E> {
     pub key: bool,
     pub press: bool,
     pub release: bool,
-    pub mouse: bool,
+}
+
+/// Where a press came from: what the page itself is given, whatever MotionEvent the desktop adaptation made of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// A toolkit button press.
+    Mouse,
+    /// A touch contact, or a button press GTK emulated from one.
+    Touch,
+}
+
+/// The origin of a toolkit event of type `t` (`emulated`: GTK's pointer-emulation flag), None for one that starts no gesture. The one site input origin is classified (the touch-focus rule:
+/// Chromium's WebView focuses on mouse down, not on touch down).
+pub fn origin(t: gdk::EventType, emulated: bool) -> Option<Origin> {
+    match t {
+        gdk::EventType::ButtonPress if !emulated => Some(Origin::Mouse),
+        gdk::EventType::ButtonPress | gdk::EventType::TouchBegin => Some(Origin::Touch),
+        _ => None,
+    }
+}
+
+/// The origins of the presses published last, by stamp (bounded: [`MAX_ORIGINS`]).
+#[derive(Debug)]
+pub struct Origins(VecDeque<(i64, Origin)>);
+
+impl Origins {
+    pub const fn new() -> Self {
+        Self(VecDeque::new())
+    }
+
+    fn record(&mut self, ns: i64, o: Origin) {
+        if self.0.len() == MAX_ORIGINS {
+            self.0.pop_front();
+        }
+        self.0.push_back((ns, o));
+    }
+
+    /// Whether `claim` stamped `t` is the Down of a mouse-button press: the press a Down claims is the one stamped `t` (`Gate::claim` takes no press before it).
+    pub fn mouse_press(&self, claim: InputClaim, t: i64) -> bool {
+        claim == InputClaim::Down && self.0.iter().any(|&(ns, o)| ns == t && o == Origin::Mouse)
+    }
+}
+
+/// [`Origins`] of what the window published; written on the display thread before publishing, read by [`claim`] on any thread.
+static ORIGINS: Mutex<Origins> = Mutex::new(Origins::new());
+
+/// Records `origin` of the event stamped `ns` in `origins`, then runs `publish`: a reader that learns of the event from what `publish` hands on (Android's MotionEvent) finds its origin.
+fn record_then_publish<T>(
+    origins: &Mutex<Origins>,
+    ns: i64,
+    origin: Option<Origin>,
+    publish: impl FnOnce() -> T,
+) -> T {
+    if let Some(o) = origin {
+        lock(origins).record(ns, o);
+    }
+    publish()
 }
 
 impl<E> Held<E> {
@@ -70,8 +130,6 @@ pub struct Claimed<E> {
     /// [`Held::class`] of each `replay` event, in order.
     pub classes: Vec<&'static str>,
     pub left_pressed: bool,
-    /// A Down claim replayed a mouse-button press ([`Held::mouse`]): the provider applies Chromium's mouse-down focus rule (a touch press never focuses a WebView).
-    pub mouse_press: bool,
     /// Classes of the held events the claim dropped unclaimed (before a Down, or a cancelled gesture's).
     pub dropped: Vec<&'static str>,
 }
@@ -134,7 +192,6 @@ impl<E> Gate<E> {
                     replay: Vec::new(),
                     classes: Vec::new(),
                     left_pressed,
-                    mouse_press: false,
                     dropped,
                 };
             }
@@ -150,11 +207,9 @@ impl<E> Gate<E> {
         };
         let mut replay = Vec::new();
         let mut classes = Vec::new();
-        let mut mouse_press = false;
         let mut rest = VecDeque::with_capacity(self.held.len());
         for h in self.held.drain(..) {
             if h.ns <= t && takes(&h) {
-                mouse_press |= h.press && h.mouse;
                 classes.push(h.class());
                 replay.push(h.event);
             } else {
@@ -166,7 +221,6 @@ impl<E> Gate<E> {
             replay,
             classes,
             left_pressed,
-            mouse_press,
             dropped,
         }
     }
@@ -177,11 +231,12 @@ impl<E> Gate<E> {
     }
 }
 
-/// A registered widget, its gate and its unhandled-key report (UiVtable::sideband_attach).
+/// A registered widget, its gate and its reports (UiVtable::sideband_attach).
 struct Entry {
     widget: gtk4::Widget,
     gate: std::cell::RefCell<Gate<gdk::Event>>,
     unhandled_key: std::cell::RefCell<Callback<i64>>,
+    press_not_cancelled: std::cell::RefCell<Callback<()>>,
 }
 
 /// The registered widgets, by key.
@@ -219,8 +274,14 @@ fn entry(key: i32) -> Option<std::rc::Rc<Entry>> {
         .map(|(_, e)| e.get_ref().clone())
 }
 
-/// Registers `widget` as the content of `[SIDEBAND_WEB_VIEW, key]` and puts the input gate on it; `unhandled_key` takes the stamps of the presses it leaves unhandled.
-pub fn attach(key: i32, widget: gtk4::Widget, unhandled_key: Callback<i64>) {
+/// Registers `widget` as the content of `[SIDEBAND_WEB_VIEW, key]` and puts the input gate on it; `unhandled_key` takes the stamps of the presses it leaves unhandled,
+/// `press_not_cancelled` hears of each Cancel claim that found the page mid-press.
+pub fn attach(
+    key: i32,
+    widget: gtk4::Widget,
+    unhandled_key: Callback<i64>,
+    press_not_cancelled: Callback<()>,
+) {
     let gate = gtk4::EventControllerLegacy::new();
     gate.set_propagation_phase(gtk4::PropagationPhase::Capture);
     gate.connect_event(move |_, event| on_gate(key, event));
@@ -232,6 +293,7 @@ pub fn attach(key: i32, widget: gtk4::Widget, unhandled_key: Callback<i64>) {
         widget,
         gate: std::cell::RefCell::default(),
         unhandled_key: std::cell::RefCell::new(unhandled_key),
+        press_not_cancelled: std::cell::RefCell::new(press_not_cancelled),
     });
     let mut list = lock(&SIDEBANDS);
     list.retain(|(k, _)| *k != key);
@@ -282,8 +344,17 @@ pub fn routes_to_gate(w: Option<gtk4::Widget>) -> bool {
     })
 }
 
-/// The window's controllers published `event` to Android stamped `ns`.
-pub fn stamp(event: Option<gdk::Event>, ns: i64) {
+/// The window's controllers publish `event` (their controller's current event) to Android stamped `ns`: `publish` hands it on. Stamp and press origin are recorded first (module doc), at every publish site.
+pub fn publish(event: Option<gdk::Event>, ns: i64, publish: impl FnOnce()) {
+    let o = event
+        .as_ref()
+        .and_then(|e| origin(e.event_type(), e.is_pointer_emulated()));
+    stamp(event, ns);
+    record_then_publish(&ORIGINS, ns, o, publish);
+}
+
+/// `event` was stamped `ns`: the gate holds it with that stamp ([`stamp_of`]).
+fn stamp(event: Option<gdk::Event>, ns: i64) {
     let Some(e) = event else { return };
     let evicted = {
         let mut s = lock(&STAMPS);
@@ -389,8 +460,6 @@ fn on_gate(key: i32, event: &gdk::Event) -> glib::Propagation {
         key: key_event,
         press,
         release,
-        // a touch-emulated button press is the touch's (GTK flags it), not the mouse's
-        mouse: event.event_type() == gdk::EventType::ButtonPress && !event.is_pointer_emulated(),
     };
     crate::count::hit(&format!("sideband.held.{}", h.class()));
     let dropped = e.gate.borrow_mut().hold(h);
@@ -405,17 +474,27 @@ fn count_dropped(classes: &[&'static str]) {
     }
 }
 
-/// The provider's View received `claim` stamped `t` (ns): `key`'s held events up to `t` go back on the queue.
+/// The provider's View received `claim` stamped `t` (ns), on any thread: the answer comes from [`ORIGINS`] now; `key`'s held events up to `t` go back on the queue on the display thread
+/// (inline when the caller owns its context).
 pub fn claim(key: i32, claim: InputClaim, t: i64) -> ClaimReply {
+    // a key with no widget gets the empty answer, as its replay finds nothing to give the page
+    let registered = lock(&SIDEBANDS).iter().any(|(k, _)| *k == key);
+    let mouse_press = registered && lock(&ORIGINS).mouse_press(claim, t);
+    if mouse_press {
+        crate::count::hit("sideband.claim.mouse-press");
+    }
+    glib::MainContext::default().invoke(move || replay(key, claim, t));
+    ClaimReply { mouse_press }
+}
+
+/// [`claim`]'s display-thread half: the gate's claim, its events put back, a page left mid-press reported.
+fn replay(key: i32, claim: InputClaim, t: i64) {
     let Some(e) = entry(key) else {
         crate::count::hit("sideband.claim.no-widget");
-        return ClaimReply::default();
+        return;
     };
     let claimed = e.gate.borrow_mut().claim(claim, t);
     count_dropped(&claimed.dropped);
-    if claimed.mouse_press {
-        crate::count::hit("sideband.claim.mouse-press");
-    }
     for c in &claimed.classes {
         crate::count::hit(&format!("sideband.replayed.{c}"));
     }
@@ -438,14 +517,18 @@ pub fn claim(key: i32, claim: InputClaim, t: i64) -> ClaimReply {
         }
     }
     crate::mirror::resync();
-    ClaimReply {
-        left_pressed: claimed.left_pressed,
-        mouse_press: claimed.mouse_press,
+    if claimed.left_pressed {
+        e.press_not_cancelled.borrow_mut().call(&());
     }
 }
 
-/// Android focus on `key`'s View: its widget takes the toolkit's keyboard focus (WebKit's own input method context follows it), or gives it back to the window.
+/// Android focus on `key`'s View, on any thread: on the display thread, after the same thread's earlier claims (one context's invoke order), see [`focus_now`].
 pub fn focus(key: i32, on: bool) {
+    glib::MainContext::default().invoke(move || focus_now(key, on));
+}
+
+/// Its widget takes the toolkit's keyboard focus (WebKit's own input method context follows it), or gives it back to the window.
+fn focus_now(key: i32, on: bool) {
     let Some(e) = entry(key) else { return };
     tracing::info!("atl-platform-ui: sideband {key} android focus {on}");
     if on {
@@ -476,7 +559,6 @@ mod tests {
             key: false,
             press,
             release,
-            mouse: false,
         }
     }
 
@@ -487,30 +569,67 @@ mod tests {
             key: true,
             press: false,
             release: false,
-            mouse: false,
         }
     }
 
-    /// Focus on press is keyed on the physical input (Chromium: mouse-down focuses a WebView, touch ACTION_DOWN does not -- aw_field_trials disables it): only a Down claim that replays
-    /// a mouse-button press reports one; a touch press, a Move / Up / Hover claim after a mouse press, and a Cancel report none.
+    /// Focus on press is keyed on the physical input (Chromium: mouse-down focuses a WebView, touch ACTION_DOWN does not -- aw_field_trials disables it): only the Down claim of a mouse-button
+    /// press reports one; a touch press, a Move / Up / Hover / Cancel claim of a mouse gesture, and a Down at a stamp nothing pressed at report none.
     #[test]
     fn mouse_press_only_from_a_claimed_mouse_button_press() {
-        let mouse = |ns, press, release| Held {
-            mouse: press,
-            ..ptr(ns, press, release)
-        };
-        let mut g = Gate::default();
-        g.hold(mouse(10, true, false));
-        g.hold(mouse(15, false, false));
-        g.hold(mouse(20, false, true));
-        assert!(g.claim(InputClaim::Down, 10).mouse_press);
-        assert!(!g.claim(InputClaim::Move, 15).mouse_press);
-        assert!(!g.claim(InputClaim::Up, 20).mouse_press);
-        g.hold(ptr(30, true, false));
-        assert!(!g.claim(InputClaim::Down, 30).mouse_press);
-        let mut c = Gate::default();
-        c.hold(mouse(40, true, false));
-        assert!(!c.claim(InputClaim::Cancel, 40).mouse_press);
+        let mut o = Origins::new();
+        o.record(10, Origin::Mouse);
+        o.record(30, Origin::Touch);
+        assert!(o.mouse_press(InputClaim::Down, 10));
+        for c in [
+            InputClaim::Move,
+            InputClaim::Up,
+            InputClaim::Hover,
+            InputClaim::Cancel,
+            InputClaim::Key,
+        ] {
+            assert!(!o.mouse_press(c, 10), "{c:?}");
+        }
+        assert!(!o.mouse_press(InputClaim::Down, 30));
+        assert!(!o.mouse_press(InputClaim::Down, 20));
+    }
+
+    /// The touch-focus rule's classification: a real button press is the mouse's; a press GTK emulated from a touch, and a touch contact, are the touch's; nothing else starts a gesture.
+    #[test]
+    fn origin_of_presses() {
+        use gdk::EventType as T;
+        assert_eq!(origin(T::ButtonPress, false), Some(Origin::Mouse));
+        assert_eq!(origin(T::ButtonPress, true), Some(Origin::Touch));
+        assert_eq!(origin(T::TouchBegin, false), Some(Origin::Touch));
+        for t in [
+            T::ButtonRelease,
+            T::MotionNotify,
+            T::TouchUpdate,
+            T::KeyPress,
+            T::Scroll,
+        ] {
+            assert_eq!(origin(t, false), None, "{t:?}");
+        }
+    }
+
+    /// Classified before published: whoever learns of a press from what the publish step hands on (the app thread, from Android's MotionEvent) already finds its origin, without the display thread.
+    #[test]
+    fn origin_is_visible_inside_the_publish_step() {
+        static T: Mutex<Origins> = Mutex::new(Origins::new());
+        let seen = record_then_publish(&T, 50, Some(Origin::Mouse), || {
+            lock(&T).mouse_press(InputClaim::Down, 50)
+        });
+        assert!(seen);
+    }
+
+    /// The bound: past MAX_ORIGINS the oldest press goes.
+    #[test]
+    fn origins_are_bounded() {
+        let mut o = Origins::new();
+        for t in 0..(MAX_ORIGINS as i64 + 1) {
+            o.record(t, Origin::Mouse);
+        }
+        assert!(!o.mouse_press(InputClaim::Down, 0));
+        assert!(o.mouse_press(InputClaim::Down, 1));
     }
 
     /// A tap the View gets: press at 10, release at 20; Android claims Down 10, Up 20; both replayed in order, nothing left.

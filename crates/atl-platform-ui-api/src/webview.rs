@@ -99,37 +99,30 @@ pub trait WebView {
     fn set_focused(&self, on: bool);
 }
 
-/// What a claim ([`WebView::claim_input`]) found.
+/// What a claim ([`WebView::claim_input`]) answers synchronously; what the claim's replay finds later is reported as a [`WebEvent`] ([`WebEvent::PressNotCancelled`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClaimReply {
-    /// A Cancel left the page mid-press: the page is told of no cancel (a counted divergence).
-    pub left_pressed: bool,
-    /// A Down claim gave the page a mouse-button press (the toolkit event, whatever MotionEvent the desktop adaptation made of it): Chromium's WebView focuses on mouse down
-    /// (kFocusRenderWidgetHostViewAndroidOnMouseDown) but not on touch down (kFocusRenderWidgetHostViewAndroidOnActionDown, disabled for WebView). The one place input origin is classified.
+    /// A Down claim whose press is a mouse button's (the toolkit event, whatever MotionEvent the desktop adaptation made of it): Chromium's WebView focuses on mouse down
+    /// (kFocusRenderWidgetHostViewAndroidOnMouseDown) but not on touch down (kFocusRenderWidgetHostViewAndroidOnActionDown, disabled for WebView). The origin is classified where the window publishes the press.
     pub mouse_press: bool,
 }
 
 impl ClaimReply {
-    const LEFT_PRESSED: u32 = 1;
+    /// Bit 1 was a Cancel's left-pressed report, now [`WebEvent::PressNotCancelled`]; not reused.
     const MOUSE_PRESS: u32 = 2;
 
     /// The ABI form (UiVtable::sideband_claim's return).
     pub fn bits(self) -> u32 {
-        (if self.left_pressed {
-            Self::LEFT_PRESSED
-        } else {
-            0
-        }) | (if self.mouse_press {
+        if self.mouse_press {
             Self::MOUSE_PRESS
         } else {
             0
-        })
+        }
     }
 
     /// From [`Self::bits`].
     pub fn of_bits(b: u32) -> Self {
         Self {
-            left_pressed: b & Self::LEFT_PRESSED != 0,
             mouse_press: b & Self::MOUSE_PRESS != 0,
         }
     }
@@ -214,6 +207,9 @@ pub enum WebEvent {
     /// The page left the key Android delivered stamped this monotonic ns (`KeyEvent.getEventTimeNanos`, the time [`WebView::claim_input`] got) unhandled: no handler took it, the engine's default did nothing.
     /// Only key presses are reported (WebKitGTK puts back an unhandled press, not a release). The provider reports it to the app (WebViewClient.onUnhandledKeyEvent).
     UnhandledKey(i64),
+    /// A Cancel claim ([`InputClaim::Cancel`]: a parent intercepted) found the page mid-press: its Down's press reached the page, and no toolkit API sends the page a cancel (webview plan S2.2), a divergence
+    /// the provider counts. Reported while the claim's held events are processed, before any later claim's.
+    PressNotCancelled,
     /// A navigation's response is one the engine does not show (a type it cannot render, or `Content-Disposition: attachment`): the navigation was dropped, nothing is saved.
     Download {
         /// The response's URL.

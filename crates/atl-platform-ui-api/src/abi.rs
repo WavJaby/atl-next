@@ -1244,14 +1244,20 @@ pub struct UiVtable {
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the one the WebView module's [`WebViewVtable::view_create`] `shown` reports) the content of every sideband quad whose
     /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. UI thread.
-    /// `unhandled_key` (kept until detach, called on the UI thread): the widget left a key unhandled (the toolkit put back a delivered key event); its value is that key's stamp, the monotonic ns Android's KeyEvent carries (`WebEvent::UnhandledKey`).
-    pub sideband_attach:
-        unsafe extern "C" fn(key: i32, widget: *mut c_void, unhandled_key: Callback<i64>),
+    /// Both callbacks are kept until detach and called on the display thread. `unhandled_key`: the widget left a key unhandled (the toolkit put back a delivered key event); its value is that key's stamp,
+    /// the monotonic ns Android's KeyEvent carries (`WebEvent::UnhandledKey`). `press_not_cancelled`: a Cancel claim's replay found the page mid-press (`WebEvent::PressNotCancelled`).
+    pub sideband_attach: unsafe extern "C" fn(
+        key: i32,
+        widget: *mut c_void,
+        unhandled_key: Callback<i64>,
+        press_not_cancelled: Callback<()>,
+    ),
     /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
     pub sideband_detach: unsafe extern "C" fn(key: i32),
-    /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns [`ClaimReply::bits`](crate::webview::ClaimReply::bits). UI thread.
+    /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns [`ClaimReply::bits`](crate::webview::ClaimReply::bits). Any thread, never waits
+    /// for the display thread: the reply reads the press origins the window recorded before it published the events; the replay of the held events is invoked on the display thread (inline on its owner).
     pub sideband_claim: unsafe extern "C" fn(key: i32, claim: u32, time_ns: i64) -> u32,
-    /// `WebView::set_focused` for `key`'s widget. UI thread.
+    /// `WebView::set_focused` for `key`'s widget. Any thread: invoked on the display thread, after the same thread's earlier claims.
     pub sideband_focus: unsafe extern "C" fn(key: i32, on: bool),
 }
 

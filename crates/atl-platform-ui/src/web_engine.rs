@@ -141,10 +141,14 @@ impl WebEngine for PlatformWebEngine {
                 return unsafe { (ui.sideband_detach)(key) };
             }
             let events = Arc::clone(&shown_events);
-            let unhandled_key =
-                Callback::new(move |ns: &i64| deliver(&events, WebEvent::UnhandledKey(*ns)));
+            let unhandled_key = Callback::new({
+                let events = Arc::clone(&events);
+                move |ns: &i64| deliver(&events, WebEvent::UnhandledKey(*ns))
+            });
+            let press_not_cancelled =
+                Callback::new(move |_: &()| deliver(&events, WebEvent::PressNotCancelled));
             // SAFETY: display thread = the UI module's thread until display-thread S5; the widget is the live view's (borrowed), the UI module takes its own reference (same libgtk in both modules).
-            unsafe { (ui.sideband_attach)(key, *widget, unhandled_key) }
+            unsafe { (ui.sideband_attach)(key, *widget, unhandled_key, press_not_cancelled) }
         });
         // SAFETY: any thread (vtable contract); the callbacks pass to the module.
         if !unsafe { (m.view_create)(key, sink, shown) } {
@@ -319,7 +323,7 @@ impl WebView for PlatformWebView {
     }
 
     fn claim_input(&self, claim: InputClaim, time_ns: i64) -> ClaimReply {
-        // SAFETY: UI thread (trait contract); the key is this live view's.
+        // SAFETY: any thread (vtable contract); the key is this live view's.
         ClaimReply::of_bits(unsafe { (self.ui.sideband_claim)(self.key, claim as u32, time_ns) })
     }
 

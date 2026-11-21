@@ -752,9 +752,13 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     }));
     let sink_shared = Arc::clone(&shared);
     let sink_poster = poster.clone();
-    // on the display thread: a bridge prompt goes to the JavaBridge thread with the interface table (WTC R5: U not involved), every other event to the WebView's Looper in engine order
+    // on the display thread: a bridge prompt goes to the JavaBridge thread with the interface table (WTC R5: U not involved), a divergence is counted here (its diag line stays in input order),
+    // every other event to the WebView's Looper in engine order
     let sink = move |ev| {
         let ev = match ev {
+            WebEvent::PressNotCancelled => {
+                return atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
+            }
             WebEvent::Prompt {
                 message,
                 default,
@@ -2229,17 +2233,13 @@ mod action {
     pub const SCROLL: i32 = 8;
 }
 
-/// The divergence a Cancel can leave: the page got the press, Android cancelled the gesture (a parent intercepted), and the page is told of no cancel (webview plan S2.2: no toolkit API sends one).
+/// The divergence a Cancel can leave (WebEvent::PressNotCancelled): the page got the press, Android cancelled the gesture (a parent intercepted), and the page is told of no cancel (webview plan S2.2: no toolkit API sends one).
 const INTERCEPT_NO_CANCEL: &str = "webview.input.intercept-no-cancel";
 
 /// Claims `claim` at `ev`'s own time (`getEventTimeNanos`: the CLOCK_MONOTONIC stamp the toolkit event was published with).
 fn claim(env: Env, n: &Native, claim: InputClaim, ev: Obj) -> ClaimReply {
     let t = call_long(env, ev, c"getEventTimeNanos", c"()J");
-    let r = n.view.claim_input(claim, t);
-    if r.left_pressed {
-        atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
-    }
-    r
+    n.view.claim_input(claim, t)
 }
 
 /// `touchEvent`'s answer: 0 = consumed (Chromium consumes every touch it is given, AwContents.onTouchEvent); 1 = consumed, and the press was a mouse button's, so the Java side focuses

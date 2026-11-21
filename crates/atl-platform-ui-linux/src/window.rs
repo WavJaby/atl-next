@@ -285,8 +285,9 @@ impl GtkWindow {
                 shared.pointer_time.set(Some(time_ms));
             }
             let event = input::pointer(phase, x, y, scale_of(controller), monotonic_ns);
-            shared.on_event.call(|f| f(event));
-            sideband::stamp(controller.current_event(), monotonic_ns);
+            sideband::publish(controller.current_event(), monotonic_ns, || {
+                shared.on_event.call(|f| f(event))
+            });
         }
         // Every pointer controller runs in the capture phase, so it publishes an event before a sideband widget's gate holds it (sideband.rs); a held event put back is Android's already and skipped.
         // raw wl_pointer buttons, not GestureClick: a click gesture interprets presses (gtk-dnd-drag-threshold -> "stopped", n_press counting), and a drag past it lost its release -> the mouse finger never lifted
@@ -367,8 +368,7 @@ impl GtkWindow {
             s.swiping.set(unit == input::ScrollUnit::Surface);
             let at = s.stamp("scroll", c.current_event_time());
             let event = input::scroll(unit, dx, dy, s.pointer_at.get(), scale_of(c), at);
-            s.on_event.call(|f| f(event));
-            sideband::stamp(c.current_event(), at);
+            sideband::publish(c.current_event(), at, || s.on_event.call(|f| f(event)));
             // a scroll over a sideband widget goes on to its gate
             if sideband::routes_to_gate(picked(c, s.pointer_at.get())) {
                 gtk4::glib::Propagation::Proceed
@@ -409,8 +409,7 @@ impl GtkWindow {
             if let (Some(id), Some((x, y))) = (id, point) {
                 let at = s.stamp("touch", c.current_event_time());
                 let event = input::touch(phase, id, x, y, scale_of(c), at);
-                s.on_event.call(|f| f(event));
-                sideband::stamp(c.current_event(), at);
+                sideband::publish(c.current_event(), at, || s.on_event.call(|f| f(event)));
             }
             // a touch on a sideband widget goes on to its gate
             if point.is_some_and(|p| sideband::routes_to_gate(picked(c, p))) {
@@ -458,8 +457,7 @@ impl GtkWindow {
             let at = s.stamp("key", c.current_event_time());
             if let Some(event) = input::key(down, keycode, locks, at) {
                 crate::count::hit("key.published");
-                s.on_event.call(|f| f(event));
-                sideband::stamp(c.current_event(), at);
+                sideband::publish(c.current_event(), at, || s.on_event.call(|f| f(event)));
             } else {
                 crate::count::hit("key.no-scancode");
             }
