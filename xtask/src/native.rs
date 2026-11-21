@@ -133,6 +133,45 @@ impl Args {
 }
 
 /// A tool flag's value, else the binary of its deps.toml row.
+/// The converter goal that compiles the pinned SELinux policy and derives the service access table (tools/bp2ninja sepolicy.go).
+pub const SEPOLICY_GOAL: &str = "atl-sepolicy";
+/// Its table tool's package (crate atl-sepolicy-av).
+const SEPOLICY_AV: &str = "atl-sepolicy-av";
+/// The repo's policy dir (`java/sepolicy`) as the tree shows it through the repo bind (AOSP's `vendor/<name>/sepolicy` place), compiled with the platform policy as a SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS entry;
+/// tree-relative, as product config names one, so the outputs do not depend on the checkout's path.
+const SEPOLICY_DIR: &str = "vendor/atl/sepolicy";
+
+/// Goal [`SEPOLICY_GOAL`]'s converter flags: the deps.toml rows m4, checkpolicy and secilc, the table tool (built here for the build machine into `<out>/cargo`, before the conversion names it) and
+/// [`SEPOLICY_DIR`]. Empty without the goal.
+fn sepolicy_args(root: &Path, goals: &[String], out: &Path) -> Result<Vec<String>> {
+    if !goals.iter().any(|g| g == SEPOLICY_GOAL) {
+        return Ok(Vec::new());
+    }
+    let target = out.join("cargo");
+    crate::unit_use::exec(
+        crate::cargo_command()
+            .current_dir(root)
+            .args(["build", "--release", "--locked", "-p", SEPOLICY_AV])
+            .arg("--target-dir")
+            .arg(&target),
+        "cargo build (sepolicy table tool)",
+    )?;
+    let av = target.join("release").join(SEPOLICY_AV);
+    ensure!(av.is_file(), "{} missing after cargo build", av.display());
+    Ok(vec![
+        "-m4".to_owned(),
+        deps::binary(root, "m4")?,
+        "-checkpolicy".to_owned(),
+        deps::binary(root, "checkpolicy")?,
+        "-secilc".to_owned(),
+        deps::binary(root, "secilc")?,
+        "-sepolicy-av".to_owned(),
+        av.display().to_string(),
+        "-sepolicy-system-ext-private".to_owned(),
+        SEPOLICY_DIR.to_owned(),
+    ])
+}
+
 fn flag_or_row(flag: &Option<String>, root: &Path, row: &str) -> Result<String> {
     match flag {
         Some(name) => Ok(name.clone()),
@@ -378,6 +417,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let nb = native_bridge_flags(root, &arches, args, &converter, &tree, &graph_out, &llvm)?;
     // the pinned tag's release config: build flags, and the values aconfig flag libraries are generated with (the converter builds aconfig from the tree)
     let release = aosp::target_release(&tree)?;
+    let sepolicy = sepolicy_args(root, &args.goals, &graph_out)?;
     // the table check: providers.toml rows the converter finds wrong against the tree, then the none gate
     let mut table: Vec<String> = Vec::new();
     // host Java tools (xsdc for xsd_config's C++ output, ...) are built by the converter's Java pipeline where a goal reaches one; nothing Java is emitted otherwise
@@ -473,6 +513,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 .map(str::to_owned),
         );
         argv.extend(nb.flags.iter().cloned());
+        argv.extend(sepolicy.iter().cloned());
         argv.extend(args.goals.iter().cloned());
         argv.extend(aidl_goals.iter().cloned());
         let regen = convert(&converter, &graph_out, &argv, &env)?;

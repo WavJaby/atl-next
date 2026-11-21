@@ -65,8 +65,11 @@ func treeFiles(base string) []string {
 // Tools are the host programs the generated rules call. RustVersion: Rustc's version, Soong's ANDROID_RUST_VERSION, which crates read (rustversion).
 // LibClang: the directory of CC's libclang.so, which bindgen loads at run time (LIBCLANG_PATH): the cc side's clang parses the headers bindgen reads.
 // Launcher: compiler cache prefixed to the cc rule only (empty = none), except compiles with debug info (debugInfo). Not yasm (sccache does not know it) nor rustc: sccache 0.10 refuses rustc's `-o`, keys Rust on the cwd (= the out dir, so no hit across out dirs) and restores the dep-info of the out dir that filled the entry.
-// BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go).
-type Tools struct{ CC, CXX, AR, Bison, Flex, M4, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string }
+// BionicStaticRust: -bionic-static-rust (rust.go rustStaticlib). LicenceGate: -licence-gate (licence.go). Sepolicy: goal atl-sepolicy's tools (sepolicy.go).
+type Tools struct {
+	CC, CXX, AR, Bison, Flex, M4, Yasm, Rustc, RustVersion, LibClang, LLVM, Launcher, RtInclude, BionicStaticRust, LicenceGate string
+	Sepolicy                                                                                                                   sepolicyTools
+}
 
 // ninjaFile: build.ninja written through a buffer, compared with the file already at path while the bytes match: an unchanged manifest (~750 MB) is never written, and keeps its mtime
 // (the regeneration edge is `restat`, regen.go, so ninja takes that as clean). At the first difference <path>.tmp gets the matched prefix copied from the old file, then the rest; commit renames it

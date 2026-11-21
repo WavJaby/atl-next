@@ -116,6 +116,12 @@ crates = ["atl-android-runtime"]
 crates = ["atl-diag"]
 exports = ["atl-diag"]
 
+# the SELinux decisions ATL makes in the kernel's place (service-access plan): the service access table derived from the compiled pinned policy, the context file formats, the AOSP domains of atld's spawns;
+# atl-sepolicy-av: the build-time tool that queries the binary policy through libsepol and writes the table (converter goal atl-sepolicy)
+[sepolicy]
+crates = ["atl-sepolicy", "atl-sepolicy-av"]
+exports = ["atl-sepolicy"]
+
 # Rust stubs of AIDL interfaces against AOSP's libbinder_rs, both from the converter (built by `xtask native` after it), and the Rust types of the Java-only parcelables they pass (a converter rust_library)
 [aidl]
 crates = ["atl-aidl", "atl-parcelables", "atl-parcel-truth"]
@@ -288,5 +294,5 @@ uses = ["layout", "bwrap", "services-types", "android-paths", "fonts-table"]
 # the runtime harness: `cargo xtask test|run-apk|remote` and the check steps that need product logic (gl-proxies), run by xtask as a process
 [xtask-harness]
 crates = ["xtask-harness"]
-# xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back; property-service: the default property set the installer gate maps, with the device ABI list replaced for its break abi-arm64; fonts + fonts-table: the product's font list over the desktop's fontconfig, as atld builds it (step host-fonts)
-uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators", "property-service", "diag", "fonts", "fonts-table"]
+# xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back; property-service: the default property set the installer gate maps, with the device ABI list replaced for its break abi-arm64; fonts + fonts-table: the product's font list over the desktop's fontconfig, as atld builds it (step host-fonts); sepolicy: the service access table and spawn domains the sepolicy gate checks
+uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators", "property-service", "diag", "fonts", "fonts-table", "sepolicy"]

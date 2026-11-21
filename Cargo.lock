@@ -722,6 +722,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-sepolicy"
+version = "0.0.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "atl-sepolicy-av"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-sepolicy",
+ "bindgen",
+ "clap",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "atl-service-view"
 version = "0.0.0"
 dependencies = [
@@ -3048,6 +3067,7 @@ dependencies = [
  "atl-native-bridge",
  "atl-platform-host",
  "atl-property-service",
+ "atl-sepolicy",
  "atl-services-types",
  "atl-sigaction-hook",
  "clap",

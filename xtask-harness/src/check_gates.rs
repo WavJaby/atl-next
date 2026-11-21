@@ -56,6 +56,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["task-bind"], false, false),
     Row::new(&["sandbox"], true, true),
     Row::new(&["signing"], true, true),
+    Row::new(&["sepolicy"], true, true),
     Row::new(&["gl-dispatch"], false, true),
     // reads the workspace's APK cache (default APKs); a missing APK is its own red verdict
     Row::new(&["app-imports"], false, false),

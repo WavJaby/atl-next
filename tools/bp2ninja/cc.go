@@ -284,7 +284,9 @@ type Graph struct {
 	synthMods map[string]*Module
 	// build/release config (release.go) and aconfig codegen (aconfig.go); nil without -release
 	release *Release
-	acfg    *aconfigGraph
+	// goal atl-sepolicy given (sepolicy.go)
+	sepolicy bool
+	acfg     *aconfigGraph
 	// Java modules (java.go)
 	java *javaGraph
 }

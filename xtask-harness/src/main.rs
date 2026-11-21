@@ -67,6 +67,7 @@ mod sandbox;
 mod scenarios;
 mod screencopy;
 mod sensors;
+mod sepolicy;
 mod services;
 mod session_bus;
 mod signing;
@@ -253,6 +254,10 @@ enum Test {
     ///
     /// Control every run: a libGLESv2 with its own atl-bionic copy (dlmopen) must fail. Needs libEGL + libGLESv2 in --out; no driver.
     GlDispatch(gl_dispatch::Args),
+    /// The service access table derived from the compiled pinned SELinux policy answers as the cited policy sources say, and every name atld's processes register is add-allowed for their domain.
+    ///
+    /// Control every run: a table granting untrusted_app find on the KeyMint HAL must fail. Needs `native --for sepolicy`.
+    Sepolicy(sepolicy::Args),
     /// The GLES driver over the host's system EGL (libEGL_atl.so) rendering into an ANativeWindow of gralloc buffers, loaded as AOSP's loader loads it; every pixel of every queued buffer checked with its transform applied.
     ///
     /// Controls every run: a window dropping the buffer transform and framebuffer entries taken from the host must fail. Needs no native build.
@@ -422,6 +427,9 @@ fn main() -> Result<ExitCode> {
             test: Test::GlDispatch(args),
         } => gl_dispatch::run(&root, &args),
         Command::Test {
+            test: Test::Sepolicy(args),
+        } => sepolicy::run(&root, &args),
+        Command::Test {
             test: Test::EglDriver(args),
         } => egl_driver::run(&root, &args),
         Command::Test {
@@ -555,6 +563,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Gles2Fixture(_) => "gles2-fixture",
             Test::TaskBind(_) => "task-bind",
             Test::GlDispatch(_) => "gl-dispatch",
+            Test::Sepolicy(_) => "sepolicy",
             Test::EglDriver(_) => "egl-driver",
             Test::VkDriver(_) => "vk-driver",
             Test::Gl(_) => "gl",

@@ -53,6 +53,10 @@ func main() {
 	flex := flag.String("flex", "flex", "lexer generator for .ll/.l sources")
 	m4 := flag.String("m4", "m4", "macro processor flex runs, set as its M4 (Soong's lex rule sets M4= beside flex)")
 	yasm := flag.String("yasm", "yasm", "assembler for .asm (NASM syntax) sources, Soong's yasm rule")
+	checkpolicy := flag.String("checkpolicy", "checkpolicy", "SELinux policy compiler of goal "+sepolicyGoal+" (sepolicy.go; Soong's prebuilt checkpolicy)")
+	secilc := flag.String("secilc", "secilc", "CIL compiler of goal "+sepolicyGoal+" (sepolicy.go)")
+	sepolicyAv := flag.String("sepolicy-av", "", "goal "+sepolicyGoal+": the table tool (crate atl-sepolicy-av) the service access table edge runs over the binary policy and the context files")
+	sepolicySysExt := flag.String("sepolicy-system-ext-private", "", "goal "+sepolicyGoal+": tree-relative directory of policy compiled with the platform's, as SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS names one (the repo's java/sepolicy at vendor/atl/sepolicy); empty = none")
 	licenceGate := flag.String("licence-gate", "", "command of the licence gate edge over the device link outputs (licence.go): reads them from $out.rsp, writes its report to $out and its depfile to $out.d; empty = no edge")
 	launcher := flag.String("launcher", "", "compiler cache run in front of every C/C++ compile (sccache); empty = compile directly")
 	rustc := flag.String("rustc", "rustc", "Rust compiler of Rust modules (rust.go), with its own sysroot")
@@ -253,7 +257,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bp2ninja: -build-provided:", err)
 		os.Exit(1)
 	}
-	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate}, javaSetup{jt, *release, *measure}, omitted, provided, buildProvided, nbProvided, partial, isaTiers, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
+	se := sepolicyTools{*m4, *checkpolicy, *secilc, *sepolicyAv, *sepolicySysExt}
+	if err := run(*tree, *out, cfg, Tools{*cc, *cxx, *ar, *bison, *flex, *m4, *yasm, *rustc, *rustVersion, *libclang, *llvm, *launcher, *rtInclude, *bionicStaticRust, *licenceGate, se}, javaSetup{jt, *release, *measure}, omitted, provided, buildProvided, nbProvided, partial, isaTiers, android, moduleDefines, stand, aidlCrates, *nbExports, regen, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "bp2ninja:", err)
 		os.Exit(1)
 	}
@@ -458,6 +463,10 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 			}
 			continue
 		}
+		if goal == sepolicyGoal {
+			g.sepolicy = true
+			continue
+		}
 		if goal == bootJniGoal {
 			libs, err := g.bootJniLibs()
 			if err != nil {
@@ -513,6 +522,9 @@ func run(tree, out string, cfg Config, tools Tools, js javaSetup, omit map[strin
 		ninja.WriteString(g.java.ninja(g))
 	}
 	ninja.WriteString(g.licenceNinja(tools.LicenceGate))
+	if g.sepolicy {
+		ninja.WriteString(g.sepolicyNinja(tools.Sepolicy))
+	}
 	// compat/ has one reader, the device-side compile (ninja.go compileFlags): a plan without one writes nothing and needs no libc provider for api-level.h
 	if g.hasDeviceObjs() {
 		if err := writeCompat(tree, out, provided); err != nil {

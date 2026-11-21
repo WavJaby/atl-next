@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Types of ATL's own service names (service_contexts beside this file). Compiled with AOSP's platform policy, so AOSP's neverallows check every rule here.
+
+# atl.compositor_registry: no AOSP counterpart (on a device SurfaceFlinger is one system process; here each app process runs its own and registers it, plus its UI agent, with atld's registry).
+# Apps must find and call it, as they do surfaceflinger_service (public/service.te: app_api_service); atl-system-services registers it in system_server's role (system_server_service: add_service rule of private/system_server.te).
+type atl_compositor_registry_service, app_api_service, system_server_service, service_manager_type;

@@ -18,6 +18,7 @@
 #                 `<binary> <version_arg>`) must be >= min. Other distro rows: pkg-config or package version.
 #                 aosp rows take no min: the pin is the version. A min without an upstream requirement records
 #                 the version observed on 2026-11-07 (min_reason says so): older is untested.
+#   min_of        `package`: a binary row whose tool prints no version of its own; its min is checked against the installed package's version instead
 #   group, covers  optional distro row only (atld): `group` is the name atld's missing-font warning gives the faces the
 #                 package provides, `covers` their ISO 15924 scripts (a fallback lang's likely script; atl-fonts' tests check them against ICU)
 # Every row:
@@ -81,6 +82,18 @@ cargo = "cargo-deny"
 version = "0.20.2"
 scope = ["test"]
 used_by = ["xtask:check"]
+
+# SELinux policy compiler of the converter goal atl-sepolicy (tools/bp2ninja sepolicy.go, Soong's se_policy_cil): policy.conf -> CIL. Build time only, nothing of it ships. `checkpolicy --version`
+# prints the policy version it writes (34), not its own: the package version is checked. 3.8.1 = the version the pinned policy was first compiled with (2026-11-21); older is untested
+[checkpolicy]
+debian = "checkpolicy"
+arch = "checkpolicy"
+binary = "checkpolicy"
+min = "3.8.1"
+min_reason = "observed 2026-11-21 compiling the pinned system/sepolicy; older is untested"
+min_of = "package"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 # the distro C/C++ toolchain of the converter route (plan D7-2): clang, lld, llvm-ar, libc++
 [clang]
@@ -269,6 +282,16 @@ pkgconfig = "libelf"
 scope = ["build", "runtime"]
 used_by = ["upstream:aosp"]
 
+# libsepol's access-vector query (sepol_compute_av), which the build-time tool atl-sepolicy-av links to derive the service access table from the compiled policy; nothing of it ships
+[libsepol]
+debian = "libsepol-dev"
+arch = "libsepol"
+pkgconfig = "libsepol"
+min = "3.8.1"
+min_reason = "observed 2026-11-21 with the checkpolicy / secilc rows of the same release; older is untested"
+scope = ["build"]
+used_by = ["crate:atl-sepolicy-av"]
+
 # the converter's linker: Soong's commonGlobalLldflags -fuse-ld=lld, which the `clang` row's clang resolves to its own ld.lld
 [lld]
 debian = "lld-19"
@@ -295,6 +318,16 @@ arch = "llvm"
 binary = "llvm-ar-19"
 min = "19.1.7"
 min_reason = "observed 2026-11-07; older is untested"
+scope = ["build"]
+used_by = ["xtask:native"]
+
+# Soong's prebuilt m4: the converter goal atl-sepolicy's policy.conf and context files (sepolicy.go), and flex's M4
+[m4]
+debian = "m4"
+arch = "m4"
+binary = "m4"
+min = "1.4.19"
+min_reason = "observed 2026-11-21; older is untested"
 scope = ["build"]
 used_by = ["xtask:native"]
 
@@ -616,6 +649,18 @@ min = "0.8"
 min_reason = "nested_wayland.rs:10: labwc >= 0.8"
 scope = ["test"]
 used_by = ["xtask:test"]
+
+# CIL compiler of the converter goal atl-sepolicy (sepolicy.go, Soong's secilc check + se_policy_binary): CIL -> binary policy, AOSP's neverallows checked. Build time only, nothing of it ships.
+# secilc has no version option: the package version is checked (same release as the checkpolicy row)
+[secilc]
+debian = "secilc"
+arch = "secilc"
+binary = "secilc"
+min = "3.8.1"
+min_reason = "observed 2026-11-21 compiling the pinned system/sepolicy; older is untested"
+min_of = "package"
+scope = ["build"]
+used_by = ["xtask:native"]
 
 # xtask native's compiler cache (CompilerCache in native.rs): C/C++ compiles of the converter's builds, shared by every out dir
 [sccache]

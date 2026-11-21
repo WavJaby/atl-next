@@ -22,6 +22,7 @@ atl-native-bridge = { path = "../crates/atl-native-bridge" }
 atl-sigaction-hook = { path = "../crates/atl-sigaction-hook" }
 atl-platform-host = { path = "../crates/atl-platform-host" }
 atl-property-service = { path = "../crates/atl-property-service" }
+atl-sepolicy = { path = "../crates/atl-sepolicy" }
 atl-diag = { path = "../crates/atl-diag", features = ["serde"] }
 atl-services-types = { path = "../crates/atl-services-types" }
 clap.workspace = true

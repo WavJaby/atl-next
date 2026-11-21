@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-sepolicy-av"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+atl-sepolicy = { path = "../atl-sepolicy" }
+clap.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+pkg-config.workspace = true
+
+[lints]
+workspace = true

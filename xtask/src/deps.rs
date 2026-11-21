@@ -42,6 +42,8 @@ pub struct Dep {
     pub sysroot_debs: Option<Vec<String>>,
     pub binary: Option<String>,
     pub version_arg: Option<String>,
+    /// Where a binary row's `min` is checked: absent = the binary's own report; `package` = the installed package's version, for a tool that prints none of its own.
+    pub min_of: Option<MinOf>,
     pub scope: Vec<Scope>,
     pub used_by: Vec<String>,
     /// A fallback group (atl-fonts' missing-font warning names it, e.g. `CJK`): with `covers`, on an optional distro row.
@@ -49,6 +51,12 @@ pub struct Dep {
     /// ISO 15924 scripts of the fallback langs the group's faces render (atl-fonts checks each against ICU).
     #[serde(default)]
     pub covers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MinOf {
+    Package,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -272,6 +280,10 @@ fn validate(name: &str, dep: &Dep, consumers: &Consumers) -> Result<()> {
             "version `{version}` is not an exact x.y.z"
         );
     }
+    ensure!(
+        dep.min_of.is_none() || dep.binary.is_some() && distro && dep.version_arg.is_none(),
+        "min_of applies to a distro binary row, without version_arg (the binary is not asked)"
+    );
     match &dep.binary {
         None => ensure!(dep.version_arg.is_none(), "version_arg needs binary"),
         Some(binary) => {
@@ -643,7 +655,7 @@ fn check_row(
     let Some(installed) = package_version(distro, package)? else {
         return Ok(Some(format!("package {package} not installed")));
     };
-    if let Some(binary) = &dep.binary {
+    if let (Some(binary), None) = (&dep.binary, dep.min_of) {
         let min = dep
             .min
             .as_deref()
@@ -1080,6 +1092,17 @@ mod tests {
     }
 
     const USED: &str = "scope = [\"test\"]\nused_by = [\"xtask:check\"]\n";
+
+    #[test]
+    fn min_of_package_needs_a_distro_binary_row_without_version_arg() {
+        let base = "debian = \"x\"\nbinary = \"x\"\nmin = \"1.0\"\nmin_reason = \"r\"\nmin_of = \"package\"\n";
+        assert!(parse(&format!("[x]\n{base}{USED}"), &consumers()).is_ok());
+        assert!(
+            err(&format!("[x]\n{base}version_arg = \"-v\"\n{USED}")).contains("min_of applies")
+        );
+        let no_binary = "debian = \"x\"\nmin = \"1.0\"\nmin_reason = \"r\"\nmin_of = \"package\"\n";
+        assert!(err(&format!("[x]\n{no_binary}{USED}")).contains("min_of applies"));
+    }
 
     #[test]
     fn host_ref_names_the_sysroot_of_its_arch() {

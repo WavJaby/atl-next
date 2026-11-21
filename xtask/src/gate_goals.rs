@@ -356,6 +356,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("rv-qemu", || Goals::host(&["libz", "libunwindstack"])),
     ("sandbox", Goals::default),
     ("sensors", runtime_gralloc),
+    // the compiled policy, its context files and the service access table (tools/bp2ninja sepolicy.go)
+    ("sepolicy", || Goals::host(&[crate::native::SEPOLICY_GOAL])),
     // the signed product APKs it verifies (framework-res: platform role; the repo bind's fixture: default role) and apksigner, the verifier
     ("signing", || {
         Goals::host(&["framework-res", "AtlSigningFixture", APK_SIGNER])
