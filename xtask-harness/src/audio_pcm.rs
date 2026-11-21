@@ -352,6 +352,15 @@ pub(crate) struct Routing {
 
 impl Routing {
     pub(crate) fn setup(name: &str) -> Result<Self> {
+        Self::null_node(name, "Audio/Sink", "")
+    }
+
+    /// A run's own null source (`Audio/Source/Virtual`, silence), for capture checks (`xtask test sandbox` pipewire row); `priority.session=1` keeps every real source ahead of it as the default.
+    pub(crate) fn source(name: &str) -> Result<Self> {
+        Self::null_node(name, "Audio/Source/Virtual", "priority.session=1 ")
+    }
+
+    fn null_node(name: &str, class: &str, extra: &str) -> Result<Self> {
         let mut routing = Routing {
             name: name.to_owned(),
             sink: None,
@@ -359,9 +368,9 @@ impl Routing {
         };
         // state.restore-props=false: WirePlumber's state-stream neither restores nor saves this node's volume, so a run leaves no `Audio/Sink:node.name:<sink>` key in the user's state file
         let props = format!(
-            "{{ factory.name=support.null-audio-sink node.name={name} media.class=Audio/Sink \
+            "{{ factory.name=support.null-audio-sink node.name={name} media.class={class} \
              audio.rate=48000 audio.channels={CHANNELS} audio.position=[ FL FR ] object.linger=true \
-             state.restore-props=false }}"
+             {extra}state.restore-props=false }}"
         );
         let created = pw_command(&["create-node", "adapter", &props])?;
         ensure!(created.status.success(), "pw-cli create-node failed");

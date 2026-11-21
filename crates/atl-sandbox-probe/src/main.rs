@@ -6,8 +6,11 @@
 //! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads),
 //! `resolv` (`ok:<first nameserver, or none>` when RESOLV reads). An outcome is `ok` or `err:<errno>`. Last, `env=<names>`: the names of its whole environment, sorted, comma-joined, no values. Exits 0 once every check ran; the gate judges the outcomes.
 //! Second form `atl-sandbox-probe wayland SOCKET NAME INTERFACE VERSION`: the Wayland interfaces the compositor offers through SOCKET and a bind attempt of one global (fn `wayland`); a raw wire client, so no libwayland in the sandbox's way.
+//! Third form `atl-sandbox-probe pipewire REMOTE SINK SOURCE PULSE`: the PipeWire graph as the app's client sees it through REMOTE, a capture attempt from SOURCE and silence played into SINK (module `pipewire`), and a connect to PULSE (the host's pulse socket path: must not be shown).
 //! Built on std, stays inside the app seccomp filter (allow-all but setpriority) and the stub's Landlock domain: no probe of its own beyond the file calls.
 #![forbid(unsafe_code)]
+
+mod pipewire;
 
 use std::fs;
 use std::io::{self, Write};
@@ -197,6 +200,22 @@ fn wayland(socket: &str, name: &str, interface: &str, version: &str) -> String {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("pipewire") {
+        let [_, remote, sink, source, pulse] = args.as_slice() else {
+            let _ = writeln!(
+                io::stderr(),
+                "probe: usage: pipewire REMOTE SINK SOURCE PULSE"
+            );
+            return ExitCode::from(2);
+        };
+        let _ = writeln!(
+            io::stdout(),
+            "probe: pipewire {} pulse={}",
+            pipewire::probe(remote, sink, source),
+            connect(Path::new(pulse))
+        );
+        return ExitCode::SUCCESS;
+    }
     if args.first().map(String::as_str) == Some("wayland") {
         let [_, socket, name, interface, version] = args.as_slice() else {
             let _ = writeln!(

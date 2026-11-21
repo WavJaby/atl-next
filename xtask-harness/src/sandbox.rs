@@ -8,6 +8,7 @@
 //! The resolver (judge_resolv): with INTERNET the probe reads the host's /etc/resolv.conf through whatever link chain the host has (WSL `/mnt/wsl/resolv.conf`, systemd-resolved `/run/...`); a dangling link reads ENOENT and fails it.
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
 //! Wayland (wayland_rows): on the gates' labwc, the probe connects through a per-app security context as atld gives it; no privileged interface offered, a privileged bind fails, ATL's interfaces stay. Deliberate break: mount `nested.socket` instead of the context socket; the row must then fail.
+//! PipeWire (pipewire_rows): on the desktop's PipeWire, through a per-app security context made as atld makes one (atl_platform_host::pipewire_context), at the tier its probe picks; built-in red control: the same probe through the raw socket must fail the same judgement.
 //! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
 
 use std::collections::BTreeMap;
@@ -131,6 +132,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     fails.extend(wl_fails);
     lines.push(format!("[wayland] {wl_line}"));
+    let (pw_lines, pw_fails) = pipewire_rows(&broker, &probe, &work)?;
+    println!(
+        "sandbox: pipewire {}",
+        if pw_fails.is_empty() { "ok" } else { "FAILED" }
+    );
+    fails.extend(pw_fails);
+    lines.extend(pw_lines);
     for (tag, run) in runs {
         let p = run?;
         match p.abi {
@@ -529,6 +537,206 @@ fn wayland_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(String, V
     }
     fails.extend(judge_wayland(&line, target, |i| outside.contains_key(i)));
     Ok((line, fails))
+}
+
+/// The pipewire rows' runs: (tag, RECORD_AUDIO granted, raw socket instead of a context).
+const PIPEWIRE_RUNS: &[(&str, bool, bool)] = &[
+    ("pipewire", false, false),
+    ("pipewire RECORD_AUDIO", true, false),
+    ("pipewire raw socket (red control)", false, true),
+];
+
+/// The PipeWire rows: the gate makes its own null sink + null source (silence, never the session's nodes), starts a permission manager as atld does (its tier probe decides the tier), and runs the probe as an app process
+/// with the context socket at the PipeWire socket's path (atld `Host::app_spawn`). Each run is judged by [`judge_pipewire`]; the raw-socket run is the red control: it must fail, or the probe cannot tell a context from the raw socket.
+/// WriteRestricted runs only the plain and raw runs: capture is not restricted there, so a RECORD_AUDIO run would judge nothing.
+fn pipewire_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    use atl_platform_host::pipewire_context::{Grants, Manager, Probe, Tier};
+    let Some(socket) = app_access::pipewire_socket() else {
+        return Ok((
+            vec!["[pipewire] no PipeWire socket".into()],
+            vec!["pipewire: no PipeWire socket on this host: the row cannot be judged".into()],
+        ));
+    };
+    let pid = std::process::id();
+    let sink = crate::audio_pcm::Routing::setup(&format!("atl-sbx-sink-{pid}"))?;
+    let source = crate::audio_pcm::Routing::source(&format!("atl-sbx-src-{pid}"))?;
+    let manager = match Manager::start(&socket) {
+        Probe::Available(m) => m,
+        Probe::Unavailable(why) => {
+            return Ok((
+                vec![format!("[pipewire] security context unavailable ({why})")],
+                vec!["pipewire: no SecurityContext: the context tier cannot be judged".into()],
+            ));
+        }
+    };
+    let tier = manager.tier();
+    let p = manager.probe();
+    println!(
+        "sandbox: pipewire tier={} probe_default={} probe_ms={:.1}",
+        tier.name(),
+        p.probe_default
+            .map_or("unproven".into(), |d| format!("{d:#o}")),
+        p.waited.as_secs_f64() * 1e3
+    );
+    if tier == Tier::WriteRestricted {
+        println!(
+            "sandbox: pipewire capture not restricted at tier write-restricted (session manager grants read to restricted clients)"
+        );
+    }
+    let pulse = app_access::pulse_socket().unwrap_or_else(|| {
+        let mut p = socket.clone();
+        p.set_file_name("pulse/native");
+        p
+    });
+    let (mut lines, mut fails) = (Vec::new(), Vec::new());
+    for &(tag, mic, raw) in PIPEWIRE_RUNS {
+        if mic && tier == Tier::WriteRestricted {
+            continue;
+        }
+        let ctx = if raw {
+            None
+        } else {
+            Some(manager.create(
+                Some(&format!("atl.{PACKAGE}")),
+                Grants {
+                    record_audio: mic,
+                    camera: false,
+                },
+            )?)
+        };
+        let mut cmd = Command::new(probe);
+        cmd.arg("pipewire")
+            .arg(&socket)
+            .arg(sink.name())
+            .arg(source.name())
+            .arg(&pulse);
+        let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
+        spawn.mounts.push(Mount {
+            host: ctx
+                .as_ref()
+                .map_or(socket.clone(), |c| c.socket().to_path_buf()),
+            at: socket.clone(),
+            writable: false,
+        });
+        let log = work.join(format!("probe-{}.log", tag.replace(' ', "-")));
+        (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
+        let mut child = broker.spawn(spawn).context("starting the pipewire probe")?;
+        let status = binder::wait_limited(&mut child.child, LIMIT)?;
+        drop(ctx);
+        let line = fs::read_to_string(&log)?
+            .lines()
+            .find(|l| l.starts_with("probe: pipewire "))
+            .unwrap_or("probe: pipewire no line in the probe's log")
+            .to_owned();
+        let mut f = judge_pipewire(&line, tier, mic);
+        if !status.is_some_and(|s| s.success()) {
+            f.push(format!("probe ended {status:?}"));
+        }
+        if raw {
+            println!("sandbox: [{tag}] red: {} failures (want > 0)", f.len());
+            if f.is_empty() {
+                fails.push(format!(
+                    "[{tag}] the raw socket passes the context's judgement: the probe cannot tell them apart"
+                ));
+            }
+        } else {
+            println!(
+                "sandbox: [{tag}] {}",
+                if f.is_empty() { "green" } else { "FAILED" }
+            );
+            fails.extend(f.into_iter().map(|x| format!("[{tag}] {x}")));
+        }
+        // counts and yes/no only (atl-sandbox-probe pipewire): the evidence line of every run, red or green
+        println!("sandbox: [{tag}] {line}");
+        lines.push(format!("[{tag}] {line}"));
+    }
+    Ok((lines, fails))
+}
+
+/// The verdict on one `pipewire` probe line at `tier` ([`pipewire_rows`]). Both tiers: the access value atld's tier assigns (never the unknown `atl` value at WriteRestricted: wireplumber 0.5.19 gives it full access),
+/// no W / M on any object but the client's own client, the run's null sink visible and silence played into it, the pulse socket not shown. Enforced adds the allow-list: no node but sinks
+/// (pipewire_context `wanted`), and the null source visible + capture > 0 bytes exactly when RECORD_AUDIO is granted (`mic`).
+fn judge_pipewire(
+    line: &str,
+    tier: atl_platform_host::pipewire_context::Tier,
+    mic: bool,
+) -> Vec<String> {
+    use atl_platform_host::pipewire_context::Tier;
+    let field = |key: &str| {
+        line.split(' ')
+            .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+            .unwrap_or("missing")
+            .to_owned()
+    };
+    let num = |key: &str| field(key).parse::<u64>().ok();
+    let mut fails = Vec::new();
+    let mut want = |ok: bool, what: String| {
+        if !ok {
+            fails.push(what);
+        }
+    };
+    let access = field("access");
+    let want_access = match tier {
+        Tier::Enforced => "atl",
+        Tier::WriteRestricted => "restricted",
+    };
+    want(
+        access == want_access,
+        format!("access={access} (want {want_access})"),
+    );
+    for k in ["w", "m"] {
+        let v = field(k);
+        want(
+            v == "0",
+            format!("{k}={v}: write/metadata access on foreign objects (want 0)"),
+        );
+    }
+    want(
+        field("sink") == "yes",
+        "the run's null sink is not visible".into(),
+    );
+    let play = field("play");
+    want(
+        play == "ok",
+        format!("play={play}: silence into the null sink failed"),
+    );
+    let pulse = field("pulse");
+    want(
+        HOME_REFUSED.iter().any(|e| pulse == format!("err:{e}")),
+        format!("pulse={pulse}: the pulse socket is reachable from an app process"),
+    );
+    if tier == Tier::Enforced {
+        let foreign = field("foreign");
+        want(
+            foreign == "0",
+            format!("foreign={foreign}: nodes other than sinks visible (want 0)"),
+        );
+        let (source, capture) = (field("source"), num("capture"));
+        if mic {
+            want(
+                source == "yes",
+                "RECORD_AUDIO granted, the null source is not visible".into(),
+            );
+            want(
+                capture.is_some_and(|n| n > 0),
+                format!(
+                    "RECORD_AUDIO granted, capture={} (want > 0)",
+                    field("capture")
+                ),
+            );
+        } else {
+            let sources = field("sources");
+            want(
+                sources == "0",
+                format!("sources={sources} without RECORD_AUDIO (want 0)"),
+            );
+            want(
+                capture == Some(0),
+                format!("capture={} without RECORD_AUDIO (want 0)", field("capture")),
+            );
+        }
+    }
+    fails
 }
 
 /// The verdict on the probe's `wayland` line ([`wayland_rows`]): `bound` = the privileged interface it tried to bind; `offered_outside` = what the compositor offers an unsandboxed client.

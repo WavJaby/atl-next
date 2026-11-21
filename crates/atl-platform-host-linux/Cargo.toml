@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 # The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown). The desktop's fonts through the safe `fontconfig` crate. The session bus through `zbus` (notifications).
-# `unsafe` only in pipewire_context.rs (the SecurityContext extension's bind + create through the raw method tables: no pipewire-rs binding); everything else the safe gtk4-rs / pipewire-rs bindings.
+# `unsafe` only in pipewire_context.rs (the SecurityContext extension's bind + create through the raw method tables, generated from the header by build.rs: no pipewire-rs binding); everything else the safe gtk4-rs / pipewire-rs bindings.
 
 [dependencies]
 atl-platform-host-api = { path = "../atl-platform-host-api" }
@@ -22,6 +22,11 @@ tracing.workspace = true
 wayland-client.workspace = true
 wayland-protocols = { workspace = true, features = ["staging"] }
 zbus.workspace = true
+
+# build.rs: the SecurityContext extension's bindings from the installed header, as pipewire-sys generates the core API (same bindgen + features: no new crate)
+[build-dependencies]
+bindgen.workspace = true
+pkg-config.workspace = true
 
 [lints]
 workspace = true

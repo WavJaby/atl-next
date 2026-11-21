@@ -700,13 +700,17 @@ impl PipeWire {
         let socket = atl_platform_host::app_access::pipewire_socket()?;
         let manager = match pipewire_context::Manager::start(&socket) {
             pipewire_context::Probe::Available(m) => {
-                match m.tier() {
-                    pipewire_context::Tier::Enforced => log(format_args!(
-                        "pipewire: security context available tier=enforced (session manager grants context clients nothing; atld grants own objects, sinks, sources by RECORD_AUDIO/CAMERA)"
+                let p = m.probe();
+                let ms = format!("{:.1}", p.waited.as_secs_f64() * 1e3);
+                match (m.tier(), p.probe_default) {
+                    (pipewire_context::Tier::Enforced, _) => log(format_args!(
+                        "pipewire: security context available tier=enforced probe=settled probe_ms={ms} (session manager grants context clients nothing; atld grants own objects, sinks, sources by RECORD_AUDIO/CAMERA)"
                     )),
-                    pipewire_context::Tier::WriteRestricted => log(format_args!(
-                        "pipewire: security context available tier=write-restricted (session manager gave the probe client {:o}; apps use pipewire.access=restricted: no write/metadata, capture not restricted)",
-                        m.probe_default()
+                    (pipewire_context::Tier::WriteRestricted, Some(d)) => log(format_args!(
+                        "pipewire: security context available tier=write-restricted probe=settled probe_ms={ms} (session manager gave the probe client {d:#o}; apps use pipewire.access=restricted: no write/metadata, capture not restricted)"
+                    )),
+                    (pipewire_context::Tier::WriteRestricted, None) => log(format_args!(
+                        "pipewire: security context available tier=write-restricted probe=unproven probe_ms={ms} (session manager did not handle the probe within its budget; apps use pipewire.access=restricted: no write/metadata, capture not restricted)"
                     )),
                 }
                 Some(m)

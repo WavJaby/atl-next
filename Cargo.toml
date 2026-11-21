@@ -13,6 +13,8 @@ publish = false
 # Every dependency is declared here once; member crates use `dep.workspace = true`.
 [workspace.dependencies]
 anyhow = "1"
+# build-time bindings of pipewire's SecurityContext extension (atl-platform-host-linux build.rs); pipewire-sys's own version + features, so no new crate
+bindgen = { version = "0.72", default-features = false, features = ["runtime"] }
 clang ={ version = "2.1", features = ["clang_10_0"] }
 # atl-bridgegen: `support::Clang::find` locates the clang binary paired with libclang (bindgen's route), for its resource dir
 clang-sys = "1.9"
@@ -44,6 +46,8 @@ webkit6 = { version = "0.6", features = ["v2_42"] }
 object ={ version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
 # PipeWire client (plan A0): the PCM output of atl-platform-ui-linux, over the safe pipewire crate and its pipewire-sys / libspa bindings (libpipewire-0.3: deps.toml [pipewire]); deny.toml keeps it out of every crate but -linux
 pipewire = "0.10.1"
+# build-time: libpipewire-0.3's include dirs for the SecurityContext bindings (atl-platform-host-linux build.rs); already in the graph via system-deps
+pkg-config = "0.3"
 # xtask only: `run-apk --drive` screenshots
 png = "0.18"
 roxmltree = "0.21"

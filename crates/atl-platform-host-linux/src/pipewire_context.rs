@@ -2,8 +2,8 @@
 //! Per-process PipeWire security contexts (`PipeWire:Interface:SecurityContext`, pipewire >= 1.0: the mechanism Flatpak and `pw-container` use) and atld as the permission manager of the clients arriving through them.
 //! atld makes one listening socket per app process and hands it to PipeWire with `pipewire.sec.engine` / `.app-id` / `.instance-id` + `pipewire.access`; PipeWire copies those onto every client connecting through it,
 //! and a client can neither set nor change them (pipewire impl-client.c `check_client_property_update`). The sandbox shows only that socket.
-//! Tiers, chosen by probing (`Manager::start`): no SecurityContext global -> `Unavailable`. Else a probe client connects through a context with an access value the session manager has no rule for and atld reads
-//! its default permissions: still empty -> `Enforced` (the session manager grants nothing, so atld's per-object grants are the whole truth); anything granted -> `WriteRestricted`: contexts carry
+//! Tiers, chosen by probing (`Manager::start`): no SecurityContext global -> `Unavailable`. Else a probe client connects through a context with an access value the session manager has no rule for, then a
+//! `restricted` control client; once the control client is served (proof the session manager handled the probe client: [`PROBE_LIMIT`]) atld reads the probe's default permissions: still empty -> `Enforced` (the session manager grants nothing, so atld's per-object grants are the whole truth); anything granted -> `WriteRestricted`: contexts carry
 //! `pipewire.access=restricted`, which stock WirePlumber maps to read+execute on every object (no write, no metadata), and atld grants nothing itself -- visibility and capture stay open there.
 //! An unknown access value on such a host is never used for apps: it means full access on wireplumber 0.5.19 (measured W 40, M 98).
 //! Grants (Enforced): core RX, own client RWX, `client-node` factory RX, every Audio/Sink node + its ports R (a link needs the stream owner's R on the other node: impl-link.c `check_owner_permissions`),
@@ -34,11 +34,14 @@ pub const SECURITY_CONTEXT_INTERFACE: &str = "PipeWire:Interface:SecurityContext
 const ACCESS_ATL: &str = "atl";
 /// WirePlumber's read+execute value (0.5.8 access-default.lua, 0.5.19 find-default-access.lua): the WriteRestricted tier.
 const ACCESS_RESTRICTED: &str = "restricted";
-/// How long the probe waits for the session manager to act on its client before reading its permissions. WirePlumber handles a client within its next main-loop dispatches after
-/// `client-added` (select-access event chain); 1 s leaves two orders of magnitude over a loaded desktop's dispatch latency. A slower session manager reads as Enforced too early -> its
-/// grants then reach app clients; the gate row's foreign-node count catches that.
-const PROBE_SETTLE: Duration = Duration::from_millis(1000);
-const PROBE_POLL: Duration = Duration::from_millis(100);
+/// The control context's instance id: a `restricted` client the session manager always grants (RX), connected after the probe client is registered.
+const CONTROL_INSTANCE: &str = "probe-control";
+/// Startup budget for the tier probe, not a correctness bound. The verdict waits on an event, never a sleep: the control client's core sync completes only once the session manager granted it
+/// (a client without core R is busy: impl-client.c `update_busy`), and WirePlumber handles clients strictly in order (event-dispatcher.c `event_cmp_func`: equal priority -> push seq; an async hook
+/// holds the queue; 0.5.8 + 0.5.19), so by then the probe client, registered first, has its final permissions. Past the budget the verdict is unproven -> WriteRestricted, logged `probe=unproven`:
+/// never Enforced, because an unknown access value means full access on wireplumber 0.5.19 (W 40, M 98 measured) -- a wrong Enforced would hand apps that, a wrong WriteRestricted only RX.
+/// 3 s: a session manager at login may still be starting; measured `probe_ms` is printed with the tier.
+const PROBE_LIMIT: Duration = Duration::from_secs(3);
 
 /// The tier the probe chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +58,23 @@ impl Tier {
         match self {
             Tier::Enforced => "enforced",
             Tier::WriteRestricted => "write-restricted",
+        }
+    }
+}
+
+/// The tier probe's evidence: the probe client's default permission bits once the session manager provably handled it (None: not proven within [`PROBE_LIMIT`]), and how long that took.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeResult {
+    pub probe_default: Option<u32>,
+    pub waited: Duration,
+}
+
+impl ProbeResult {
+    /// The tier this evidence allows: only a proven empty default is Enforced (failure direction: [`PROBE_LIMIT`]).
+    pub fn tier(&self) -> Tier {
+        match self.probe_default {
+            Some(0) => Tier::Enforced,
+            _ => Tier::WriteRestricted,
         }
     }
 }
@@ -81,21 +101,16 @@ enum Cmd {
         grants: Grants,
         reply: mpsc::Sender<io::Result<OwnedFd>>,
     },
-    Grants {
-        instance: String,
-        grants: Grants,
-    },
     Release {
         instance: String,
     },
 }
 
 /// atld's connection to PipeWire, on its own thread (pipewire-rs objects are thread-bound); one per run.
+/// Grants are fixed at [`Manager::create`] (the process's runtime permissions at spawn): ATL has no revoke path, and a runtime grant to a running process takes effect at its next start.
 pub struct Manager {
     tx: pw::channel::Sender<Cmd>,
-    tier: Tier,
-    /// default permission bits the probe client got from the session manager (0 in Enforced)
-    probe_default: u32,
+    probe: ProbeResult,
     dir: PathBuf,
     seq: std::sync::atomic::AtomicU64,
 }
@@ -110,13 +125,14 @@ impl Manager {
             return Probe::Unavailable(format!("{}: {e}", dir.display()));
         }
         let (tx, rx) = pw::channel::channel::<Cmd>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<(Tier, u32), String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<ProbeResult, String>>();
         let remote = remote.to_owned();
         let probe_path = dir.join(format!("pipewire-{}.probe", std::process::id()));
+        let control_path = dir.join(format!("pipewire-{}.control", std::process::id()));
         let spawned = std::thread::Builder::new()
             .name("atl-pw-sec".into())
             .spawn(move || {
-                if let Err(e) = run(&remote, probe_path, rx, &ready_tx) {
+                if let Err(e) = run(&remote, [probe_path, control_path], rx, &ready_tx) {
                     let _ = ready_tx.send(Err(e));
                 }
             });
@@ -124,10 +140,9 @@ impl Manager {
             return Probe::Unavailable(format!("thread: {e}"));
         }
         match ready_rx.recv() {
-            Ok(Ok((tier, probe_default))) => Probe::Available(Self {
+            Ok(Ok(probe)) => Probe::Available(Self {
                 tx,
-                tier,
-                probe_default,
+                probe,
                 dir,
                 seq: Default::default(),
             }),
@@ -137,12 +152,12 @@ impl Manager {
     }
 
     pub fn tier(&self) -> Tier {
-        self.tier
+        self.probe.tier()
     }
 
-    /// Default permission bits (pipewire `PW_PERM_*`) the session manager gave the probe client: 0 in [`Tier::Enforced`].
-    pub fn probe_default(&self) -> u32 {
-        self.probe_default
+    /// The tier probe's evidence ([`ProbeResult`]).
+    pub fn probe(&self) -> ProbeResult {
+        self.probe
     }
 
     /// A new context for one app process: `app_id` (None: a process of no package), instance id `<atld pid>.<n>`. Returns once PipeWire has taken the listener (a core sync after create).
@@ -169,14 +184,6 @@ impl Manager {
             _close: close,
             tx: self.tx.clone(),
         })
-    }
-
-    /// Re-evaluates one context's grants (an Android runtime permission changed). No effect in [`Tier::WriteRestricted`].
-    pub fn set_grants(&self, ctx: &AppContext, grants: Grants) {
-        let _ = self.tx.send(Cmd::Grants {
-            instance: ctx.instance.clone(),
-            grants,
-        });
     }
 }
 
@@ -347,15 +354,14 @@ fn kind_of(g: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>) -> Ki
     }
 }
 
-/// The security-context methods table (pipewire extensions/security-context.h `struct pw_security_context_methods`, PW_VERSION_SECURITY_CONTEXT_METHODS 0): pipewire-sys has no binding for the extension.
-#[repr(C)]
-struct SecurityContextMethods {
-    version: u32,
-    add_listener: *const c_void,
-    create: Option<
-        unsafe extern "C" fn(*mut c_void, c_int, c_int, *const pw::spa::sys::spa_dict) -> c_int,
-    >,
+/// The SecurityContext extension's method table, generated from the installed header (build.rs; same header in pipewire 1.4.2 and 1.6.11): the struct is the header's, so a reordered table changes
+/// the binding, and a changed `create` prototype fails the call below to compile. The asserts pin what this module was written against: `create` is method 1 of methods version 0.
+#[allow(non_camel_case_types, non_upper_case_globals, dead_code, unsafe_code)]
+mod sys {
+    include!(concat!(env!("OUT_DIR"), "/security_context.rs"));
 }
+const _: () = assert!(sys::PW_SECURITY_CONTEXT_METHOD_CREATE == 1);
+const _: () = assert!(sys::PW_VERSION_SECURITY_CONTEXT_METHODS == 0);
 
 /// Binds the SecurityContext global `id` and sends one `create` with `listen` / `close` and `props`; the proxy is destroyed after the request is queued (the request is in the stream already).
 #[allow(unsafe_code)]
@@ -383,14 +389,20 @@ fn security_context_create(
     if proxy.is_null() {
         return Err(io::Error::other("bind SecurityContext failed"));
     }
-    // SAFETY: proxy is the pw_proxy bind returned for a SecurityContext global, whose first member is its spa_interface; the method table layout is the header's (version, add_listener, create);
-    // props' dict and the fds stay valid for the call, which marshals them into the outgoing message.
+    // SAFETY: proxy is the pw_proxy bind returned for a SecurityContext global, whose first member is its spa_interface; pw_proxy_get_type names the interface its marshal serves (checked below);
+    // the method table layout is the header's (build.rs static asserts); props' dict and the fds stay valid for the call, which marshals them into the outgoing message.
     let res = unsafe {
+        let mut v = 0u32;
+        let t = pw::sys::pw_proxy_get_type(proxy.cast(), &mut v);
         let iface: *mut pw::spa::sys::spa_interface = proxy.cast();
-        let funcs: *const SecurityContextMethods = (*iface).cb.funcs.cast();
-        let r = match (*funcs).create {
-            Some(f) => f((*iface).cb.data, listen, close, props.dict().as_raw_ptr()),
-            None => -libc_enosys(),
+        let funcs: *const sys::pw_security_context_methods = (*iface).cb.funcs.cast();
+        let r = if t.is_null() || std::ffi::CStr::from_ptr(t) != ty.as_c_str() || funcs.is_null() {
+            -libc_enosys()
+        } else {
+            match (*funcs).create {
+                Some(f) => f((*iface).cb.data, listen, close, props.dict().as_raw_ptr()),
+                None => -libc_enosys(),
+            }
         };
         pw::sys::pw_proxy_destroy(proxy.cast());
         r
@@ -450,9 +462,9 @@ fn context_props(
 
 fn run(
     remote: &Path,
-    probe_path: PathBuf,
+    [probe_path, control_path]: [PathBuf; 2],
     rx: pw::channel::Receiver<Cmd>,
-    ready: &mpsc::Sender<Result<(Tier, u32), String>>,
+    ready: &mpsc::Sender<Result<ProbeResult, String>>,
 ) -> Result<(), String> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
@@ -557,50 +569,85 @@ fn run(
         return Err(format!("PipeWire offers no {SECURITY_CONTEXT_INTERFACE}"));
     };
 
-    // tier probe: a client through a context with an access value no stock rule names
-    let (probe_close, ours) = make_context(
-        &registry,
-        sc_id,
-        &probe_path,
-        &context_props(None, PROBE_INSTANCE, ACCESS_ATL),
-    )
-    .map_err(|e| format!("probe context: {e}"))?;
-    sync(&mainloop, &core).map_err(|e| format!("sync: {e}"))?;
-    drop(ours);
-    let mut pp = pw::properties::PropertiesBox::new();
-    pp.insert("remote.name", probe_path.to_string_lossy().as_ref());
-    pp.insert("application.name", "atld-tier-probe");
-    let probe_core = context
-        .connect_rc(Some(pp))
-        .map_err(|e| format!("probe connect: {e}"))?;
-    let mut waited = Duration::ZERO;
-    let mut granted = 0u32;
-    while waited < PROBE_SETTLE {
-        iterate(&mainloop, PROBE_POLL);
-        waited += PROBE_POLL;
-        let s = st.borrow();
-        if let Some(c) = s.probe_client.and_then(|c| s.clients.get(&c)) {
-            c.proxy.get_permissions(0, 1);
-        }
-        if let Some(d) = s.probe_default
-            && d != 0
-        {
-            granted = d;
-            break;
-        }
+    // tier probe (PROBE_LIMIT): a client through a context with an access value no stock rule names, then a `restricted` control client the session manager always grants
+    let mut contexts = Vec::new();
+    for (path, instance, access) in [
+        (&probe_path, PROBE_INSTANCE, ACCESS_ATL),
+        (&control_path, CONTROL_INSTANCE, ACCESS_RESTRICTED),
+    ] {
+        let (close, ours) = make_context(
+            &registry,
+            sc_id,
+            path,
+            &context_props(None, instance, access),
+        )
+        .map_err(|e| format!("probe context: {e}"))?;
+        contexts.push((close, ours));
     }
     sync(&mainloop, &core).map_err(|e| format!("sync: {e}"))?;
-    if let Some(d) = st.borrow().probe_default {
-        granted |= d;
-    }
-    drop(probe_core);
-    drop(probe_close);
-    let _ = std::fs::remove_file(&probe_path);
-    let tier = if granted == 0 {
-        Tier::Enforced
-    } else {
-        Tier::WriteRestricted
+    let connect = |path: &Path, name: &str| {
+        let mut p = pw::properties::PropertiesBox::new();
+        p.insert("remote.name", path.to_string_lossy().as_ref());
+        p.insert("application.name", name);
+        context
+            .connect_rc(Some(p))
+            .map_err(|e| format!("probe connect: {e}"))
     };
+    let start = std::time::Instant::now();
+    let deadline = start + PROBE_LIMIT;
+    let wait = |until: &dyn Fn() -> bool| {
+        while !until() {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            iterate(&mainloop, left.min(Duration::from_millis(50)));
+        }
+        true
+    };
+    let probe_core = connect(&probe_path, "atld-tier-probe")?;
+    // the session manager handles clients in registration order: the control client connects only once the probe client is registered (atld saw its global + info)
+    let registered = wait(&|| st.borrow().probe_client.is_some());
+    let mut control = None;
+    let handled = registered && {
+        let core = connect(&control_path, "atld-tier-control")?;
+        let done = Rc::new(std::cell::Cell::new(false));
+        let seq = core.sync(0).map_err(|e| format!("probe sync: {e}"))?;
+        let listener = core
+            .add_listener_local()
+            .done({
+                let done = done.clone();
+                move |id, s| {
+                    if id == pw::core::PW_ID_CORE && s == seq {
+                        done.set(true);
+                    }
+                }
+            })
+            .register();
+        control = Some((core, listener));
+        wait(&|| done.get())
+    };
+    let probe_default = if handled {
+        {
+            let s = st.borrow();
+            if let Some(m) = s.probe_client.and_then(|c| s.clients.get(&c)) {
+                m.proxy.get_permissions(0, 1);
+            }
+        }
+        sync(&mainloop, &core).map_err(|e| format!("sync: {e}"))?;
+        st.borrow().probe_default
+    } else {
+        None
+    };
+    let probe = ProbeResult {
+        probe_default,
+        waited: start.elapsed(),
+    };
+    drop(control);
+    drop(probe_core);
+    drop(contexts);
+    let _ = std::fs::remove_file(&probe_path);
+    let _ = std::fs::remove_file(&control_path);
+    let tier = probe.tier();
     {
         let mut s = st.borrow_mut();
         s.tier = Some(tier);
@@ -608,7 +655,7 @@ fn run(
             s.clients.remove(&c);
         }
     }
-    let _ = ready.send(Ok((tier, granted)));
+    let _ = ready.send(Ok(probe));
 
     let access = if tier == Tier::Enforced {
         ACCESS_ATL
@@ -666,21 +713,6 @@ fn run(
                     }
                 }
             }
-            Cmd::Grants { instance, grants } => {
-                let mut s = st.borrow_mut();
-                s.apps.insert(instance.clone(), grants);
-                if s.tier == Some(Tier::Enforced) {
-                    let ids: Vec<u32> = s
-                        .clients
-                        .iter()
-                        .filter(|(_, m)| m.instance.as_deref() == Some(instance.as_str()))
-                        .map(|(&c, _)| c)
-                        .collect();
-                    for c in ids {
-                        regrant(&mut s, c);
-                    }
-                }
-            }
             Cmd::Release { instance } => {
                 let mut s = st.borrow_mut();
                 s.apps.remove(&instance);
@@ -716,4 +748,104 @@ fn sync(mainloop: &pw::main_loop::MainLoopRc, core: &pw::core::CoreRc) -> Result
 
 fn iterate(mainloop: &pw::main_loop::MainLoopRc, d: Duration) {
     mainloop.loop_().iterate(pw::loop_::Timeout::Finite(d));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_proven_empty_default_is_enforced() {
+        let r = |d| ProbeResult {
+            probe_default: d,
+            waited: Duration::ZERO,
+        };
+        assert_eq!(r(Some(0)).tier(), Tier::Enforced);
+        // wireplumber 0.5.19's grant to an unknown access value (PW_PERM_ALL = RWXM, permission.h)
+        assert_eq!(r(Some(RWX | P::M.bits())).tier(), Tier::WriteRestricted);
+        // the session manager never provably handled the probe (PROBE_LIMIT): never Enforced
+        assert_eq!(r(None).tier(), Tier::WriteRestricted);
+    }
+
+    #[test]
+    fn allow_list() {
+        let me = 40;
+        let globals: HashMap<u32, Kind> = [
+            (me, Kind::Client),
+            (41, Kind::Client),
+            (
+                2,
+                Kind::Factory {
+                    name: "client-node".into(),
+                },
+            ),
+            (
+                3,
+                Kind::Factory {
+                    name: "link-factory".into(),
+                },
+            ),
+            (
+                10,
+                Kind::Node {
+                    class: "Audio/Sink".into(),
+                    owner: None,
+                },
+            ),
+            (11, Kind::Port { node: 10 }),
+            (
+                20,
+                Kind::Node {
+                    class: "Audio/Source".into(),
+                    owner: None,
+                },
+            ),
+            (21, Kind::Port { node: 20 }),
+            (
+                30,
+                Kind::Node {
+                    class: "Video/Source".into(),
+                    owner: None,
+                },
+            ),
+            (
+                50,
+                Kind::Node {
+                    class: "Stream/Output/Audio".into(),
+                    owner: Some(me),
+                },
+            ),
+            (
+                51,
+                Kind::Node {
+                    class: "Stream/Output/Audio".into(),
+                    owner: Some(41),
+                },
+            ),
+            (60, Kind::Other),
+        ]
+        .into_iter()
+        .collect();
+        let none = Grants::default();
+        let mic = Grants {
+            record_audio: true,
+            camera: false,
+        };
+        let cam = Grants {
+            record_audio: false,
+            camera: true,
+        };
+        let w = |g, id| wanted(&globals, me, g, id);
+        // the module doc's allow-list, row by row
+        assert_eq!(w(none, 0), RX);
+        assert_eq!(w(none, me), RWX);
+        assert_eq!(w(none, 41), 0);
+        assert_eq!(w(none, 2), RX);
+        assert_eq!(w(none, 3), 0);
+        assert_eq!((w(none, 10), w(none, 11)), (R, R));
+        assert_eq!((w(none, 20), w(none, 21), w(none, 30)), (0, 0, 0));
+        assert_eq!((w(mic, 20), w(mic, 21), w(mic, 30)), (R, R, 0));
+        assert_eq!((w(cam, 20), w(cam, 30)), (0, R));
+        assert_eq!((w(none, 50), w(none, 51), w(none, 60)), (RWX, 0, 0));
+    }
 }

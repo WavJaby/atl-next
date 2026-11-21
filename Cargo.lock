@@ -565,9 +565,11 @@ name = "atl-platform-host-linux"
 version = "0.0.0"
 dependencies = [
  "atl-platform-host-api",
+ "bindgen",
  "fontconfig",
  "gtk4",
  "pipewire",
+ "pkg-config",
  "rustix",
  "tracing",
  "wayland-client",
@@ -696,6 +698,9 @@ dependencies = [
 [[package]]
 name = "atl-sandbox-probe"
 version = "0.0.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "atl-sandbox-stub"
