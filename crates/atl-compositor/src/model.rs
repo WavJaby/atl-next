@@ -541,6 +541,13 @@ impl Compositor {
         self.layers.len()
     }
 
+    /// Whether a layer holds the buffer with `GraphicBuffer::id` `id` (shown or not: a hidden or offscreen layer keeps its buffer until it is replaced or the layer goes).
+    pub fn holds_buffer(&self, id: u64) -> bool {
+        self.layers
+            .values()
+            .any(|l| l.held.as_ref().is_some_and(|h| h.buffer.id == id))
+    }
+
     /// Transactions queued and not yet applied.
     pub fn pending_transactions(&self) -> usize {
         self.queues.values().map(VecDeque::len).sum()

@@ -198,7 +198,7 @@ pub struct Stats {
     pub releases_peer_gone: u64,
     /// Releases sent with the read fence the window exported at its paint.
     pub releases_fenced: u64,
-    /// Read fences the window exported for a buffer no waiting release named (dropped).
+    /// Read fences the window exported for a buffer the core no longer holds and no release named (dropped).
     pub releases_fenced_unmatched: u64,
     /// File descriptors taken out of transaction parcels.
     pub fds_taken: u64,
@@ -234,6 +234,9 @@ struct State {
     in_flight: VecDeque<Vec<i32>>,
     /// Calls the core produced outside a tick (a layer destroyed), delivered at the next one.
     pending_calls: Vec<ClientCall>,
+    /// Read fences the window exported for a buffer a layer still holds (the layer left the scene: hidden or offscreen), by buffer id: they ride that buffer's release when it comes, as
+    /// SurfaceFlinger keeps a layer's last present fence for its buffer's eventual release. Dropped when the window holds the buffer again (its next paint exports a newer one).
+    read_fences: HashMap<u64, OwnedFd>,
     next_layer_id: i32,
     next_vsync_id: i64,
     /// The vsync time of the last tick (monotonic ns).
@@ -472,6 +475,7 @@ impl Composer {
                 tubes: HashMap::new(),
                 in_flight: VecDeque::new(),
                 pending_calls: Vec::new(),
+                read_fences: HashMap::new(),
                 next_layer_id: 1,
                 next_vsync_id: 0,
                 last_tick_ns: None,
@@ -772,14 +776,44 @@ impl Composer {
     ) -> Vec<ClientCall> {
         let held = self.held(latch);
         st.compositor.set_held(&held);
+        st.read_fences.retain(|id, _| !held.contains(id));
         let Some(mut report) = latch.take_report() else {
             return Vec::new();
         };
         let mut calls = st.compositor.painted(&held);
         fences.extend(attach_read_fences(&mut calls, &mut report));
-        // a fence whose buffer the core released already (never retired) is dropped: closing a sync_file does not signal or cancel it
-        st.stats.releases_fenced_unmatched += report.len() as u64;
+        for (id, fence) in report {
+            if st.compositor.holds_buffer(id) {
+                st.read_fences.insert(id, fence);
+            } else {
+                // its buffer the core released already (never retired): dropped, closing a sync_file does not signal or cancel it
+                st.stats.releases_fenced_unmatched += 1;
+            }
+        }
         calls
+    }
+
+    /// Gives the tick's releases of buffers that left the scene while a layer still held them the read fence the window exported for them ([`State::read_fences`]); a kept fence whose buffer the
+    /// core no longer holds found no release and is dropped (`releases_fenced_unmatched`).
+    fn kept_read_fences(
+        st: &mut State,
+        calls: &mut [ClientCall],
+        fences: &mut HashMap<i32, OwnedFd>,
+    ) {
+        fences.extend(attach_read_fences(calls, &mut st.read_fences));
+        let State {
+            compositor,
+            read_fences,
+            stats,
+            ..
+        } = st;
+        read_fences.retain(|id, _| {
+            let kept = compositor.holds_buffer(*id);
+            if !kept {
+                stats.releases_fenced_unmatched += 1;
+            }
+            kept
+        });
     }
 
     /// The last reference to a layer's handle went away: the core processes the death at a tick, as SurfaceFlinger does ([`Compositor::handle_destroyed`]), so the layer's buffers are released through the tick's
@@ -1053,6 +1087,7 @@ impl Composer {
             st.stats.scenes += 1;
         }
         all.extend(calls);
+        Self::kept_read_fences(&mut st, &mut all, &mut fences);
         let (scene, published) = match (latch.as_mut(), scene) {
             (Some(l), Some(scene)) => {
                 l.publish(scene, at_ns);
