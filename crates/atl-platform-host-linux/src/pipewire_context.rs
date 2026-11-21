@@ -3,8 +3,10 @@
 //! atld makes one listening socket per app process and hands it to PipeWire with `pipewire.sec.engine` / `.app-id` / `.instance-id` + `pipewire.access`; PipeWire copies those onto every client connecting through it,
 //! and a client can neither set nor change them (pipewire impl-client.c `check_client_property_update`). The sandbox shows only that socket.
 //! Tiers, chosen by probing (`Manager::start`): no SecurityContext global -> `Unavailable`. Else a probe client connects through a context with an access value the session manager has no rule for, then a
-//! `restricted` control client; once the control client is served (proof the session manager handled the probe client: [`PROBE_LIMIT`]) atld reads the probe's default permissions: still empty -> `Enforced` (the session manager grants nothing, so atld's per-object grants are the whole truth); anything granted -> `WriteRestricted`: contexts carry
-//! `pipewire.access=restricted`, which stock WirePlumber maps to read+execute on every object (no write, no metadata), and atld grants nothing itself -- visibility and capture stay open there.
+//! `restricted` control client; once the control client is served (proof the session manager handled the probe client: [`PROBE_LIMIT`]) atld reads both clients' default permissions ([`ProbeResult::tier`]):
+//! probe empty -> `Enforced` (the session manager grants nothing, so atld's per-object grants are the whole truth); else control R without W and M -> `WriteRestricted`: contexts carry
+//! `pipewire.access=restricted`, which stock WirePlumber maps to read+execute on every object (no write, no metadata), and atld grants nothing itself -- visibility and capture stay open there;
+//! else (control granted W or M -- wireplumber 0.5.15 gives `restricted` full access --, no R, or unproven) -> `Unavailable`: no context restricts anything provable, so none is claimed.
 //! An unknown access value on such a host is never used for apps: it means full access on wireplumber 0.5.19 (measured W 40, M 98).
 //! Grants (Enforced): core RX, own client RWX, `client-node` factory RX, every Audio/Sink node + its ports R (a link needs the stream owner's R on the other node: impl-link.c `check_owner_permissions`),
 //! own nodes + ports RWX, links with an own node at either end R (the PCM output checks its stream reached a sink: atl-platform-ui-linux audio.rs), Audio/Source nodes + ports R only with RECORD_AUDIO,
@@ -35,12 +37,12 @@ pub const SECURITY_CONTEXT_INTERFACE: &str = "PipeWire:Interface:SecurityContext
 const ACCESS_ATL: &str = "atl";
 /// WirePlumber's read+execute value (0.5.8 access-default.lua, 0.5.19 find-default-access.lua): the WriteRestricted tier.
 const ACCESS_RESTRICTED: &str = "restricted";
-/// The control context's instance id: a `restricted` client the session manager always grants (RX), connected after the probe client is registered.
+/// The control context's instance id: a `restricted` client, connected after the probe client is registered; the session manager always serves it, and its default is the WriteRestricted tier's evidence.
 const CONTROL_INSTANCE: &str = "probe-control";
 /// Startup budget for the tier probe, not a correctness bound. The verdict waits on an event, never a sleep: the control client's core sync completes only once the session manager granted it
 /// (a client without core R is busy: impl-client.c `update_busy`), and WirePlumber handles clients strictly in order (event-dispatcher.c `event_cmp_func`: equal priority -> push seq; an async hook
-/// holds the queue; 0.5.8 + 0.5.19), so by then the probe client, registered first, has its final permissions. Past the budget the verdict is unproven -> WriteRestricted, logged `probe=unproven`:
-/// never Enforced, because an unknown access value means full access on wireplumber 0.5.19 (W 40, M 98 measured) -- a wrong Enforced would hand apps that, a wrong WriteRestricted only RX.
+/// holds the queue; 0.5.8 + 0.5.19), so by then the probe client, registered first, has its final permissions. Past the budget the verdict is unproven -> Unavailable, the defaults logged `unproven`:
+/// never a restricting tier, because neither value's grant is known -- an unknown access value means full access on wireplumber 0.5.19 (W 40, M 98 measured), `restricted` full access on 0.5.15.
 /// 3 s: a session manager at login may still be starting; measured `probe_ms` is printed with the tier.
 const PROBE_LIMIT: Duration = Duration::from_secs(3);
 
@@ -63,20 +65,38 @@ impl Tier {
     }
 }
 
-/// The tier probe's evidence: the probe client's default permission bits once the session manager provably handled it (None: not proven within [`PROBE_LIMIT`]), and how long that took.
+/// The tier probe's evidence: the default permission bits of the probe client (unknown access value) and of the control client (`restricted`, the value WriteRestricted apps get) once the session
+/// manager provably handled them (None: not proven within [`PROBE_LIMIT`]), and how long that took.
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeResult {
     pub probe_default: Option<u32>,
+    pub control_default: Option<u32>,
     pub waited: Duration,
 }
 
 impl ProbeResult {
-    /// The tier this evidence allows: only a proven empty default is Enforced (failure direction: [`PROBE_LIMIT`]).
-    pub fn tier(&self) -> Tier {
-        match self.probe_default {
-            Some(0) => Tier::Enforced,
-            _ => Tier::WriteRestricted,
+    /// The tier this evidence proves, None = none (`Unavailable`). Each tier is claimed only for what apps of that tier get: Enforced apps use the probe's access value, so a proven empty probe
+    /// default; WriteRestricted apps use `restricted`, so a proven control default with R and without W and M (the tier's definition: read to everything, no write, no metadata). Anything else --
+    /// unproven, or `restricted` granting W/M (wireplumber 0.5.15: full access) -- restricts nothing provable.
+    pub fn tier(&self) -> Option<Tier> {
+        match (self.probe_default, self.control_default) {
+            (Some(0), _) => Some(Tier::Enforced),
+            (_, Some(c)) if c & R != 0 && c & (P::W.bits() | P::M.bits()) == 0 => {
+                Some(Tier::WriteRestricted)
+            }
+            _ => None,
         }
+    }
+
+    /// What the probe observed, for the tier log lines: `probe_default=<octal|unproven> control_default=<octal|unproven> probe_ms=<ms>`.
+    pub fn observed(&self) -> String {
+        let bits = |d: Option<u32>| d.map_or("unproven".into(), |d| format!("{d:#o}"));
+        format!(
+            "probe_default={} control_default={} probe_ms={:.1}",
+            bits(self.probe_default),
+            bits(self.control_default),
+            self.waited.as_secs_f64() * 1e3
+        )
     }
 }
 
@@ -111,6 +131,7 @@ enum Cmd {
 /// Grants are fixed at [`Manager::create`] (the process's runtime permissions at spawn): ATL has no revoke path, and a runtime grant to a running process takes effect at its next start.
 pub struct Manager {
     tx: pw::channel::Sender<Cmd>,
+    tier: Tier,
     probe: ProbeResult,
     dir: PathBuf,
     seq: std::sync::atomic::AtomicU64,
@@ -126,7 +147,7 @@ impl Manager {
             return Probe::Unavailable(format!("{}: {e}", dir.display()));
         }
         let (tx, rx) = pw::channel::channel::<Cmd>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<ProbeResult, String>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(Tier, ProbeResult), String>>();
         let remote = remote.to_owned();
         let probe_path = dir.join(format!("pipewire-{}.probe", std::process::id()));
         let control_path = dir.join(format!("pipewire-{}.control", std::process::id()));
@@ -141,8 +162,9 @@ impl Manager {
             return Probe::Unavailable(format!("thread: {e}"));
         }
         match ready_rx.recv() {
-            Ok(Ok(probe)) => Probe::Available(Self {
+            Ok(Ok((tier, probe))) => Probe::Available(Self {
                 tx,
+                tier,
                 probe,
                 dir,
                 seq: Default::default(),
@@ -153,7 +175,7 @@ impl Manager {
     }
 
     pub fn tier(&self) -> Tier {
-        self.probe.tier()
+        self.tier
     }
 
     /// The tier probe's evidence ([`ProbeResult`]).
@@ -240,6 +262,8 @@ fn on_client_info(st: &Rc<RefCell<State>>, id: u32, instance: Option<&str>) {
     }
     if inst == PROBE_INSTANCE && s.tier.is_none() {
         s.probe_client = Some(id);
+    } else if inst == CONTROL_INSTANCE && s.tier.is_none() {
+        s.control_client = Some(id);
     } else if !s.apps.contains_key(inst) {
         return;
     }
@@ -262,6 +286,8 @@ struct State {
     tier: Option<Tier>,
     probe_client: Option<u32>,
     probe_default: Option<u32>,
+    control_client: Option<u32>,
+    control_default: Option<u32>,
     /// links [`refused_link`] destroyed this run
     links_refused: u64,
 }
@@ -523,7 +549,7 @@ fn run(
     remote: &Path,
     [probe_path, control_path]: [PathBuf; 2],
     rx: pw::channel::Receiver<Cmd>,
-    ready: &mpsc::Sender<Result<ProbeResult, String>>,
+    ready: &mpsc::Sender<Result<(Tier, ProbeResult), String>>,
 ) -> Result<(), String> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
@@ -585,10 +611,14 @@ fn run(
                             move |index, perms| {
                                 let mut s = st.borrow_mut();
                                 if index == 0
-                                    && s.probe_client == Some(id)
                                     && let Some(d) = perms.first()
                                 {
-                                    s.probe_default = Some(d.permission_flags().bits());
+                                    let bits = Some(d.permission_flags().bits());
+                                    if s.probe_client == Some(id) {
+                                        s.probe_default = bits;
+                                    } else if s.control_client == Some(id) {
+                                        s.control_default = bits;
+                                    }
                                 }
                             }
                         })
@@ -693,20 +723,26 @@ fn run(
         control = Some((core, listener));
         wait(&|| done.get())
     };
-    let probe_default = if handled {
+    // the control client's own sync done = the session manager served it; atld reads its default once atld's registry knows it (its info names the control instance)
+    let (probe_default, control_default) = if handled {
+        wait(&|| st.borrow().control_client.is_some());
         {
             let s = st.borrow();
-            if let Some(m) = s.probe_client.and_then(|c| s.clients.get(&c)) {
-                m.proxy.get_permissions(0, 1);
+            for c in [s.probe_client, s.control_client].into_iter().flatten() {
+                if let Some(m) = s.clients.get(&c) {
+                    m.proxy.get_permissions(0, 1);
+                }
             }
         }
         sync(&mainloop, &core).map_err(|e| format!("sync: {e}"))?;
-        st.borrow().probe_default
+        let s = st.borrow();
+        (s.probe_default, s.control_default)
     } else {
-        None
+        (None, None)
     };
     let probe = ProbeResult {
         probe_default,
+        control_default,
         waited: start.elapsed(),
     };
     drop(control);
@@ -714,15 +750,23 @@ fn run(
     drop(contexts);
     let _ = std::fs::remove_file(&probe_path);
     let _ = std::fs::remove_file(&control_path);
-    let tier = probe.tier();
+    let Some(tier) = probe.tier() else {
+        return Err(format!(
+            "tier probe proved no restriction: {} (unknown access not empty, restricted not read-only without write/metadata)",
+            probe.observed()
+        ));
+    };
     {
         let mut s = st.borrow_mut();
         s.tier = Some(tier);
-        if let Some(c) = s.probe_client.take() {
+        for c in [s.probe_client.take(), s.control_client.take()]
+            .into_iter()
+            .flatten()
+        {
             s.clients.remove(&c);
         }
     }
-    let _ = ready.send(Ok(probe));
+    let _ = ready.send(Ok((tier, probe)));
 
     let access = if tier == Tier::Enforced {
         ACCESS_ATL
@@ -835,14 +879,11 @@ mod tests {
         let Probe::Available(m) = Manager::start(&socket) else {
             panic!("no SecurityContext on this host");
         };
-        let p = m.probe();
         let _ = writeln!(
             io::stdout(),
-            "host: pipewire tier={} probe_default={} probe_ms={:.1}",
+            "host: pipewire tier={} {}",
             m.tier().name(),
-            p.probe_default
-                .map_or("unproven".into(), |d| format!("{d:#o}")),
-            p.waited.as_secs_f64() * 1e3
+            m.probe().observed()
         );
         let ctx = m
             .create(Some("atl.host.tier"), Grants::default())
@@ -858,17 +899,40 @@ mod tests {
         assert!(status.success());
     }
 
+    /// The decision table, one row per observed (probe, control) combination; each expected tier follows from the tier definitions in [`ProbeResult::tier`], not from the code.
+    /// Grant values: PW_PERM_ALL = RWXM (pipewire permission.h); RX = stock `restricted` (wireplumber 0.4.17-0.5.14, 0.5.16+); unknown access value: nothing on 0.4.x-0.5.14, ALL on 0.5.15+.
     #[test]
-    fn only_a_proven_empty_default_is_enforced() {
-        let r = |d| ProbeResult {
-            probe_default: d,
-            waited: Duration::ZERO,
+    fn tier_only_for_a_proven_restriction() {
+        let all = RWX | P::M.bits();
+        let r = |probe, control| {
+            ProbeResult {
+                probe_default: probe,
+                control_default: control,
+                waited: Duration::ZERO,
+            }
+            .tier()
         };
-        assert_eq!(r(Some(0)).tier(), Tier::Enforced);
-        // wireplumber 0.5.19's grant to an unknown access value (PW_PERM_ALL = RWXM, permission.h)
-        assert_eq!(r(Some(RWX | P::M.bits())).tier(), Tier::WriteRestricted);
-        // the session manager never provably handled the probe (PROBE_LIMIT): never Enforced
-        assert_eq!(r(None).tier(), Tier::WriteRestricted);
+        // wireplumber 0.5.0-0.5.14 (probe nothing, restricted RX), or any version with the ATL fragment: apps' access value gets nothing
+        assert_eq!(r(Some(0), Some(RX)), Some(Tier::Enforced));
+        // 0.5.15 with the fragment: Enforced apps never use `restricted`, so its ALL does not matter
+        assert_eq!(r(Some(0), Some(all)), Some(Tier::Enforced));
+        // 0.5.16+ without the fragment: unknown ALL, restricted RX -> apps use restricted: no write, no metadata
+        assert_eq!(r(Some(all), Some(RX)), Some(Tier::WriteRestricted));
+        // R without X still has no write or metadata
+        assert_eq!(r(Some(all), Some(R)), Some(Tier::WriteRestricted));
+        // 0.5.15 without the fragment: restricted ALL (the scoping bug) -> nothing restricts
+        assert_eq!(r(Some(all), Some(all)), None);
+        // restricted with write but not metadata, or metadata but not write: either breaks the tier's definition
+        assert_eq!(r(Some(all), Some(RWX)), None);
+        assert_eq!(r(Some(all), Some(RX | P::M.bits())), None);
+        // restricted granted nothing: not the tier (read to everything); apps would see no sink
+        assert_eq!(r(Some(all), Some(0)), None);
+        // the control client served but atld did not see its default in time: unproven
+        assert_eq!(r(Some(all), None), None);
+        // the session manager never provably handled the probe (PROBE_LIMIT): nothing proven
+        assert_eq!(r(None, None), None);
+        // probe unproven alone cannot be Enforced; a proven read-only control still proves WriteRestricted
+        assert_eq!(r(None, Some(RX)), Some(Tier::WriteRestricted));
     }
 
     #[test]

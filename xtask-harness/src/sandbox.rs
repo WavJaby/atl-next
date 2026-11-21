@@ -571,13 +571,10 @@ fn pipewire_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(Vec<Stri
         }
     };
     let tier = manager.tier();
-    let p = manager.probe();
     println!(
-        "sandbox: pipewire tier={} probe_default={} probe_ms={:.1}",
+        "sandbox: pipewire tier={} {}",
         tier.name(),
-        p.probe_default
-            .map_or("unproven".into(), |d| format!("{d:#o}")),
-        p.waited.as_secs_f64() * 1e3
+        manager.probe().observed()
     );
     if tier == Tier::WriteRestricted {
         println!(
