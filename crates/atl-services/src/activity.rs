@@ -896,6 +896,52 @@ impl ActivityManager {
         }
     }
 
+    /// broadcastIntentWithFeature's body for its binder caller `caller` = (pid, uid): verifyBroadcastLocked's Intent checks, then [`Self::send_broadcast`] as that caller.
+    /// The binder method passes only ThreadState's calling identity here: an app never reaches the system identity of [`Self::broadcast_as_system`]. `ordered` = serialized or a resultTo.
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_from_caller(
+        &self,
+        caller: (i32, u32),
+        intent: Option<&Intent>,
+        resolved_type: Option<&str>,
+        ordered: bool,
+        required: &[String],
+        result: (i32, Option<String>, Option<Bundle>),
+        sticky: bool,
+        user_id: i32,
+    ) -> binder::Result<i32> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("broadcastIntent: null Intent"),
+            ));
+        };
+        if intent.has_file_descriptors() {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
+        if intent.flags & FLAG_RECEIVER_BOOT_UPGRADE != 0 {
+            return Err(illegal_argument(
+                "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
+            ));
+        }
+        if ordered {
+            atl_diag::answered(
+                AM,
+                "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
+            );
+        }
+        self.send_broadcast(
+            intent,
+            resolved_type,
+            caller.0,
+            caller.1,
+            incoming_user(user_id),
+            required,
+            result,
+            sticky,
+        )
+    }
+
     /// BroadcastController.broadcastIntentLocked after verifyBroadcastLocked, for a sender (`pid`, `uid`) to `user`: a sticky is checked and stored (:1415-1495), an explicit component reaches its manifest
     /// receiver (:1516-1518, unless FLAG_RECEIVER_REGISTERED_ONLY), an intent without one the matching registered receivers (:1520-1545); each passes BroadcastSkipPolicy (broadcast.rs) and is queued for its
     /// process (BroadcastQueueImpl, broadcast_queue.rs). `result` = (code, data, extras) each receiver gets. Result BROADCAST_SUCCESS.
@@ -2665,38 +2711,20 @@ impl IActivityManager for ActivityManager {
         sticky: bool,
         user_id: i32,
     ) -> binder::Result<i32> {
-        let Some(intent) = intent else {
-            return Err(Status::new_exception_str(
-                ExceptionCode::NULL_POINTER,
-                Some("broadcastIntent: null Intent"),
-            ));
-        };
-        if intent.has_file_descriptors() {
-            return Err(illegal_argument("File descriptors passed in Intent"));
-        }
-        if intent.flags & FLAG_RECEIVER_BOOT_UPGRADE != 0 {
-            return Err(illegal_argument(
-                "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
-            ));
-        }
-        if serialized || result_to.is_some() {
-            atl_diag::answered(
-                AM,
-                "broadcastIntentWithFeature ordered / resultTo (P2: sent unordered, no result)",
-            );
-        }
         let required: Vec<String> = required_permissions
             .unwrap_or_default()
             .iter()
             .flatten()
             .cloned()
             .collect();
-        self.send_broadcast(
+        self.broadcast_from_caller(
+            (
+                ThreadState::get_calling_pid(),
+                ThreadState::get_calling_uid(),
+            ),
             intent,
             resolved_type,
-            ThreadState::get_calling_pid(),
-            ThreadState::get_calling_uid(),
-            incoming_user(user_id),
+            serialized || result_to.is_some(),
             &required,
             (
                 result_code,
@@ -2704,6 +2732,7 @@ impl IActivityManager for ActivityManager {
                 result_extras.cloned(),
             ),
             sticky,
+            user_id,
         )
     }
 
@@ -3143,38 +3172,77 @@ mod tests {
 
     use super::*;
 
-    /// R7-3 must not get worse: the system sender identity (`broadcast_as_system`, SYSTEM_UID) is no binder method, and its only caller is atl-system-services' battery sender.
-    /// Every app reaches broadcasts through broadcastIntentWithFeature, which passes the binder caller's uid. A new call site (an AIDL handler routing through it) fails here.
+    /// A process control that starts nothing: the broadcast tests below send to no receiver.
+    struct NoProcesses;
+    impl ProcessControl for NoProcesses {
+        fn start(&self, _: &StartRequest) -> std::io::Result<i32> {
+            Err(std::io::Error::other("no processes in this test"))
+        }
+        fn kill(&self, _: i32) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn program_pid(&self, pid: i32) -> std::io::Result<i32> {
+            Ok(pid)
+        }
+        fn last_app_ended(&self, _: i32, _: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn no_app_manager() -> ActivityManager {
+        let packages = Arc::new(Packages::new(Vec::new(), Default::default()));
+        let permissions = Arc::new(Permissions::new(&packages, &[]));
+        ActivityManager::new(
+            packages,
+            permissions,
+            Arc::new(NoProcesses),
+            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(UiAgents::default()),
+            true,
+            RootBack::default(),
+            true,
+        )
+    }
+
+    fn sticky_uids(am: &ActivityManager, action: &str) -> Vec<u32> {
+        let filter = broadcast::Filter {
+            actions: vec![action.to_owned()],
+            ..Default::default()
+        };
+        let st = am.inner.state();
+        st.broadcasts
+            .stickies(&filter, USER_SYSTEM)
+            .iter()
+            .map(|s| s.calling_uid)
+            .collect()
+    }
+
+    /// R7-3: what broadcastIntentWithFeature does for an app-uid binder caller. The battery's sticky ACTION_BATTERY_CHANGED needs BROADCAST_STICKY, which an app without it does not hold:
+    /// SecurityException, nothing stored. Only the services' own entry ([`ActivityManager::broadcast_as_system`], no binder method) stores it, as SYSTEM_UID.
     #[test]
-    fn system_broadcast_entry_has_only_the_battery_caller() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).expect("src dir") {
-                let p = e.expect("entry").path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        let mut calls = Vec::new();
-        for f in files {
-            let text = std::fs::read_to_string(&f).expect("source");
-            for (n, line) in text.lines().enumerate() {
-                if line.contains(".broadcast_as_system(") {
-                    calls.push(format!(
-                        "{}:{}",
-                        f.strip_prefix(&src).expect("under src").display(),
-                        n + 1
-                    ));
-                }
-            }
-        }
-        assert_eq!(calls.len(), 1, "{calls:?}");
-        assert!(calls[0].starts_with("bin/system_services.rs:"), "{calls:?}");
+    fn app_caller_cannot_send_the_system_sticky() {
+        const ACTION: &str = "android.intent.action.BATTERY_CHANGED";
+        const APP_UID: u32 = 10_050;
+        let am = no_app_manager();
+        let intent = Intent {
+            action: Some(ACTION.to_owned()),
+            ..Intent::default()
+        };
+        let sent = am.broadcast_from_caller(
+            (4242, APP_UID),
+            Some(&intent),
+            None,
+            false,
+            &[],
+            (0, None, None),
+            true,
+            USER_CURRENT,
+        );
+        let e = sent.expect_err("an app without BROADCAST_STICKY sends no sticky");
+        assert_eq!(e.exception_code(), ExceptionCode::SECURITY);
+        assert!(sticky_uids(&am, ACTION).is_empty());
+        am.broadcast_as_system(&intent, true);
+        assert_eq!(sticky_uids(&am, ACTION), vec![SYSTEM_UID]);
     }
 
     /// The global configuration's locale: the host's UI language tag as given, else AOSP's en-US (LocaleList needs one; ActivityThread.handleBindApplication).
