@@ -843,10 +843,7 @@ fn main() -> Result<()> {
         }));
     }
     spin(&looper, deadline, "the app thread's call", || {
-        from_app
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_some()
+        from_app.lock().unwrap_or_else(|p| p.into_inner()).is_some()
     })?;
     let app_call = from_app
         .lock()

@@ -15,10 +15,10 @@ use atl_platform_ui_api::audio::{
     AudioError, AudioHost, PcmOutput, PcmSpec, StreamIdentity, StreamVolume,
 };
 use atl_platform_ui_api::{
-    Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester,
-    FrameTick, InputEvent, InputSource, Looper, LooperPoster, Monitor, Painted, PhysRect, PhysSize,
-    PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput, TextInputEvent, Ui, UiError,
-    DisplayInvoker, Window, WindowAttributes,
+    Capture, ContentHints, ContentPurpose, CursorShape, DeviceNumber, DisplayInvoker, FrameClock,
+    FrameRequester, FrameTick, InputEvent, InputSource, Looper, LooperPoster, Monitor, Painted,
+    PhysRect, PhysSize, PresentError, PresentTiming, Scale, Scene, Surrounding, TextInput,
+    TextInputEvent, Ui, UiError, Window, WindowAttributes,
 };
 
 use crate::module::module;

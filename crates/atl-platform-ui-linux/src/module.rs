@@ -13,9 +13,9 @@ use atl_platform_ui_api::abi::{
 };
 use atl_platform_ui_api::audio::{AudioHost, PcmOutput, PcmSpec, StreamIdentity, StreamVolume};
 use atl_platform_ui_api::{
-    ContentHints, ContentPurpose, CursorShape, DeviceNumber, FrameClock, FrameRequester, FrameTick,
-    InputEvent, InputSource, PhysRect, PhysSize, PresentError, PresentTiming, Surrounding,
-    DisplayInvoker, TextInput, Ui, Window,
+    ContentHints, ContentPurpose, CursorShape, DeviceNumber, DisplayInvoker, FrameClock,
+    FrameRequester, FrameTick, InputEvent, InputSource, PhysRect, PhysSize, PresentError,
+    PresentTiming, Surrounding, TextInput, Ui, Window,
 };
 
 use crate::ui::GtkInvoker;
