@@ -7,7 +7,8 @@
 //! `pipewire.access=restricted`, which stock WirePlumber maps to read+execute on every object (no write, no metadata), and atld grants nothing itself -- visibility and capture stay open there.
 //! An unknown access value on such a host is never used for apps: it means full access on wireplumber 0.5.19 (measured W 40, M 98).
 //! Grants (Enforced): core RX, own client RWX, `client-node` factory RX, every Audio/Sink node + its ports R (a link needs the stream owner's R on the other node: impl-link.c `check_owner_permissions`),
-//! own nodes + ports RWX, Audio/Source nodes + ports R only with RECORD_AUDIO, Video/Source + ports R only with CAMERA; everything else 0. Revocation sets ports too: link teardown listens on port globals.
+//! own nodes + ports RWX, links with an own node at either end R (the PCM output checks its stream reached a sink: atl-platform-ui-linux audio.rs), Audio/Source nodes + ports R only with RECORD_AUDIO,
+//! Video/Source + ports R only with CAMERA; everything else 0. Revocation sets ports too: link teardown listens on port globals.
 //! A context ends when its [`AppContext`] drops: the close pipe's write end closes, PipeWire stops accepting on the listener (existing connections stay); the socket file goes.
 
 use std::cell::RefCell;
@@ -217,6 +218,7 @@ enum Kind {
     Client,
     Node { class: String, owner: Option<u32> },
     Port { node: u32 },
+    Link { output: u32, input: u32 },
     Factory { name: String },
     Other,
 }
@@ -260,6 +262,8 @@ struct State {
     tier: Option<Tier>,
     probe_client: Option<u32>,
     probe_default: Option<u32>,
+    /// links [`refused_link`] destroyed this run
+    links_refused: u64,
 }
 
 const R: u32 = P::R.bits();
@@ -289,8 +293,56 @@ fn wanted(globals: &HashMap<u32, Kind>, me: u32, g: Grants, id: u32) -> u32 {
             Some(Kind::Node { class, owner }) => node_perm(class, *owner),
             _ => 0,
         },
+        Some(Kind::Link { output, input }) => {
+            let own = |n: &u32| matches!(globals.get(n), Some(Kind::Node { owner: Some(o), .. }) if *o == me);
+            if own(output) || own(input) { R } else { 0 }
+        }
         _ => 0,
     }
+}
+
+/// A link the Enforced tier destroys: it feeds a node an app client owns from a node that app was not granted as a source. PipeWire checks links per node only (impl-link.c `check_permission`), so the R a stream
+/// needs on its sink also lets a capture stream be linked from that sink's monitor ports (measured: a target-less pw-record through a context with sources=0 captured the WSL sink's monitor) -- Android lets no
+/// app record other apps' output (CAPTURE_AUDIO_OUTPUT is a system permission). Window: the link exists from its creation until atld's destroy, one registry round trip; counted in `links_refused`.
+fn refused_link(st: &State, output: u32, input: u32) -> bool {
+    refused_link_of(
+        &st.globals,
+        |c| {
+            st.clients
+                .get(&c)
+                .and_then(|m| m.instance.as_ref())
+                .and_then(|i| st.apps.get(i))
+                .copied()
+        },
+        output,
+        input,
+    )
+}
+
+/// [`refused_link`] over the globals and `grants_of(client)` (None: not an app client of a live context).
+fn refused_link_of(
+    globals: &HashMap<u32, Kind>,
+    grants_of: impl Fn(u32) -> Option<Grants>,
+    output: u32,
+    input: u32,
+) -> bool {
+    let owner = |n: u32| match globals.get(&n) {
+        Some(Kind::Node { owner, .. }) => *owner,
+        _ => None,
+    };
+    let me = owner(input);
+    let Some(g) = me.and_then(&grants_of) else {
+        return false;
+    };
+    let granted = match globals.get(&output) {
+        Some(Kind::Node { owner, .. }) if *owner == me => true,
+        Some(Kind::Node { class, .. }) => {
+            (g.record_audio && class.starts_with("Audio/Source"))
+                || (g.camera && class == "Video/Source")
+        }
+        _ => false,
+    };
+    !granted
 }
 
 /// Sends the difference between what `client` has and what the allow-list says; core last, so a fresh client leaves its busy state with every other grant in place.
@@ -347,6 +399,13 @@ fn kind_of(g: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>) -> Ki
             Some(node) => Kind::Port { node },
             None => Kind::Other,
         },
+        ObjectType::Link => {
+            let node = |k: &str| prop(k).and_then(|s| s.parse().ok());
+            match (node("link.output.node"), node("link.input.node")) {
+                (Some(output), Some(input)) => Kind::Link { output, input },
+                _ => Kind::Other,
+            }
+        }
         ObjectType::Factory => Kind::Factory {
             name: prop("factory.name").unwrap_or_default(),
         },
@@ -495,6 +554,14 @@ fn run(
                 let kind = kind_of(g);
                 let mut s = st.borrow_mut();
                 s.globals.insert(g.id, kind.clone());
+                if s.tier == Some(Tier::Enforced)
+                    && let Kind::Link { output, input } = kind
+                    && refused_link(&s, output, input)
+                {
+                    s.links_refused += 1;
+                    tracing::info!(link = g.id, refused = s.links_refused, "pipewire: link into an app's input from a node it was not granted destroyed");
+                    registry.destroy_global(g.id);
+                }
                 // a client global carries only access / app name (impl-client.c `global_keys`): its sec props come with the bound proxy's info
                 if matches!(kind, Kind::Client)
                     && g.props.and_then(|p| p.get("application.name")) != Some("atld")
@@ -754,6 +821,43 @@ fn iterate(mainloop: &pw::main_loop::MainLoopRc, d: Duration) {
 mod tests {
     use super::*;
 
+    /// By hand on a test desktop whose sinks a run must not touch (`<test binary> --ignored --nocapture host_tier`, atl-sandbox-probe copied beside the test binary): the tier this host's session
+    /// manager yields, then what one app context's client sees (atl-sandbox-probe `pipewire` with SINK `-`: no playback; SOURCE `-`: a default-source capture attempt, bytes counted and dropped).
+    #[test]
+    #[ignore = "needs a desktop PipeWire session; run by hand"]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "a by-hand host test: runs the probe binary on the context socket, no sandbox"
+    )]
+    fn host_tier() {
+        use std::io::Write;
+        let socket = crate::app_access::pipewire_socket().expect("a PipeWire socket");
+        let Probe::Available(m) = Manager::start(&socket) else {
+            panic!("no SecurityContext on this host");
+        };
+        let p = m.probe();
+        let _ = writeln!(
+            io::stdout(),
+            "host: pipewire tier={} probe_default={} probe_ms={:.1}",
+            m.tier().name(),
+            p.probe_default
+                .map_or("unproven".into(), |d| format!("{d:#o}")),
+            p.waited.as_secs_f64() * 1e3
+        );
+        let ctx = m
+            .create(Some("atl.host.tier"), Grants::default())
+            .expect("a context");
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let probe = exe.with_file_name("atl-sandbox-probe");
+        let status = std::process::Command::new(&probe)
+            .arg("pipewire")
+            .arg(ctx.socket())
+            .args(["-", "-", "/nonexistent-pulse"])
+            .status()
+            .expect("running atl-sandbox-probe beside the test binary");
+        assert!(status.success());
+    }
+
     #[test]
     fn only_a_proven_empty_default_is_enforced() {
         let r = |d| ProbeResult {
@@ -823,6 +927,20 @@ mod tests {
                 },
             ),
             (60, Kind::Other),
+            (
+                70,
+                Kind::Link {
+                    output: 50,
+                    input: 10,
+                },
+            ),
+            (
+                71,
+                Kind::Link {
+                    output: 51,
+                    input: 10,
+                },
+            ),
         ]
         .into_iter()
         .collect();
@@ -847,5 +965,26 @@ mod tests {
         assert_eq!((w(mic, 20), w(mic, 21), w(mic, 30)), (R, R, 0));
         assert_eq!((w(cam, 20), w(cam, 30)), (0, R));
         assert_eq!((w(none, 50), w(none, 51), w(none, 60)), (RWX, 0, 0));
+        // own stream -> sink visible, another client's stream -> sink not
+        assert_eq!((w(none, 70), w(none, 71)), (R, 0));
+        // links into the app's own capture node 52: from a sink's monitor never, from a source only with RECORD_AUDIO; playback (own node -> sink) and other clients' links untouched
+        let mut globals = globals;
+        globals.insert(
+            52,
+            Kind::Node {
+                class: "Stream/Input/Audio".into(),
+                owner: Some(me),
+            },
+        );
+        let refused = |g: Grants, output, input| {
+            refused_link_of(&globals, |c| (c == me).then_some(g), output, input)
+        };
+        assert!(refused(mic, 10, 52));
+        assert!(refused(none, 20, 52));
+        assert!(!refused(mic, 20, 52));
+        assert!(refused(mic, 30, 52));
+        assert!(!refused(cam, 30, 52));
+        assert!(!refused(none, 50, 10));
+        assert!(!refused(none, 20, 51));
     }
 }

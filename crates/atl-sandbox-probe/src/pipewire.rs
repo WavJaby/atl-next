@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `atl-sandbox-probe pipewire REMOTE SINK SOURCE`: what an app process's PipeWire client sees and may do through REMOTE (the socket the sandbox shows at the PipeWire socket's path).
 //! Uses the host's own PipeWire clients, as an app's native code would use libpipewire: `pw-dump` for the graph as this client sees it (each object's permission bits), `pw-record` for a capture attempt
-//! from SOURCE, `pw-play` for a playback of silence into SINK; both streams `node.dont-fallback` so a target the client cannot see fails instead of reaching another node.
+//! from SOURCE, `pw-play` for a playback of silence into SINK; both streams `node.dont-fallback` so a target the client cannot see fails instead of reaching another node. `-` for either: see [`DEFAULT`].
 //! Privacy: counts and yes/no only; no object name or property value is printed; captured bytes are counted and dropped.
 #![expect(
     clippy::disallowed_types,
@@ -20,6 +20,8 @@ const CAPTURE_FOR: Duration = Duration::from_millis(1500);
 const TOOL_LIMIT: Duration = Duration::from_secs(10);
 /// The silence pw-play gets: 0.25 s of pw-cat's raw default (s16, 2 channels, 48 kHz) = 48000 * 2 * 2 / 4 bytes.
 const SILENCE_BYTES: usize = 48_000;
+/// SINK / SOURCE `-`: on a desktop the run must not play into (the owner's laptop): no playback at all, and the capture attempt takes the default source (bytes counted, dropped).
+const DEFAULT: &str = "-";
 /// Both streams' extra props: no fallback to the default node when the target is not visible.
 const NO_FALLBACK: &str = "{ node.dont-fallback=true }";
 
@@ -175,21 +177,20 @@ pub fn probe(remote: &str, sink: &str, source: &str) -> String {
     };
     let mut rec = Command::new("pw-record");
     // pw-cat's remote is `--remote` / `-R`; its `-r` is `--rate`
-    rec.args([
-        "--remote",
-        remote,
-        "--target",
-        source,
-        "-P",
-        NO_FALLBACK,
-        "--raw",
-        "-",
-    ]);
+    rec.args(["--remote", remote]);
+    if source != DEFAULT {
+        rec.args(["--target", source, "-P", NO_FALLBACK]);
+    }
+    rec.args(["--raw", "-"]);
     let capture = match run_bounded(rec, Some(CAPTURE_FOR), None) {
         Ok((n, _)) => n.to_string(),
         Err(e) => e,
     };
-    let play = play(remote, sink);
+    let play = if sink == DEFAULT {
+        "skipped".into()
+    } else {
+        play(remote, sink)
+    };
     format!("{census_part} capture={capture} play={play}")
 }
 

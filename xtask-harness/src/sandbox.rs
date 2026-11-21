@@ -539,7 +539,8 @@ fn wayland_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(String, V
     Ok((line, fails))
 }
 
-/// The pipewire rows' runs: (tag, RECORD_AUDIO granted, raw socket instead of a context).
+/// The pipewire rows' runs: (tag, RECORD_AUDIO granted, raw socket instead of a context). Without RECORD_AUDIO the capture attempt names no target (the session manager's own choice: with no
+/// source visible WirePlumber links a sink's monitor, which atld's link guard must destroy, pipewire_context `refused_link`); with it, the gate's null source by name.
 const PIPEWIRE_RUNS: &[(&str, bool, bool)] = &[
     ("pipewire", false, false),
     ("pipewire RECORD_AUDIO", true, false),
@@ -608,7 +609,7 @@ fn pipewire_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(Vec<Stri
         cmd.arg("pipewire")
             .arg(&socket)
             .arg(sink.name())
-            .arg(source.name())
+            .arg(if mic { source.name() } else { "-" })
             .arg(&pulse);
         let mut spawn = binder::spawn_of(&cmd, APP_UID)?;
         spawn.mounts.push(Mount {
