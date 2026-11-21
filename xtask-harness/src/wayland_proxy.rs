@@ -6,7 +6,7 @@
 //! * `xdg_wm_base.pong(serial)` (request opcode 3) -> [`Event::Pong`], `wl_shm.create_pool` (opcode 0) -> [`Event::ShmPool`];
 //! * `xdg_wm_base.ping(serial)` from the compositor (event opcode 0) -> [`Event::Ping`] with `injected: false`;
 //! * `xdg_toplevel.set_title(title)` of the window's toplevel (request opcode 2) -> [`Event::Title`], its `set_app_id(app_id)` (opcode 3) -> [`Event::AppId`], its `set_minimized` (opcode 13) -> [`Event::Minimized`];
-//! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`];
+//! * the window's first `wl_surface.commit` (xdg-shell's initial one, no buffer) -> [`Event::FirstCommit`]; every window commit's time -> [`Commits`];
 //! * `wp_presentation.feedback` (request 1) -> its `wp_presentation_feedback`'s `presented` (event 1) counted by its `kind` flags in [`Presented`]: the host's vsync marking as the compositor sends
 //!   it, independent of the client's reading of it (the window gate's vsync-tier check).
 //!
@@ -164,6 +164,32 @@ impl Presented {
         )
     }
 }
+
+/// The window surface's `wl_surface.commit` requests, over every connection, each stamped when the proxy read it: CLOCK_MONOTONIC ns, the clock the app's `SystemClock.uptimeMillis` reads (AOSP
+/// libutils `uptimeNanos` -> `systemTime(SYSTEM_TIME_MONOTONIC)`), so the times compare with the app's own log values. Always on: one push per commit.
+#[derive(Debug, Default)]
+pub struct Commits {
+    times_ns: Mutex<Vec<u64>>,
+}
+
+impl Commits {
+    /// The commit times so far, in order.
+    pub fn times_ns(&self) -> Vec<u64> {
+        self.times_ns.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, ns: u64) {
+        if let Ok(mut t) = self.times_ns.lock() {
+            t.push(ns);
+        }
+    }
+}
+
+/// CLOCK_MONOTONIC now, ns.
+fn monotonic_ns() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
 /// `wl_display` is object 1; its request 1 is `get_registry(new_id)`.
 const WL_DISPLAY_ID: u32 = 1;
 const WL_DISPLAY_GET_REGISTRY: u16 = 1;
@@ -319,6 +345,8 @@ struct Ids {
     frame_callbacks: Vec<u32>,
     /// The proxy-wide [`Throttle`].
     throttle: Arc<Throttle>,
+    /// The proxy-wide [`Commits`] this connection's window commits add to.
+    commits: Arc<Commits>,
 }
 
 impl Ids {
@@ -434,6 +462,7 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         return None;
     }
     if Some(object) == ids.surface && opcode == WL_SURFACE_COMMIT {
+        ids.commits.record(monotonic_ns());
         let initial = !ids.first_commit;
         ids.first_commit = true;
         return initial.then_some(Event::FirstCommit);
@@ -584,6 +613,7 @@ pub struct Proxy {
     drop_input: AtomicBool,
     presented: Arc<Presented>,
     throttle: Arc<Throttle>,
+    commits: Arc<Commits>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -604,6 +634,7 @@ impl Proxy {
         let wakes = Arc::new(Mutex::new(Vec::new()));
         let presented: Arc<Presented> = Arc::default();
         let throttle: Arc<Throttle> = Arc::default();
+        let commits: Arc<Commits> = Arc::default();
         let hub = Hub {
             upstream: upstream.to_owned(),
             events: tx,
@@ -614,6 +645,7 @@ impl Proxy {
             counters: Counters {
                 presented: Arc::clone(&presented),
                 throttle: Arc::clone(&throttle),
+                commits: Arc::clone(&commits),
             },
         };
         thread::spawn(move || {
@@ -631,7 +663,13 @@ impl Proxy {
             drop_input: AtomicBool::new(false),
             presented,
             throttle,
+            commits,
         })
+    }
+
+    /// The window surface's commits so far ([`Commits`]); the handle stays valid after the proxy moves.
+    pub fn commits(&self) -> Arc<Commits> {
+        Arc::clone(&self.commits)
     }
 
     /// The throttle's counts so far ([`Throttle`]); the handle stays valid after the proxy moves.
@@ -747,6 +785,7 @@ type Shared<T> = Arc<Mutex<T>>;
 struct Counters {
     presented: Arc<Presented>,
     throttle: Arc<Throttle>,
+    commits: Arc<Commits>,
 }
 
 /// What every connection of one proxy shares. A security context's relayed connections ([`relay_context`]) share it too, with the proxy's context listener as their upstream.
@@ -770,6 +809,7 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
     let ids: Shared<Ids> = Arc::new(Mutex::new(Ids {
         presented: Arc::clone(&hub.counters.presented),
         throttle: Arc::clone(&hub.counters.throttle),
+        commits: Arc::clone(&hub.counters.commits),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
@@ -1565,6 +1605,26 @@ mod tests {
             Some(Event::FirstCommit)
         );
         assert_eq!(note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]), None);
+    }
+
+    /// Every window commit is timed, the first included, in order, on CLOCK_MONOTONIC (bracketed by two reads of it); another surface's is not.
+    #[test]
+    fn window_commits_are_timed_on_the_monotonic_clock() {
+        let mut ids = Ids {
+            surface: Some(5),
+            ..Ids::default()
+        };
+        let before = monotonic_ns();
+        note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]);
+        note_request(&mut ids, 6, WL_SURFACE_COMMIT, &[]);
+        note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]);
+        let after = monotonic_ns();
+        let t = ids.commits.times_ns();
+        assert_eq!(t.len(), 2);
+        assert!(
+            before <= t[0] && t[0] <= t[1] && t[1] <= after,
+            "{before} {t:?} {after}"
+        );
     }
 
     /// A message cut off mid-body is not consumed: the prefix ends at the last complete message.

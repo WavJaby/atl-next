@@ -2471,6 +2471,8 @@ struct LiveOut {
     presented: Option<(u64, u64)>,
     /// The proxy's frame-callback throttle (held, released); (0, 0) unless the stage throttled (slow-display).
     throttle: (u64, u64),
+    /// The window surface's commit times on CLOCK_MONOTONIC ns (wayland_proxy `Commits`); None: no proxy, or a remote run (its target's clock, not carried in `live.json`).
+    commits: Option<Vec<u64>>,
 }
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
@@ -2512,6 +2514,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
     let throttle = proxy.as_ref().map(Proxy::throttle);
+    let commits = proxy.as_ref().map(Proxy::commits);
     let probe = proxy.map(|p| {
         let log = run.log(package);
         let services_log = run.log("services");
@@ -2643,6 +2646,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         pressure: sampler.stop(),
         presented: presented.map(|p| p.counts()),
         throttle: throttle.map_or((0, 0), |t| t.counts()),
+        commits: commits.map(|c| c.times_ns()),
     })
 }
 
@@ -2686,6 +2690,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         pressure,
         presented,
         throttle,
+        commits,
     } = out;
     let read = atl_diag::logfiles::read;
     let app_log = run.log(package);
@@ -2750,7 +2755,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             args.esc_back,
             args.tap_origin.focuses() != args.break_tap_origin,
         ),
-        (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz),
+        (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz, commits.as_deref()),
         (Stage::SlowDisplay, Some(_)) => {
             let c = slow_display::checks(&app, display.refresh_hz, throttle);
             undecided = c.undecided;
@@ -3360,6 +3365,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         presented: record.presented,
         // remote stages do not throttle (slow-display is local)
         throttle: (0, 0),
+        // the target's clock: the commits sub-gate is local only
+        commits: None,
     };
     judge(
         &Judged {

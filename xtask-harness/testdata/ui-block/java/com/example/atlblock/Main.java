@@ -19,7 +19,7 @@ import android.widget.FrameLayout;
  *    replaced unseen);
  * 2. block: a 2 s sleep on the UI thread (ordinary app behaviour: a slow click handler): the producer must not stay blocked: after the composer's bound it latches every vsync.
  * Logs `ub steady start` / `ub steady end` and `ub block start` / `ub block end` around the phases, then `ub result` with the frames posted inside each, the longest gap between two posts inside the block
- * and the phases' measured lengths.
+ * and the phases' measured lengths, and the phases' edges (uptimeMillis = CLOCK_MONOTONIC ms: the harness's proxy times the window's commits on that clock).
  */
 public class Main extends Activity {
     static final String TAG = "AtlWindow";
@@ -140,7 +140,8 @@ public class Main extends Activity {
             }
             if (end >= 0 && now - end >= TAIL_MS) {
                 Log.i(TAG, "ub result posts_during=" + during + " max_gap_ms=" + maxGap + " block_ms=" + (end - start) + " steady_posts=" + steadyPosts
-                        + " steady_ms=" + (steadyEnd - steadyStart) + " posted=" + posted);
+                        + " steady_ms=" + (steadyEnd - steadyStart) + " posted=" + posted + " block_start_ms=" + start + " block_end_ms=" + end + " steady_start_ms=" + steadyStart
+                        + " steady_end_ms=" + steadyEnd);
                 return;
             }
         }

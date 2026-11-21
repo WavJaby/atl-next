@@ -3,6 +3,9 @@
 //! thread sleeps 2 s (block). The fixture's steady phase before it is stage slow-display's subject (slow_display.rs), not judged here.
 //! - Block: the window takes nothing, so the composer holds until its bound (`bound_ms` on its start line), then latches every vsync as a display that presents: the frames posted inside the sleep are at
 //!   least floor((block - bound) / period) - [`SLACK`], and no dequeue timed out (`-110`). A compositor that latches only when the window's thread runs leaves the producer blocked for the whole sleep.
+//! - Commits (local runs only: the proxy and the app share CLOCK_MONOTONIC; a remote run carries no commit times): the window surface's `wl_surface.commit`s the proxy timed, against the phase edges on the
+//!   fixture's result line. Probe responds: >= 1 inside the steady phase. Today's design (GTK runs only inside the UI thread's Looper poll): 0 strictly inside [block start + EDGE, block end - EDGE],
+//!   EDGE = one display period (a commit already in flight at the start edge, the first after the end). Display-thread S5d flips this expectation in place.
 
 use super::{ACK_WAIT, Liveness, Sub, await_event, wait_for_line};
 use crate::composer::word;
@@ -95,12 +98,48 @@ fn timeouts_check(app: &str) -> Result<String, String> {
     }
 }
 
-/// The sub-gates; `refresh_hz`: the run's display (the block's grid).
-pub fn checks(app: &str, refresh_hz: f32) -> Vec<Sub> {
-    vec![
+/// The window's commits ([`crate::wayland_proxy::Commits`], CLOCK_MONOTONIC ns) against the fixture's phase edges (uptimeMillis, the same clock in ms): >= 1 in the steady phase (the probe sees
+/// commits at all), 0 strictly inside the block less one display period at each edge.
+fn commits_check(app: &str, refresh_hz: f32, commits_ns: &[u64]) -> Result<String, String> {
+    const NS_PER_MS: f64 = 1_000_000.0;
+    let line = result_line(app)?;
+    let ms = |k| number(line, k).map(|v| v as f64);
+    let (block_start, block_end) = (ms("block_start_ms")?, ms("block_end_ms")?);
+    let (steady_start, steady_end) = (ms("steady_start_ms")?, ms("steady_end_ms")?);
+    let edge = period_ms(refresh_hz);
+    let (lo, hi) = (block_start + edge, block_end - edge);
+    let at = |t: &&u64| **t as f64 / NS_PER_MS;
+    let inside = commits_ns
+        .iter()
+        .filter(|t| at(t) > lo && at(t) < hi)
+        .count();
+    let steady = commits_ns
+        .iter()
+        .filter(|t| at(t) >= steady_start && at(t) <= steady_end)
+        .count();
+    let summary = format!(
+        "{inside} inside the block ({lo:.1}..{hi:.1} ms, edge {edge:.2} ms), {steady} in the steady phase ({} window commits in all)",
+        commits_ns.len()
+    );
+    if steady == 0 {
+        Err(format!("probe silent: {summary}"))
+    } else if inside > 0 {
+        Err(summary)
+    } else {
+        Ok(summary)
+    }
+}
+
+/// The sub-gates; `refresh_hz`: the run's display (the block's grid); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock).
+pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Vec<Sub> {
+    let mut subs = vec![
         ("posts", posts_check(app, refresh_hz)),
         ("timeouts", timeouts_check(app)),
-    ]
+    ];
+    if let Some(commits_ns) = commits_ns {
+        subs.push(("commits", commits_check(app, refresh_hz, commits_ns)));
+    }
+    subs
 }
 
 /// The probe: the window's configure is acked, then the fixture's result line (the phases are the app's own doing).
@@ -141,5 +180,39 @@ mod tests {
         assert!(posts_check(ON, 60.0).is_err());
         assert!(posts_check(&format!("{ON}{}", result(225)), 120.0).is_ok());
         assert!(posts_check(&format!("{ON}{}", result(224)), 120.0).is_err());
+    }
+
+    /// Steady phase 6000..10000 ms, block 10000..12000 ms on the app's uptimeMillis.
+    const EDGES: &str = "9.0 I AtlWindow: ub result posts_during=111 block_start_ms=10000 block_end_ms=12000 steady_start_ms=6000 steady_end_ms=10000\n";
+    const MS: u64 = 1_000_000;
+
+    /// 60 Hz: EDGE = 16.666... ms, so the block's judged span is 10016.67..11983.33 ms. A commit at 10016 ms is the one in flight at the start edge, one at 11984 ms the first after the end: both outside.
+    /// 10017 and 11983 ms are inside. A commit at 7000 ms is the steady phase's; none there = a probe that saw no commits.
+    #[test]
+    fn commits_inside_the_block_less_one_period_per_edge() {
+        let steady = 7_000 * MS;
+        assert!(commits_check(EDGES, 60.0, &[steady, 10_016 * MS, 11_984 * MS]).is_ok());
+        assert!(commits_check(EDGES, 60.0, &[steady, 10_017 * MS]).is_err());
+        assert!(commits_check(EDGES, 60.0, &[steady, 11_983 * MS]).is_err());
+        assert!(commits_check(EDGES, 60.0, &[]).is_err());
+        assert!(commits_check(EDGES, 60.0, &[10_016 * MS]).is_err());
+        // no phase edges on the line (a fixture before this check)
+        assert!(commits_check(&result(111), 60.0, &[steady]).is_err());
+    }
+
+    /// The commits sub-gate exists only with commit times (a local run).
+    #[test]
+    fn commits_only_judged_locally() {
+        let app = format!("{ON}{EDGES}");
+        assert!(
+            !checks(&app, 60.0, None)
+                .iter()
+                .any(|(n, _)| *n == "commits")
+        );
+        assert!(
+            checks(&app, 60.0, Some(&[7_000 * MS]))
+                .iter()
+                .any(|(n, r)| *n == "commits" && r.is_ok())
+        );
     }
 }
