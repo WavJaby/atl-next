@@ -589,6 +589,7 @@ mod tests {
         p.write(&none).expect("query packages");
         p.write(&none).expect("query providers");
         w_typed_list::<Intent>(&mut p.borrowed(), &Some(Vec::new())).expect("query intents");
+        p.write(&empty).expect("protected broadcasts");
         let mut out = Vec::new();
         write_frame(&mut out, Kind::Package, &package_bytes()).expect("frame");
         write_frame(

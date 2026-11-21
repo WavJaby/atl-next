@@ -180,7 +180,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
         (
             "registerReceiver(null, BATTERY_CHANGED) returns the system's sticky, not the app's fake",
-            s.lines().any(|l| l.ends_with(&system_level)) && !s.lines().any(|l| l.ends_with(FAKE_LEVEL)),
+            s.lines().any(|l| l.ends_with(&system_level))
+                && !s.lines().any(|l| l.ends_with(FAKE_LEVEL)),
         ),
         (
             "a receiver of only protected actions registered without an export flag",
