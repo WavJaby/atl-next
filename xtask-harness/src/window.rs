@@ -167,6 +167,10 @@ pub struct Args {
     /// Stage dialog only: an unhandled root Back closes the root instead of minimizing (atld `--root-back close`), so the minimize sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_root_minimize: bool,
+    /// Stage orientation only: orientation requests follow AOSP's rule (atld `--orientation-reshape unresizeable`), so the resizeable fixture's window stays landscape and the reshaped and told
+    /// sub-gates must fail (the gate's deliberate break).
+    #[arg(long)]
+    break_orientation_reshape: bool,
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
@@ -2464,6 +2468,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let rt = if args.break_root_minimize {
         rt.with_root_back_close()
+    } else {
+        rt
+    };
+    let rt = if args.break_orientation_reshape {
+        rt.with_orientation_unresizeable()
     } else {
         rt
     };

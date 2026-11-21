@@ -415,6 +415,8 @@ pub struct Runtime {
     back_finish: bool,
     /// An unhandled Back on the root closes it instead of minimizing (atld `--root-back close`, the dialog gate's minimize sub-gate's deliberate break).
     root_back_close: bool,
+    /// Orientation requests reshape only non-resizeable activities' windows (atld `--orientation-reshape unresizeable`, AOSP's rule: the window gate's orientation stage's deliberate break).
+    orientation_unresizeable: bool,
     /// The services register `sensorservice` unless this is cleared (`--no-sensor-service`, the sensors gate's deliberate break).
     sensor_service: bool,
     /// Services left unregistered (`--omit-service`, the app gate's per-service breaks).
@@ -956,6 +958,7 @@ impl Runtime {
             job_runner: true,
             back_finish: true,
             root_back_close: false,
+            orientation_unresizeable: false,
             sensor_service: true,
             omitted_services: Vec::new(),
             tilt_keys: None,
@@ -1452,6 +1455,12 @@ impl Runtime {
     /// An unhandled root Back closes the root (atld `--root-back close`): the dialog gate's minimize sub-gate must then fail.
     pub fn with_root_back_close(mut self) -> Self {
         self.root_back_close = true;
+        self
+    }
+
+    /// Orientation requests follow AOSP's rule (atld `--orientation-reshape unresizeable`): a resizeable activity's request leaves its window, so the orientation stage must fail.
+    pub fn with_orientation_unresizeable(mut self) -> Self {
+        self.orientation_unresizeable = true;
         self
     }
 
@@ -2173,6 +2182,9 @@ impl Runtime {
         }
         if self.root_back_close {
             cmd.args(["--root-back", "close"]);
+        }
+        if self.orientation_unresizeable {
+            cmd.args(["--orientation-reshape", "unresizeable"]);
         }
         for jar in &self.art.boot {
             cmd.arg("--boot-jar").arg(jar);
