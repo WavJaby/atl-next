@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 //! The app-process half of the platform layer as traits (plan S1 `atl-platform-ui`; M3 slice 6).
-//! * [`Ui`]: the toolkit session; [`DisplayInvoker`] reaches its thread, the display thread, from any other. The thread that attaches is the display thread, today also the UI thread, which is also the Android Looper's thread (plan Q6, owner 2026-11-05). The Looper is the outer loop: its poll runs the toolkit's fds through the [`Looper`] seam, so a UI thread that stops polling answers no compositor ping and the desktop shows its own "not responding" dialog.
+//! * [`Ui`]: the toolkit session; [`DisplayInvoker`] reaches its thread, the display thread, from any other. The implementation starts the display thread at attach and runs the toolkit's own main loop there (display-thread plan D2); app threads, Android's UI thread included, run their Looper apart from it. A compositor ping is answered only after the app's main Looper ran a liveness token ([`LooperPoster`]), so a UI thread that stops polling answers none and the desktop shows its own "not responding" dialog.
 //! * [`Window`]: a toplevel the compositor's [`Scene`] is presented into; [`FrameClock`] and [`InputSource`] are the display's vsync and pointer events of that window.
 //! * [`audio`]: the PCM output (plan A0): [`audio::AudioHost`] connects to the audio server, [`audio::PcmOutput`] is one stream on it.
 //!
 //! Sizes cross this boundary in physical pixels with an explicit [`Scale`]; no logical-pixel type exists here, because the compositor's layer stack and the app's buffers are physical and a toolkit's logical unit is an implementation detail of the `-<os>` crate.
-//! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Window callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the UI thread from inside the Looper's poll. The [`Looper`] seam takes boxed callbacks: one erasure, because the launcher's callback is a C function pointer.
+//! The traits are shaped by the first implementation (GTK4, atl-platform-ui-linux) and by what slices 5 and 7 need of it; they are reshaped when a second implementation is built (CLAUDE.md "One implementation per concept"). Window callbacks are generic parameters (static dispatch) and `'static`: the implementation keeps them for the window's life and calls them on the display thread.
 //! [`abi`] is the same traits as a C ABI, for the platform module a process loads `RTLD_LOCAL` (launcher-ui-module plan S2); the value types its views do not wrap are `#[repr(C)]` here, at their definition.
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 
 // the C ABI's callbacks and views: raw pointers across the module boundary, each turned into safe types at once
 #[allow(unsafe_code)]
@@ -39,12 +39,9 @@ pub enum UiError {
     /// The toolkit cannot start: no display to connect to, or the toolkit refused to initialise.
     #[error("display toolkit unavailable: {0}")]
     Unavailable(String),
-    /// The call was made from a thread other than the one that attached the [`Ui`].
-    #[error("not on the UI thread")]
+    /// The call was made from a thread other than the display thread (or the toolkit was started by another thread earlier in the process).
+    #[error("not on the display thread")]
     WrongThread,
-    /// The Looper refused a registration (or the toolkit's timer could not be made).
-    #[error("Android Looper: {0}")]
-    Looper(String),
     /// [`Window::capture`] could not produce pixels (window not realised yet, renderer failure).
     #[error("capture failed: {0}")]
     Capture(String),
@@ -81,18 +78,15 @@ pub struct QuadRelease {
     pub release_fence: Option<OwnedFd>,
 }
 
-/// The toolkit session. The thread that attaches is the display thread: the toolkit's objects live there, and every operation on them either hops there ([`DisplayInvoker`]) or is refused off it ([`UiError::WrongThread`]); the session handle itself is plain data, so it may move to and be shared with app threads.
-/// Today the display thread is the thread that attaches, the app's main thread (display-thread plan S5d moves it to its own thread).
+/// The toolkit session. Its objects live on the display thread, and every operation on them either hops there ([`DisplayInvoker`]) or is refused off it ([`UiError::WrongThread`]); the session handle itself is plain data, so it may move to and be shared with app threads.
 pub trait Ui: Sized + Send + Sync {
     /// The handle that runs work on the display thread from any thread.
     type Invoker: DisplayInvoker;
 
-    /// Starts the toolkit on the calling thread, which becomes the display thread, and registers the fds its main loop waits on with `looper`. Called once, when the thread's Looper is prepared and before Java adopts it; never per window.
-    /// `looper` is the temporary seam display-thread S5 deletes, when the toolkit gets its own thread and loop.
+    /// Starts the display thread, starts the toolkit there and runs its main loop on it for the process's life; returns once the toolkit has started (or failed to). Called once per process, before any app code can reach the toolkit; never per window.
     /// `liveness`: the app's main Looper, where the toolkit posts its liveness token: a compositor ping is answered only after that Looper ran the token (display-thread plan D3), so a blocked main thread answers none and the desktop shows its own "not responding" dialog.
     /// `buffer_device`: the run's gralloc node (st_rdev); every presented buffer must have been allocated there, others are refused by name. None (no gralloc in this process): every buffer is refused.
     fn attach(
-        looper: Box<dyn Looper>,
         liveness: Box<dyn LooperPoster>,
         buffer_device: Option<DeviceNumber>,
     ) -> Result<Self, UiError>;
@@ -176,35 +170,10 @@ pub enum CursorShape {
     Grabbing,
 }
 
-/// The UI thread's Android Looper as the toolkit's main loop registers its fds with it. The launcher implements it over `ALooper_addFd` / `ALooper_removeFd`; Java's `nativePollOnce` polls it, and each readiness reaches the sink on the UI thread from inside that poll.
-pub trait Looper {
-    /// Sets the callback run for each readiness of a registered fd. Set once, before the first [`add_fd`](Looper::add_fd).
-    fn set_sink(&self, sink: Box<dyn FnMut(RawFd, FdEvents)>);
-
-    /// Registers `fd` for the events it asks for, replacing a registration of the same fd.
-    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError>;
-
-    /// Unregisters `fd`. The Looper may still report it once from the batch it is polling: the sink must ignore an fd it no longer waits on.
-    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError>;
-}
-
 /// Runs closures on one Looper's thread, posted from any thread: the toolkit -> Looper form of the display seam (display-thread plan D2 `post`). The process implements it over its Looper (atl-looper `Poster`); the toolkit only posts.
 pub trait LooperPoster: Send + Sync {
     /// Queues `f` to run on the Looper's thread inside its poll, after every earlier post. Once that Looper's thread has ended, `f` is dropped unrun (the implementation counts it).
     fn post(&self, f: Box<dyn FnOnce() + Send>);
-}
-
-/// Readiness of a registered fd: `input` and `output` are what the registration asks for; `error` and `hangup` are reported on every poll.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FdEvents {
-    /// Readable.
-    pub input: bool,
-    /// Writable.
-    pub output: bool,
-    /// Error condition.
-    pub error: bool,
-    /// Peer hung up.
-    pub hangup: bool,
 }
 
 /// What a new window asks for.
@@ -618,7 +587,7 @@ pub enum TextInputEvent {
     },
 }
 
-/// One window's connection to the desktop's input method (fcitx5, IBus, an on-screen keyboard): the focused Android text field's half of it. All calls on the UI thread.
+/// One window's connection to the desktop's input method (fcitx5, IBus, an on-screen keyboard): the focused Android text field's half of it. All calls on the display thread.
 /// The input method asks for the surrounding text whenever it wants; the implementation answers with the last [`set_surrounding`](TextInput::set_surrounding), so the caller only reports changes.
 pub trait TextInput {
     /// A text field gained focus: the input method may start composing for it.

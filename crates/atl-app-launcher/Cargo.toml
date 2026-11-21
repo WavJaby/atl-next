@@ -51,9 +51,9 @@ atl-resource-manager = { path = "../atl-resource-manager" }
 atl-media-player = { path = "../atl-media-player" }
 # the media extractor service the process serves through the view, made at launch (lib.rs step 1c)
 atl-media-extractors = { path = "../atl-media-extractors" }
-# UI mode (lib.rs start_ui): GTK on the main thread, its GLib context mirrored into the Looper by atl-platform-ui-linux (looper.rs is the Looper seam)
+# UI mode (lib.rs start_ui): the platform module, which runs GTK on its own display thread
 atl-platform-ui = { path = "../atl-platform-ui" }
-# UI mode: the main thread's Looper (libandroid) and its post executor, the platform's liveness poster (looper.rs)
+# UI mode: the main thread's Looper (libandroid) and its post executor, the platform's liveness poster (lib.rs `MainPoster`)
 atl-looper = { path = "../atl-looper" }
 # the app's desktop identity `atl.<package>` its audio stream carries (lib.rs serve_media_services), the one its window and desktop file carry
 atl-launch = { path = "../atl-launch" }

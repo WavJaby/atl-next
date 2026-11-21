@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The compositor's output transforms (`wl_output.geometry` `transform`), by output name (`wl_output.name`, v4: the connector GDK reports as `GdkMonitor:connector`).
 //! GDK reads the transform but exposes none (GdkMonitor has no transform; a half turn changes no geometry, so no GDK signal either), so this process opens a second Wayland connection that binds every
-//! `wl_output` and follows its events on the GLib main context (an fd source; the context is the UI thread's, mirror.rs). One connection per process, shared by its windows.
+//! `wl_output` and follows its events on the GLib main context (an fd source; the context is the display thread's, ui.rs). One connection per process, shared by its windows.
 //! No connection (no WAYLAND_DISPLAY, refused) = every monitor reports [`Rotation::Deg0`], and the window says so once.
 
 use std::cell::RefCell;

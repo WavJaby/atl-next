@@ -168,14 +168,14 @@ impl WebEngine for PlatformWebEngine {
             changed(views.iter().map(|v| unsafe { v.get() }).collect());
         });
         // SAFETY: any thread (vtable contract).
-        ui_thread(unsafe { (m.cookies_watch)(cb) })
+        queued_on_display(unsafe { (m.cookies_watch)(cb) })
     }
 
     fn add_cookie(cookie: &Cookie, done: Box<dyn FnOnce(bool) + Send>) -> Result<(), WebViewError> {
         let m = module()?;
         let view = CookieView::of(cookie);
         // SAFETY: any thread; the module copies the cookie before return.
-        ui_thread(unsafe { (m.cookies_add)(&view, once(done)) })
+        queued_on_display(unsafe { (m.cookies_add)(&view, once(done)) })
     }
 
     fn replace_cookies(
@@ -189,21 +189,21 @@ impl WebEngine for PlatformWebEngine {
             len: views.len(),
         };
         // SAFETY: as add_cookie; `views` borrows `cookies` for the call.
-        ui_thread(unsafe { (m.cookies_replace)(list, once(done)) })
+        queued_on_display(unsafe { (m.cookies_replace)(list, once(done)) })
     }
 
     fn set_cookie_policy(policy: CookiePolicy) -> Result<(), WebViewError> {
         let m = module()?;
         // SAFETY: any thread.
-        ui_thread(unsafe { (m.cookies_policy)(policy) })
+        queued_on_display(unsafe { (m.cookies_policy)(policy) })
     }
 }
 
-/// A module's "queued on the UI thread" answer; false = the process has no UI thread (no-UI mode).
-fn ui_thread(queued: bool) -> Result<(), WebViewError> {
+/// A module's "queued on the display thread" answer; false = the process has no display thread (no-UI mode).
+fn queued_on_display(queued: bool) -> Result<(), WebViewError> {
     queued
         .then_some(())
-        .ok_or_else(|| WebViewError::NoDisplay("no UI thread for the cookie store".into()))
+        .ok_or_else(|| WebViewError::NoDisplay("no display thread for the cookie store".into()))
 }
 
 /// A view's event sink, fed on the display thread by the engine module and the UI module.

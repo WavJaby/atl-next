@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The WebView module's exports (`atl_platform_ui_api::abi::WebViewVtable`): WebKitGTK behind the facade's `PlatformWebEngine`.
-//! The display thread: the thread that owns GLib's default context and runs GTK (today the Android UI thread, which the UI module's mirror makes the context's owner; display-thread plan D2: its own
-//! thread later). WebKit binds its main thread to the first thread that touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView SIGSEGV/abort in
+//! The display thread: the thread that owns GLib's default context and runs GTK, which the UI module starts at attach before ART boots (`atl-display`, display-thread plan D2). WebKit binds its main thread to the first thread that touches it: settings made on an app worker (AdMob's AdWorker asks the UA first) made every later WebView SIGSEGV/abort in
 //! instance init (AB2, Temple Run; test app row webview-ua runs on a worker for this). So WebKit is touched on the display thread only, found as the default context's owner; another thread's call hops there.
 //! Default UA: `webkit_settings_get_user_agent` of fresh settings -- the engine's own default, made once on the display thread and cached.
 //! Views: a `WebKitWebView` (W0: loads and runs JS unrealized, before any window parents it), named by the process's sideband key; shown by the UI module, which parents it into the window whose
@@ -72,8 +71,7 @@ static USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// [`USER_AGENT`] from any thread: the display plan's `call` form (an app thread waits on the display thread, which never waits on an app thread). The display thread owns GLib's default context for
 /// the process's life, so: owner -> run here; a context nobody owns -> no display thread in this process, refuse (invoking would run WebKit right here, on the caller); else invoke there and wait.
-/// While the display thread is the UI thread (until display-thread S5): if the app blocks its UI thread on this worker (join, Future.get) both wait, as Chromium's provider blocks a background
-/// caller until its UI thread started the engine. No fallback: answering on the worker is exactly the off-thread WebKit touch this avoids.
+/// The wait is bounded by the display thread's own work: a UI thread blocked on this worker (join, Future.get) does not stall it. No fallback: answering on the worker is exactly the off-thread WebKit touch this avoids.
 fn user_agent() -> Result<String, &'static [u8]> {
     if let Some(ua) = USER_AGENT.get() {
         return Ok(ua.clone());

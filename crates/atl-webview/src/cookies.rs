@@ -340,7 +340,7 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// Starts the engine's change watch and pushes the policy, once per process (the first CookieManager or WebView); a failure (no UI thread) is logged and the copy stays app-only.
+/// Starts the engine's change watch and pushes the policy, once per process (the first CookieManager or WebView); a failure (no display thread) is logged and the copy stays app-only.
 pub fn start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

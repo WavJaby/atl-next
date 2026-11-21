@@ -35,8 +35,6 @@ mod ffi;
 mod installer;
 mod log;
 mod logdw;
-#[allow(unsafe_code)]
-mod looper;
 mod package;
 mod trace;
 
@@ -137,13 +135,13 @@ fn start_compositor(vm: &ffi::Vm, window: Option<OpenWindow>) {
 #[cfg(not(feature = "converter"))]
 fn start_compositor(_vm: &ffi::Vm, _window: Option<OpenWindow>) {}
 
-/// How long step 1d polls the UI thread's Looper for the starting window's first paint before ART boots anyway: the desktop maps and paints a new toplevel within a few frames,
+/// How long step 1d waits for the starting window's first paint before ART boots anyway: the desktop maps and paints a new toplevel within a few frames,
 /// so this bounds only a desktop that never maps it (a hidden workspace), which must not delay the app's start by more than a blink. Not an Android value: AOSP's system_server draws the splash in another process.
 #[cfg(feature = "converter")]
 const SPLASH_PAINT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Step 1d. UI mode's window before ART boots: the toolkit (step 5b''), the Task's window with the starting window in it (atl-composer `open_window`: the window stays on the display thread, this thread holds its Send token), and the Looper polled until the token's painted flag is set,
-/// since GTK runs only inside that poll and Java's MessageQueue polls it only after the VM, the framework and ActivityThread are up. During ART's boot the desktop keeps showing that frame.
+/// Step 1d. UI mode's window before ART boots: the toolkit (step 5b''), the Task's window with the starting window in it (atl-composer `open_window`: the window stays on the display thread, this thread holds its Send token), and a wait until the display thread set the token's painted flag,
+/// so the desktop shows the starting window before ART's boot takes the CPU. During ART's boot the display thread keeps showing that frame.
 /// A process with no Task, or a window that fails to open, gets none (said on stderr) and runs as headless.
 #[cfg(feature = "converter")]
 fn open_window(rt: &ffi::Runtime, started: std::time::Instant) -> Option<OpenWindow> {
@@ -151,31 +149,21 @@ fn open_window(rt: &ffi::Runtime, started: std::time::Instant) -> Option<OpenWin
     let opened = std::ffi::CString::new(atl_gralloc::node::RENDER_NODE_PROPERTY)
         .map_err(anyhow::Error::from)
         .and_then(|name| start_ui(rt.property(&name)))
-        .and_then(|(ui, looper)| {
-            atl_composer::open_window(ui, started)
-                .map_err(|e| anyhow!(e))
-                .map(|w| w.map(|w| (w, looper)))
-        });
-    let (window, looper) = match opened {
-        Ok(Some(opened)) => opened,
+        .and_then(|ui| atl_composer::open_window(ui, started).map_err(|e| anyhow!(e)));
+    let window = match opened {
+        Ok(Some(window)) => window,
         Ok(None) => return None,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "atl-app-launcher: no UI mode: {e:#}");
             return None;
         }
     };
-    let deadline = std::time::Instant::now() + SPLASH_PAINT_WAIT;
-    while !window.painted() {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "splash: not painted within {} ms; ART boots",
-                SPLASH_PAINT_WAIT.as_millis()
-            );
-            break;
-        }
-        looper.poll_once(i32::try_from(left.as_millis()).unwrap_or(i32::MAX));
+    if !window.wait_painted(SPLASH_PAINT_WAIT) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "splash: not painted within {} ms; ART boots",
+            SPLASH_PAINT_WAIT.as_millis()
+        );
     }
     Some(window)
 }
@@ -237,29 +225,31 @@ fn serve_media_services(_launch: &args::Launch) -> Result<()> {
     Ok(())
 }
 
-/// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it), then GTK starts on this thread with its GLib main context mirrored
-/// into the Looper (atl-platform-ui-linux `mirror`, over the `looper` seam), so GTK runs while the app's main thread idles in its Looper. The liveness poster targets the same Looper: the toolkit answers a compositor ping only after a main Looper pass (display-thread plan D3), so a blocked main thread answers none.
+/// Step 5b''. UI mode (`ro.atl.ui=gtk`, atld `--ui gtk`): the main thread's Looper is made before Java (its MessageQueue adopts it; the liveness poster needs it now), then the platform module starts its display thread,
+/// where GTK runs its own main loop apart from this thread (display-thread plan D2). The liveness poster targets the main Looper: the toolkit answers a compositor ping only after a main Looper pass (D3), so a blocked main thread answers none.
 /// `gralloc_node`: the run's node (`ro.atl.gpu.render_node`), whose device number every presented buffer must carry; unset: no gralloc, the window refuses every buffer.
-/// Returns the Looper too, which step 1d polls before Java exists.
 #[cfg_attr(not(feature = "converter"), allow(dead_code))]
-fn start_ui(
-    gralloc_node: Option<String>,
-) -> Result<(atl_platform_ui::PlatformUi, atl_looper::Looper)> {
+fn start_ui(gralloc_node: Option<String>) -> Result<atl_platform_ui::PlatformUi> {
     let device = gralloc_node
         .map(|n| {
             atl_gralloc::node::device_number(std::path::Path::new(&n))
                 .with_context(|| format!("gralloc node {n}"))
         })
         .transpose()?;
-    let thread_looper = atl_looper::LooperApi::load()?.prepare_looper()?;
-    let liveness = atl_looper::Poster::attach(&thread_looper)?;
-    let ui = atl_platform_ui::PlatformUi::attach(
-        Box::new(looper::AndroidLooper::new(thread_looper)),
-        Box::new(looper::MainPoster(liveness)),
-        device,
-    )
-    .map_err(|e| anyhow!("{e}"))?;
-    Ok((ui, thread_looper))
+    let main_looper = atl_looper::LooperApi::load()?.prepare_looper()?;
+    let liveness = atl_looper::Poster::attach(&main_looper)?;
+    let ui = atl_platform_ui::PlatformUi::attach(Box::new(MainPoster(liveness)), device)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(ui)
+}
+
+/// The main thread's `post` executor as the platform's liveness poster: the toolkit's liveness token runs in the main Looper's poll, as AOSP's input events do.
+struct MainPoster(atl_looper::Poster);
+
+impl atl_platform_ui::LooperPoster for MainPoster {
+    fn post(&self, f: Box<dyn FnOnce() + Send>) {
+        self.0.post(f);
+    }
 }
 
 /// AndroidRuntime::startVm's NativeBridge option from `ro.dalvik.vm.native.bridge` (unset, empty or "0": none), plus `-Xforce-nb-testing`: a non-zygote ART unloads the bridge unless forced

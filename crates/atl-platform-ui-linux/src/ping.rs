@@ -2,7 +2,7 @@
 //! The ping hold (display-thread plan D3): a compositor's `xdg_wm_base.ping` is answered only after the app's main Looper ran a liveness token, so a blocked main thread answers none and the desktop shows its own "not responding" dialog, whatever thread the toolkit runs on.
 //! GDK pongs inside its own ping listener and has no API to defer it (GTK 4.14.5 and 4.18.6 `gdk/wayland/gdkdisplay-wayland.c` `xdg_wm_base_ping`). So this module exports libwayland-client's `wl_proxy_add_listener` (public ABI, not variadic): libgtk's call binds here, because the module precedes libwayland-client in its RTLD_LOCAL group and libwayland-client is not in the process's global scope.
 //! Every call is forwarded to the real function (`dlsym(RTLD_NEXT)`); for the first `xdg_wm_base` proxy only, GDK's listener and data are kept and a one-entry listener installed whose `ping` holds the serial.
-//! A held ping with no token in flight posts one through the liveness poster ([`prepare`]); the token, on the app's Looper thread, invokes the toolkit thread, which runs GDK's own handler for every serial held before that token was posted, in order. Serials held while a token is in flight wait for the next token. No timer and no threshold: the answer follows a Looper pass that began after the ping.
+//! A held ping with no token in flight posts one through the liveness poster ([`prepare`]); the token, on the app's Looper thread, invokes the display thread, which runs GDK's own handler for every serial held before that token was posted, in order. Serials held while a token is in flight wait for the next token. No timer and no threshold: the answer follows a Looper pass that began after the ping.
 //! Capability probe, not an environment name: [`report`] logs once whether GDK's listener was seen during attach (`display: ping hold armed` / `not armed (<reason>)`); not armed = GDK pongs at once. Counters `pings_held`, `pings_answered` (count.rs, every hit).
 
 use std::ffi::{CStr, c_char, c_int, c_void};
@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use atl_platform_ui_api::LooperPoster;
 use gtk4::glib;
 
-use crate::{count, mirror};
+use crate::count;
 
 /// `wl_proxy_add_listener(proxy, implementation, data)`.
 type AddListener = unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int;
@@ -218,8 +218,7 @@ fn answer() {
         unsafe { (gdk.ping)(gdk.data.0, gdk.wm_base.0, serial) };
         count::each("pings_answered");
     }
-    // the pong is queued on the connection; GDK flushes in its source's prepare, which a call outside a mirror pass never reaches (a no-op inside a pass: its sync prepares)
-    mirror::resync();
+    // the pong is queued on the connection; GDK flushes it in its source's prepare, the display loop's next pass
     if more {
         post_token();
     }

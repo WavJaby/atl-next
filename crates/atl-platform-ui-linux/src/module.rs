@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use atl_platform_ui_api::abi::{
-    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, LooperAbi, MonitorView,
+    self, AudioHandle, BytesOut, Callback, FillCallback, InvokerHandle, MonitorView,
     PaintedView, PcmHandle, PosterAbi, RequesterHandle, SceneView, SendCallback, Status, Str,
     StreamIdentityView, Task, TextInputEventView, TextInputHandle, UiHandle, UiVtable,
     WindowAttributesView, WindowHandle,
@@ -142,7 +142,6 @@ unsafe fn fail(err: *mut BytesOut, (kind, text): (Status, String)) -> Status {
 }
 
 unsafe extern "C" fn ui_attach(
-    looper: LooperAbi,
     liveness: PosterAbi,
     device: u32,
     has_device: bool,
@@ -150,9 +149,9 @@ unsafe extern "C" fn ui_attach(
     err: *mut BytesOut,
 ) -> Status {
     let device = has_device.then_some(DeviceNumber(device));
-    match GtkUi::attach(Box::new(looper), Box::new(liveness), device) {
+    match GtkUi::attach(Box::new(liveness), device) {
         Ok(ui) => {
-            tracing::info!(target: "atl-platform-ui", "atl-platform-ui: module attached: GTK {}.{}.{} on the process's Looper", gtk4::major_version(), gtk4::minor_version(), gtk4::micro_version());
+            tracing::info!(target: "atl-platform-ui", "atl-platform-ui: module attached: GTK {}.{}.{} on thread {}", gtk4::major_version(), gtk4::minor_version(), gtk4::micro_version(), crate::ui::DISPLAY_THREAD);
             // SAFETY: `out` is the caller's out-parameter for this call.
             unsafe { *out = into_handle(ui) };
             abi::OK

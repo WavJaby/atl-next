@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! Stage `ui-block` of `xtask test window` (composer threading S2, composer backpressure): a SurfaceView whose thread keeps posting frames (xtask-harness/testdata/ui-block, Main.java) while the app's UI
-//! thread sleeps 2 s (block). The fixture's steady phase before it is stage slow-display's subject (slow_display.rs), not judged here.
-//! - Block: the window takes nothing, so the composer holds until its bound (`bound_ms` on its start line), then latches every vsync as a display that presents: the frames posted inside the sleep are at
-//!   least floor((block - bound) / period) - [`SLACK`], and no dequeue timed out (`-110`). A compositor that latches only when the window's thread runs leaves the producer blocked for the whole sleep.
-//! - Commits (local runs only: the proxy and the app share CLOCK_MONOTONIC; a remote run carries no commit times): the window surface's `wl_surface.commit`s the proxy timed, against the phase edges on the
-//!   fixture's result line. Probe responds: >= 1 inside the steady phase. Today's design (GTK runs only inside the UI thread's Looper poll): 0 strictly inside [block start + EDGE, block end - EDGE],
-//!   EDGE = one display period (a commit already in flight at the start edge, the first after the end). Display-thread S5d flips this expectation in place.
+//! Stage `ui-block` of `xtask test window` (composer threading S2, composer backpressure, display-thread S5d): a SurfaceView whose thread keeps posting frames (xtask-harness/testdata/ui-block, Main.java)
+//! while the app's UI thread sleeps 2 s (block). The fixture's steady phase before it is stage slow-display's subject (slow_display.rs); here it is only the window's own idle rate.
+//! The window runs on the platform's display thread, which waits on no app thread (display-thread plan D2), so the block must not stop it. Judged on local runs only (the proxy and the app share
+//! CLOCK_MONOTONIC; a remote run carries no commit times), from the window surface's `wl_surface.commit`s the proxy timed against the phase edges on the fixture's result line:
+//! - Commits: the window keeps committing through the block at its own idle rate: strictly inside [block start + EDGE, block end - EDGE] (EDGE = one display period: a commit in flight at the start edge,
+//!   the first after the end) at least max(1, floor(span / steady_p95) - [`SLACK`]), steady_p95 = the 95th percentile commit interval of the steady phase. Probe responds: >= 2 steady commits.
+//!   Red before S5d: the toolkit ran inside the UI thread's Looper poll, so a sleeping UI thread committed nothing (S5c measured 0 inside).
+//! - Posts: SurfaceFlinger's rule, one latch per present (display-thread plan D4): the producer tracks the display, not the UI thread, so the frames posted during the block are at least the window's
+//!   commits in it less [`SLACK`].
+//! - Timeouts (every run): no dequeue timed out (`-110`).
 
 use super::{ACK_WAIT, Liveness, Sub, await_event, wait_for_line};
 use crate::composer::word;
@@ -17,14 +20,14 @@ use std::time::Duration;
 pub const FIXTURE: &str = "xtask-harness/testdata/ui-block";
 /// The fixture's result line (Main.java draw).
 const RESULT: &str = "AtlWindow: ub result ";
-/// The composer's start line in UI mode (atl-composer host.rs `start`): whether backpressure is on and its bound.
-const BACKPRESSURE_LINE: &str = "atl-composer: ui: backpressure=";
-/// Grid points lost at the block's two edges (the post in flight when it starts, the first latch after it): the design's `- 2`.
+/// Frames lost at the block's two edges (the post in flight when it starts, the first latch or commit after it): the design's `- 2`.
 const SLACK: u64 = 2;
 /// Warm-up (60 frames, 1 s at 60 Hz) + steady phase 4 s + block 2 s + tail 1 s, with room for a slow start.
 const RESULT_WAIT: Duration = Duration::from_secs(25);
 /// A dequeue that timed out (HWUI / libgui log `dequeueBuffer failed ... -110`, TIMED_OUT).
 const TIMED_OUT: &str = "-110";
+/// The steady phase's interval taken as the window's idle rate: its 95th percentile (nearest rank), so a few slow paints do not set it and the block is held to what the window nearly always does.
+const STEADY_PERCENTILE: f64 = 0.95;
 
 /// The frame period of the run's display (the gate's output locally, the target's display remotely), ms.
 pub(super) fn period_ms(refresh_hz: f32) -> f64 {
@@ -43,48 +46,6 @@ pub(super) fn number(line: &str, k: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("no {k}= in {line}"))
 }
 
-/// The composer's start line.
-fn backpressure_line(app: &str) -> Result<&str, String> {
-    app.lines()
-        .find(|l| l.contains(BACKPRESSURE_LINE))
-        .ok_or_else(|| "no `atl-composer: ui: backpressure=` line".to_owned())
-}
-
-/// The composer's backpressure bound, ms: 0 when backpressure is off (the gate's break).
-pub(super) fn bound_ms(app: &str) -> Result<u64, String> {
-    let line = backpressure_line(app)?;
-    if word(line, "backpressure") == Some("false") {
-        return Ok(0);
-    }
-    number(line, "bound_ms")
-}
-
-/// The composer's configured hold bound, ms, whether backpressure is on or off.
-pub(super) fn hold_bound_ms(app: &str) -> Result<u64, String> {
-    number(backpressure_line(app)?, "bound_ms")
-}
-
-/// The frames the producer posted inside the block against the vsync grid, less the composer's bound.
-fn posts_check(app: &str, refresh_hz: f32) -> Result<String, String> {
-    let line = result_line(app)?;
-    let (during, gap, block) = (
-        number(line, "posts_during")?,
-        number(line, "max_gap_ms")?,
-        number(line, "block_ms")?,
-    );
-    let bound = bound_ms(app)?;
-    let want = ((block.saturating_sub(bound) as f64 / period_ms(refresh_hz)).floor() as u64)
-        .saturating_sub(SLACK);
-    let summary = format!(
-        "{during} frames posted during the {block} ms block (want >= {want}: bound {bound} ms), longest gap {gap} ms"
-    );
-    if during >= want {
-        Ok(summary)
-    } else {
-        Err(summary)
-    }
-}
-
 /// No dequeue timed out.
 fn timeouts_check(app: &str) -> Result<String, String> {
     let n = app
@@ -98,46 +59,107 @@ fn timeouts_check(app: &str) -> Result<String, String> {
     }
 }
 
-/// The window's commits ([`crate::wayland_proxy::Commits`], CLOCK_MONOTONIC ns) against the fixture's phase edges (uptimeMillis, the same clock in ms): >= 1 in the steady phase (the probe sees
-/// commits at all), 0 strictly inside the block less one display period at each edge.
-fn commits_check(app: &str, refresh_hz: f32, commits_ns: &[u64]) -> Result<String, String> {
-    const NS_PER_MS: f64 = 1_000_000.0;
-    let line = result_line(app)?;
-    let ms = |k| number(line, k).map(|v| v as f64);
-    let (block_start, block_end) = (ms("block_start_ms")?, ms("block_end_ms")?);
-    let (steady_start, steady_end) = (ms("steady_start_ms")?, ms("steady_end_ms")?);
-    let edge = period_ms(refresh_hz);
-    let (lo, hi) = (block_start + edge, block_end - edge);
-    let at = |t: &&u64| **t as f64 / NS_PER_MS;
-    let inside = commits_ns
-        .iter()
-        .filter(|t| at(t) > lo && at(t) < hi)
-        .count();
-    let steady = commits_ns
-        .iter()
-        .filter(|t| at(t) >= steady_start && at(t) <= steady_end)
-        .count();
-    let summary = format!(
-        "{inside} inside the block ({lo:.1}..{hi:.1} ms, edge {edge:.2} ms), {steady} in the steady phase ({} window commits in all)",
-        commits_ns.len()
-    );
-    if steady == 0 {
-        Err(format!("probe silent: {summary}"))
-    } else if inside > 0 {
-        Err(summary)
-    } else {
-        Ok(summary)
+/// The window's commits ([`crate::wayland_proxy::Commits`], CLOCK_MONOTONIC ns) placed on the fixture's phases (uptimeMillis, the same clock in ms).
+struct Phases {
+    /// Commit times in ms, ascending.
+    commits_ms: Vec<f64>,
+    block: (f64, f64),
+    steady: (f64, f64),
+    /// One display period.
+    edge: f64,
+}
+
+impl Phases {
+    fn of(app: &str, refresh_hz: f32, commits_ns: &[u64]) -> Result<Self, String> {
+        const NS_PER_MS: f64 = 1_000_000.0;
+        let line = result_line(app)?;
+        let ms = |k| number(line, k).map(|v| v as f64);
+        let mut commits_ms: Vec<f64> = commits_ns.iter().map(|t| *t as f64 / NS_PER_MS).collect();
+        commits_ms.sort_by(f64::total_cmp);
+        Ok(Phases {
+            commits_ms,
+            block: (ms("block_start_ms")?, ms("block_end_ms")?),
+            steady: (ms("steady_start_ms")?, ms("steady_end_ms")?),
+            edge: period_ms(refresh_hz),
+        })
+    }
+
+    /// The judged span inside the block: one period in from each edge.
+    fn inside(&self) -> (f64, f64) {
+        (self.block.0 + self.edge, self.block.1 - self.edge)
+    }
+
+    fn count(&self, (lo, hi): (f64, f64), open: bool) -> u64 {
+        let within = |t: f64| if open { t > lo && t < hi } else { t >= lo && t <= hi };
+        self.commits_ms.iter().filter(|t| within(**t)).count() as u64
+    }
+
+    /// The steady phase's commit interval at [`STEADY_PERCENTILE`] (nearest rank), ms; None below two steady commits.
+    fn steady_p95(&self) -> Option<f64> {
+        let (lo, hi) = self.steady;
+        let steady: Vec<f64> = self
+            .commits_ms
+            .iter()
+            .copied()
+            .filter(|t| *t >= lo && *t <= hi)
+            .collect();
+        let mut intervals: Vec<f64> = steady.windows(2).map(|w| w[1] - w[0]).collect();
+        if intervals.is_empty() {
+            return None;
+        }
+        intervals.sort_by(f64::total_cmp);
+        let rank = (STEADY_PERCENTILE * intervals.len() as f64).ceil() as usize;
+        Some(intervals[rank.clamp(1, intervals.len()) - 1])
     }
 }
 
-/// The sub-gates; `refresh_hz`: the run's display (the block's grid); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock).
+/// The window kept committing through the block at no less than its own steady rate (module docs).
+fn commits_check(phases: &Phases) -> Result<String, String> {
+    let (lo, hi) = phases.inside();
+    let inside = phases.count((lo, hi), true);
+    let Some(p95) = phases.steady_p95() else {
+        return Err(format!(
+            "probe silent: fewer than 2 window commits in the steady phase ({} in all)",
+            phases.commits_ms.len()
+        ));
+    };
+    let want = (((hi - lo) / p95).floor() as u64)
+        .saturating_sub(SLACK)
+        .max(1);
+    let summary = format!(
+        "{inside} inside the block ({lo:.1}..{hi:.1} ms, edge {:.2} ms; want >= {want}: steady p95 {p95:.1} ms), {} window commits in all",
+        phases.edge,
+        phases.commits_ms.len()
+    );
+    if inside >= want { Ok(summary) } else { Err(summary) }
+}
+
+/// The producer posted at least once per window commit during the block, less [`SLACK`] (module docs).
+fn posts_check(app: &str, phases: &Phases) -> Result<String, String> {
+    let line = result_line(app)?;
+    let (during, gap) = (number(line, "posts_during")?, number(line, "max_gap_ms")?);
+    let commits = phases.count(phases.block, false);
+    let want = commits.saturating_sub(SLACK);
+    let summary = format!(
+        "{during} frames posted during the block (want >= {want}: {commits} window commits in it), longest gap {gap} ms"
+    );
+    if during >= want { Ok(summary) } else { Err(summary) }
+}
+
+/// The sub-gates; `refresh_hz`: the run's display (the block's edges); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock): commits and posts are then not judged.
 pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Vec<Sub> {
-    let mut subs = vec![
-        ("posts", posts_check(app, refresh_hz)),
-        ("timeouts", timeouts_check(app)),
-    ];
+    let mut subs = vec![("timeouts", timeouts_check(app))];
     if let Some(commits_ns) = commits_ns {
-        subs.push(("commits", commits_check(app, refresh_hz, commits_ns)));
+        match Phases::of(app, refresh_hz, commits_ns) {
+            Ok(phases) => {
+                subs.push(("commits", commits_check(&phases)));
+                subs.push(("posts", posts_check(app, &phases)));
+            }
+            Err(e) => {
+                subs.push(("commits", Err(e.clone())));
+                subs.push(("posts", Err(e)));
+            }
+        }
     }
     subs
 }
@@ -158,61 +180,78 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
 mod tests {
     use super::*;
 
-    const ON: &str = "0.5 INFO atl-composer: ui: backpressure=true bound_ms=100\n";
-
-    fn result(during: u64) -> String {
+    /// Steady phase 6000..10000 ms, block 10000..12000 ms on the app's uptimeMillis.
+    fn edges(during: u64) -> String {
         format!(
-            "9.0 I AtlWindow: ub result posts_during={during} max_gap_ms=20 block_ms=2000 steady_posts=240 steady_ms=4000 posted=500\n"
+            "9.0 I AtlWindow: ub result posts_during={during} max_gap_ms=20 block_ms=2000 block_start_ms=10000 block_end_ms=12000 steady_start_ms=6000 steady_end_ms=10000\n"
         )
     }
-
-    /// At 60 Hz (period 16.666...67 ms in f64) with a 100 ms bound a 2000 ms block holds floor(113.99...) = 113 grid points, minus SLACK 2: 111 posts pass, 110 fail. Backpressure off (bound 0): floor(119.99...)
-    /// = 119, minus 2: 117. No start line or no result line fails.
-    /// A 120 Hz target display (period 8.333...34 ms in f64): 1900 ms holds floor(227.99...) = 227 grid points, minus 2: 225 pass, 224 fail.
-    #[test]
-    fn posts_against_the_grid_less_the_bound() {
-        assert!(posts_check(&format!("{ON}{}", result(111)), 60.0).is_ok());
-        assert!(posts_check(&format!("{ON}{}", result(110)), 60.0).is_err());
-        let off = "0.5 INFO atl-composer: ui: backpressure=false bound_ms=100\n";
-        assert!(posts_check(&format!("{off}{}", result(117)), 60.0).is_ok());
-        assert!(posts_check(&format!("{off}{}", result(116)), 60.0).is_err());
-        assert!(posts_check(&result(117), 60.0).is_err());
-        assert!(posts_check(ON, 60.0).is_err());
-        assert!(posts_check(&format!("{ON}{}", result(225)), 120.0).is_ok());
-        assert!(posts_check(&format!("{ON}{}", result(224)), 120.0).is_err());
-    }
-
-    /// Steady phase 6000..10000 ms, block 10000..12000 ms on the app's uptimeMillis.
-    const EDGES: &str = "9.0 I AtlWindow: ub result posts_during=111 block_start_ms=10000 block_end_ms=12000 steady_start_ms=6000 steady_end_ms=10000\n";
     const MS: u64 = 1_000_000;
 
-    /// 60 Hz: EDGE = 16.666... ms, so the block's judged span is 10016.67..11983.33 ms. A commit at 10016 ms is the one in flight at the start edge, one at 11984 ms the first after the end: both outside.
-    /// 10017 and 11983 ms are inside. A commit at 7000 ms is the steady phase's; none there = a probe that saw no commits.
-    #[test]
-    fn commits_inside_the_block_less_one_period_per_edge() {
-        let steady = 7_000 * MS;
-        assert!(commits_check(EDGES, 60.0, &[steady, 10_016 * MS, 11_984 * MS]).is_ok());
-        assert!(commits_check(EDGES, 60.0, &[steady, 10_017 * MS]).is_err());
-        assert!(commits_check(EDGES, 60.0, &[steady, 11_983 * MS]).is_err());
-        assert!(commits_check(EDGES, 60.0, &[]).is_err());
-        assert!(commits_check(EDGES, 60.0, &[10_016 * MS]).is_err());
-        // no phase edges on the line (a fixture before this check)
-        assert!(commits_check(&result(111), 60.0, &[steady]).is_err());
+    /// Commits every `step_ms` from `from` to `to` ms (inclusive start, exclusive end).
+    fn every(from: u64, to: u64, step_ms: u64) -> Vec<u64> {
+        (from..to).step_by(step_ms as usize).map(|t| t * MS).collect()
     }
 
-    /// The commits sub-gate exists only with commit times (a local run).
+    fn phases(during: u64, commits: &[u64]) -> Phases {
+        Phases::of(&edges(during), 60.0, commits).expect("phases")
+    }
+
+    /// Steady commits every 20 ms (p95 = 20 ms). 60 Hz: EDGE = 16.666... ms, the judged span 10016.67..11983.33 ms = 1966.67 ms: floor(98.33) = 98 - SLACK 2 = 96 wanted.
+    /// Commits every 20 ms in the block from 10020: 10020..11980 = 99 inside, pass; every 21 ms: 10020..11973 = 94 inside, fail. None inside (the UI thread's block stopping the window): fail.
     #[test]
-    fn commits_only_judged_locally() {
-        let app = format!("{ON}{EDGES}");
-        assert!(
-            !checks(&app, 60.0, None)
-                .iter()
-                .any(|(n, _)| *n == "commits")
+    fn commits_through_the_block_at_the_steady_rate() {
+        let steady = every(6_000, 10_000, 20);
+        let at = |step| [steady.clone(), every(10_020, 11_984, step)].concat();
+        assert!(commits_check(&phases(0, &at(20))).is_ok());
+        assert!(commits_check(&phases(0, &at(21))).is_err());
+        assert!(commits_check(&phases(0, &steady)).is_err());
+    }
+
+    /// Two steady commits 1000 ms apart: p95 1000 ms, floor(1966.67 / 1000) = 1 - 2 saturates to 0, so the floor of 1 holds: one inside passes, none fails. One steady commit: probe silent.
+    #[test]
+    fn commits_want_at_least_one_and_a_live_probe() {
+        let steady = vec![7_000 * MS, 8_000 * MS];
+        assert!(commits_check(&phases(0, &[steady.clone(), vec![11_000 * MS]].concat())).is_ok());
+        assert!(commits_check(&phases(0, &steady)).is_err());
+        assert!(commits_check(&phases(0, &[7_000 * MS, 11_000 * MS])).is_err());
+    }
+
+    /// p95 by nearest rank: 20 intervals, 19 of 10 ms and one of 100 ms: rank ceil(19.0) = 19 -> 10 ms (the one slow paint does not set the rate); with 2 slow of 20, rank 19 -> 100 ms.
+    #[test]
+    fn steady_rate_is_the_95th_percentile_interval() {
+        let mut t: Vec<u64> = (0..20).map(|i| (6_000 + 10 * i) * MS).collect();
+        t.push(6_290 * MS);
+        assert_eq!(phases(0, &t).steady_p95(), Some(10.0));
+        let mut t: Vec<u64> = (0..19).map(|i| (6_000 + 10 * i) * MS).collect();
+        t.extend([6_280 * MS, 6_380 * MS]);
+        assert_eq!(phases(0, &t).steady_p95(), Some(100.0));
+    }
+
+    /// Block commits counted over the whole block 10000..12000 ms inclusive: 100 there (every 20 ms) want 98 posts; 98 pass, 97 fail.
+    #[test]
+    fn posts_track_the_window_commits_less_two() {
+        let commits = [every(6_000, 10_000, 20), every(10_000, 12_000, 20)].concat();
+        assert!(posts_check(&edges(98), &phases(98, &commits)).is_ok());
+        assert!(posts_check(&edges(97), &phases(97, &commits)).is_err());
+    }
+
+    /// Commits and posts exist only with commit times (a local run); a result line without phase edges fails both.
+    #[test]
+    fn commits_and_posts_only_judged_locally() {
+        let app = edges(98);
+        let names = |subs: Vec<Sub>| subs.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names(checks(&app, 60.0, None)), ["timeouts"]);
+        assert_eq!(
+            names(checks(&app, 60.0, Some(&[7_000 * MS]))),
+            ["timeouts", "commits", "posts"]
         );
+        let bare = "9.0 I AtlWindow: ub result posts_during=98 max_gap_ms=20\n";
         assert!(
-            checks(&app, 60.0, Some(&[7_000 * MS]))
+            checks(bare, 60.0, Some(&[7_000 * MS]))
                 .iter()
-                .any(|(n, r)| *n == "commits" && r.is_ok())
+                .skip(1)
+                .all(|(_, r)| r.is_err())
         );
     }
 }

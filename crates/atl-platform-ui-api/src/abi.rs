@@ -2,13 +2,13 @@
 //! The C ABI between a process and the platform module it loads with `dlopen(RTLD_NOW | RTLD_LOCAL)` (launcher-ui-module plan S2, slices M1 + M3): the module's toolkit and host libraries (GTK, GLib, PipeWire and their closure) stay out of the process's global symbol scope, so an app `.so` that needs `libvulkan.so` or `libz.so` binds AOSP's copy, not the host's.
 //! Shape: the module exports one symbol, [`ENTRY_SYMBOL`] (an [`Entry`]), which returns its static [`UiVtable`]: one `extern "C"` fn per trait method of this crate over opaque handles. The facade (`atl-platform-ui`) wraps the vtable in proxies implementing the traits; the module wraps its implementation in the exports. Both sides compile these definitions, so no layout is copied by hand.
 //! Identity, not versioning: [`UiVtable::abi`] is [`ABI_ID`], a hash of this crate's sources, atl-platform-types' and the rustc version (build.rs). The loader reads it before any other field and refuses a module of another build by name.
-//! Ownership: a callback ([`Callback`], [`FillCallback`], [`Task`], [`LooperAbi`], [`PosterAbi`]) is made by `new` on the side whose closure it carries, and its `drop` runs that side's code: nothing is freed by the other artifact's std. Views ([`Str`], [`SceneView`], [`PaintedView`], ...) borrow for one call; the fences of a [`PaintedView`] pass to the receiver.
+//! Ownership: a callback ([`Callback`], [`FillCallback`], [`Task`], [`PosterAbi`]) is made by `new` on the side whose closure it carries, and its `drop` runs that side's code: nothing is freed by the other artifact's std. Views ([`Str`], [`SceneView`], [`PaintedView`], ...) borrow for one call; the fences of a [`PaintedView`] pass to the receiver.
 //! No unwind crosses: an `extern "C"` fn aborts on panic. Strings cross as views because `String`'s layout is Rust's, unspecified between two artifacts.
 
 use std::borrow::Cow;
 use std::ffi::{c_int, c_void};
 use std::mem::ManuallyDrop;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
 use atl_compositor::scene::{BufferContent, Content, Quad, Scene, SceneBuffer, SceneFd};
@@ -17,7 +17,7 @@ use atl_libgui_parcel::state::FloatRect;
 use crate::audio::AudioError;
 use crate::webview::{CookiePolicy, WebSetting};
 use crate::{
-    FdEvents, Looper, LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale,
+    LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale,
     TextInputEvent, UiError,
 };
 
@@ -43,33 +43,6 @@ pub const ABI_ID: AbiId = AbiId(include!(concat!(env!("OUT_DIR"), "/abi_id.rs"))
 
 /// The entry ([`ENTRY_SYMBOL`]): the module's static vtable. Reads nothing and starts nothing; the caller checks [`UiVtable::abi`] before any other field.
 pub type Entry = unsafe extern "C" fn() -> *const UiVtable;
-
-/// [`FdEvents`] as bits: readable.
-pub const FD_INPUT: u32 = 1;
-/// Writable.
-pub const FD_OUTPUT: u32 = 2;
-/// Error condition.
-pub const FD_ERROR: u32 = 4;
-/// Peer hung up.
-pub const FD_HANGUP: u32 = 8;
-
-/// [`FdEvents`] -> `FD_*` bits.
-pub fn fd_bits(e: FdEvents) -> u32 {
-    (if e.input { FD_INPUT } else { 0 })
-        | (if e.output { FD_OUTPUT } else { 0 })
-        | (if e.error { FD_ERROR } else { 0 })
-        | (if e.hangup { FD_HANGUP } else { 0 })
-}
-
-/// `FD_*` bits -> [`FdEvents`].
-pub fn fd_events(b: u32) -> FdEvents {
-    FdEvents {
-        input: b & FD_INPUT != 0,
-        output: b & FD_OUTPUT != 0,
-        error: b & FD_ERROR != 0,
-        hangup: b & FD_HANGUP != 0,
-    }
-}
 
 /// A log record's level, `tracing`'s order: 1 error .. 5 trace.
 pub type Level = u8;
@@ -221,7 +194,7 @@ unsafe extern "C" fn drop_box<F>(data: *mut c_void) {
     drop(unsafe { Box::from_raw(data.cast::<F>()) });
 }
 
-/// An `FnMut(&T)` closure across the boundary; called and dropped on the thread that holds it (the UI thread: never Send).
+/// An `FnMut(&T)` closure across the boundary; called and dropped on the thread that holds it (the display thread: never Send).
 #[repr(C)]
 pub struct Callback<T> {
     data: *mut c_void,
@@ -253,7 +226,7 @@ impl<T> Drop for Callback<T> {
     }
 }
 
-/// An `FnMut(&T) + Send` closure across the boundary: made on one thread, called and dropped on another (the module's UI thread).
+/// An `FnMut(&T) + Send` closure across the boundary: made on one thread, called and dropped on another (the module's display thread).
 #[repr(C)]
 pub struct SendCallback<T> {
     data: *mut c_void,
@@ -411,120 +384,6 @@ impl BytesOut {
     }
 }
 
-/// One readiness report of a Looper fd.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FdReady {
-    /// The fd.
-    pub fd: c_int,
-    /// `FD_*` bits.
-    pub events: u32,
-}
-
-/// The process's [`Looper`] as the module holds it: owned by the module from `ui_attach` on, dropped (the process's `drop`) when the module's main loop mirror ends.
-#[repr(C)]
-pub struct LooperAbi {
-    data: *mut c_void,
-    set_sink: unsafe extern "C" fn(*mut c_void, Callback<FdReady>),
-    add_fd: unsafe extern "C" fn(*mut c_void, c_int, u32, *mut BytesOut) -> c_int,
-    remove_fd: unsafe extern "C" fn(*mut c_void, c_int, *mut BytesOut) -> c_int,
-    drop: unsafe extern "C" fn(*mut c_void),
-}
-
-type BoxLooper = Box<dyn Looper>;
-
-unsafe extern "C" fn looper_set_sink(data: *mut c_void, mut sink: Callback<FdReady>) {
-    // SAFETY: `data` is the Box<BoxLooper> `LooperAbi::new` leaked, alive until `drop`.
-    let looper = unsafe { &*data.cast::<BoxLooper>() };
-    looper.set_sink(Box::new(move |fd, events| {
-        sink.call(&FdReady {
-            fd,
-            events: fd_bits(events),
-        })
-    }));
-}
-
-unsafe extern "C" fn looper_add_fd(
-    data: *mut c_void,
-    fd: c_int,
-    events: u32,
-    err: *mut BytesOut,
-) -> c_int {
-    // SAFETY: as `looper_set_sink`.
-    let looper = unsafe { &*data.cast::<BoxLooper>() };
-    match looper.add_fd(fd, fd_events(events)) {
-        Ok(()) => 0,
-        Err(e) => {
-            // SAFETY: `err` is the sink the caller lent for this call.
-            unsafe { BytesOut::put_to(err, e.to_string().as_bytes()) };
-            -1
-        }
-    }
-}
-
-unsafe extern "C" fn looper_remove_fd(data: *mut c_void, fd: c_int, err: *mut BytesOut) -> c_int {
-    // SAFETY: as `looper_set_sink`.
-    let looper = unsafe { &*data.cast::<BoxLooper>() };
-    match looper.remove_fd(fd) {
-        Ok(()) => 0,
-        Err(e) => {
-            // SAFETY: `err` is the sink the caller lent for this call.
-            unsafe { BytesOut::put_to(err, e.to_string().as_bytes()) };
-            -1
-        }
-    }
-}
-
-impl LooperAbi {
-    /// Carries `looper` (the process side).
-    pub fn new(looper: Box<dyn Looper>) -> Self {
-        Self {
-            data: Box::into_raw(Box::new(looper)).cast(),
-            set_sink: looper_set_sink,
-            add_fd: looper_add_fd,
-            remove_fd: looper_remove_fd,
-            drop: drop_box::<BoxLooper>,
-        }
-    }
-}
-
-impl Looper for LooperAbi {
-    fn set_sink(&self, mut sink: Box<dyn FnMut(RawFd, FdEvents)>) {
-        let sink = Callback::new(move |r: &FdReady| sink(r.fd, fd_events(r.events)));
-        // SAFETY: paired by `new`; the sink's ownership passes to the process's Looper.
-        unsafe { (self.set_sink)(self.data, sink) }
-    }
-
-    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError> {
-        // SAFETY: paired by `new`; `err` lives for the call.
-        let (rc, msg) =
-            BytesOut::collect(|err| unsafe { (self.add_fd)(self.data, fd, fd_bits(events), err) });
-        looper_result(rc, msg)
-    }
-
-    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError> {
-        // SAFETY: as add_fd.
-        let (rc, msg) = BytesOut::collect(|err| unsafe { (self.remove_fd)(self.data, fd, err) });
-        looper_result(rc, msg)
-    }
-}
-
-/// The process's Looper error, already formatted: carried as `Looper` with its text.
-fn looper_result(rc: c_int, msg: Vec<u8>) -> Result<(), UiError> {
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(UiError::Looper(String::from_utf8_lossy(&msg).into_owned()))
-    }
-}
-
-impl Drop for LooperAbi {
-    fn drop(&mut self) {
-        // SAFETY: paired by `new`; Drop runs once.
-        unsafe { (self.drop)(self.data) }
-    }
-}
-
 /// The process's [`LooperPoster`] as the module holds it: owned by the module from `ui_attach` on; callable from any thread (the toolkit's).
 #[repr(C)]
 pub struct PosterAbi {
@@ -581,8 +440,7 @@ pub fn ui_error_parts(e: &UiError) -> (Status, String) {
     match e {
         UiError::Unavailable(s) => (1, s.clone()),
         UiError::WrongThread => (2, String::new()),
-        UiError::Looper(s) => (3, s.clone()),
-        UiError::Capture(s) => (4, s.clone()),
+        UiError::Capture(s) => (3, s.clone()),
     }
 }
 
@@ -591,8 +449,7 @@ pub fn ui_error(kind: Status, text: Vec<u8>) -> UiError {
     let text = String::from_utf8_lossy(&text).into_owned();
     match kind {
         2 => UiError::WrongThread,
-        3 => UiError::Looper(text),
-        4 => UiError::Capture(text),
+        3 => UiError::Capture(text),
         _ => UiError::Unavailable(text),
     }
 }
@@ -1086,7 +943,7 @@ pub struct PcmHandle {
     _opaque: [u8; 0],
 }
 
-/// Everything the module offers: one fn per trait method of this crate. A fn on a handle runs on the thread its trait allows (UI thread, except the invoker, the frame requester and the audio calls the traits mark Send); a fn that can fail returns a [`Status`] and writes the error text to its `err` sink. `*_drop` ends a handle; a `*mut` out-parameter receives a new handle on [`OK`].
+/// Everything the module offers: one fn per trait method of this crate. A fn on a handle runs on the thread its trait allows (the display thread, except the invoker, the frame requester and the audio calls the traits mark Send); a fn that can fail returns a [`Status`] and writes the error text to its `err` sink. `*_drop` ends a handle; a `*mut` out-parameter receives a new handle on [`OK`].
 #[repr(C)]
 pub struct UiVtable {
     /// The module's [`ABI_ID`]; the only field read before the check.
@@ -1095,7 +952,6 @@ pub struct UiVtable {
     pub set_log: unsafe extern "C" fn(sink: LogSink),
     /// `Ui::attach`; `device` counts when `has_device`.
     pub ui_attach: unsafe extern "C" fn(
-        looper: LooperAbi,
         liveness: PosterAbi,
         device: u32,
         has_device: bool,
@@ -1245,7 +1101,7 @@ pub struct UiVtable {
     /// `PcmOutput::underruns`.
     pub pcm_underruns: unsafe extern "C" fn(pcm: *mut PcmHandle) -> u64,
     /// Makes the toolkit widget `widget` (a `GtkWidget *` of the same libgtk, from another module: the one the WebView module's [`WebViewVtable::view_create`] `shown` reports) the content of every sideband quad whose
-    /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. UI thread.
+    /// stream is `[SIDEBAND_WEB_VIEW, key]` (crate::webview); the module takes its own reference. Display thread.
     /// Both callbacks are kept until detach and called on the display thread. `unhandled_key`: the widget left a key unhandled (the toolkit put back a delivered key event); its value is that key's stamp,
     /// the monotonic ns Android's KeyEvent carries (`WebEvent::UnhandledKey`). `press_not_cancelled`: a Cancel claim's replay found the page mid-press (`WebEvent::PressNotCancelled`).
     pub sideband_attach: unsafe extern "C" fn(
@@ -1254,7 +1110,7 @@ pub struct UiVtable {
         unhandled_key: Callback<i64>,
         press_not_cancelled: Callback<()>,
     ),
-    /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. UI thread.
+    /// Drops `key`'s widget (unparented from its window, its reference released); a quad still naming it shows nothing. Display thread.
     pub sideband_detach: unsafe extern "C" fn(key: i32),
     /// `WebView::claim_input` for `key`'s widget: `claim` an [`InputClaim`](crate::webview::InputClaim) number; returns [`ClaimReply::bits`](crate::webview::ClaimReply::bits). Any thread, never waits
     /// for the display thread: the reply reads the press origins the window recorded before it published the events; the replay of the held events is invoked on the display thread (inline on its owner).
@@ -1475,8 +1331,8 @@ pub struct WebViewVtable {
     pub abi: AbiId,
     /// Hands the module the process's log sink, right after the check; the module's [`set_log`].
     pub set_log: unsafe extern "C" fn(sink: LogSink),
-    /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display, no UI thread). Any thread: the engine is touched on the UI thread only, so a call from another thread
-    /// waits until the UI thread's Looper has run it (blocks while the UI thread is blocked).
+    /// `WebEngine::default_user_agent`: the engine's own default UA string into `out` and true; false with the reason in `out` when the engine cannot run (no display, no display thread). Any thread: the engine is touched on the display thread only, so a call from another thread
+    /// waits until the display thread has run it (`call`: bounded by the display thread's own work, never by an app thread).
     pub default_user_agent: unsafe extern "C" fn(out: *mut BytesOut) -> bool,
     /// `WebEngine::create_view` for the view `key`. On the display thread: `shown(widget)` once the view exists (its `GtkWidget *`, borrowed, for [`UiVtable::sideband_attach`]) and
     /// `shown(null)` before `view_drop` destroys it; `events` gets every event. False = no display thread in the process (both callbacks dropped).
@@ -1519,9 +1375,9 @@ pub struct WebViewVtable {
     pub view_set_background: unsafe extern "C" fn(key: i32, argb: u32),
     /// `WebView::set_initial_scale`.
     pub view_set_initial_scale: unsafe extern "C" fn(key: i32, percent: i32),
-    /// `WebEngine::watch_cookies`; any thread (queued to the UI thread). False = no UI thread in the process (`changed` dropped).
+    /// `WebEngine::watch_cookies`; any thread (queued to the display thread). False = no display thread in the process (`changed` dropped).
     pub cookies_watch: unsafe extern "C" fn(changed: SendCallback<CookieList>) -> bool,
-    /// `WebEngine::add_cookie`; any thread, the cookie copied before return; `done` once, on the UI thread. False as `cookies_watch`.
+    /// `WebEngine::add_cookie`; any thread, the cookie copied before return; `done` once, on the display thread. False as `cookies_watch`.
     pub cookies_add:
         unsafe extern "C" fn(cookie: *const CookieView, done: SendCallback<bool>) -> bool,
     /// `WebEngine::replace_cookies`; as `cookies_add`.

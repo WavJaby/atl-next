@@ -16,7 +16,6 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib, graphene, gsk};
 
 use crate::input;
-use crate::mirror;
 use crate::outputs;
 use crate::paint_stats::PaintStats;
 use crate::presentation::Presentation;
@@ -616,7 +615,6 @@ impl Window for GtkWindow {
                         {
                             view.rescale();
                             fit_window(&window, &view);
-                            mirror::resync();
                         }
                     });
                 });
@@ -664,7 +662,6 @@ impl Window for GtkWindow {
         this.set_title(&attributes.title);
         this.set_size(attributes.size);
         this.window.present();
-        mirror::resync();
         Ok(this)
     }
 
@@ -672,13 +669,10 @@ impl Window for GtkWindow {
         self.requested.set(size);
         self.view.set_wanted(size);
         fit_window(&self.window, &self.view);
-        // every GTK change this layer makes may attach a source (a layout or paint request of the frame clock): from outside a mirror pass it reaches the Looper only through a sync. The platform layer is the only GTK caller, so its entry points are the complete set.
-        mirror::resync();
     }
 
     fn set_title(&self, title: &str) {
         self.window.set_title(Some(title));
-        mirror::resync();
     }
 
     /// On the content view: GDK sets it through `wp_cursor_shape_v1` where the compositor has it, else a themed cursor surface.
@@ -686,14 +680,12 @@ impl Window for GtkWindow {
         let name = input::cursor_name(shape);
         tracing::info!("atl-platform-ui: cursor {name}");
         self.view.set_cursor_from_name(Some(name));
-        mirror::resync();
     }
 
     /// `gtk_window_minimize`: GDK's Wayland backend sends `xdg_toplevel.set_minimized`.
     fn minimize(&self) {
         tracing::info!("atl-platform-ui: minimize");
         self.window.minimize();
-        mirror::resync();
     }
 
     fn size(&self) -> PhysSize {
@@ -779,7 +771,6 @@ impl Window for GtkWindow {
                 self.view.scale().get()
             );
         }
-        mirror::resync();
         Ok(())
     }
 
@@ -905,15 +896,13 @@ fn request_frame(window: &gtk4::Window, shared: &Rc<Shared>) {
     if let Some(clock) = window.frame_clock() {
         clock.request_phase(gdk::FrameClockPhase::UPDATE);
     }
-    // a request from outside a mirror pass (the app's vsync request, Java on the Looper): the frame clock's source reaches the Looper only through a sync (mirror::resync)
-    mirror::resync();
 }
 
 /// A window a [`GtkFrameRequester`] names: its id, then the window and its state, weakly.
 type RequestTarget = (u64, glib::WeakRef<gtk4::Window>, std::rc::Weak<Shared>);
 
 thread_local! {
-    /// The windows a [`GtkFrameRequester`] may name, by id: on the GTK thread only, so the handle itself holds nothing thread-bound and drops safely on any thread.
+    /// The windows a [`GtkFrameRequester`] may name, by id: on the display thread only, so the handle itself holds nothing thread-bound and drops safely on any thread.
     static REQUEST_TARGETS: RefCell<Vec<RequestTarget>> = const { RefCell::new(Vec::new()) };
 }
 

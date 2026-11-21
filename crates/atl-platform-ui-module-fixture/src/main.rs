@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: MIT
 //! The process of `xtask test ui-module` (launcher-ui-module plan slices M1, M3): loads the platform module through the `atl-platform-ui` facade, as the launcher does, then an app library, and reports on stdout what each part saw. The harness judges; this program only reports.
-//! 1. `PlatformUi::attach` with this program's Looper (a `poll(2)` loop on this thread, state in an `Rc`, not a thread-local): the facade dlopens the module `RTLD_NOW | RTLD_LOCAL` by file name, checks its build identity and routes its log records into this program's subscriber (target `atl_platform_ui_linux`). A refusal is reported (`attach_error`) and the run goes on without UI, as the launcher's "no UI mode". `--global`: the module is dlopened `RTLD_GLOBAL` first (the gate's break: the facade's later local load gets the same, global, object). `--drop-module-records`: this subscriber filters the module's records out (the other break).
-//! 2. One `PlatformWindow` presenting a colour scene at each tick until the first paint or `--timeout-ms`. `--audio <socket>`: `PlatformAudioHost::connect` (loads SPA plugins inside the local group).
+//! 1. `PlatformUi::attach` (the module starts its display thread, which runs GTK's loop): the facade dlopens the module `RTLD_NOW | RTLD_LOCAL` by file name, checks its build identity and routes its log records into this program's subscriber (target `atl_platform_ui_linux`). A refusal is reported (`attach_error`) and the run goes on without UI, as the launcher's "no UI mode". `--global`: the module is dlopened `RTLD_GLOBAL` first (the gate's break: the facade's later local load gets the same, global, object). `--drop-module-records`: this subscriber filters the module's records out (the other break).
+//! 2. One `PlatformWindow`, made on the display thread by `call`, presenting a colour scene at each tick until the first paint or `--timeout-ms`. `--panic-on-display`: then a panicking closure invoked there, which must abort the process. `--audio <socket>`: `PlatformAudioHost::connect` (loads SPA plugins inside the local group).
 //! 3. `dlopen(<app>, RTLD_NOW)` as nativeloader would, and the app's `app_probe` (the stand-in's `vkCreateInstance`). Then `dlsym(RTLD_DEFAULT)` of host-library symbols: any found means the module's closure leaked into global scope.
 //! 4. Drops the window and the session, then returns from `main`: the normal exit runs every thread-local destructor, which must not reach a dropped object (state note ui-module-m1, trap 1).
 //!
 //! Lines: module records under target `atl_platform_ui_linux`; results as `RESULT <key>=<value>`.
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_int, c_void};
-use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use atl_compositor::scene::{Content, Quad};
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::audio::AudioHost;
 use atl_platform_ui::{
-    FdEvents, FrameClock, Looper, LooperPoster, PhysSize, PlatformAudioHost, PlatformUi,
+    DisplayInvoker, FrameClock, LooperPoster, PhysSize, PlatformAudioHost, PlatformUi,
     PlatformWindow, Scene, Ui, UiError, Window, WindowAttributes, abi,
 };
 use clap::Parser;
@@ -40,9 +40,12 @@ struct Args {
     /// Connect the module's audio host to this PipeWire socket.
     #[arg(long)]
     audio: Option<PathBuf>,
-    /// How long the Looper runs waiting for the first paint.
+    /// How long to wait for the first paint.
     #[arg(long, default_value_t = 10_000)]
     timeout_ms: u64,
+    /// After the paint, run a panicking closure on the display thread: the process must end by SIGABRT, its panic report naming the closure's message.
+    #[arg(long)]
+    panic_on_display: bool,
 }
 
 /// Host-library symbols no object of this process may find in global scope (one per library of the module's closure that an AOSP lib or an app also exports, plus the toolkit's own).
@@ -72,20 +75,7 @@ fn result(key: &str, value: impl std::fmt::Display) {
     tracing::info!("RESULT {key}={value}");
 }
 
-type Sink = Box<dyn FnMut(RawFd, FdEvents)>;
-
-/// The Looper's registrations and the module's sink.
-#[derive(Default)]
-struct LoopState {
-    sink: Option<Sink>,
-    fds: BTreeMap<RawFd, FdEvents>,
-}
-
-/// This thread's Looper: registered fds polled by [`PollLooper::poll_once`], readiness handed to the sink.
-#[derive(Clone, Default)]
-struct PollLooper(Rc<RefCell<LoopState>>);
-
-/// The liveness poster: runs each post at once. This program has no app thread apart from the toolkit's, so a ping is answered as soon as it arrives; what it gates is module loading, not liveness (`xtask test platform-ui` gate 4 is that).
+/// The liveness poster: runs each post at once. This program has no Looper thread, so a ping is answered as soon as it arrives; what it gates is module loading, not liveness (`xtask test platform-ui` gate 4 is that).
 struct InlinePoster;
 
 impl LooperPoster for InlinePoster {
@@ -94,64 +84,9 @@ impl LooperPoster for InlinePoster {
     }
 }
 
-impl Looper for PollLooper {
-    fn set_sink(&self, sink: Sink) {
-        self.0.borrow_mut().sink = Some(sink);
-    }
-
-    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError> {
-        self.0.borrow_mut().fds.insert(fd, events);
-        Ok(())
-    }
-
-    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError> {
-        self.0.borrow_mut().fds.remove(&fd);
-        Ok(())
-    }
-}
-
-impl PollLooper {
-    /// One `poll(2)` pass of at most `timeout`, then the sink for each ready fd.
-    fn poll_once(&self, timeout: Duration) -> Result<()> {
-        let mut pfds: Vec<libc::pollfd> = self
-            .0
-            .borrow()
-            .fds
-            .iter()
-            .map(|(&fd, ev)| libc::pollfd {
-                fd,
-                events: (if ev.input { libc::POLLIN } else { 0 })
-                    | (if ev.output { libc::POLLOUT } else { 0 }),
-                revents: 0,
-            })
-            .collect();
-        let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
-        // SAFETY: `pfds` is a valid array of its length for the call.
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(());
-            }
-            bail!("poll: {e}");
-        }
-        for p in pfds.iter().filter(|p| p.revents != 0) {
-            let r = p.revents;
-            let events = FdEvents {
-                input: r & libc::POLLIN != 0,
-                output: r & libc::POLLOUT != 0,
-                error: r & libc::POLLERR != 0,
-                hangup: r & libc::POLLHUP != 0,
-            };
-            // the sink adds and removes fds: run it with the state unborrowed, then put it back
-            let sink = self.0.borrow_mut().sink.take();
-            if let Some(mut sink) = sink {
-                sink(p.fd, events);
-                self.0.borrow_mut().sink.get_or_insert(sink);
-            }
-        }
-        Ok(())
-    }
+thread_local! {
+    /// The colour window, on the module's display thread (a window is not Send: it is made, kept and dropped there).
+    static WINDOW: RefCell<Option<Rc<PlatformWindow>>> = const { RefCell::new(None) };
 }
 
 fn dlerror() -> String {
@@ -223,52 +158,64 @@ fn color_scene(width: u32, height: u32, rgb: [f32; 3]) -> Scene {
     }
 }
 
-/// Opens the colour window and runs the Looper until its first paint or the deadline; returns the window and the paint count.
-fn paint_window(
-    ui: &PlatformUi,
-    looper: &PollLooper,
-    timeout: Duration,
-) -> Result<(Rc<PlatformWindow>, u64)> {
+/// Opens the colour window on the display thread ([`WINDOW`], by `call` from this thread) and waits until its first paint or `timeout`; returns the paint count.
+fn paint_window(ui: &Arc<PlatformUi>, timeout: Duration) -> Result<u64> {
     let (width, height) = (320, 240);
-    let window = Rc::new(
-        PlatformWindow::create(
-            ui,
+    let painted = Arc::new(AtomicU64::new(0));
+    let (first, first_paint) = mpsc::channel();
+    let session = Arc::clone(ui);
+    let count = Arc::clone(&painted);
+    atl_platform_ui::call(&ui.invoker(), move || -> Result<(), UiError> {
+        let window = Rc::new(PlatformWindow::create(
+            &session,
             &WindowAttributes {
                 title: "atl ui-module fixture".into(),
                 app_id: None,
                 size: PhysSize { width, height },
             },
-        )
-        .map_err(|e| anyhow::anyhow!("window: {e}"))?,
-    );
-    let painted = Rc::new(Cell::new(0u64));
-    // the colour the harness may look for in a capture; any opaque colour shows a paint
-    let scene = color_scene(width, height, [0.2, 0.6, 0.9]);
-    let weak = Rc::downgrade(&window);
-    let count = Rc::clone(&painted);
-    window.on_tick(move |_| {
-        let Some(w) = weak.upgrade() else { return };
-        if let Err(e) = w.present(&scene) {
-            tracing::error!("present: {e}");
-        }
-        if count.get() == 0 {
-            w.request_frame();
-        }
-    });
-    let count = Rc::clone(&painted);
-    window.on_painted(move |_| count.set(count.get() + 1));
-    window.request_frame();
-    let deadline = Instant::now() + timeout;
-    while painted.get() == 0 && Instant::now() < deadline {
-        looper.poll_once(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100)),
-        )?;
-    }
-    let n = painted.get();
-    Ok((window, n))
+        )?);
+        // the colour the harness may look for in a capture; any opaque colour shows a paint
+        let scene = color_scene(width, height, [0.2, 0.6, 0.9]);
+        let weak = Rc::downgrade(&window);
+        let ticks = Arc::clone(&count);
+        window.on_tick(move |_| {
+            let Some(w) = weak.upgrade() else { return };
+            if let Err(e) = w.present(&scene) {
+                tracing::error!("present: {e}");
+            }
+            if ticks.load(Ordering::Acquire) == 0 {
+                w.request_frame();
+            }
+        });
+        window.on_painted(move |_| {
+            if count.fetch_add(1, Ordering::AcqRel) == 0 {
+                let _ = first.send(());
+            }
+        });
+        window.request_frame();
+        WINDOW.set(Some(window));
+        Ok(())
+    })
+    .context("the display thread ended")?
+    .map_err(|e| anyhow::anyhow!("window: {e}"))?;
+    // a timeout is the gate's `painted >= 1` failure, not this program's
+    let _ = first_paint.recv_timeout(timeout);
+    Ok(painted.load(Ordering::Acquire))
 }
+
+/// `--panic-on-display`: a closure that panics on the display thread, then a wait the process must not survive (the panic aborts it: no display thread ends quietly while calls wait on it).
+fn panic_on_display(ui: &PlatformUi) {
+    ui.invoker().invoke(Box::new(|| {
+        panic!("{PANIC_MESSAGE}");
+    }));
+    std::thread::sleep(PANIC_WAIT);
+    result("panic_survived", 1);
+}
+
+/// The panic's message, which the harness finds in the panic report (xtask-harness ui_module.rs `DISPLAY_PANIC`).
+const PANIC_MESSAGE: &str = "module fixture: panic on the display thread";
+/// How long `--panic-on-display` waits for the abort: the display thread runs the closure at its next pass, a paint at most (llvmpipe paints under load reach 500 ms, display-thread S4 note); 10 such passes.
+const PANIC_WAIT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -303,14 +250,16 @@ fn main() -> Result<()> {
             libc::RTLD_NOW | libc::RTLD_GLOBAL,
         )?;
     }
-    let looper = PollLooper::default();
     let mut session = None;
-    match PlatformUi::attach(Box::new(looper.clone()), Box::new(InlinePoster), None) {
+    match PlatformUi::attach(Box::new(InlinePoster), None) {
         Ok(ui) => {
-            let (window, painted) =
-                paint_window(&ui, &looper, Duration::from_millis(args.timeout_ms))?;
+            let ui = Arc::new(ui);
+            let painted = paint_window(&ui, Duration::from_millis(args.timeout_ms))?;
             result("painted", painted);
-            session = Some((ui, window));
+            if args.panic_on_display {
+                panic_on_display(&ui);
+            }
+            session = Some(ui);
         }
         Err(e) => result("attach_error", e),
     }
@@ -347,13 +296,9 @@ fn main() -> Result<()> {
         .map(|(s, b)| format!("{s}@{b}"))
         .collect();
     result("global_before_module", preexisting.join(","));
-    // a few more passes after the app load: the module keeps running in the same loop
-    for _ in 0..5 {
-        looper.poll_once(Duration::from_millis(20))?;
-    }
-    // window first, then the session: the order the trait objects' owners use
-    if let Some((ui, window)) = session.take() {
-        drop(window);
+    // window first (on the display thread, where it lives), then the session: the order the trait objects' owners use
+    if let Some(ui) = session.take() {
+        atl_platform_ui::call(&ui.invoker(), || drop(WINDOW.take()));
         drop(ui);
     }
     result("done", 1);

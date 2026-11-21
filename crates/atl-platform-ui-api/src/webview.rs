@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The web engine behind `android.webkit.WebView` (webview plan S4.1, M68): shaped by its first implementation, WebKitGTK (atl-webview-linux), and by what the provider needs so far (W1 default UA; W2 views: load, JS, script dialogs, load events).
-//! Threads (display-thread plan D5): the engine runs on the display thread only (the owner of GLib's default context; today the UI thread). [`WebEngine::create_view`] and the [`WebView`] commands run
+//! Threads (display-thread plan D5): the engine runs on the display thread only (the owner of GLib's default context, the UI module's thread). [`WebEngine::create_view`] and the [`WebView`] commands run
 //! on the view's own thread (the WebView's Looper thread, any thread) and are queued to the display thread in call order, returning at once; events and results arrive on the display thread, where
-//! the receiver hands them on (the provider posts them to the WebView's Looper). Exception until display-thread S5: [`WebView::claim_input`] and [`WebView::set_focused`] call the UI module, UI thread.
+//! the receiver hands them on (the provider posts them to the WebView's Looper). [`WebView::claim_input`] and [`WebView::set_focused`] go to the UI module: the claim's answer is read there under a lock, its replay and the focus are queued to the display thread.
 //! No method answers with engine state: what the provider's synchronous getters need comes with the events ([`WebEvent::Location`], `Title`, `Progress`), so the display thread never has to answer one.
 
 /// The process's web engine, reached through its module.
@@ -17,7 +17,7 @@ pub trait WebEngine {
     /// [`WebEvent`] on the display thread until the view drops. JavaScript starts disabled (Android's default, WebSettings.getJavaScriptEnabled). Err: no engine module, or no display thread.
     fn create_view(events: Box<dyn FnMut(WebEvent) + Send>) -> Result<Self::View, WebViewError>;
 
-    /// The process's cookie store (shared by every view). Any thread: the engine is touched on the UI thread only, so each call is queued there and returns at once; callbacks run on the UI thread.
+    /// The process's cookie store (shared by every view). Any thread: the engine is touched on the display thread only, so each call is queued there and returns at once; callbacks run on the display thread.
     /// `changed` gets the store's full list now and again after every change, whoever made it (a page's `document.cookie` / `Set-Cookie`, or [`Self::add_cookie`] / [`Self::replace_cookies`]).
     /// Watching twice replaces the first watcher.
     fn watch_cookies(changed: Box<dyn FnMut(Vec<Cookie>) + Send>) -> Result<(), WebViewError>;

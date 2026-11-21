@@ -4,11 +4,11 @@
 //! 1. **maps + frames**: the window maps (`is_mapped` at the first frame-clock tick) and `--frames` ticks of the window's frame clock each present one scene; ticks are strictly increasing in time. The presentation samples (`PRESENT`: the compositor's feedback for each presented frame, which choose the composer's vsync source tier) are monotonic, on CLOCK_MONOTONIC, and where they state a period it is the monitor's +-2%; no sample at all fails these.
 //! 2. **readback**: after each present the client renders the window content with GSK (`Window::capture`); every pixel must equal the frame's pattern, R = (x + 7f) mod 256, G = (3y + f) mod 256, B = ((x xor y) + 31f) mod 256, A = 255, computed here from that formula, not by the code under test. The buffers have padded rows and alternate the opaque (`X8`) texture path.
 //!    A composite scene (crop + FLIP_H, ROT_90 clockwise, scissor, alpha 0.5, an opaque and a half-transparent colour layer) is compared with a CPU composition worked out here from the HAL transform definitions; alpha pixels within `ALPHA_TOLERANCE`, the rest exact.
-//! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a watched fd's callback ran on the UI thread inside the Looper's poll.
-//!    `call` (display-thread plan D2): from the app thread it returns a value computed on the toolkit thread (the window's size equals the size last asked for: the smaller probe size, or the configured one when maximized); on the toolkit thread it runs inline and the module logs `display: call on display` exactly once.
-//! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the app's UI thread is blocked (`block`) for the ping timeout plus a margin while the toolkit keeps running on its own thread: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
+//! 3. **refusals + release + loop**: a handle with a short pitch or an unknown fourcc is refused; a replaced buffer goes back at the paint after its replacement, with a read fence, and nothing before that paint; GTK's log shows every buffer imported as a dmabuf texture and none downloaded (`gdk_dmabuf`); a posted callback ran on the Looper thread inside its poll.
+//!    `call` (display-thread plan D2): from the app thread it returns a value computed on the display thread (the window's size equals the size last asked for: the smaller probe size, or the configured one when maximized); on the display thread it runs inline and the module logs `display: call on display` exactly once.
+//! 4. **ping/pong**: the client runs behind a Wayland proxy (`wayland_proxy.rs`) that injects `xdg_wm_base.ping` into the real connection. Probe proven responsive: an idle UI thread answers within `RESPONSIVE_LIMIT`, and again after the block. Then the app's UI thread is blocked (`block`) for the ping timeout plus a margin while the module's display thread keeps running: no pong may arrive before the timeout, and the late pong must arrive once the thread runs again.
 //!    The ping hold (display-thread plan D3) makes that so: after the client exits, its module log must hold `display: ping hold armed`, `pings_held` at least the probe's pings and `pings_answered` equal to it. `--break-ping-hold` builds the module with its listener unwrapped: GDK pongs at once, so the blocked check and the hold checks fail.
-//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (the toolkit on one thread answers pings only after the app thread's Looper ran a token); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
+//!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (the display thread answers pings only after the app thread's Looper ran a token); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //! 5. **text input**: a fake input method (`nested_wayland::Ime`, input-method v2 on labwc's seat) is bound, then the client focuses its window's `TextInput` with a content type and surrounding text. Checks: the IME is activated; it receives the content type and surrounding text as text-input v3 numbers them; its preedit, commit and delete_surrounding_text (protocol units: UTF-8 bytes) reach the client as `TextInputEvent`s (GTK units: chars). Expected values are worked out from the encodings in the constants below. `--break-ime-commit` skips the commit_string, so the commit check must fail.
 //!    Evidence tier: isolated runtime, real compositor relay (wlroots) and GTK's own Wayland IM module; a desktop IME (fcitx5) and the candidate popup at the cursor rect stay laptop checks.
 //!
@@ -822,23 +822,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "GTK imported every buffer as a dmabuf texture (GDK_DEBUG=dmabuf), never an mmap download",
         &dmabuf.to_string(),
     );
-    let fdwatch = client
-        .lines_with("FDWATCH")
-        .first()
-        .map(|l| l.to_string())
-        .unwrap_or_default();
-    report.check(
-        field(&fdwatch, "on-ui-thread") == Some("true")
-            && field(&fdwatch, "fired").is_some_and(|n| n != "0"),
-        "watched fd callback ran on the UI thread inside the Looper poll",
-        &fdwatch,
-    );
-    // gate 3b: `call` (display-thread plan D2): an app thread gets a value computed on the toolkit thread, the window's size, which is the size the client last asked for (the smaller probe size; maximized: the configured one)
     let call = client
         .lines_with("CALL ")
         .first()
         .map(|l| l.to_string())
         .unwrap_or_default();
+    report.check(
+        field(&call, "posted-on-app") == Some("true"),
+        "a posted callback ran on the Looper thread inside its poll",
+        &call,
+    );
+    // gate 3b: `call` (display-thread plan D2): an app thread gets a value computed on the display thread, the window's size, which is the size the client last asked for (the smaller probe size; maximized: the configured one)
     let asked = if args.maximized {
         fixed
     } else {
@@ -847,7 +841,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     report.check(
         field(&call, "app-on-toolkit") == Some("true")
             && field(&call, "app-size").and_then(|s| size_of(s, "")) == asked,
-        "call from the app thread returns a value computed on the toolkit thread (the window's size, as asked)",
+        "call from the app thread returns a value computed on the display thread (the window's size, as asked)",
         &format!("{call} (asked {asked:?})"),
     );
 
@@ -1023,14 +1017,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .find(|l| l.contains("display: ping hold"))
             .unwrap_or("no ping hold line"),
     );
-    // the client's one call on the toolkit thread ran inline: it returned (no deadlock) and the module logged it, once
+    // the client's one call on the display thread ran inline: it returned (no deadlock) and the module logged it, once
     let inline_calls = module_log
         .lines()
         .filter(|l| l.contains(CALL_ON_DISPLAY))
         .count();
     report.check(
         field(&call, "inline") == Some("true") && inline_calls == 1,
-        "call on the toolkit thread runs inline, logged once",
+        "call on the display thread runs inline, logged once",
         &format!("{call}; `{CALL_ON_DISPLAY}` lines {inline_calls}"),
     );
     let held = last_count(&module_log, "pings_held");

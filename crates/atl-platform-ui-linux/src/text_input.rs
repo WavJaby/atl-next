@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! [`GtkTextInput`]: a window's `TextInput` on a `GtkIMMulticontext` whose client widget is the window's `SceneView`. GTK picks the IM module (Wayland: text-input v3; X11/IBus: its own), so this file speaks GtkIMContext only.
-//! Every call ends with `mirror::resync`: the IM module's Wayland requests (a new registry at the first focus_in, text-input state) are flushed only from GLib's prepare, which a call from the Looper outside a mirror pass never reaches (measured 2026-11-06: without it the text-input manager is never bound).
+//! Every call runs on the display thread, whose own main loop flushes the IM module's Wayland requests (a new registry at the first focus_in, text-input state) in GLib's prepare.
 //! Units pass through as GTK has them (UTF-8 + byte indices for surrounding, chars for preedit cursor and delete); converting to Android's is atl-ime's.
 //! Keys are not filtered here yet: a desktop IM that composes from key presses (IBus/fcitx over GTK's key path) needs `filter_keypress` on the window's key controller (IME plan step 7). The Wayland input-method path (compositor-side IME) does not.
 
@@ -13,7 +13,6 @@ use atl_platform_ui_api::{
 use gtk4::prelude::*;
 use gtk4::{InputHints, InputPurpose, gdk};
 
-use crate::mirror;
 use crate::view::SceneView;
 use crate::window::Slot;
 
@@ -123,29 +122,24 @@ fn hints(h: ContentHints) -> InputHints {
 impl TextInput for GtkTextInput {
     fn focus_in(&self) {
         self.context.focus_in();
-        mirror::resync();
     }
 
     fn focus_out(&self) {
         self.context.focus_out();
-        mirror::resync();
     }
 
     fn reset(&self) {
         self.context.reset();
-        mirror::resync();
     }
 
     fn set_content(&self, p: ContentPurpose, h: ContentHints) {
         self.context.set_input_purpose(purpose(p));
         self.context.set_input_hints(hints(h));
-        mirror::resync();
     }
 
     fn set_surrounding(&self, surrounding: &Surrounding) {
         *self.surrounding.borrow_mut() = surrounding.clone();
         send_surrounding(&self.context, surrounding);
-        mirror::resync();
     }
 
     fn set_cursor_rect(&self, rect: PhysRect) {
@@ -163,7 +157,6 @@ impl TextInput for GtkTextInput {
             (right - x) as i32,
             (bottom - y) as i32,
         ));
-        mirror::resync();
     }
 
     fn on_events<F: FnMut(TextInputEvent) + 'static>(&self, on_event: F) {

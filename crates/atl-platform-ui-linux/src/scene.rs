@@ -30,7 +30,7 @@ pub struct Shown {
     /// A dup of its first plane's dma-buf: the read fence is exported from it.
     pub dmabuf: OwnedFd,
     /// What the texture was built from: the next present reuses `texture` for the same (buffer, frame, opaque). A new `GdkDmabufTexture` of unchanged content is a GSK cache miss, which on a host that
-    /// cannot import costs a full mmap download + upload on the UI thread per present (WSLg d3d12: one per unchanged layer per frame). Same frame number = not queued again; a buffer still shown is not
+    /// cannot import costs a full mmap download + upload on the display thread per present (WSLg d3d12: one per unchanged layer per frame). Same frame number = not queued again; a buffer still shown is not
     /// released, so its producer cannot have written it.
     pub frame_number: u64,
     pub opaque: bool,

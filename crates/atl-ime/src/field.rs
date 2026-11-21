@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The focused field, on the display thread (today the UI thread): the desktop input method's events (the window's TextInput) as calls on the field's IRemoteInputConnection, the way an Android IME drives its
+//! The focused field, on the display thread: the desktop input method's events (the window's TextInput) as calls on the field's IRemoteInputConnection, the way an Android IME drives its
 //! InputConnection (InputMethodService.getCurrentInputConnection -> RemoteInputConnection, core/java/android/inputmethodservice/RemoteInputConnection.java: one oneway call per edit,
 //! each with an InputConnectionCommandHeader of the session id). GTK objects and this state live on the display thread only; binder threads reach it through the display invoker (method.rs).
 //! Mapping (IME study §7): preedit -> setComposingText(text, 1); preedit end / empty preedit -> setComposingText("", 1) (the composing text goes, a following commit replaces nothing);

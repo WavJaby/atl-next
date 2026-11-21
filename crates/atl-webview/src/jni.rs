@@ -2085,7 +2085,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
     *COOKIE_MANAGER.get_or_init(|| global) as Obj
 }
 
-/// A CookieReply (global ref) as a done callback: `post(value)` on the thread the engine answers on (the UI thread), which the reply hands to the caller's Looper.
+/// A CookieReply (global ref) as a done callback: `post(value)` on the thread the engine answers on (the display thread), which the reply hands to the caller's Looper.
 fn cookie_reply(env: Env, reply: Obj) -> Box<dyn FnOnce(bool) + Send> {
     let g = (!reply.is_null()).then(|| jni_call!(env, NewGlobalRef, reply) as usize);
     Box::new(move |ok| {

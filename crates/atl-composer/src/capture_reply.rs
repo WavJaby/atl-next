@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The reply of `captureDisplay` / `captureDisplayById` (AOSP ISurfaceComposer, both oneway): the arguments are checked (capture.rs), the window's picture is read back on the UI thread, written into a
+//! The reply of `captureDisplay` / `captureDisplayById` (AOSP ISurfaceComposer, both oneway): the arguments are checked (capture.rs), the window's picture is read back on the display thread, written into a
 //! gralloc buffer the allocator service makes, and answered on the listener as ScreenCaptureResults. The picture is the window content as the toolkit renders it (`Window::capture`), so the buffer is the window's size.
 //! A refusal, or a failed readback or allocation, is answered the same way, in the reply's fence status: a oneway call has no caller to return an error to (SurfaceFlinger does the same).
 
@@ -26,7 +26,7 @@ const CPU_USAGE: u64 = 3 | (3 << 4);
 /// The buffer's name in the allocator's log (BufferDescriptorInfo.name, NUL-terminated).
 const NAME: &[u8] = b"atl-capture";
 
-/// Answers one capture on `listener`: a refused request at once, a picture from the UI thread (`ui_window::capture`).
+/// Answers one capture on `listener`: a refused request at once, a picture from the display thread (`ui_window::capture`).
 pub fn serve(
     listener: &Strong<dyn IScreenCaptureListener>,
     request: Result<Args, &'static str>,
@@ -65,7 +65,7 @@ fn send(listener: &Strong<dyn IScreenCaptureListener>, results: ScreenCaptureRes
     }
 }
 
-/// Runs on the UI thread with the readback (or its failure).
+/// Runs on the outbox with the display thread's readback (or its failure): the allocation and the reply are binder calls the display thread does not make.
 fn answer(listener: &Strong<dyn IScreenCaptureListener>, picture: Result<Capture, UiError>) {
     let picture = match picture {
         Ok(picture) => picture,

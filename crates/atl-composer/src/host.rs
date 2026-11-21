@@ -128,7 +128,7 @@ pub struct ComposerConfig {
 
 /// How long a published scene may wait untaken before the window counts as not presenting, ns [est]. SurfaceFlinger has no such bound (SurfaceFlinger.cpp commit: `wouldBackpressureHwc` ->
 /// `scheduleCommit`, return; FrameTargeter.cpp `beginFrame`: pending = the previous present fence still unsignalled after a 0-1 ms grace): a device's present fence signals at the next scanout, since the
-/// display never stops presenting. A GTK window can stop taking for good (minimised or occluded: the desktop stops its frame callbacks; the app's own UI thread blocked, it is the window's thread), so
+/// display never stops presenting. A GTK window can stop taking for good (minimised, occluded or suspended: the desktop stops its frame callbacks), so
 /// past the bound the clock latches every tick, as a display that presents. 100 ms: above a presenting window's slowest paint cycle measured, 65 ms (GTK4 GL on WSLg's desktop, 960x600: the commit to
 /// frame-done wait grows with surface area), and short enough that a stalled window costs the app 6 vsyncs, not a blocked dequeueBuffer.
 pub const BACKPRESSURE_BOUND_NS: i64 = 100_000_000;
@@ -144,10 +144,9 @@ enum Latching {
     /// Untaken for [`BACKPRESSURE_BOUND_NS`] or more: the window is not presenting; the tick latches and its scene replaces the untaken one.
     LatchUnpainted,
     /// Untaken, but a queued transaction came from the window's take thread: the tick latches as without backpressure (latest wins). Precondition of the hold: the producer cannot block the consumer
-    /// (AOSP: SurfaceFlinger never runs on an app thread, so its present fence signals whatever the app does). Here the window takes on the app's UI thread (GLib on the UI Looper, plan Q6, owner
-    /// 2026-11-05); an app drawing on that thread (software canvas: lockCanvas -> dequeueBuffer) blocks in BufferReleaseReader waiting for a release only the take it is blocking would cause -> held
-    /// until the bound (83-100 ms gaps). Re-check: same thread = a buffer-setting `setTransactionState` that arrived on the tid [`Latch::taker`] names (in-process binder runs on the caller's thread) is still queued in the core. Retired by a display stage
-    /// on its own thread (take + paint never on an app thread): then delete this variant, [`State::taker_queued`] and `backpressure_same_thread`.
+    /// (AOSP: SurfaceFlinger never runs on an app thread, so its present fence signals whatever the app does). Until display-thread S5d the window took on the app's UI thread (GLib on the UI Looper); an app drawing on that thread (software canvas: lockCanvas -> dequeueBuffer) blocks in BufferReleaseReader waiting for a release only the take it is blocking would cause -> held
+    /// until the bound (83-100 ms gaps). Re-check: same thread = a buffer-setting `setTransactionState` that arrived on the tid [`Latch::taker`] names (in-process binder runs on the caller's thread) is still queued in the core. Retired: the window now takes and paints
+    /// on the platform's display thread, never an app thread (S5d), so this condition cannot hold; display-thread S6 deletes this variant, [`State::taker_queued`] and `backpressure_same_thread`.
     LatchSameThread,
 }
 

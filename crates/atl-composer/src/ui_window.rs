@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! UI mode's window (M3 slice 6): the process's one window, a GTK window of the UI thread that shows the compositor's display. The compositor's clock thread publishes each scene into the [`Mailbox`] and
+//! UI mode's window (M3 slice 6): the process's one window, a GTK window on the platform's display thread that shows the compositor's display. The compositor's clock thread publishes each scene into the [`Mailbox`] and
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
-//! GTK objects live on the display thread only (today the thread that attached the toolkit, the app's main thread): the launcher's startup attaches the toolkit and [`open`]s the window before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local of the display thread and wires the window to the compositor. Both run their work there by `call`, so the caller holds only the Send [`OpenWindow`] token; no other thread touches GTK.
+//! GTK objects live on the display thread only (the platform module's own thread, started when the toolkit attaches): the launcher's startup attaches the toolkit and [`open`]s the window before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local of the display thread and wires the window to the compositor. Both run their work there by `call`, so the caller holds only the Send [`OpenWindow`] token; no other thread touches GTK.
 //! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_reports.rs); the monitor is also this process's compositor display (Composer::set_display).
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use atl_compositor::scene::{Content, Quad, Scene};
 use atl_libgui_parcel::state::FloatRect;
@@ -134,7 +133,7 @@ pub struct OpenWindow {
     /// taken by [`install`]; Some until then
     ui: Option<PlatformUi>,
     /// the splash's first paint has happened (or there is no splash to wait for); set on the display thread
-    painted: Arc<AtomicBool>,
+    painted: Arc<PaintedFlag>,
     /// the launcher's start: the origin of the `splash:` lines' `after=`
     started: Instant,
     splash: bool,
@@ -154,10 +153,44 @@ const _: fn() = || {
     let _ = <PlatformWindow as AmbiguousIfSend<_>>::check;
 };
 
+/// The splash's first paint, set once on the display thread and waited for on the launcher's thread.
+struct PaintedFlag {
+    set: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl PaintedFlag {
+    fn new(set: bool) -> Self {
+        Self {
+            set: Mutex::new(set),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Sets the flag; true the first time.
+    fn set(&self) -> bool {
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        let first = !*set;
+        *set = true;
+        self.cv.notify_all();
+        first
+    }
+
+    /// Waits up to `timeout` for the flag; whether it is set.
+    fn wait(&self, timeout: Duration) -> bool {
+        let set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        let (set, _) = self
+            .cv
+            .wait_timeout_while(set, timeout, |set| !*set)
+            .unwrap_or_else(|p| p.into_inner());
+        *set
+    }
+}
+
 impl OpenWindow {
-    /// The splash has been painted, or there is none: the launcher's wait before ART boot ends.
-    pub fn painted(&self) -> bool {
-        self.painted.load(Ordering::Acquire)
+    /// Waits up to `timeout` until the splash has been painted (or there is none): the launcher's wait before ART boot. The display thread paints on its own loop, so this thread only waits; false = not painted in time.
+    pub fn wait_painted(&self, timeout: Duration) -> bool {
+        self.painted.wait(timeout)
     }
 
     /// The display thread's invoker (the in-app input method's calls into the window).
@@ -231,7 +264,7 @@ fn open_on_display(
     tracing::info!("atl-composer: ui: opening the window");
     let window =
         Rc::new(PlatformWindow::create(&ui, attributes).map_err(|e| format!("ui window: {e}"))?);
-    let painted = Arc::new(AtomicBool::new(splash.is_none()));
+    let painted = Arc::new(PaintedFlag::new(splash.is_none()));
     match splash {
         Some(splash) => {
             window
@@ -239,7 +272,7 @@ fn open_on_display(
                 .map_err(|e| format!("splash present: {e}"))?;
             let done = Arc::clone(&painted);
             window.on_painted(move |_| {
-                if !done.swap(true, Ordering::AcqRel) {
+                if done.set() {
                     tracing::info!(
                         "splash: shown after={} background={}",
                         after_ms(started),
@@ -417,8 +450,8 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
             monitors.submit_display(model);
         });
         window.request_frame();
-        // the in-app input method's desktop side: the window's TextInput. Its connection calls stay on this thread until the display thread splits off (S5): posting them makes the editor's
-        // surrounding answer arrive after GTK's `done` commit, and GTK only sends a surrounding from `retrieve-surrounding` inside its own state commit (needs a display-side mirror, S5)
+        // the in-app input method's desktop side: the window's TextInput. Its connection calls stay on this thread (display-thread S5e reshapes them): posting them makes the editor's
+        // surrounding answer arrive after GTK's `done` commit, and GTK only sends a surrounding from `retrieve-surrounding` inside its own state commit (needs a display-side copy)
         atl_ime::attach(Rc::clone(&window));
         session.window = Some(window);
     });

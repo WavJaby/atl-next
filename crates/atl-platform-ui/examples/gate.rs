@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The client of `xtask test platform-ui` (M3 slice 6): a window through the `atl-platform-ui` facade, driven only by its frame clock and its Looper's poll, as the launcher's UI thread drives it. [`TestLooper`] is this program's Looper: the platform's `Looper` seam, polled by [`TestLooper::poll`].
-//! Two threads (display-thread plan D3): the toolkit stays on the main thread with its `TestLooper`; [`AppThread`] is the app's UI thread, a second thread with its own `TestLooper` that drains the liveness poster ([`TestPoster`]), so the ping hold is seen apart from the toolkit's loop. The launcher's poster targets the main Looper, the toolkit's own thread today.
+//! The client of `xtask test platform-ui` (M3 slice 6): a window through the `atl-platform-ui` facade, driven only by its frame clock, as the launcher's process drives it. The module runs the window on its own display thread; this program's threads are app threads.
+//! Threads (display-thread plan D2/D3): the main thread drives the phases, reaching the window only by `call` ([`on_display`]; the window lives in [`WINDOW`] on the display thread) and waiting on what the window's callbacks (run on the display thread) record; [`AppThread`] is the app's UI thread, a `poll(2)` loop ([`TestLooper`]) that drains the liveness poster ([`TestPoster`]), so the ping hold is seen apart from the display thread.
 //! The module's log records go to stderr (`display: ping hold armed`, the `pings_held` / `pings_answered` counts), where the harness reads them.
 //! The harness reads this program's stdout (one `KEY value...` line per event) and the raw RGBA captures it writes to `--out`; it checks them against its own implementation of the pattern below, not against this program.
 //!
@@ -11,17 +11,16 @@
 //! 2. one composite scene (crop, flips, rotation, scissor, opacity, colour layers: [`composite_scene`]) captured to `composite.rgba`. Then the resize probe: `set_size` larger then smaller, each size the content gets as `RESIZED`; on a
 //!    size-fixed window (maximized / tiled: `Window::is_size_fixed`) `SIZE-FIXED <granted>`, and after each request `FIXED-AFTER <size>` instead of a wait no configure would end.
 //! 3. refusals + release: a handle whose pitch is shorter than a row and one with a fourcc the table does not have are refused (never a CPU fallback); a scene that replaces the frame buffer releases it at the next paint, with a read fence (`RELEASES`).
-//! 4. an eventfd added with [`TestLooper::watch`] is written from another thread; its callback must run on this thread inside `poll`.
-//!    Then (4b) `call` (`CALL`): from [`AppThread`] it returns the window's size read on the toolkit thread while that thread keeps polling (`app-on-toolkit`, `app-size`); on the toolkit thread it runs inline (`inline`), which the module logs as `display: call on display`.
-//! 5. `READY`, then commands on stdin, served by a `watch` callback on the stdin fd: `block <ms>` sleeps the app's UI thread ([`AppThread`]) that long, printing `BLOCKING` when it starts (the harness's ping probe; the toolkit thread keeps running); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` ends.
+//! 4. `call` (`CALL`): a closure posted to [`AppThread`] runs there, inside its poll (`posted-on-app`); its `call` returns the window's size read on the display thread (`app-on-toolkit`, `app-size`); a call made on the display thread itself runs inline (`inline`), which the module logs as `display: call on display`.
+//! 5. `READY`, then commands on stdin, read by the main thread: `block <ms>` sleeps the app's UI thread ([`AppThread`]) that long, printing `BLOCKING` when it starts (the harness's ping probe; the display thread keeps running); `ime-focus <text> <cursor-byte>` sets the window's `TextInput` content type, surrounding text and cursor rect, then focuses it (`IME-FOCUSED`), and every `TextInputEvent` is printed as an `IME-*` line; `quit` (or the end of stdin) ends.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,9 +34,9 @@ use atl_gralloc_dmabuf::{Mapping, SYNC_WRITE, begin_cpu_access, end_cpu_access};
 use atl_gralloc_service::backend::Backend;
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
-    ContentHints, ContentPurpose, FdEvents, FrameClock, Looper, LooperPoster, PhysRect, PhysSize,
+    ContentHints, ContentPurpose, FrameClock, LooperPoster, PhysRect, PhysSize, PlatformInvoker,
     PlatformUi, PlatformWindow, PresentError, PresentTiming, Surrounding, TextInput,
-    TextInputEvent, Ui, UiError, Window, WindowAttributes,
+    TextInputEvent, Ui, Window, WindowAttributes,
 };
 
 /// What `ime-focus` declares the field to be; the harness checks the input method sees it (as text-input v3 `content_type`).
@@ -88,7 +87,7 @@ struct Args {
 const STRIDE_PAD_PIXELS: u32 = 16;
 /// The padding's byte value: a reader that ignores the stride shows it.
 const PAD_BYTE: u8 = 0xEE;
-/// One `poll` waits at most this long when nothing is ready.
+/// One wait step: a `poll` of the app thread with nothing ready, or one look at what the display thread recorded.
 const PASS: Duration = Duration::from_millis(20);
 /// Phase 2b on a size-fixed window: ticks after each size request before the size is read. GTK applies set_default_size at the next layout (one tick); a second covers the commit the compositor would answer with a configure.
 const FIXED_TICKS: u32 = 2;
@@ -340,35 +339,22 @@ fn save(out: &std::path::Path, name: &str, window: &PlatformWindow) -> Result<St
     ))
 }
 
-/// The example's own callback for one of its fds, shared with the poll that runs it.
+/// The app thread's own callback for one of its fds, shared with the poll that runs it.
 type OwnCallback = Rc<RefCell<dyn FnMut()>>;
 
-/// The platform's sink for the toolkit's readiness.
-type ToolkitSink = Box<dyn FnMut(RawFd, FdEvents)>;
-
-/// This program's Looper: the platform's [`Looper`] seam over a `poll(2)` loop. [`TestLooper::poll`] is its `pollOnce`: it waits for the registered fds, then runs the example's own callbacks ([`TestLooper::watch`]) and hands the toolkit's readiness to the platform's sink.
+/// The app thread's Looper: a `poll(2)` loop over its own fds. [`TestLooper::poll`] is its `pollOnce`: it waits for the watched fds, then runs their callbacks ([`TestLooper::watch`]).
 #[derive(Clone, Default)]
-struct TestLooper(Rc<LooperState>);
-
-#[derive(Default)]
-struct LooperState {
-    /// The toolkit's registrations, with the events each asked for.
-    toolkit: RefCell<BTreeMap<RawFd, FdEvents>>,
-    /// The example's own fds, with their callbacks.
-    own: RefCell<BTreeMap<RawFd, OwnCallback>>,
-    /// The platform's sink, set by `Ui::attach`.
-    sink: RefCell<Option<ToolkitSink>>,
-}
+struct TestLooper(Rc<RefCell<BTreeMap<RawFd, OwnCallback>>>);
 
 /// Ends a [`TestLooper::watch`] when dropped.
 struct OwnWatch {
-    looper: Rc<LooperState>,
+    looper: TestLooper,
     fd: RawFd,
 }
 
 impl Drop for OwnWatch {
     fn drop(&mut self) {
-        self.looper.own.borrow_mut().remove(&self.fd);
+        self.looper.0.borrow_mut().remove(&self.fd);
     }
 }
 
@@ -377,92 +363,44 @@ impl TestLooper {
     fn watch<F: FnMut() + 'static>(&self, fd: BorrowedFd<'_>, on_readable: F) -> OwnWatch {
         let raw = fd.as_raw_fd();
         let callback: OwnCallback = Rc::new(RefCell::new(on_readable));
-        self.0.own.borrow_mut().insert(raw, callback);
+        self.0.borrow_mut().insert(raw, callback);
         OwnWatch {
-            looper: Rc::clone(&self.0),
+            looper: self.clone(),
             fd: raw,
         }
     }
 
-    /// One `pollOnce`: waits up to `timeout` for a registered fd, then runs what is ready, in fd order.
+    /// One `pollOnce`: waits up to `timeout` for a watched fd, then runs what is ready, in fd order.
     fn poll(&self, timeout: Duration) -> Result<()> {
-        let registered: Vec<(RawFd, PollFlags)> = self
-            .0
-            .toolkit
-            .borrow()
-            .iter()
-            .map(|(&fd, events)| (fd, poll_flags(*events)))
-            .chain(self.0.own.borrow().keys().map(|&fd| (fd, PollFlags::IN)))
-            .collect();
+        let registered: Vec<RawFd> = self.0.borrow().keys().copied().collect();
         let mut borrowed = Vec::with_capacity(registered.len());
-        for &(fd, _) in &registered {
-            // SAFETY: a fd this looper registered and has not removed; the toolkit's fds stay open while registered (the mirror syncs its registrations after every pass)
+        for &fd in &registered {
+            // SAFETY: a fd a live watch registered; its owner keeps it open while watched
             borrowed.push(unsafe { BorrowedFd::borrow_raw(fd) });
         }
         let mut fds: Vec<PollFd<'_>> = borrowed
             .iter()
-            .zip(&registered)
-            .map(|(fd, &(_, flags))| PollFd::new(fd, flags))
+            .map(|fd| PollFd::new(fd, PollFlags::IN))
             .collect();
         let timespec = Timespec {
             tv_sec: i64::try_from(timeout.as_secs())?,
             tv_nsec: i64::from(timeout.subsec_nanos()),
         };
         poll(&mut fds, Some(&timespec))?;
-        let ready: Vec<(RawFd, PollFlags)> = fds
+        let ready: Vec<RawFd> = fds
             .iter()
             .zip(&registered)
             .filter(|(fd, _)| !fd.revents().is_empty())
-            .map(|(fd, &(raw, _))| (raw, fd.revents()))
+            .map(|(_, &raw)| raw)
             .collect();
         drop(fds);
-        for (fd, revents) in ready {
-            let own = self.0.own.borrow().get(&fd).cloned();
-            if let Some(callback) = own {
+        for fd in ready {
+            let callback = self.0.borrow().get(&fd).cloned();
+            if let Some(callback) = callback {
                 (callback.borrow_mut())();
-            } else if let Some(sink) = self.0.sink.borrow_mut().as_mut() {
-                sink(fd, events_of(revents));
             }
         }
         Ok(())
-    }
-}
-
-impl Looper for TestLooper {
-    fn set_sink(&self, sink: Box<dyn FnMut(RawFd, FdEvents)>) {
-        *self.0.sink.borrow_mut() = Some(sink);
-    }
-
-    fn add_fd(&self, fd: RawFd, events: FdEvents) -> Result<(), UiError> {
-        self.0.toolkit.borrow_mut().insert(fd, events);
-        Ok(())
-    }
-
-    fn remove_fd(&self, fd: RawFd) -> Result<(), UiError> {
-        self.0.toolkit.borrow_mut().remove(&fd);
-        Ok(())
-    }
-}
-
-/// The `poll(2)` events a registration asks for.
-fn poll_flags(events: FdEvents) -> PollFlags {
-    let mut flags = PollFlags::empty();
-    if events.input {
-        flags |= PollFlags::IN;
-    }
-    if events.output {
-        flags |= PollFlags::OUT;
-    }
-    flags
-}
-
-/// The readiness `poll(2)` reported, in the Looper's terms.
-fn events_of(revents: PollFlags) -> FdEvents {
-    FdEvents {
-        input: revents.contains(PollFlags::IN),
-        output: revents.contains(PollFlags::OUT),
-        error: revents.contains(PollFlags::ERR),
-        hangup: revents.contains(PollFlags::HUP),
     }
 }
 
@@ -555,15 +493,34 @@ impl AppThread {
 }
 
 thread_local! {
-    /// The window on the toolkit thread, for phase 4b's closures: they are Send, so they reach it by the thread they run on, not by capture.
+    /// The window, on the display thread: made, used and dropped there (it is not Send); this program's threads reach it by [`on_display`].
     static WINDOW: RefCell<Option<Rc<PlatformWindow>>> = const { RefCell::new(None) };
 }
 
-/// Polls `looper` until `done` is true or `deadline` passes.
-fn spin(looper: &TestLooper, deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
+/// Runs `f` with the window on the display thread and returns its result (`call`: this thread waits, the display thread keeps running).
+fn on_display<R: Send + 'static>(
+    invoker: &PlatformInvoker,
+    f: impl FnOnce(&Rc<PlatformWindow>) -> Result<R> + Send + 'static,
+) -> Result<R> {
+    atl_platform_ui::call(invoker, move || {
+        WINDOW.with_borrow(|w| match w {
+            Some(w) => f(w),
+            None => bail!("no window on the display thread"),
+        })
+    })
+    .context("the display thread ended")?
+}
+
+/// Shared between the display thread's callbacks and this program's threads.
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Waits until `done` is true or `deadline` passes, looking every [`PASS`].
+fn spin(deadline: Instant, what: &str, done: impl Fn() -> bool) -> Result<()> {
     while !done() {
         ensure!(Instant::now() < deadline, "timed out waiting for {what}");
-        looper.poll(PASS)?;
+        thread::sleep(PASS);
     }
     Ok(())
 }
@@ -578,129 +535,148 @@ fn main() -> Result<()> {
         .init();
     std::fs::create_dir_all(&args.out)?;
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
-    let looper = TestLooper::default();
     let app = AppThread::spawn()?;
     // the window imports what this gate's own GBM backend allocates
-    let ui = PlatformUi::attach(
-        Box::new(looper.clone()),
+    let ui = Arc::new(PlatformUi::attach(
         Box::new(app.poster.clone()),
         Some(backend()?.device()),
-    )?;
-    let window = Rc::new(PlatformWindow::create(
-        &ui,
-        &WindowAttributes {
+    )?);
+    let invoker = Arc::new(ui.invoker());
+
+    // the monitor's rate, and every frame the display showed (its presentation time and period), in order: printed before DONE
+    let monitor_hz: Arc<Mutex<Option<f32>>> = Arc::default();
+    let presents: Arc<Mutex<Vec<(PresentTiming, i64)>>> = Arc::default();
+    {
+        let (session, monitor_hz, presents) = (
+            Arc::clone(&ui),
+            Arc::clone(&monitor_hz),
+            Arc::clone(&presents),
+        );
+        let attributes = WindowAttributes {
             title: "atl gate".to_owned(),
             app_id: None,
             size: PhysSize {
                 width: args.width,
                 height: args.height,
             },
-        },
-    )?);
-
-    // the monitor's rate, and every frame the display showed (its presentation time and period), in order: printed before DONE
-    let monitor_hz: Rc<Cell<Option<f32>>> = Rc::default();
-    {
-        let monitor_hz = Rc::clone(&monitor_hz);
-        window.on_monitor(move |m| monitor_hz.set(m.refresh_hz));
-    }
-    let presents: Rc<RefCell<Vec<(PresentTiming, i64)>>> = Rc::default();
-    {
-        let presents = Rc::clone(&presents);
-        window.on_presented(move |p| presents.borrow_mut().push((p, monotonic_ns())));
+        };
+        atl_platform_ui::call(&*invoker, move || -> Result<()> {
+            let window = Rc::new(PlatformWindow::create(&session, &attributes)?);
+            window.on_monitor(move |m| *locked(&monitor_hz) = m.refresh_hz);
+            window.on_presented(move |p| locked(&presents).push((p, monotonic_ns())));
+            WINDOW.set(Some(window));
+            Ok(())
+        })
+        .context("the display thread ended")??;
     }
 
     // phase 1: the frame series, one frame per tick
-    let frame = Rc::new(Cell::new(0u32));
-    let failure: Rc<RefCell<Option<String>>> = Rc::default();
+    let frame = Arc::new(AtomicU32::new(0));
+    let failure: Arc<Mutex<Option<String>>> = Arc::default();
     {
-        let (window2, frame, failure) =
-            (Rc::clone(&window), Rc::clone(&frame), Rc::clone(&failure));
+        let (frame, failure) = (Arc::clone(&frame), Arc::clone(&failure));
         let (frames, width, height, out) = (args.frames, args.width, args.height, args.out.clone());
         let (await_scale, scale_deadline) = (args.await_scale, deadline);
-        let mapped_printed = Rc::new(Cell::new(false));
-        window.on_tick(move |tick| {
-            let f = frame.get();
-            let step = || -> Result<()> {
-                if f == 0 && !mapped_printed.replace(true) {
+        on_display(&invoker, move |window| {
+            let window2 = Rc::downgrade(window);
+            let mapped_printed = Cell::new(false);
+            window.on_tick(move |tick| {
+                let Some(window2) = window2.upgrade() else {
+                    return;
+                };
+                let f = frame.load(Ordering::Acquire);
+                let step = || -> Result<()> {
+                    if f == 0 && !mapped_printed.replace(true) {
+                        emit(format_args!(
+                            "MAPPED mapped={} scale={}",
+                            window2.is_mapped(),
+                            window2.scale().get()
+                        ));
+                    }
+                    // no frame until the window is at the target scale with the requested size: the frames then all show the state it ends at
+                    let settled = |target: f64| {
+                        let size = window2.size();
+                        (window2.scale().get() - target).abs() <= SCALE_EPSILON
+                            && (size.width, size.height) == (width, height)
+                    };
+                    if let Some(target) = await_scale.filter(|t| !settled(*t)) {
+                        let size = window2.size();
+                        ensure!(
+                            Instant::now() < scale_deadline,
+                            "the window never settled at scale {target} and {width}x{height}: scale {}, size {}x{}",
+                            window2.scale().get(),
+                            size.width,
+                            size.height
+                        );
+                        window2.request_frame();
+                        return Ok(());
+                    }
+                    let (_fd, scene) = frame_scene(width, height, f)?;
+                    window2.present(&scene)?;
+                    let saved = save(&out, &format!("frame-{f}.rgba"), &window2)?;
                     emit(format_args!(
-                        "MAPPED mapped={} scale={}",
-                        window2.is_mapped(),
+                        "FRAME {f} time_ns={} scale={} {saved}",
+                        tick.time_ns,
                         window2.scale().get()
                     ));
-                }
-                // no frame until the window is at the target scale with the requested size: the frames then all show the state it ends at
-                let settled = |target: f64| {
-                    let size = window2.size();
-                    (window2.scale().get() - target).abs() <= SCALE_EPSILON
-                        && (size.width, size.height) == (width, height)
+                    frame.store(f + 1, Ordering::Release);
+                    if f + 1 < frames {
+                        window2.request_frame();
+                    }
+                    Ok(())
                 };
-                if let Some(target) = await_scale.filter(|t| !settled(*t)) {
-                    let size = window2.size();
-                    ensure!(
-                        Instant::now() < scale_deadline,
-                        "the window never settled at scale {target} and {width}x{height}: scale {}, size {}x{}",
-                        window2.scale().get(),
-                        size.width,
-                        size.height
-                    );
-                    window2.request_frame();
-                    return Ok(());
+                if let Err(e) = step() {
+                    *locked(&failure) = Some(format!("frame {f}: {e:#}"));
                 }
-                let (_fd, scene) = frame_scene(width, height, f)?;
-                window2.present(&scene)?;
-                let saved = save(&out, &format!("frame-{f}.rgba"), &window2)?;
-                emit(format_args!(
-                    "FRAME {f} time_ns={} scale={} {saved}",
-                    tick.time_ns,
-                    window2.scale().get()
-                ));
-                frame.set(f + 1);
-                if f + 1 < frames {
-                    window2.request_frame();
-                }
-                Ok(())
-            };
-            if let Err(e) = step() {
-                *failure.borrow_mut() = Some(format!("frame {f}: {e:#}"));
-            }
-        });
+            });
+            window.request_frame();
+            Ok(())
+        })?;
     }
-    window.request_frame();
-    spin(&looper, deadline, "the frame series", || {
-        frame.get() >= args.frames || failure.borrow().is_some()
+    spin(deadline, "the frame series", || {
+        frame.load(Ordering::Acquire) >= args.frames || locked(&failure).is_some()
     })?;
-    if let Some(e) = failure.borrow().as_ref() {
+    if let Some(e) = locked(&failure).as_ref() {
         bail!("{e}");
     }
 
     // the ticks from here on are counted: phase 2b waits for them
-    let ticks = Rc::new(Cell::new(0u32));
+    let ticks = Arc::new(AtomicU32::new(0));
     {
-        let ticks = Rc::clone(&ticks);
-        window.on_tick(move |_| ticks.set(ticks.get() + 1));
+        let ticks = Arc::clone(&ticks);
+        on_display(&invoker, move |window| {
+            window.on_tick(move |_| {
+                ticks.fetch_add(1, Ordering::AcqRel);
+            });
+            Ok(())
+        })?;
     }
 
     // phase 2: the composite scene
     let (_fds, scene) = composite_scene(args.width, args.height)?;
-    window.present(&scene)?;
-    emit(format_args!(
-        "COMPOSITE {}",
-        save(&args.out, "composite.rgba", &window)?
-    ));
+    let out = args.out.clone();
+    let composite = on_display(&invoker, move |window| {
+        window.present(&scene)?;
+        save(&out, "composite.rgba", window)
+    })?;
+    emit(format_args!("COMPOSITE {composite}"));
 
     // phase 2b: the content follows the window: set_size asks the platform for a larger, then a smaller size; each size the content gets is reported
-    let sizes: Rc<RefCell<Vec<PhysSize>>> = Rc::default();
+    let sizes: Arc<Mutex<Vec<PhysSize>>> = Arc::default();
     {
-        let sizes = Rc::clone(&sizes);
-        window.on_resize(move |size| sizes.borrow_mut().push(size));
+        let sizes = Arc::clone(&sizes);
+        on_display(&invoker, move |window| {
+            window.on_resize(move |size| locked(&sizes).push(size));
+            Ok(())
+        })?;
     }
     let step = args.resize_step;
     // a maximized / tiled / fullscreen window keeps the configured size (xdg-shell: that configure's size is binding), so no request can be waited for: each is followed by
     // FIXED_TICKS frame-clock ticks (each a commit + frame callback round trip), then the content size is reported, which must still be the granted one
-    let fixed = window.is_size_fixed();
+    let (fixed, granted) = on_display(&invoker, |window| {
+        Ok((window.is_size_fixed(), window.size()))
+    })?;
     if fixed {
-        let granted = window.size();
         emit(format_args!(
             "SIZE-FIXED {}x{}",
             granted.width, granted.height
@@ -711,30 +687,36 @@ fn main() -> Result<()> {
         (args.width - step, args.height - step),
     ] {
         let want = PhysSize { width, height };
-        window.set_size(want);
+        on_display(&invoker, move |window| {
+            window.set_size(want);
+            Ok(())
+        })?;
         if fixed {
-            let start = ticks.get();
+            let start = ticks.load(Ordering::Acquire);
             for n in 1..=FIXED_TICKS {
-                window.request_frame();
-                spin(&looper, deadline, "a tick after the size request", || {
-                    ticks.get() >= start + n
+                on_display(&invoker, |window| {
+                    window.request_frame();
+                    Ok(())
+                })?;
+                spin(deadline, "a tick after the size request", || {
+                    ticks.load(Ordering::Acquire) >= start + n
                 })?;
             }
-            let now = window.size();
+            let now = on_display(&invoker, |window| Ok(window.size()))?;
             emit(format_args!("FIXED-AFTER {}x{}", now.width, now.height));
         } else {
-            spin(&looper, deadline, "the resized content", || {
-                sizes.borrow().last() == Some(&want)
+            spin(deadline, "the resized content", || {
+                locked(&sizes).last() == Some(&want)
             })?;
         }
     }
-    for size in sizes.borrow().iter() {
+    for size in locked(&sizes).iter() {
         emit(format_args!("RESIZED {}x{}", size.width, size.height));
     }
 
     // phase 3: refusals, then the release of a replaced buffer at the paint after its replacement
     let (_fd, scene) = frame_scene(args.width, args.height, RELEASE_FRAMES[0])?;
-    let refused = |ints: &dyn Fn(&mut Params)| -> Result<bool> {
+    let bad = |ints: &dyn Fn(&mut Params)| -> Result<Scene> {
         let mut bad = scene.clone();
         let b = content(&mut bad.quads[0]);
         let mut p = Params::from_handle(b.buffer.fds.len(), &b.buffer.ints)
@@ -744,38 +726,51 @@ fn main() -> Result<()> {
             ints: p.to_ints().to_vec(),
             ..(*b.buffer).clone()
         });
-        Ok(matches!(
-            window.present(&bad),
-            Err(PresentError::Buffer { layer_id: 0, .. })
-        ))
+        Ok(bad)
     };
-    let short_pitch = refused(&|p| p.pitch = p.width * 4 - 4)?;
-    let bad_fourcc = refused(&|p| p.fourcc = u32::from_le_bytes(*b"ZZ99"))?;
-    let painted: Rc<RefCell<Vec<(u64, bool)>>> = Rc::default();
-    let seen = Rc::clone(&painted);
-    window.on_painted(move |p| {
-        seen.borrow_mut().extend(
-            p.releases
-                .into_iter()
-                .map(|r| (r.buffer_key, r.release_fence.is_some())),
-        )
-    });
-    window.present(&scene)?;
-    spin(&looper, deadline, "the first release scene's paint", || {
+    let refused = |bad: Scene| -> Result<bool> {
+        on_display(&invoker, move |window| {
+            Ok(matches!(
+                window.present(&bad),
+                Err(PresentError::Buffer { layer_id: 0, .. })
+            ))
+        })
+    };
+    let short_pitch = refused(bad(&|p| p.pitch = p.width * 4 - 4)?)?;
+    let bad_fourcc = refused(bad(&|p| p.fourcc = u32::from_le_bytes(*b"ZZ99"))?)?;
+    let painted: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+    {
+        let seen = Arc::clone(&painted);
+        on_display(&invoker, move |window| {
+            window.on_painted(move |p| {
+                locked(&seen).extend(
+                    p.releases
+                        .into_iter()
+                        .map(|r| (r.buffer_key, r.release_fence.is_some())),
+                )
+            });
+            window.present(&scene)?;
+            Ok(())
+        })?;
+    }
+    spin(deadline, "the first release scene's paint", || {
         // the frame series' last buffer goes back once this scene is painted
-        !painted.borrow().is_empty()
+        !locked(&painted).is_empty()
     })?;
-    painted.borrow_mut().clear();
     let (_fd2, replacing) = frame_scene(args.width, args.height, RELEASE_FRAMES[1])?;
-    window.present(&replacing)?;
-    let early = painted.borrow().len();
-    spin(
-        &looper,
-        deadline,
-        "the release of the replaced buffer",
-        || !painted.borrow().is_empty(),
-    )?;
-    let released = painted.borrow().clone();
+    // cleared and presented in one display-thread step: no paint can report between them
+    let early = {
+        let seen = Arc::clone(&painted);
+        on_display(&invoker, move |window| {
+            locked(&seen).clear();
+            window.present(&replacing)?;
+            Ok(locked(&seen).len())
+        })?
+    };
+    spin(deadline, "the release of the replaced buffer", || {
+        !locked(&painted).is_empty()
+    })?;
+    let released = locked(&painted).clone();
     let keys: Vec<String> = released.iter().map(|(k, _)| k.to_string()).collect();
     emit(format_args!(
         "REFUSALS short-pitch={short_pitch} bad-fourcc={bad_fourcc}"
@@ -787,151 +782,102 @@ fn main() -> Result<()> {
         keys.join(",")
     ));
 
-    // phase 4: a watched fd is serviced on this thread, inside the Looper's poll
-    let wake = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?;
-    let fired = Rc::new(Cell::new(0u32));
-    let ui_thread = thread::current().id();
-    let on_ui_thread = Rc::new(Cell::new(false));
-    let watch = {
-        let (fired, on_ui_thread, drain) = (
-            Rc::clone(&fired),
-            Rc::clone(&on_ui_thread),
-            wake.try_clone()?,
-        );
-        looper.watch(wake.as_fd(), move || {
-            // drain the counter: the watch is level-triggered
-            let mut counter = [0u8; 8];
-            let _ = read(&drain, &mut counter);
-            on_ui_thread.set(thread::current().id() == ui_thread);
-            fired.set(fired.get() + 1);
-        })
-    };
-    let writer = {
-        let wake = wake.try_clone()?;
-        thread::spawn(move || {
-            thread::sleep(PASS);
-            write(&wake, &1u64.to_ne_bytes())
-        })
-    };
-    spin(&looper, deadline, "the watched fd", || fired.get() > 0)?;
-    writer
-        .join()
-        .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
-    emit(format_args!(
-        "FDWATCH fired={} on-ui-thread={}",
-        fired.get(),
-        on_ui_thread.get()
-    ));
-    drop(watch);
-
-    // phase 4b: `call` (display-thread plan D2). From the app thread it returns a value computed on the toolkit thread, which keeps polling its Looper meanwhile; on the toolkit thread it runs inline (a queued call would wait on itself)
-    WINDOW.set(Some(Rc::clone(&window)));
-    let invoker = Arc::new(ui.invoker());
-    let toolkit = thread::current().id();
+    // phase 4: `call` (display-thread plan D2). From the app thread it returns a value computed on the display thread; on the display thread itself it runs inline (a queued call would wait on itself)
+    let display = atl_platform_ui::call(&*invoker, || thread::current().id())
+        .context("the display thread ended")?;
     let on_toolkit = move || {
         let size = WINDOW.with_borrow(|w| w.as_ref().map(|w| w.size()));
-        (thread::current().id() == toolkit, size)
+        (thread::current().id() == display, size)
     };
-    // set once by the app thread: what its call returned (None: dropped unrun)
-    type AppCall = Option<(bool, Option<PhysSize>)>;
+    // set once by the posted closure: whether it ran on the app thread (inside its poll), and what its call returned (None: dropped unrun)
+    type AppCall = (bool, Option<(bool, Option<PhysSize>)>);
     let from_app: Arc<Mutex<Option<AppCall>>> = Arc::default();
+    let app_ui = app.handle.thread().id();
     {
         let (invoker, slot) = (Arc::clone(&invoker), Arc::clone(&from_app));
         app.poster.post(Box::new(move || {
+            let on_app = thread::current().id() == app_ui;
             let got = atl_platform_ui::call(&*invoker, on_toolkit);
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(got);
+            *locked(&slot) = Some((on_app, got));
         }));
     }
-    spin(&looper, deadline, "the app thread's call", || {
-        from_app.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    spin(deadline, "the app thread's call", || {
+        locked(&from_app).is_some()
     })?;
-    let app_call = from_app
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take()
-        .flatten();
-    let inline = atl_platform_ui::call(&*invoker, move || thread::current().id() == toolkit);
+    let (posted_on_app, app_call) = locked(&from_app).take().unwrap_or((false, None));
+    // a call made on the display thread (inside one queued from here): inline
+    let nested = Arc::clone(&invoker);
+    let inline = atl_platform_ui::call(&*invoker, move || {
+        atl_platform_ui::call(&*nested, move || thread::current().id() == display)
+    })
+    .flatten();
     let app_size = app_call
         .and_then(|(_, s)| s)
         .map_or("none".to_owned(), |s| format!("{}x{}", s.width, s.height));
     emit(format_args!(
-        "CALL app-on-toolkit={} app-size={app_size} inline={}",
+        "CALL posted-on-app={posted_on_app} app-on-toolkit={} app-size={app_size} inline={}",
         app_call.is_some_and(|(on, _)| on),
         inline == Some(true)
     ));
-    WINDOW.set(None);
 
     // the text input's events, one line each (phase 5 `ime-focus` enables it)
-    window.text_input().on_events(|event| match event {
-        TextInputEvent::Preedit { text, cursor_chars } => emit(format_args!(
-            "IME-PREEDIT cursor={cursor_chars} text={text}"
-        )),
-        TextInputEvent::PreeditEnd => emit(format_args!("IME-PREEDIT-END")),
-        TextInputEvent::Commit(text) => emit(format_args!("IME-COMMIT text={text}")),
-        TextInputEvent::DeleteSurrounding {
-            offset_chars,
-            n_chars,
-        } => emit(format_args!("IME-DELETE offset={offset_chars} n={n_chars}")),
-    });
+    on_display(&invoker, |window| {
+        window.text_input().on_events(|event| match event {
+            TextInputEvent::Preedit { text, cursor_chars } => emit(format_args!(
+                "IME-PREEDIT cursor={cursor_chars} text={text}"
+            )),
+            TextInputEvent::PreeditEnd => emit(format_args!("IME-PREEDIT-END")),
+            TextInputEvent::Commit(text) => emit(format_args!("IME-COMMIT text={text}")),
+            TextInputEvent::DeleteSurrounding {
+                offset_chars,
+                n_chars,
+            } => emit(format_args!("IME-DELETE offset={offset_chars} n={n_chars}")),
+        });
+        Ok(())
+    })?;
 
-    // phase 5: commands on stdin, until quit
-    let quit = Rc::new(Cell::new(false));
-    let pending = Rc::new(RefCell::new(Vec::<u8>::new()));
-    let _stdin_watch = {
-        let (quit, pending, window) = (Rc::clone(&quit), Rc::clone(&pending), Rc::clone(&window));
-        let app_poster = app.poster.clone();
-        looper.watch(rustix::stdio::stdin(), move || {
-            let mut chunk = [0u8; 256];
-            let n = read(rustix::stdio::stdin(), &mut chunk).unwrap_or(0);
-            if n == 0 {
-                quit.set(true);
-                return;
-            }
-            let mut pending = pending.borrow_mut();
-            pending.extend_from_slice(&chunk[..n]);
-            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-                let line = String::from_utf8_lossy(&pending[..end]).into_owned();
-                pending.drain(..=end);
-                match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-                    ["block", ms] => {
-                        let ms: u64 = ms.parse().unwrap_or(0);
-                        // the app's UI thread only: the toolkit thread keeps running
-                        app_poster.post(Box::new(move || {
-                            emit(format_args!("BLOCKING {ms}"));
-                            thread::sleep(Duration::from_millis(ms));
-                            emit(format_args!("UNBLOCKED"));
-                        }));
-                    }
-                    ["ime-focus", text, cursor] => {
-                        let cursor_byte = cursor.parse().unwrap_or(0);
-                        let input = window.text_input();
-                        input.set_content(IME_PURPOSE, IME_HINTS);
-                        input.set_surrounding(&Surrounding {
-                            text: (*text).to_owned(),
-                            cursor_byte,
-                            anchor_byte: cursor_byte,
-                        });
-                        input.set_cursor_rect(IME_CURSOR);
-                        input.focus_in();
-                        emit(format_args!("IME-FOCUSED"));
-                    }
-                    ["quit"] => quit.set(true),
-                    other => emit(format_args!("UNKNOWN-COMMAND {other:?}")),
-                }
-            }
-        })
-    };
+    // phase 5: commands on stdin, until quit or its end
     emit(format_args!("READY"));
-    while !quit.get() {
-        looper.poll(PASS)?;
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["block", ms] => {
+                let ms: u64 = ms.parse().unwrap_or(0);
+                // the app's UI thread only: the display thread keeps running
+                app.poster.post(Box::new(move || {
+                    emit(format_args!("BLOCKING {ms}"));
+                    thread::sleep(Duration::from_millis(ms));
+                    emit(format_args!("UNBLOCKED"));
+                }));
+            }
+            ["ime-focus", text, cursor] => {
+                let cursor_byte = cursor.parse().unwrap_or(0);
+                let text = (*text).to_owned();
+                on_display(&invoker, move |window| {
+                    let input = window.text_input();
+                    input.set_content(IME_PURPOSE, IME_HINTS);
+                    input.set_surrounding(&Surrounding {
+                        text,
+                        cursor_byte,
+                        anchor_byte: cursor_byte,
+                    });
+                    input.set_cursor_rect(IME_CURSOR);
+                    input.focus_in();
+                    Ok(())
+                })?;
+                emit(format_args!("IME-FOCUSED"));
+            }
+            ["quit"] => break,
+            other => emit(format_args!("UNKNOWN-COMMAND {other:?}")),
+        }
     }
     app.stop()?;
     // `xtask test platform-ui` checks these: the monitor's rate (0 = none reported), then every presentation sample in order, with the monotonic time its report arrived
     emit(format_args!(
         "MONITOR refresh_hz={}",
-        monitor_hz.get().unwrap_or(0.0)
+        locked(&monitor_hz).unwrap_or(0.0)
     ));
-    for (p, seen_ns) in presents.borrow().iter() {
+    for (p, seen_ns) in locked(&presents).iter() {
         emit(format_args!(
             "PRESENT time_ns={} refresh_ns={} source={:?} seen_ns={seen_ns}",
             p.time_ns, p.refresh_ns, p.source

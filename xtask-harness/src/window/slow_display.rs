@@ -7,9 +7,7 @@
 //! Host too slow: when the window's own measured render inside the steady phase exceeds the composer's hold bound, held / replaced judge nothing and the stage is `undecided` (neither pass nor fail);
 //! never decided from the composer's counters, which broken backpressure moves the same way ([`gpu_starved`]).
 
-use super::ui_block::{
-    FIXTURE as UI_BLOCK_FIXTURE, bound_ms, hold_bound_ms, number, period_ms, result_line,
-};
+use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, number, period_ms, result_line};
 use super::{ACK_WAIT, Liveness, Sub, await_event, line_stamp, wait_for_line};
 use crate::composer::word;
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
@@ -28,6 +26,29 @@ const STEADY_END: &str = "AtlWindow: ub steady end";
 const RESULT: &str = "AtlWindow: ub result ";
 /// The composer's counters line (host.rs `counters_line`).
 const COUNTERS: &str = "composer: counters ";
+/// The composer's start line in UI mode (atl-composer host.rs `start`): whether backpressure is on and its bound.
+const BACKPRESSURE_LINE: &str = "atl-composer: ui: backpressure=";
+
+/// The composer's start line.
+fn backpressure_line(app: &str) -> Result<&str, String> {
+    app.lines()
+        .find(|l| l.contains(BACKPRESSURE_LINE))
+        .ok_or_else(|| "no `atl-composer: ui: backpressure=` line".to_owned())
+}
+
+/// The composer's backpressure bound, ms: 0 when backpressure is off (the gate's break).
+fn bound_ms(app: &str) -> Result<u64, String> {
+    let line = backpressure_line(app)?;
+    if word(line, "backpressure") == Some("false") {
+        return Ok(0);
+    }
+    number(line, "bound_ms")
+}
+
+/// The composer's configured hold bound, ms, whether backpressure is on or off.
+fn hold_bound_ms(app: &str) -> Result<u64, String> {
+    number(backpressure_line(app)?, "bound_ms")
+}
 /// Posts that can go out with no latch for them: the SurfaceView's BufferQueue slots (3, triple buffering) can all be queued and waiting at once.
 const IN_FLIGHT: u64 = 3;
 /// Takes at the phase's edges beyond floor(steady / T): the frame callback already released when the phase starts.

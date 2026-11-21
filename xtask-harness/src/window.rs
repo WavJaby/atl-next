@@ -205,7 +205,7 @@ enum Stage {
     Frames,
     /// Resume, then the touches the injected pointer script makes are the ones the fixture logs.
     Input,
-    /// Resume in UI mode (`ro.atl.ui=gtk`): the app's window is a GTK window of its process. Spike stage: the verdict is the resume one, the mirror's counters are in the app log.
+    /// Resume in UI mode (`ro.atl.ui=gtk`): the app's window is a GTK window of its process, on the platform's display thread. Sub-gates: mapped, readback, touch, pong, ping-hold, startup-order (the display thread attached before ART's first record).
     Gtk,
     /// The widget fixture in UI mode: layout, the text in the readback, a tap on the button, focus, a list drag, presents and cadence (xtask-harness/src/window/widgets.rs).
     Widgets,
@@ -231,7 +231,7 @@ enum Stage {
     /// UI mode: an in-game survey's arrangement, a full-window WebView added at runtime over an animating focused GLSurfaceView; resize, click and three Escs on the real GTK path (xtask-harness/src/window/webview_overlay.rs).
     #[value(name = "webview-overlay")]
     WebViewOverlay,
-    /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the compositor's clock must keep releasing its buffers (xtask-harness/src/window/ui_block.rs; composer threading S2).
+    /// UI mode: a SurfaceView's thread keeps posting while the UI thread sleeps 2 s; the window keeps committing at its own idle rate and the producer tracks it (xtask-harness/src/window/ui_block.rs; display-thread S5d).
     UiBlock,
     /// UI mode, the ui-block fixture: the proxy answers the window's frame callbacks at 1/4 of the output rate; the SurfaceView producer must be held to that slow display, none of its frames replaced
     /// unseen (xtask-harness/src/window/slow_display.rs; display-thread S4).
@@ -1294,6 +1294,51 @@ fn ping_hold_check(app: &str) -> Result<String, String> {
         Some(l) if l.contains("display: ping hold armed") => Ok("ping hold armed".to_owned()),
         Some(l) => Err(l.trim().to_owned()),
         None => Err("no ping hold line in the app log".to_owned()),
+    }
+}
+
+/// The module's attach record names the display thread it started (atl-platform-ui-linux module.rs `ui_attach`, ui.rs `DISPLAY_THREAD`).
+const ATTACHED_ON_DISPLAY: &str = "module attached: GTK";
+const DISPLAY_THREAD: &str = "on thread atl-display";
+
+/// An ART record: libbase's logger (ART's `LOG`, routed through the launcher's logger) carries its source position, `<file>.cc:<line>`; no record logged before the VM exists has one.
+fn is_art_line(line: &str) -> bool {
+    line.split_whitespace().any(|t| {
+        t.split_once(".cc:").is_some_and(|(file, n)| {
+            !file.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
+}
+
+/// Stage `gtk` sub-gate `startup-order` (display-thread plan S5d, proof 4): the display thread exists and owns the toolkit before ART boots, so no Java can reach the module first: the module's attach record, naming thread `atl-display`, precedes the first ART record in the app log.
+fn startup_order_check(app: &str) -> Result<String, String> {
+    let lines: Vec<&str> = app.lines().collect();
+    let attached = lines
+        .iter()
+        .position(|l| l.contains(ATTACHED_ON_DISPLAY))
+        .ok_or("no module attach line in the app log")?;
+    if !lines[attached].contains(DISPLAY_THREAD) {
+        return Err(format!(
+            "the attach line names no display thread: {}",
+            lines[attached].trim()
+        ));
+    }
+    let art = lines
+        .iter()
+        .position(|l| is_art_line(l))
+        .ok_or("no ART line in the app log")?;
+    if attached < art {
+        Ok(format!(
+            "attach on atl-display at line {}, first ART line {}",
+            attached + 1,
+            art + 1
+        ))
+    } else {
+        Err(format!(
+            "ART logged (line {}) before the module attached (line {})",
+            art + 1,
+            attached + 1
+        ))
     }
 }
 
@@ -2893,6 +2938,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             ),
             ("pong", pong_check(&liveness)),
             ("ping-hold", ping_hold_check(&app)),
+            ("startup-order", startup_order_check(&app)),
         ],
         _ => Vec::new(),
     };
@@ -3451,6 +3497,22 @@ fn opening_size_i32(display: DisplayModel) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lines as the app log has them (step1-webview run, 2026-11-22): the module's attach record, then ART's first libbase record.
+    const ATTACH: &str =
+        "1795287835.463  INFO atl-platform-ui: module attached: GTK 4.18.6 on thread atl-display";
+    const ART: &str = "11-22 03:03:55.849     2     2 I atl-app-launcher: parsed_options.cc:697 setting boot class path to /system/framework/core-oj.jar";
+
+    #[test]
+    fn startup_order_passes_only_with_the_attach_on_the_display_thread_before_art() {
+        assert!(startup_order_check(&format!("{ATTACH}\n{ART}\n")).is_ok());
+        assert!(startup_order_check(&format!("{ART}\n{ATTACH}\n")).is_err());
+        let on_looper = ATTACH.replace("on thread atl-display", "on the process's Looper");
+        assert!(startup_order_check(&format!("{on_looper}\n{ART}\n")).is_err());
+        assert!(startup_order_check(&format!("{ATTACH}\n")).is_err());
+        // a record with a `.cc` word but no line number is not ART's
+        assert!(!is_art_line("diag: first prop:miss log.tag.foo.cc: 1"));
+    }
 
     /// A counters line with the release fields `release_check` reads.
     fn release_log(released: u64, held: u64, fenced: u64, unmatched: u64) -> String {

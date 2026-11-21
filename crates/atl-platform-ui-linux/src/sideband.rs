@@ -516,13 +516,12 @@ fn replay(key: i32, claim: InputClaim, t: i64) {
             display.put_event(&ev);
         }
     }
-    crate::mirror::resync();
     if claimed.left_pressed {
         e.press_not_cancelled.borrow_mut().call(&());
     }
 }
 
-/// Android focus on `key`'s View, on any thread: on the display thread, after the same thread's earlier claims (one context's invoke order), see [`focus_now`].
+/// Android focus on `key`'s View, on any thread: on the display thread, after the same thread's earlier claims (one context's invokes from one thread run in queue order: ui.rs `GtkInvoker`), see [`focus_now`].
 pub fn focus(key: i32, on: bool) {
     glib::MainContext::default().invoke(move || focus_now(key, on));
 }
@@ -545,7 +544,6 @@ fn focus_now(key: i32, on: bool) {
         }
         e.widget.set_can_focus(false);
     }
-    crate::mirror::resync();
 }
 
 #[cfg(test)]

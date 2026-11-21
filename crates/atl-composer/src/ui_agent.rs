@@ -107,7 +107,7 @@ impl IUiAgent for UiAgent {
             .map_err(|_| StatusCode::DEAD_OBJECT)
     }
 
-    /// To the UI thread's window (ui_window); headless mode has none and ignores it.
+    /// To the display thread's window (ui_window); headless mode has none and ignores it.
     fn input_method(&self) -> Result<Option<SpIBinder>, StatusCode> {
         Ok(self.input_method.clone())
     }

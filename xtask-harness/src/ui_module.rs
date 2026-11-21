@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test ui-module` (launcher-ui-module plan slice M1): GTK, GLib and PipeWire loaded as an `RTLD_LOCAL` module stay out of the process's global symbol scope, while the module still drives a window from the process's Looper and logs through the process's subscriber.
+//! `xtask test ui-module` (launcher-ui-module plan slice M1): GTK, GLib and PipeWire loaded as an `RTLD_LOCAL` module stay out of the process's global symbol scope, while the module still drives a window on its own display thread and logs through the process's subscriber.
 //! The process is `atl-platform-ui-module-fixture` (linked as the launcher is: libsigchain leads DT_NEEDED; built by `xtask native`). It finds `libatl_platform_ui_linux.so` by file name through LD_LIBRARY_PATH (staged here like the other runtime cdylibs), opens one colour window in the gate's headless labwc, connects the module's audio host to a private PipeWire server, then dlopens an app library. The app (NDK-built stand-in) imports `vkCreateInstance` from `libvulkan.so`; the AOSP stand-in of that library returns [`AOSP_VALUE`], a value no Vulkan loader returns.
 //! Gates (normal run, `LD_DEBUG=bindings`):
-//! 1. painted >= 1: the module's window painted a scene through the process's Looper.
+//! 1. painted >= 1: the module's window painted a scene on its display thread.
 //! 2. the app's `vkCreateInstance` returned [`AOSP_VALUE`]: its import bound the AOSP stand-in, not the host's libvulkan.so.1 that GTK loads.
 //! 3. the module's `module attached` record arrived in the process's subscriber (`MODULE` line).
 //! 4. bindings: every symbol of an app object (the stand-in dir) bound inside that dir or to glibc; `dlsym(RTLD_DEFAULT)` finds none of the fixture's host symbols (`global_leaks=0`), after GTK init, a paint, and the PipeWire connect that loads SPA plugins.
 //! 5. the fixture's `sigaction` comes from libsigchain (the launcher's link shape holds).
+//! 6. `--panic-on-display`: a panic on the display thread ends the process by SIGABRT, its panic report in the output (no display thread may end quietly while `call`s wait on it).
 //!
 //! Controls (each must fail the gate it targets): the module loaded `RTLD_GLOBAL` -> the app gets something other than [`AOSP_VALUE`] and leaks > 0; no log sink -> no `MODULE` line.
 //! Evidence tier: isolated runtime with the launcher's link shape (sigchain, glibc ld.so, the converter's runtime library path); ART, bionic's linker namespaces and a real app are the M3/V0 gates.
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -36,6 +38,12 @@ const API: u32 = 33;
 const ATTACHED: &str = "module attached";
 /// The target the facade gives every forwarded module record (atl-platform-ui module.rs `forward`), as the fixture's subscriber prints it.
 const MODULE_TARGET: &str = "atl_platform_ui_linux:";
+/// The fixture flag that panics on the display thread after the paint.
+const PANIC_ARG: &str = "--panic-on-display";
+/// `std::process::abort`'s signal: SIGABRT, 6 on every Linux arch (uapi asm-generic/signal.h and the x86 one agree).
+const SIGABRT: i32 = 6;
+/// The fixture's panic message (atl-platform-ui-module-fixture `PANIC_MESSAGE`), in Rust's panic report before the abort.
+const DISPLAY_PANIC: &str = "module fixture: panic on the display thread";
 /// glibc's objects: app objects may bind to them (`__cxa_finalize`), they are in every scope.
 const GLIBC: &[&str] = &["/libc.so.6", "/ld-linux-x86-64.so.2"];
 
@@ -57,6 +65,8 @@ struct Run {
     text: String,
     results: Vec<(String, String)>,
     module_lines: usize,
+    /// The signal that ended the fixture, if one did.
+    signal: Option<i32>,
 }
 
 impl Run {
@@ -131,8 +141,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let text =
             String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr);
         std::fs::write(work.join(format!("{name}.log")), &text)?;
+        // only the panic run may end otherwise: it must, by SIGABRT (judged below)
         ensure!(
-            o.status.success(),
+            o.status.success() || extra.contains(&PANIC_ARG),
             "fixture run {name}: {}\n{text}",
             o.status
         );
@@ -149,12 +160,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             text,
             results,
             module_lines,
+            signal: o.status.signal(),
         })
     };
     let go = |name: &str, extra: &[&str]| go_with(name, extra, Some(&module_dir));
     let normal = go("local", &[])?;
     let global = go("global", &["--global"])?;
     let silent = go("no-module-records", &["--drop-module-records"])?;
+    let panicked = go("panic-on-display", &[PANIC_ARG])?;
     let missing = go_with("no-module", &[], None)?;
     let foreign_dir = foreign_build(
         &module_dir.join(MODULE_FILE),
@@ -164,7 +177,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let foreign = go_with("abi-bad", &[], Some(&foreign_dir))?;
 
     let mut failures: Vec<String> = Vec::new();
+    let mut checks = 0usize;
     let mut check = |ok: bool, what: String| {
+        checks += 1;
         println!("{} {what}", if ok { "ok  " } else { "FAIL" });
         if !ok {
             failures.push(what);
@@ -272,16 +287,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             foreign.get("attach_error")
         ),
     );
+    // a panic on the display thread ends the process loudly: a display thread that ended quietly would leave every `call` waiting (display-thread S5d, proof 5)
+    check(
+        panicked.int("painted").is_some_and(|p| p >= 1)
+            && panicked.signal == Some(SIGABRT)
+            && panicked.text.contains(DISPLAY_PANIC)
+            && panicked.get("panic_survived").is_none(),
+        format!(
+            "display-thread panic: SIGABRT with `{DISPLAY_PANIC}` reported (signal {:?}, report {}, survived {:?})",
+            panicked.signal,
+            panicked.text.contains(DISPLAY_PANIC),
+            panicked.get("panic_survived")
+        ),
+    );
+    let total = checks;
     match failures.first() {
         None => {
             println!(
-                "ui-module: ok (controls: RTLD_GLOBAL leaks, filtered records vanish, absent module and foreign abi refused by name)"
+                "ui-module: ok (controls: RTLD_GLOBAL leaks, filtered records vanish, absent module and foreign abi refused by name; a display-thread panic aborts)"
             );
             Ok(ExitCode::SUCCESS)
         }
         Some(first) => {
             println!(
-                "ui-module: FAILED {} of 11; first error: {first:?}",
+                "ui-module: FAILED {} of {total}; first error: {first:?}",
                 failures.len()
             );
             Ok(ExitCode::FAILURE)
