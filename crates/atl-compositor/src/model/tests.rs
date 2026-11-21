@@ -1129,7 +1129,11 @@ fn a_queued_transaction_keeps_its_layer_until_it_is_applied() {
     assert_eq!(c.counters().handle_deaths_deferred, 1);
     let gone = c.on_frame(3);
     assert_eq!(c.layer_count(), 0);
-    assert_eq!(releases(&gone.calls).len(), 1, "the shown buffer goes with it");
+    assert_eq!(
+        releases(&gone.calls).len(),
+        1,
+        "the shown buffer goes with it"
+    );
 }
 
 /// The gate's break (`hold_handles` false): the death goes before the tick's transactions, so the same sequence meets an unknown layer.
@@ -1178,10 +1182,17 @@ fn a_parent_keeps_a_child_whose_handle_died() {
         "root and its dead-handle child go, the live child stays"
     );
     assert_eq!(releases(&out.calls).len(), 2, "both shown buffers released");
-    assert!(out.scene.unwrap().quads.is_empty(), "the live child is offscreen");
+    assert!(
+        out.scene.unwrap().quads.is_empty(),
+        "the live child is offscreen"
+    );
     c.handle_destroyed(key(&live));
     c.on_frame(4);
-    assert_eq!(c.layer_count(), 0, "an offscreen layer goes with its handle");
+    assert_eq!(
+        c.layer_count(),
+        0,
+        "an offscreen layer goes with its handle"
+    );
 }
 
 /// A layer created hidden (`createSurface` eHidden, RequestedLayerState's constructor: a SurfaceView's layer) stays out of the scene with a buffer until a transaction shows it.

@@ -926,7 +926,7 @@ impl Compositor {
             return None;
         };
         if !self.layers.contains_key(&key) {
-            self.counters.unknown_layer += 1;            // a buffer for a layer that is gone still has a producer waiting for its release
+            self.counters.unknown_layer += 1; // a buffer for a layer that is gone still has a producer waiting for its release
             if s.what & what::E_BUFFER_CHANGED != 0
                 && let Some(bd) = &s.buffer_data
             {

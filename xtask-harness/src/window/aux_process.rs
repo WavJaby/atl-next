@@ -102,7 +102,8 @@ fn released_check(app: &str) -> Result<String, String> {
             .ok_or(format!("no {key} before the kill"))
     };
     let (unknown, deferred) = (n("unknown_layer")?, n("handle_deaths_deferred")?);
-    let summary = format!("before the kill: unknown_layer={unknown} handle_deaths_deferred={deferred}");
+    let summary =
+        format!("before the kill: unknown_layer={unknown} handle_deaths_deferred={deferred}");
     if unknown == 0 {
         Ok(summary)
     } else {
