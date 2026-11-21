@@ -116,9 +116,10 @@ pub(crate) struct RemoteTest {
     apply: bool,
 }
 
-/// atld's limit on the target: the marker's [`LIMIT`], then the watch and the round trip's wait after it. atld runs to it (nothing stops it earlier there), and its logs come back then.
+/// atld's limit on the target: the marker's [`LIMIT`], then the watch and one [`RESULT_STALL`] after it. atld runs to it (nothing stops it earlier there), and its logs come back then; the target is
+/// not watched, so this is one fixed budget for the whole chain, not the local watch's progress bound.
 const REMOTE_LIMIT: Duration =
-    Duration::from_secs(LIMIT.as_secs() + RESULT_WAIT.as_secs() + WINDOW_MS / 1000 + 1);
+    Duration::from_secs(LIMIT.as_secs() + RESULT_STALL.as_secs() + WINDOW_MS / 1000 + 1);
 
 /// The local gate's checks the headless subset does not claim, each with why (printed as `app: SKIP`).
 const REMOTE_SKIPPED: [(&str, &str); 4] = [
@@ -767,7 +768,7 @@ fn judged_lines() -> impl Iterator<Item = &'static Line> {
     LOG_LINES.iter().chain(FLAG_LINES.iter())
 }
 
-/// When the fixture logs a judged line. `Async`: from a binder or WebView callback after onCreate; the watch waits for it, up to RESULT_WAIT once WINDOW_MS has passed.
+/// When the fixture logs a judged line. `Async`: from a binder or WebView callback after onCreate; the watch waits for it while awaited lines keep arriving ([`watch_on`]).
 /// `Create`: in onCreate, or on a thread onCreate starts before any callback, so WINDOW_MS covers it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Timing {
@@ -1179,9 +1180,29 @@ const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
 const PERMISSION_REQUEST: &str = "AtlTest: permission-request ";
 const PERMISSION_DISMISSED: &str =
     "request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1";
-/// How long the watch after the marker waits for the round trip's last line ([`PERMISSION_REQUEST`]) and the Async [`LOG_LINES`] rows once WINDOW_MS has passed. The gate reads the log
-/// without them after this, so a slow host gets this long and a broken round trip or a missing callback line fails after it.
-const RESULT_WAIT: Duration = Duration::from_secs(30);
+/// How long the watch after the marker waits for the next awaited line ([`awaited_logged`]) once WINDOW_MS has passed: each awaited line that arrives restarts it, so a chain of rows logged seconds apart
+/// (Flags.java: 5-10 s per scenario under load) is bounded by its progress, not by one budget for the whole chain; a stalled chain, broken round trip or missing callback line fails this long after
+/// the last line that came. 30 s: the old whole-chain budget, which every single step fits many times over.
+const RESULT_STALL: Duration = Duration::from_secs(30);
+
+/// The awaited lines the log holds, of how many: the round trip's last line ([`PERMISSION_REQUEST`]) and every Async row of [`judged_lines`].
+fn awaited_logged(log: &str) -> (usize, usize) {
+    std::iter::once(PERMISSION_REQUEST)
+        .chain(
+            judged_lines()
+                .filter(|l| l.timing == Timing::Async)
+                .map(|l| l.prefix),
+        )
+        .fold((0, 0), |(got, all), p| {
+            (got + usize::from(log.contains(p)), all + 1)
+        })
+}
+
+/// Whether the watch after the marker goes on: always within WINDOW_MS (a crash shows there), then while an awaited line is missing and the last progress (an awaited line arriving, or the watch's
+/// start) is less than [`RESULT_STALL`] ago.
+fn watch_on(since_watch: Duration, since_progress: Duration, missing: bool) -> bool {
+    since_watch < Duration::from_millis(WINDOW_MS) || (missing && since_progress < RESULT_STALL)
+}
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
 const FONT_SIZE: u16 = 2048;
@@ -2450,20 +2471,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Some(children_outside_broker(atld_child.id())?),
         Some(_) => None,
     };
-    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the round trip and every Async LOG_LINES row
-    // run in it too, until they are all logged or RESULT_WAIT; the app's death ends the watch, atld outlives it
+    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the round trip and every Async row run in it too, until they are all logged
+    // or RESULT_STALL passes with no new one ([`watch_on`]); the app's death ends the watch, atld outlives it
     let mut ended = ended;
     if passed && ended.is_none() {
         let watch = Instant::now();
-        let waiting = || {
-            let log = read(&app_log);
-            !log.contains(PERMISSION_REQUEST)
-                || judged_lines().any(|l| l.timing == Timing::Async && !log.contains(l.prefix))
-        };
-        while ended.is_none()
-            && (watch.elapsed() < Duration::from_millis(WINDOW_MS)
-                || (watch.elapsed() < RESULT_WAIT && waiting()))
-        {
+        let (mut seen, mut progress) = (0, watch);
+        while ended.is_none() {
+            let (got, all) = awaited_logged(&read(&app_log));
+            if got > seen {
+                (seen, progress) = (got, Instant::now());
+            }
+            if !watch_on(watch.elapsed(), progress.elapsed(), got < all) {
+                break;
+            }
             ended = atld_child.try_wait()?;
             if ended.is_none() && run.app_ended() {
                 ended = Some(run.stop(&mut atld_child)?);
@@ -3829,5 +3850,39 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("comes after the new intent"))
         );
+    }
+
+    /// The watch's stop rule ([`watch_on`]) from its definition: on within WINDOW_MS; after it, on only while a line is missing and the last progress is under RESULT_STALL.
+    #[test]
+    fn watch_is_bounded_by_progress() {
+        let s = Duration::from_secs;
+        let window = Duration::from_millis(WINDOW_MS);
+        // a crash window is always watched, even with nothing missing
+        assert!(watch_on(window / 2, window / 2, false));
+        // after it: everything logged -> done
+        assert!(!watch_on(window + s(1), s(0), false));
+        // a missing line with recent progress -> on
+        assert!(watch_on(window + s(1), RESULT_STALL / 2, true));
+        // no progress for RESULT_STALL -> off
+        assert!(!watch_on(window + s(1), RESULT_STALL, true));
+        // the flags-* case: a chain past the old whole-chain budget (30 s since the watch) still advancing 8 s ago -> on
+        assert!(watch_on(RESULT_STALL * 3, s(8), true));
+    }
+
+    #[test]
+    fn awaited_lines_are_the_round_trip_and_every_async_row() {
+        let asyncs = judged_lines().filter(|l| l.timing == Timing::Async).count();
+        // nothing logged -> none of the round trip's last line + the Async rows
+        assert_eq!(awaited_logged(""), (0, 1 + asyncs));
+        // a flags chain advancing: each logged row counts once
+        let one = format!("{}x\n", FLAG_LINES[0].prefix);
+        let two = format!("{one}{}y\n", FLAG_LINES[1].prefix);
+        assert_eq!(awaited_logged(&one).0, 1);
+        assert_eq!(awaited_logged(&two).0, 2);
+        let all: String = std::iter::once(PERMISSION_REQUEST)
+            .chain(judged_lines().map(|l| l.prefix))
+            .map(|p| format!("{p}v\n"))
+            .collect();
+        assert_eq!(awaited_logged(&all), (1 + asyncs, 1 + asyncs));
     }
 }
