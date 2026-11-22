@@ -326,7 +326,6 @@ fn keep_unless_pass(
     }))
 }
 
-/// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
 /// The work dir a row's runtime staged under: its `runtime: work=<key>` line (atld_run.rs `Runtime::new`). None for a row that runs no atld runtime.
 fn runtime_work(text: &str) -> Option<&str> {
     text.lines()
@@ -334,6 +333,7 @@ fn runtime_work(text: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
 fn undecided_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let prefix = format!("{cmd}: {UNDECIDED_WORD}");
     text.lines().rev().find(|l| l.starts_with(&prefix))
