@@ -8,7 +8,7 @@
 //! A process that resolves the dir holds its lock shared until it exits (`build_pool::hold_dir`); create, delete and prune take it exclusive, so a dir is never deleted under a build.
 //! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from the previous `target/` must outlive the swap.
 //! Before that, from `git worktree add` on, it links to `<pool>/boot/<id>` (the post-checkout hook [`install_hook`] writes on every xtask run), so cargo's bootstrap build of xtask lands on the pool; settle moves or removes it. A real `target/` happens only for a worktree made before the hook; settle removes it and counts it (`pool/target-real.count`, else `target-boot.count`).
-//! A dir leaves with its checkout (land `Cleanup`, [`leave`]); `out prune` deletes the dirs of checkouts removed outside xtask and every base but the newest [`KEEP_BASES`].
+//! A dir leaves with its checkout (land `Cleanup`, [`leave`]), together with the checkout's run dir (out_run.rs, same id and lock); `out prune` deletes the build and run dirs of checkouts removed outside xtask, every base but the newest [`KEEP_BASES`] and old seeds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -52,9 +52,18 @@ pub fn family_dir(root: &Path, family: &str) -> Result<PathBuf> {
 /// `out` subcommands.
 #[derive(clap::Subcommand)]
 pub enum Out {
-    /// This checkout's build dir, its base, its `target/` link, and the pool: free space, bases, every build dir.
-    Show,
-    /// Deletes the build dirs and driver probe dirs (`out/vk-driver/<id>`, `out/egl-driver/<id>`) whose checkout is gone and every base but the newest two (dry run unless --execute).
+    /// This checkout's build dir, its base, its `target/` link, its run dir, and the pool: free space, bases, every build dir.
+    Show {
+        /// Print only this checkout's run dir (out_run.rs: app data roots and bulky regenerable run data, never cited by a report), making it when missing.
+        #[arg(long)]
+        run: bool,
+    },
+    /// Seeds: installed app data roots on the pool that a run dir starts its data roots from (out_run.rs).
+    Seed {
+        #[command(subcommand)]
+        seed: crate::out_run::Seed,
+    },
+    /// Deletes the build dirs, run dirs and driver probe dirs (`out/vk-driver/<id>`, `out/egl-driver/<id>`) whose checkout is gone, every base but the newest two, and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
     ///
     /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus the trees no build dir owns (`out/egl-driver/*/cargo*`, a real `repo/target`); use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
     Prune {
@@ -92,7 +101,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Tier::Reflink => "reflink",
             Tier::Copy => "copy",
@@ -969,13 +978,18 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
         Entry::Absent | Entry::Other => {}
     }
     let dir = dir_of(ws, &id);
-    if present(&dir)? {
+    let run = crate::out_run::run_dir_of(ws, &id);
+    if present(&dir)? || present(&run)? {
         let Some(_lock) = build_pool::try_lock_dir(ws, &id)? else {
             bail!(
                 "{} is held by a running process: not removed",
                 dir.display()
             );
         };
+        if present(&run)? {
+            crate::out_run::remove(&run)?;
+            removed.push(run.display().to_string());
+        }
         if let Some(rec) = crate::delta::record(&dir)? {
             crate::delta::drop_ram(ws, &id, &rec)?;
             removed.push(format!(
@@ -983,7 +997,7 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
                 dir.display(),
                 rec.dir(&id).display()
             ));
-        } else {
+        } else if present(&dir)? {
             remove_build_dir(&dir)?;
             removed.push(dir.display().to_string());
         }
@@ -1350,7 +1364,12 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let live = live_ids_of(root)?;
     match cmd {
-        Out::Show => {
+        Out::Show { run: true } => {
+            let (_, run, _held) = crate::out_run::ensure(root)?;
+            println!("{}", run.display());
+        }
+        Out::Seed { seed } => return crate::out_run::run(root, seed),
+        Out::Show { run: false } => {
             let id = checkout_id(root)?;
             let dir = dir_of(&ws, &id);
             if let Some(rec) = crate::delta::record(&dir)? {
@@ -1374,6 +1393,19 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 println!("target: {state}");
             } else {
                 println!("out: ws/{id}: not made yet: the next build command makes it");
+            }
+            let run = crate::out_run::run_dir_of(&ws, &id);
+            match crate::out_run::record(&run)? {
+                Some(rec) => println!(
+                    "run={} ({}; {} seeded data root(s))",
+                    run.display(),
+                    rec.tier,
+                    rec.uses.len()
+                ),
+                None => println!(
+                    "run={}: not made yet (`cargo xtask out show --run` or `out seed use` makes it)",
+                    run.display()
+                ),
             }
             let cfg = crate::ws_config::load(&ws)?;
             let store = &cfg.delta.ram_store;
@@ -1569,6 +1601,39 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             },
         }
     }
+    let (runs, seeds) = crate::out_run::orphans(ws, live)?;
+    for (id, path) in &runs {
+        if !execute {
+            println!("orphan run/{id}: {} (checkout gone)", path.display());
+            continue;
+        }
+        match build_pool::try_lock_dir(ws, id)? {
+            None => println!("orphan run/{id}: busy, skipped: a process holds it"),
+            Some(_lock) => match crate::out_run::remove(path) {
+                Ok(()) => println!("orphan run/{id}: removed"),
+                Err(e) => {
+                    failed += 1;
+                    println!("orphan run/{id}: FAILED: {e:#}");
+                }
+            },
+        }
+    }
+    for (name, path) in &seeds {
+        if !execute {
+            println!(
+                "old seed {name}: {} (not its package's newest, no live run dir names it)",
+                path.display()
+            );
+            continue;
+        }
+        match crate::out_run::remove(path) {
+            Ok(()) => println!("old seed {name}: removed"),
+            Err(e) => {
+                failed += 1;
+                println!("old seed {name}: FAILED: {e:#}");
+            }
+        }
+    }
     let family = family_orphans(ws, live)?;
     for (name, path) in &family {
         if !execute {
@@ -1628,8 +1693,10 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan driver probe dir(s), {} orphan ram delta(s) and {} old base(s)",
+        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan driver probe dir(s), {} orphan ram delta(s) and {} old base(s)",
         dirs.len(),
+        runs.len(),
+        seeds.len(),
         family.len(),
         strays.len(),
         old.len()
