@@ -281,6 +281,8 @@ pub enum Verdict {
     Refuse(String),
     /// The class can never fit this store: pool tier.
     NeverFits(String),
+    /// Fits only without land's hold ([`Hold`]): a standing reservation, so waiting is pointless.
+    Held(String),
 }
 
 impl Verdict {
@@ -289,14 +291,48 @@ impl Verdict {
         match self {
             Verdict::Admit { need_ram } => format!("admitted, {:.2} GiB RAM", gib(*need_ram)),
             Verdict::Wait(w) => format!("{w} (others' reservations)"),
-            Verdict::Refuse(w) | Verdict::NeverFits(w) => w.clone(),
+            Verdict::Refuse(w) | Verdict::NeverFits(w) | Verdict::Held(w) => w.clone(),
         }
     }
 }
 
-/// Admission of a build growing the upper by `need_raw` bytes while others hold `reserved` RAM bytes; `margin` RAM bytes stay free. need_ram = ceil(need_raw / ratio).
-pub fn judge(s: &Stats, need_raw: u64, reserved: u64, margin: u64) -> Verdict {
-    let need_ram = (need_raw * 1000).div_ceil(s.ratio_milli.max(1));
+/// Upper growth of one admission: raw bytes on the store fs and the RAM they take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Need {
+    pub raw: u64,
+    pub ram: u64,
+}
+
+impl Need {
+    /// `class`'s peak on `s`: ram = ceil(raw / ratio).
+    pub fn of(class: Class, cfg: &DeltaConfig, s: &Stats) -> Need {
+        let raw = class.peak(cfg);
+        let ratio = s.ratio_milli;
+        Need {
+            raw,
+            ram: (raw * 1000).div_ceil(ratio.max(1)),
+        }
+    }
+}
+
+/// Land first (plan ram-delta S3): room for land's next native build that every other admission leaves free. Zero for land itself, while land's own reservation is live (it stands in), and when land's native class never fits the store (land is pool then).
+pub type Hold = Need;
+
+/// The hold an admission by `id` counts on `s`; `land_live` = a live reservation of land exists.
+pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land_live: bool) -> Hold {
+    if id == out::LAND_ID || land_live {
+        return Hold::default();
+    }
+    let native = Need::of(Class::Native, cfg, s);
+    match judge(s, native, 0, Hold::default(), cfg.ram_margin_gib.value * GIB) {
+        Verdict::NeverFits(_) => Hold::default(),
+        _ => native,
+    }
+}
+
+/// Admission of a build needing `need` while others hold `reserved` RAM bytes and land's `hold` stays free; `margin` RAM bytes stay free.
+pub fn judge(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> Verdict {
+    let (need_raw, need_ram) = (need.raw, need.ram);
     let n = |b: u64| format!("{:.2} GiB", gib(b));
     if need_raw > s.fs_size || need_ram + margin > s.ram_limit {
         return Verdict::NeverFits(format!(
@@ -324,12 +360,25 @@ pub fn judge(s: &Stats, need_raw: u64, reserved: u64, margin: u64) -> Verdict {
             n(margin)
         ));
     }
-    if need_ram + reserved + margin > ram_free {
+    if need_raw + hold.raw > s.fs_free || need_ram + hold.ram + margin > ram_free {
+        return Verdict::Held(format!(
+            "land hold {} RAM / {} raw: store RAM free {}, fs free {} < need {} RAM / {} raw + hold + margin {}",
+            n(hold.ram),
+            n(hold.raw),
+            n(ram_free),
+            n(s.fs_free),
+            n(need_ram),
+            n(need_raw),
+            n(margin)
+        ));
+    }
+    if need_ram + hold.ram + reserved + margin > ram_free {
         return Verdict::Wait(format!(
-            "store RAM free {} < need {} + {} reserved by running builds + margin {}",
+            "store RAM free {} < need {} + {} reserved by running builds + land hold {} + margin {}",
             n(ram_free),
             n(need_ram),
             n(reserved),
+            n(hold.ram),
             n(margin)
         ));
     }
@@ -394,13 +443,14 @@ impl Drop for Reservation {
     }
 }
 
-/// Bytes reserved by live reservations; files whose lock is free (their process gone) are removed.
-fn reserved(ws: &Path) -> Result<u64> {
+/// Bytes reserved by live reservations, and whether one of them is land's (`land-<pid>`); files whose lock is free (their process gone) are removed.
+fn reserved(ws: &Path) -> Result<(u64, bool)> {
     let dir = lock_dir(ws).join("reserve");
     let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Ok(0);
+        return Ok((0, false));
     };
     let mut sum = 0;
+    let mut land = false;
     for e in rd.flatten() {
         let p = e.path();
         let Ok(f) = std::fs::File::open(&p) else {
@@ -411,6 +461,11 @@ fn reserved(ws: &Path) -> Result<u64> {
                 let _ = std::fs::remove_file(&p);
             }
             None => {
+                land |= e
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.rsplit_once('-'))
+                    .is_some_and(|(id, _)| id == out::LAND_ID);
                 sum += std::fs::read_to_string(&p)
                     .ok()
                     .and_then(|t| t.trim().parse::<u64>().ok())
@@ -418,7 +473,30 @@ fn reserved(ws: &Path) -> Result<u64> {
             }
         }
     }
-    Ok(sum)
+    Ok((sum, land))
+}
+
+/// The verdict for `class` by `id` on `stats` against the live reservations and land's hold; the caller holds the admit gate. Counts `delta-land-hold` on a [`Verdict::Held`].
+fn judge_now(ws: &Path, id: &str, cfg: &DeltaConfig, class: Class, stats: &Stats) -> Result<Verdict> {
+    let (others, land_live) = reserved(ws)?;
+    let hold = hold_for(id, cfg, stats, land_live);
+    let v = judge(
+        stats,
+        Need::of(class, cfg, stats),
+        others,
+        hold,
+        cfg.ram_margin_gib.value * GIB,
+    );
+    if matches!(v, Verdict::Held(_)) {
+        out::count(ws, "delta-land-hold");
+    }
+    Ok(v)
+}
+
+/// Land's hold on `stats` as a non-land admission sees it now (`out show`).
+pub fn hold_now(ws: &Path, cfg: &DeltaConfig, stats: &Stats) -> Result<Hold> {
+    let (_, land_live) = reserved(ws)?;
+    Ok(hold_for("", cfg, stats, land_live))
 }
 
 fn reserve(ws: &Path, id: &str, need_ram: u64) -> Result<Reservation> {
@@ -448,12 +526,7 @@ pub fn admit_once(
     };
     let gate = lock_dir(ws).join("admit.lock");
     let _gate = Flock::take(open_lock(&gate)?, Mode::Exclusive)?;
-    match judge(
-        &stats,
-        class.peak(cfg),
-        reserved(ws)?,
-        cfg.ram_margin_gib.value * GIB,
-    ) {
+    match judge_now(ws, id, cfg, class, &stats)? {
         Verdict::Admit { need_ram } => Ok(Ok((reserve(ws, id, need_ram)?, stats, need_ram))),
         other => Ok(Err(other)),
     }
@@ -479,7 +552,7 @@ pub fn fits_now(
     })
 }
 
-/// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits.
+/// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits / Held.
 fn admit(
     ws: &Path,
     id: &str,
@@ -495,8 +568,7 @@ fn admit(
         };
         let gate = lock_dir(ws).join("admit.lock");
         let _gate = Flock::take(open_lock(&gate)?, Mode::Exclusive)?;
-        let margin = cfg.ram_margin_gib.value * GIB;
-        match judge(&stats, class.peak(cfg), reserved(ws)?, margin) {
+        match judge_now(ws, id, cfg, class, &stats)? {
             Verdict::Admit { need_ram } => {
                 return Ok(Ok((reserve(ws, id, need_ram)?, stats, need_ram)));
             }
@@ -706,6 +778,15 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
                 "ws/{id} is a ram delta and its store is full ({why}): not started. Free room: `cargo xtask out prune --execute` (gone worktrees' deltas), or move this checkout to the pool: `cargo xtask out tier pool --execute`"
             );
         }
+        // land first: the hold is standing, so an existing ram dir is refused (waiting is pointless) and a new dir takes the pool
+        Err(Verdict::Held(why)) if rec.is_some() => {
+            out::count(&ws, "delta-refused");
+            println!("out: delta refused ({why})");
+            bail!(
+                "ws/{id} is a ram delta and the store's free room is held for land ({why}): not started. Move this checkout to the pool: `cargo xtask out tier pool --execute`"
+            );
+        }
+        Err(Verdict::Held(why)) => return pool(&why),
         Err(Verdict::Refuse(why) | Verdict::NeverFits(why) | Verdict::Wait(why)) => {
             if let Some(r) = rec.take() {
                 drop_ram(&ws, &id, &r)?;
@@ -998,6 +1079,14 @@ mod tests {
         }
     }
 
+    /// `b` raw bytes at `s`'s ratio (the D3 formula, as `Need::of` for a build class).
+    fn raw(s: &Stats, b: u64) -> Need {
+        Need {
+            raw: b,
+            ram: (b * 1000).div_ceil(s.ratio_milli),
+        }
+    }
+
     /// Expected values from the D3 formula, worked by hand: need_ram = ceil(need_raw * 1000 / ratio_milli).
     /// check: 4915 MiB = 5_153_751_040 B at 1.95 -> 5_153_751_040_000 / 1950 = 2_642_949_251.3 -> ceil 2_642_949_252 B (2.46 GiB); limit 8, used 2.5, margin 1 -> RAM free 5.5 GiB.
     #[test]
@@ -1005,24 +1094,24 @@ mod tests {
         let s = stats(8.0, 2.5, 1950);
         let check = 4915 * MIB;
         assert_eq!(
-            judge(&s, check, 0, GIB),
+            judge(&s, raw(&s, check), 0, Hold::default(), GIB),
             Verdict::Admit {
                 need_ram: 2_642_949_252
             }
         );
         // 2.46 + 2.5 reserved + 1 = 5.96 > 5.5 free: others' reservations stand in the way -> wait
         assert!(matches!(
-            judge(&s, check, 5 * GIB / 2, GIB),
+            judge(&s, raw(&s, check), 5 * GIB / 2, Hold::default(), GIB),
             Verdict::Wait(_)
         ));
         // used 5.0: free 3.0 < 2.46 + 1 -> refused before starting, whatever is reserved
         assert!(matches!(
-            judge(&stats(8.0, 5.0, 1950), check, 0, GIB),
+            judge(&stats(8.0, 5.0, 1950), raw(&stats(8.0, 5.0, 1950), check), 0, Hold::default(), GIB),
             Verdict::Refuse(_)
         ));
         // cross 20 GiB at 1.95 = 10.26 GiB RAM > limit 8 - margin: never fits -> pool tier; also > fs size 16
         assert!(matches!(
-            judge(&s, 20480 * MIB, 0, GIB),
+            judge(&s, raw(&s, 20480 * MIB), 0, Hold::default(), GIB),
             Verdict::NeverFits(_)
         ));
         // tmpfs ratio 1.0: 4.8 GiB raw = 4.8 RAM; limit 6, used 0: 4.8 + 1 = 5.8 <= 6
@@ -1032,7 +1121,7 @@ mod tests {
             ..stats(6.0, 0.0, 1000)
         };
         assert_eq!(
-            judge(&t, check, 0, GIB),
+            judge(&t, raw(&t, check), 0, Hold::default(), GIB),
             Verdict::Admit {
                 need_ram: 4915 * MIB
             }
@@ -1042,7 +1131,62 @@ mod tests {
             ram_limit: 64 * GIB,
             ..stats(64.0, 0.0, 4000)
         };
-        assert!(matches!(judge(&big, 15 * GIB, 0, GIB), Verdict::Refuse(_)));
+        assert!(matches!(judge(&big, raw(&big, 15 * GIB), 0, Hold::default(), GIB), Verdict::Refuse(_)));
+    }
+
+    /// Land first, hand arithmetic: zram limit 10 GiB, used 3, margin 1 -> RAM free 7 GiB = 7_516_192_768 B; ratio 1.95.
+    /// native 9216 MiB = 9_663_676_416 B -> ram ceil(9_663_676_416_000 / 1950) = 4_955_731_496 B (4.62 GiB, plan S3 "land hold 4.62"); check 2_642_949_252 B (admission_arithmetic).
+    #[test]
+    fn land_hold_keeps_room_for_land() {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml")).expect("cfg").delta;
+        let s = stats(10.0, 3.0, 1950);
+        let native = Hold {
+            raw: 9 * GIB,
+            ram: 4_955_731_496,
+        };
+        assert_eq!(hold_for("child", &cfg, &s, false), native);
+        let check = Need::of(Class::Check, &cfg, &s);
+        assert_eq!(check.ram, 2_642_949_252);
+        // with the hold: 2.46 + 4.62 + 1 = 8.07 GiB > 7 free -> held (a new dir takes the pool)
+        assert!(matches!(
+            judge(&s, check, 0, native, GIB),
+            Verdict::Held(_)
+        ));
+        // land's own admission ignores the hold: 4.62 + 1 = 5.62 <= 7
+        assert_eq!(hold_for(out::LAND_ID, &cfg, &s, false), Hold::default());
+        let land = Need::of(Class::Native, &cfg, &s);
+        assert_eq!(
+            judge(&s, land, 0, Hold::default(), GIB),
+            Verdict::Admit {
+                need_ram: 4_955_731_496
+            }
+        );
+        // red control, no hold: the child is admitted, and land behind its reservation waits (4.62 + 2.46 + 1 > 7)
+        assert_eq!(
+            judge(&s, check, 0, Hold::default(), GIB),
+            Verdict::Admit {
+                need_ram: 2_642_949_252
+            }
+        );
+        assert!(matches!(
+            judge(&s, land, check.ram, Hold::default(), GIB),
+            Verdict::Wait(_)
+        ));
+        // land's live reservation stands in for the hold; a store native never fits (limit 4 < 4.62 + 1) holds nothing
+        assert_eq!(hold_for("child", &cfg, &s, true), Hold::default());
+        assert_eq!(
+            hold_for("child", &cfg, &stats(4.0, 0.0, 1950), false),
+            Hold::default()
+        );
+        // the hold on fs raw: fs free 14, check 4.8 + native 9 = 13.8 fits; with fs free 13 it is held though RAM has room
+        let roomy = Stats {
+            fs_free: 13 * GIB,
+            ..stats(64.0, 0.0, 1950)
+        };
+        assert!(matches!(
+            judge(&roomy, check, 0, hold_for("child", &cfg, &roomy, false), GIB),
+            Verdict::Held(_)
+        ));
     }
 
     /// Red control: a full store refuses in the admission step, so the build (here a closure that would record its start) never runs.
@@ -1169,13 +1313,19 @@ mod tests {
         let ws = std::env::temp_dir().join(format!("xtask-delta-res-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         let r = reserve(&ws, "a", 3 * GIB).unwrap();
-        assert_eq!(reserved(&ws).unwrap(), 3 * GIB);
-        let stale = lock_dir(&ws).join("reserve").join("gone-1");
+        assert_eq!(reserved(&ws).unwrap(), (3 * GIB, false));
+        let stale = lock_dir(&ws).join("reserve").join("land-1");
         std::fs::write(&stale, "7\n").unwrap();
-        assert_eq!(reserved(&ws).unwrap(), 3 * GIB);
+        // a gone land's file is swept and is no live land reservation
+        assert_eq!(reserved(&ws).unwrap(), (3 * GIB, false));
         assert!(!stale.exists());
-        drop(r);
-        assert_eq!(reserved(&ws).unwrap(), 0);
+        // a checkout named land-x is not land
+        let lx = reserve(&ws, "land-x", GIB).unwrap();
+        assert_eq!(reserved(&ws).unwrap(), (4 * GIB, false));
+        let land = reserve(&ws, out::LAND_ID, GIB).unwrap();
+        assert_eq!(reserved(&ws).unwrap(), (5 * GIB, true));
+        drop((r, lx, land));
+        assert_eq!(reserved(&ws).unwrap(), (0, false));
         std::fs::remove_dir_all(&ws).unwrap();
     }
 

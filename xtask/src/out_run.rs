@@ -480,10 +480,12 @@ impl Drop for RunAdmission {
         let Ok(Ok(stats)) = delta::probe(&self.cfg.ram_store.value, &self.cfg) else {
             return;
         };
+        // full by the store's own accounting: land's hold is not fullness, so none here
         let v = delta::judge(
             &stats,
-            delta::Class::Run.peak(&self.cfg),
+            delta::Need::of(delta::Class::Run, &self.cfg, &stats),
             0,
+            delta::Hold::default(),
             self.cfg.ram_margin_gib.value << 30,
         );
         if matches!(v, delta::Verdict::Refuse(_)) {
