@@ -771,7 +771,13 @@ impl Plan {
         );
         s.push_str(&lock_sh(&format!("remote run {}", self.tag)));
         s.push_str(&stale_sh(&self.tag, &self.manifest_sha256));
-        s.push_str(&format!("rm -rf {}\n", word(&out_path(&self.root))));
+        // the root and its data root (atld_run `fresh_data_root`, the only one a remote run takes): every run starts from a clean install, nothing left from the previous run on the target
+        let data = crate::atld_run::fresh_data_root(Path::new(&self.root));
+        s.push_str(&format!(
+            "rm -rf {} {}\n",
+            word(&out_path(&self.root)),
+            word(&out_path(&data.to_string_lossy()))
+        ));
         s.push_str(&format!("mkdir -p {}\n", word(&out_path(&self.scratch))));
         for (path, text) in &self.files {
             s.push_str(&format!(
@@ -2849,7 +2855,7 @@ mod tests {
             "exec 9>>.run.lock\n",
             "flock -n 9 || { echo \"remote run gl/run: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
             "test -f '.bundle-abc123' || { echo \"remote run gl/run: stale: another push replaced the bundle\" >&2; exit 7; }\n",
-            "rm -rf \"$BASE/out/gl/run/root\"\n",
+            "rm -rf \"$BASE/out/gl/run/root\" \"$BASE/out/gl/run/root.data\"\n",
             "mkdir -p \"$BASE/out/gl/run/scratch\"\n",
             "sed \"s|@BASE@|$BASE|g\" > \"$BASE/out/gl/run/scratch/package-0.json\" <<'ATL_EOF'\n",
             "{\"apk\": \"@BASE@/out/gl/apk/x.apk\"}\n",

@@ -1333,7 +1333,10 @@ mod tests {
             .unwrap()
             .delta;
         assert_eq!(Class::Cross.peak(&d), 20 * GIB);
-        // run default = seed copy + reinstall launch, both measured (ws_config DEFAULT_PEAK_MIB[4]), rounded up
-        assert_eq!(Class::Run.peak(&d), (797.9_f64 + 813.7).ceil() as u64 * MIB);
+        // run default = the larger measured WeChat clean install + launch window (ws_config DEFAULT_PEAK_MIB[4]), rounded up
+        assert_eq!(
+            Class::Run.peak(&d),
+            796.5_f64.max(796.6).ceil() as u64 * MIB
+        );
     }
 }

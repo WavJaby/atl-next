@@ -31,11 +31,6 @@ pub fn path(root: &Path, row: &str) -> PathBuf {
     root.join(DIR).join(format!("{row}.{EXT}"))
 }
 
-/// The fresh data root of `row`'s scenario runs under build dir `out` (emptied before each run).
-pub fn data_root(out: &Path, row: &str) -> PathBuf {
-    out.join("scenario").join(row).join("data")
-}
-
 /// `row`'s scenario, parsed and linted against the table.
 pub fn load(root: &Path, row: &str) -> Result<Script> {
     let rows = xtask::test_apks::load(root)?;

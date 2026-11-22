@@ -31,7 +31,7 @@
 //! peak_check_gib = 4.8
 //! peak_native_gib = 9
 //! peak_cross_gib = 20
-//! peak_run_gib = 1.6   # one app data root (seed copy + one launch) in a run dir on the store (out_run.rs)
+//! peak_run_gib = 0.78  # one app data root (clean install + one launch) in a run dir on the store (out_run.rs)
 //! ```
 
 use std::collections::BTreeMap;
@@ -112,12 +112,10 @@ pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
-/// run 1612: store growth of one app data root = seed copy + worst launch (out_run.rs). Copy: WeChat 8.0 (seed com.tencent.mm-3182), 797.9 MiB ext4 used on the zram store (2 s samples, 2026-11-22).
-/// Normal launch from a seed whose installed APK equals the session's: `install skipped: unchanged`, root grows 0.1-0.4 MiB per launch (du); store peak +49.1 MiB in launch 1 is an upper bound (other writers share the store).
-/// Reinstall launch (installed APK differs from the session's: same versionCode, other bytes, or an install-format change): apk/ (741 MiB) rewritten, peak 813.7 MiB (T2, every launch rewrote apk/: same write path).
-/// Seeds are keyed by package + versionCode only, so the reinstall stays reachable: 797.9 + 813.7 = 1611.6 -> 1612. Lower (est ~850 MiB) only once a seed carries the APK identity.
-/// Small case fossify-math: 7 MiB root, negligible.
-pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 1612];
+/// run 797: store growth of one app data root = clean install + launch of the largest known app into an empty root (every app run starts so, out_run.rs `fresh_root`).
+/// WeChat 8.0 (versionCode 3182) on the zram store, ext4 used from the minimum after the previous root's removal to the run's peak (2 s samples, 2026-11-22): 796.5 and 796.6 MiB in the two windows no other writer touched; peak = end, so no install transient above the final root (du 792.8 MiB) at that resolution. 796.6 -> 797.
+/// Small cases: Temple Run root 251 MiB, fossify-math 7 MiB.
+pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 797];
 
 /// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]

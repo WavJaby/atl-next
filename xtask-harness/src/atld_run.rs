@@ -442,7 +442,7 @@ pub struct Runtime {
     llvm_lib: PathBuf,
     /// Where atld runs: this host, or a target running it from the bundle (`remote test`, remote.rs [`remote::Site`]).
     site: remote::Site,
-    /// The persistent data root (atld `--data-root`) when [`Runtime::with_data_root`] set it: kept across runs. Unset: a fresh one beside the run's root ([`fresh_data_root`], the gates), never atld's default (the user's own).
+    /// The caller's data root (atld `--data-root`) when [`Runtime::with_data_root`] set it: not removed by the run (run-apk: a fresh run-dir root it emptied, or `--reuse-data-root`). Unset: a fresh one beside the run's root ([`fresh_data_root`], the gates, remote runs), never atld's default (the user's own).
     data_root: Option<PathBuf>,
 }
 
@@ -980,7 +980,7 @@ impl Runtime {
         self
     }
 
-    /// atld's data root is the persistent dir `dir` (`--data-root`): app data and system state survive the run, and the next run on `dir` sees them (run-apk). Gates keep a fresh one ([`fresh_data_root`]).
+    /// atld's data root is the caller's dir `dir` (`--data-root`): the run neither empties nor removes it (run-apk empties a fresh one itself; `--reuse-data-root` keeps it). Gates keep a fresh one ([`fresh_data_root`]).
     pub fn with_data_root(mut self, dir: &Path) -> Self {
         self.data_root = Some(dir.to_path_buf());
         self

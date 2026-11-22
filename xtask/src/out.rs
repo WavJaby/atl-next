@@ -8,7 +8,7 @@
 //! A process that resolves the dir holds its lock shared until it exits (`build_pool::hold_dir`); create, delete and prune take it exclusive, so a dir is never deleted under a build.
 //! The checkout's `target/` is a symlink to its dir's `target/` (the only per-checkout switch cargo reads with no tracked file or env var), settled when the outermost process ends ([`settle_target`]): the xtask binary running from the previous `target/` must outlive the swap.
 //! Before that, from `git worktree add` on, it links to `<pool>/boot/<id>` (the post-checkout hook [`install_hook`] writes on every xtask run), so cargo's bootstrap build of xtask lands on the pool; settle moves or removes it. A real `target/` happens only for a worktree made before the hook; settle removes it and counts it (`pool/target-real.count`, else `target-boot.count`).
-//! A dir leaves with its checkout (land `Cleanup`, [`leave`]), together with the checkout's run dir (out_run.rs, same id and lock); `out prune` deletes the build and run dirs of checkouts removed outside xtask, every base but the newest [`KEEP_BASES`] and old seeds.
+//! A dir leaves with its checkout (land `Cleanup`, [`leave`]), together with the checkout's run dir (out_run.rs, same id and lock); `out prune` deletes the build and run dirs of checkouts removed outside xtask and every base but the newest [`KEEP_BASES`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,12 +55,7 @@ pub enum Out {
         #[arg(long)]
         run: bool,
     },
-    /// Seeds: installed app data roots on the pool that a run dir starts its data roots from (out_run.rs).
-    Seed {
-        #[command(subcommand)]
-        seed: crate::out_run::Seed,
-    },
-    /// Deletes the build dirs and run dirs whose checkout is gone, every base but the newest two, each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs), and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
+    /// Deletes the build dirs and run dirs whose checkout is gone, every base but the newest two, and each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs) (dry run unless --execute).
     ///
     /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus a real `repo/target`, which no build dir owns; use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
     Prune {
@@ -1347,7 +1342,6 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             let (_, run, _held) = crate::out_run::ensure(root)?;
             println!("{}", run.display());
         }
-        Out::Seed { seed } => return crate::out_run::run(root, seed),
         Out::Show { run: false } => {
             let id = checkout_id(root)?;
             let dir = dir_of(&ws, &id);
@@ -1375,14 +1369,9 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             }
             let cfg = crate::ws_config::load(&ws)?;
             match crate::out_run::locate(&ws, &cfg.delta.ram_store.value, &id)? {
-                Some((run, rec)) => println!(
-                    "run={} ({}; {} seeded data root(s))",
-                    run.display(),
-                    rec.tier,
-                    rec.uses.len()
-                ),
+                Some((run, rec)) => println!("run={} ({})", run.display(), rec.tier),
                 None => println!(
-                    "run=: not made yet (`cargo xtask out show --run` or `out seed use` makes it, on the ram store when class run fits, else {})",
+                    "run=: not made yet (`cargo xtask out show --run` or an app run makes it, on the ram store when class run fits, else {})",
                     crate::out_run::run_dir_of(&ws, &id).display()
                 ),
             }
@@ -1595,7 +1584,7 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         }
     }
     let store = crate::ws_config::load(ws)?.delta.ram_store.value;
-    let (runs, seeds) = crate::out_run::orphans(ws, &store, live)?;
+    let runs = crate::out_run::orphans(ws, &store, live)?;
     for (id, path) in &runs {
         if !execute {
             println!("orphan run/{id}: {} (checkout gone)", path.display());
@@ -1610,22 +1599,6 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
                     println!("orphan run/{id}: FAILED: {e:#}");
                 }
             },
-        }
-    }
-    for (name, path) in &seeds {
-        if !execute {
-            println!(
-                "old seed {name}: {} (not its package's newest, no live run dir names it)",
-                path.display()
-            );
-            continue;
-        }
-        match crate::out_run::remove(path) {
-            Ok(()) => println!("old seed {name}: removed"),
-            Err(e) => {
-                failed += 1;
-                println!("old seed {name}: FAILED: {e:#}");
-            }
         }
     }
     // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
@@ -1667,10 +1640,9 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
+        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
         dirs.len(),
         runs.len(),
-        seeds.len(),
         strays.len(),
         old.len()
     );

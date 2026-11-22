@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test app-data`: an app's data outlives a run-apk launch (AOSP: until uninstall or `pm clear`). Three `run-apk` launches of the fixture (xtask-harness/testdata/app-data) on the gate's own data root (`<out>/app-data/data-root`, never the user's):
+//! `xtask test app-data`: an app's data outlives a run-apk launch (AOSP: until uninstall or `pm clear`). Three `run-apk` launches of the fixture (xtask-harness/testdata/app-data) on the gate's own data root (`<out>/app-data/data-root`, never the user's), made empty at the gate's start and passed to every launch as `--reuse-data-root` (the explicit not-a-clean-run opt-in this gate exists to prove):
 //! 1. on empty data the app writes `save.txt` under its files dir (and its device-protected and external files dirs): `AtlData: data: wrote`;
 //! 2. the next launch reads it back: `AtlData: data: read save-v1`, and the file is on the host under each of `apps/<package>/{data,data_de,external}`;
 //! 3. `--clear-data` (`pm clear`) empties the package's data first, so the app writes again: `AtlData: data: wrote`.
@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE, SHARED_STORAGE};
 
-use crate::atld_run::{NativeLibs, Runtime, clear_package_data, package_data_dirs};
+use crate::atld_run::{NativeLibs, Runtime, package_data_dirs};
 use crate::{arches, manifest, run_apk, verdict};
 
 #[derive(clap::Args)]
@@ -65,7 +65,7 @@ const UNCHANGED_LINE: &str = "install skipped: unchanged";
 /// What a launch must do to the installed code's libraries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Code {
-    /// installed now (fresh, or replacing an earlier gate run's): the library holds these bytes
+    /// installed now into the empty root: the library holds these bytes
     Installed(&'static [u8]),
     /// unchanged APK: nothing under lib/ written, atld's unchanged line
     Kept,
@@ -129,8 +129,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let want_paths = format!(
         "files={files_dir} de={DATA_USER_DE}/0/{package}/files external={SHARED_STORAGE}/Android/data/{package}/files source={DATA_APP}/{package}/base.apk"
     );
-    // the gate starts from empty data: this package's data from an earlier run is cleared
-    clear_package_data(&data_root, &package)?;
+    // the gate starts from an empty root: nothing from an earlier gate run (data or installed code)
+    if data_root.exists() {
+        xtask::out_run::remove(&data_root)?;
+    }
+    std::fs::create_dir_all(&data_root).with_context(|| data_root.display().to_string())?;
     let mut whys = Vec::new();
     let launches = [
         (
@@ -172,8 +175,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             false,
             false,
         )
-        .with_clear_data(clear)
-        .with_data_root(&data_root);
+        .with_reused_data_root(&data_root)
+        .with_clear_data(clear);
         let code = run_apk::run(root, &launch)?;
         let libs_after = lib_files(&code_dir)?;
         let unchanged = std::fs::read_to_string(&atld_log)
@@ -265,8 +268,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             ));
         }
     }
-    // the data root is left as found: this package's data is removed again
-    clear_package_data(&data_root, &package)?;
     if whys.is_empty() {
         println!(
             "app-data: pass (4 launches: empty data, kept, --clear-data, changed APK; AOSP paths; own host dirs; code installed once, libs rewritten only for a changed APK)"
