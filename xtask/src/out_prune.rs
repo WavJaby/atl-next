@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask out prune --units`: deletes the cargo units of the target trees that no recorded build used for `--older-than` days, and the incremental sessions no build will load.
-//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each build dir's `cargo`, `cargo-converter`, `cargo-converter-test`, `cargo-converter-lint`, `target` (what a checkout's `target/` links to) and `gl/cargo*`; with the unowned trees also a real `repo/target` and `out/egl-driver/<checkout>/cargo*`, which no build dir owns.
+//! Trees (a profile dir holding `.fingerprint`, or `<triple>/<profile>`) under these roots: each build dir's `cargo`, `cargo-converter`, `cargo-converter-test`, `cargo-converter-lint`, `target` (what a checkout's `target/` links to), `gl/cargo*`, `vk-driver/cargo*` and `egl-driver/cargo*`; with the unowned trees also a real `repo/target`, which no build dir owns.
 //! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
@@ -39,9 +39,7 @@ pub const DIR_ROOTS: [&str; 7] = [
 ];
 /// `<build dir>/gl/cargo*`: the GL probes' target roots.
 const GL_DIR: &str = "gl";
-/// `<ws>/out/egl-driver/<checkout>/cargo*`: EGL driver probes, not under a build dir.
-const EGL_DIR: &str = out::FAMILIES[1];
-/// Prefix of the root names under `gl/` and `egl-driver/<checkout>/`.
+/// Prefix of the root names under `gl/` and the driver probe dirs.
 const CARGO_ROOT: &str = "cargo";
 /// cargo's lock on a build dir; a build holds it for its whole run.
 const CARGO_LOCK: &str = ".cargo-lock";
@@ -250,7 +248,7 @@ fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> R
     Ok(Outcome::Done(prune_trees(ws, &found, scope, now, execute)?))
 }
 
-/// The trees no build dir owns: a real `repo/target` (a main checkout not yet on its build dir) and the EGL driver probes. Each is busy-checked by its own `.cargo-lock`.
+/// The trees no build dir owns: a real `repo/target` (a main checkout not yet on its build dir). Each is busy-checked by its own `.cargo-lock`.
 pub fn prune_unowned(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
     let found = trees_under(&unowned_roots(ws)?)?;
     prune_trees(ws, &found, Scope::Everything { cutoff }, now, execute)
@@ -288,22 +286,21 @@ fn checked_dir(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(dir.to_owned()))
 }
 
-/// The roots of build dir `dir`: [`DIR_ROOTS`] and `gl/cargo*`.
+/// The roots of build dir `dir`: [`DIR_ROOTS`], `gl/cargo*` and each driver probe family's `cargo*` (`out::FAMILIES`).
 fn dir_roots(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut roots: Vec<PathBuf> = DIR_ROOTS.iter().map(|name| dir.join(name)).collect();
-    roots.extend(prefixed(&dir.join(GL_DIR), CARGO_ROOT)?);
+    for sub in std::iter::once(GL_DIR).chain(out::FAMILIES) {
+        roots.extend(prefixed(&dir.join(sub), CARGO_ROOT)?);
+    }
     Ok(roots)
 }
 
-/// The roots no build dir owns: the main checkout's `target` while it is a real dir (once linked it is its build dir's), and each EGL driver checkout's `cargo*`.
+/// The roots no build dir owns: the main checkout's `target` while it is a real dir (once linked it is its build dir's).
 fn unowned_roots(ws: &Path) -> Result<Vec<PathBuf>> {
     let main = ws.join("repo").join("target");
     let mut roots = Vec::new();
     if fs::symlink_metadata(&main).is_ok_and(|m| m.is_dir()) {
         roots.push(main);
-    }
-    for checkout in children(&ws.join("out").join(EGL_DIR))? {
-        roots.extend(prefixed(&checkout, CARGO_ROOT)?);
     }
     Ok(roots)
 }
@@ -1259,14 +1256,17 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, its faulted build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/`.
+    /// The root names of a build dir: the target names xtask gives cargo (build, converter build, its faulted build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/` and the driver probe dirs.
     #[test]
-    fn dir_roots_are_the_target_names_and_the_gl_cargo_probes() {
+    fn dir_roots_are_the_target_names_and_the_cargo_probes() {
         let ws = scratch("roots");
         let dir = ws.join("out/pool/ws/b");
         fs::create_dir_all(dir.join("gl/cargo")).expect("gl");
         fs::create_dir_all(dir.join("gl/cargo-undefined-gl")).expect("gl");
         fs::create_dir_all(dir.join("gl/other")).expect("gl");
+        fs::create_dir_all(dir.join("vk-driver/cargo")).expect("vk");
+        fs::create_dir_all(dir.join("vk-driver/vk")).expect("vk");
+        fs::create_dir_all(dir.join("egl-driver/cargo")).expect("egl");
         let mut names: Vec<String> = dir_roots(&dir)
             .expect("roots")
             .iter()
@@ -1282,17 +1282,19 @@ mod tests {
                 "cargo-converter-fault",
                 "cargo-converter-lint",
                 "cargo-converter-test",
+                "egl-driver/cargo",
                 "gl/cargo",
                 "gl/cargo-undefined-gl",
-                "target"
+                "target",
+                "vk-driver/cargo"
             ]
         );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The trees no build dir owns: the main checkout's real target, and each EGL driver checkout's `cargo*` roots only; a linked `repo/target` is its build dir's, not listed here.
+    /// The trees no build dir owns: the main checkout's real target only; a linked `repo/target` is its build dir's, not listed here.
     #[test]
-    fn unowned_roots_are_a_real_repo_target_and_the_egl_driver_cargo_probes() {
+    fn unowned_roots_are_a_real_repo_target() {
         let ws = scratch("unowned");
         sized(&ws.join("repo/target/debug/.fingerprint/x/y"), 1);
         sized(
@@ -1300,18 +1302,6 @@ mod tests {
             1,
         );
         sized(&ws.join("repo/target/bp2ninja/bin/tool"), 1);
-        sized(
-            &ws.join("out/egl-driver/chk/cargo/release/.fingerprint/x/y"),
-            1,
-        );
-        sized(
-            &ws.join("out/egl-driver/chk/other/release/.fingerprint/x/y"),
-            1,
-        );
-        sized(
-            &ws.join("out/egl-driver/chk2/cargo-probe/debug/.fingerprint/x/y"),
-            1,
-        );
         let mut found: Vec<String> = trees_under(&unowned_roots(&ws).expect("roots"))
             .expect("trees")
             .iter()
@@ -1321,17 +1311,14 @@ mod tests {
         assert_eq!(
             found,
             [
-                "out/egl-driver/chk/cargo/release",
-                "out/egl-driver/chk2/cargo-probe/debug",
                 "repo/target/debug",
                 "repo/target/x86_64-unknown-linux-gnu/release",
             ]
         );
         fs::rename(ws.join("repo/target"), ws.join("linked")).expect("move");
         symlink(ws.join("linked"), ws.join("repo/target")).expect("link");
-        assert_eq!(
-            unowned_roots(&ws).expect("roots").len(),
-            2,
+        assert!(
+            unowned_roots(&ws).expect("roots").is_empty(),
             "a linked repo/target was listed"
         );
         fs::remove_dir_all(&ws).expect("cleanup");

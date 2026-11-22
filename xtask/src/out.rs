@@ -38,16 +38,12 @@ const TARGET: &str = "target";
 pub(crate) const BASE_FILE: &str = ".base";
 /// A build dir's bootstrap-gate target (bootstrap_gate.rs). Its cargo units key on the checkout path: refresh keeps it (out_prune::DIR_ROOTS), publish leaves it out.
 pub const BOOTSTRAP_DIR: &str = "bootstrap";
-/// Per-checkout driver probe dirs `<ws>/out/<family>/<checkout id>` (harness vk_driver.rs, egl_driver.rs): outside the pool, so `out prune` sweeps the children of gone checkouts here too.
+/// Driver probe dirs `<build dir>/<family>` (harness vk_driver.rs, egl_driver.rs): cargo outputs of the probe and driver, regenerable, so they live and go with the checkout's build dir (ram tier for a child, shared from the base by reflink) instead of the root disk.
 pub const FAMILIES: [&str; 2] = ["vk-driver", "egl-driver"];
 
-/// The checkout at `root`'s dir of driver probe `family` ([`FAMILIES`]): keyed by [`checkout_id`], as its build dir is.
+/// The checkout at `root`'s dir of driver probe `family` ([`FAMILIES`]), inside its build dir.
 pub fn family_dir(root: &Path, family: &str) -> Result<PathBuf> {
-    Ok(Layout::of(root)?
-        .workspace()
-        .join("out")
-        .join(family)
-        .join(checkout_id(root)?))
+    Ok(dir_of(Layout::of(root)?.workspace(), &checkout_id(root)?).join(family))
 }
 
 /// `out` subcommands.
@@ -64,9 +60,9 @@ pub enum Out {
         #[command(subcommand)]
         seed: crate::out_run::Seed,
     },
-    /// Deletes the build dirs, run dirs and driver probe dirs (`out/vk-driver/<id>`, `out/egl-driver/<id>`) whose checkout is gone, every base but the newest two, each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs), and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
+    /// Deletes the build dirs and run dirs whose checkout is gone, every base but the newest two, each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs), and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
     ///
-    /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus the trees no build dir owns (`out/egl-driver/*/cargo*`, a real `repo/target`); use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
+    /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus a real `repo/target`, which no build dir owns; use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
     Prune {
         /// Prune cargo units and incremental sessions instead of dirs.
         #[arg(long)]
@@ -1279,26 +1275,6 @@ fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BT
     Ok((dirs, old, pinned))
 }
 
-/// Driver probe dirs (`out/<family>/<id>`, [`FAMILIES`]) whose id no live checkout has: `(family/id, path)`, sorted.
-fn family_orphans(ws: &Path, live: &BTreeSet<String>) -> Result<Dirs> {
-    let mut found = Vec::new();
-    for family in FAMILIES {
-        let dir = ws.join("out").join(family);
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd {
-            let e = e?;
-            let id = e.file_name().to_string_lossy().into_owned();
-            if !live.contains(&id) && e.file_type()?.is_dir() {
-                found.push((format!("{family}/{id}"), e.path()));
-            }
-        }
-    }
-    found.sort();
-    Ok(found)
-}
-
 /// Sorts prune candidates most paths first and returns each one's path count. A copy's metadata scales with its paths, so this is what a prune frees first.
 fn rank_by_paths(dirs: &mut Dirs, old: &mut [PathBuf]) -> Result<BTreeMap<PathBuf, u64>> {
     let mut counts = BTreeMap::new();
@@ -1565,7 +1541,7 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, bases beyond the keep rule, and each live checkout's kept gate logs past [`red_logs::KEEP_RUNS`] (red_logs::prune); lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
+/// `out prune` without a flag: build dirs whose checkout is not in `live`, bases beyond the keep rule, and each live checkout's kept gate logs past [`red_logs::KEEP_RUNS`] (red_logs::prune); lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
 /// Also `land`'s cleanup child, after the landed worktree is gone. The orphans and bases are under the owner's standing approval; the kept gate logs past the keep (red_logs.rs) are not on that list, yet this land cleanup (execute) removes them too.
 pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
     let rows =
@@ -1652,27 +1628,6 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             }
         }
     }
-    let family = family_orphans(ws, live)?;
-    for (name, path) in &family {
-        if !execute {
-            println!("orphan {name}: {} (checkout gone)", path.display());
-            continue;
-        }
-        let gone = crate::out_tasks::held_inside(path).and_then(|holder| match holder {
-            Some(pid) => Ok(Some(pid)),
-            None => std::fs::remove_dir_all(path)
-                .with_context(|| format!("removing {}", path.display()))
-                .map(|()| None),
-        });
-        match gone {
-            Ok(None) => println!("orphan {name}: removed"),
-            Ok(Some(pid)) => println!("orphan {name}: busy, skipped: pid {pid} holds it"),
-            Err(e) => {
-                failed += 1;
-                println!("orphan {name}: FAILED: {e:#}");
-            }
-        }
-    }
     // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
     let mut keep = live.clone();
     keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
@@ -1712,11 +1667,10 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan driver probe dir(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
+        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
         dirs.len(),
         runs.len(),
         seeds.len(),
-        family.len(),
         strays.len(),
         old.len()
     );
@@ -2338,28 +2292,5 @@ mod tests {
         assert!(want.join("kept.txt").is_file());
         assert_eq!(entry(&root.join(TARGET)).expect("entry"), Entry::Link(want));
         std::fs::remove_dir_all(&d).expect("cleanup");
-    }
-
-    #[test]
-    fn driver_probe_dirs_of_gone_checkouts_are_orphans() {
-        let ws = scratch("families");
-        for p in [
-            "vk-driver/repo",
-            "vk-driver/gone",
-            "egl-driver/live",
-            "egl-driver/gone2",
-        ] {
-            std::fs::create_dir_all(ws.join("out").join(p)).expect("dir");
-        }
-        // a file in a family dir is no checkout's dir: never a candidate
-        std::fs::write(ws.join("out/vk-driver/stray.log"), b"").expect("file");
-        let live = BTreeSet::from([MAIN_ID.to_owned(), "live".to_owned()]);
-        let names: Vec<String> = family_orphans(&ws, &live)
-            .expect("orphans")
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
-        assert_eq!(names, ["egl-driver/gone2", "vk-driver/gone"]);
-        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

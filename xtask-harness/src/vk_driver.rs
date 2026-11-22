@@ -35,7 +35,7 @@ pub struct Args {
     /// How `--node` was chosen: display or trial.
     #[arg(long, default_value = "trial")]
     node_source: String,
-    /// Output directory (default: <workspace>/out/vk-driver/<checkout id>, swept by `out prune` once the checkout is gone; never inside the checkout, whose files the static checks read).
+    /// Output directory (default: `vk-driver/` in this checkout's build dir, see `cargo xtask out show`: regenerable, gone with the dir; never inside the checkout, whose files the static checks read).
     #[arg(long)]
     out: Option<PathBuf>,
 }

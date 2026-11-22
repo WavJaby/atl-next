@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `cargo xtask out prune --tasks`: the task dirs `<workspace>/out/<task>/` (task = a worktree or branch name; a task's run outputs, data roots and logs) whose task is retired.
-//! Every top-level entry of `out/` gets one class. Keep: a name in [`KEEP`] (pool, shared tools, locks), never removable. Live: the name is a checkout id ([`out::live_ids_of`]: worktree with its checkout dir present), a local or remote branch not merged into [`MAIN_REF`], or a process has its cwd, an open fd or a mapped file inside it. Orphan: a dir whose name is a known task id (any branch, a pool build dir, a driver-family checkout dir or a landed task in [`RETIRED`] of that name) and which is not live: listed with its size, removed by `--execute`. Unknown: everything else (loose files, symlinks, dirs naming no task id, names that are not plain UTF-8): listed, never removed.
+//! Every top-level entry of `out/` gets one class. Keep: a name in [`KEEP`] (pool, shared tools, locks), never removable. Live: the name is a checkout id ([`out::live_ids_of`]: worktree with its checkout dir present), a local or remote branch not merged into [`MAIN_REF`], or a process has its cwd, an open fd or a mapped file inside it. Orphan: a dir whose name is a known task id (any branch, a pool build dir or a landed task in [`RETIRED`] of that name) and which is not live: listed with its size, removed by `--execute`. Unknown: everything else (loose files, symlinks, dirs naming no task id, names that are not plain UTF-8): listed, never removed.
 //! A deletion tool removes only what it can prove belongs to a retired task: a dir whose branch was deleted and that no build dir and no [`RETIRED`] line names is unknown, not orphan.
 //! The process probe reads `/proc/<pid>/{cwd,fd/*,maps}` of the caller's uid only (other users' processes cannot hold this user's `out/`); a same-uid process whose entries cannot be read makes `--execute` refuse. `--execute` repeats the probe right before each removal.
 
@@ -19,7 +19,7 @@ use crate::out;
 use crate::out_prune;
 
 /// Top-level `out/` entries that are no task's: never listed as removable. Explicit names only, never a pattern: an entry not here is judged as a task dir or left unknown.
-pub const KEEP: [(&str, &str); 16] = [
+pub const KEEP: [(&str, &str); 14] = [
     (
         "land-seq",
         "land-seq.sh (host scripts/.agent/runtime) logs: the last laptop prune",
@@ -31,14 +31,6 @@ pub const KEEP: [(&str, &str); 16] = [
     (
         "build",
         "canonical build path (atl_layout::BUILD): empty on the host, sandboxed builds hold fds into it",
-    ),
-    (
-        "vk-driver",
-        "per-checkout vk-driver probe output: `out prune` sweeps its children by checkout liveness",
-    ),
-    (
-        "egl-driver",
-        "per-checkout egl-driver probe output: `out prune` sweeps its children by checkout liveness",
     ),
     (
         "gles2-fixture",
@@ -98,7 +90,7 @@ pub struct Facts {
     pub checkouts: BTreeSet<String>,
     /// Branch short name (local, or remote with the remote stripped) -> merged into MAIN_REF (every ref of that name).
     pub branches: BTreeMap<String, bool>,
-    /// Other task-id evidence: pool build dir ids, driver-family checkout dir names.
+    /// Other task-id evidence: pool build dir ids, landed task names.
     pub known: BTreeSet<String>,
     /// (pid, path) a process holds: cwd, open fds, mapped files.
     pub held: Vec<(u32, PathBuf)>,
@@ -257,12 +249,9 @@ pub fn parse_retired(text: &str) -> Result<Vec<Retired>> {
     Ok(rows)
 }
 
-/// Task-id evidence on disk: pool build dir ids, driver-family checkout dir names and landed task names ([`RETIRED`]; missing file: none).
+/// Task-id evidence on disk: pool build dir ids and landed task names ([`RETIRED`]; missing file: none).
 pub fn known_ids(ws: &Path) -> Result<BTreeSet<String>> {
     let mut known: BTreeSet<String> = names(&out::pool(ws).join("ws")).into_iter().collect();
-    for family in out::FAMILIES {
-        known.extend(names(&ws.join("out").join(family)));
-    }
     let path = ws.join(RETIRED);
     match fs::read_to_string(&path) {
         Ok(text) => known.extend(parse_retired(&text)?.into_iter().map(|r| r.name)),

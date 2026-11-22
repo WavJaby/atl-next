@@ -17,7 +17,7 @@ const PROBE_BIN: &str = "atl-egl-driver-probe";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// Output directory (default: <workspace>/out/egl-driver/<checkout id>, swept by `out prune` once the checkout is gone; never inside the checkout, whose files the static checks read).
+    /// Output directory (default: `egl-driver/` in this checkout's build dir, see `cargo xtask out show`: regenerable, gone with the dir; never inside the checkout, whose files the static checks read).
     #[arg(long)]
     out: Option<PathBuf>,
     /// DRM node gralloc allocates on (default: gralloc's own trial, the node the driver renders on).
