@@ -906,7 +906,7 @@ fn layout_check(app: &str, want: (i32, i32), display: (i32, i32)) -> Result<Stri
     ))
 }
 
-/// Stage `tiled`'s tile, xdg_toplevel size in logical px (the gate output is scale 1): what a tiling compositor gives the window in every configure, the first included. Under the opening size (opening_size, 960x600 on the 1280x800 gate display) in both dimensions, as Hyprland gave fossify-math 1080x675 for its 1350x844 (2026-11-22), so content drawn at the opening size is cut.
+/// Stage `tiled`'s tile, xdg_toplevel size in logical px (the gate output is scale 1): what a tiling compositor gives the window in every configure, the first included. Under the opening size (opening_size, 1440x900 on the 1920x1200 gate display) in both dimensions, as Hyprland gave fossify-math 1080x675 for its 1350x844 (2026-11-22), so content drawn at the opening size is cut.
 const TILE: (i32, i32) = (840, 540);
 /// The client-side decorations are a header bar only (no side borders inside the xdg geometry), far under this height: the content is the tile's width by its height less the header.
 const HEADER_MAX: i32 = 200;
