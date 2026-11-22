@@ -4,11 +4,12 @@
 //! audio-app, webview) and takes under ~35 s; slower, load-flaky (widgets, dialog) and laptop-only gates stay `xtask test` runs. A host that cannot run a row's gate says so in the gate's own verdict
 //! (`host lacks ...`), never by dropping the row.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use xtask::red_logs;
 
 use crate::verdict::{Outcome, UNDECIDED_WORD};
 
@@ -113,6 +114,8 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
+    let run = red_logs::run_id();
+    let task = red_logs::task_dir(root)?;
     let mut failed = Vec::new();
     let mut undecided = Vec::new();
     for row in ROWS {
@@ -136,8 +139,14 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
             Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
         }
         .unwrap_or("no verdict line");
+        let kept = keep_unless_pass(&task, &run, row, &log, outcome);
+        let at = kept.as_ref().unwrap_or(&log);
+        let note = kept
+            .as_ref()
+            .map(|k| format!(" (log {})", k.display()))
+            .unwrap_or_default();
         eprintln!(
-            "gates: {} {} ({took:.1}s) {line}",
+            "gates: {} {} ({took:.1}s) {line}{note}",
             row.name(),
             match outcome {
                 Outcome::Pass => "ok",
@@ -147,7 +156,8 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
         );
         match outcome {
             Outcome::Pass => {}
-            Outcome::Fail => failed.push(format!("{}: {line} (log {})", row.name(), log.display())),
+            // the path leads: check quotes its first error at 160 chars (verdict.rs FIRST_ERROR_CHARS), and the verdict line lands in it
+            Outcome::Fail => failed.push(format!("{} (log {}): {line}", row.name(), at.display())),
             Outcome::Undecided => undecided.push(undecided_note(row, line)),
         }
     }
@@ -168,6 +178,21 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     // stdout leads the step's failure text (xtask harness.rs check_step), so check's first-error line is this one, not the first gate's progress line
     println!("gates: FAILED {summary}");
     bail!("{summary}")
+}
+
+/// A red or undecided gate's log is kept under the checkout's task dir (`task`, red_logs::task_dir) in its bucket, so the next check's overwrite of `check-gates/<gate>.log` cannot reach it. A pass keeps nothing. A failed copy names the log where it stands, as a note.
+fn keep_unless_pass(
+    task: &Path,
+    run: &str,
+    row: &Row,
+    log: &Path,
+    outcome: Outcome,
+) -> Option<PathBuf> {
+    let bucket = red_logs::bucket_of(outcome)?;
+    Some(red_logs::keep(task, bucket, run, log).unwrap_or_else(|e| {
+        eprintln!("gates: {} log not kept: {e:#}", row.name());
+        log.to_path_buf()
+    }))
 }
 
 /// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
@@ -263,5 +288,50 @@ mod tests {
             Row::new(&["platform-ui"], false, false).argv("h", "o"),
             ["platform-ui"]
         );
+    }
+
+    /// The red log outlives the next check's overwrite of the gate's log; an undecided one goes to its own bucket; a pass keeps nothing.
+    #[test]
+    fn red_and_undecided_logs_are_kept_and_a_pass_is_not() {
+        let out = std::env::temp_dir().join(format!("xtask-gates-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let logs = out.join("check-gates");
+        std::fs::create_dir_all(&logs).expect("logs");
+        let row = Row::new(&["window", "--stage", "ime"], true, true);
+        let log = logs.join("window-ime.log");
+        std::fs::write(&log, "window: FAILED ime: copy lost\n").expect("red log");
+        let kept = keep_unless_pass(&out, "20261122-100000-000", &row, &log, Outcome::Fail)
+            .expect("a red log is kept");
+        assert_eq!(
+            kept,
+            out.join(red_logs::RED)
+                .join("20261122-100000-000")
+                .join("window-ime.log")
+        );
+        // the next check passes and overwrites the gate's log
+        std::fs::write(&log, "window: pass ime\n").expect("pass log");
+        assert_eq!(
+            std::fs::read_to_string(&kept).expect("kept log"),
+            "window: FAILED ime: copy lost\n"
+        );
+        assert_eq!(
+            keep_unless_pass(&out, "20261122-100200-000", &row, &log, Outcome::Pass),
+            None
+        );
+        assert!(
+            !out.join(red_logs::RED).join("20261122-100200-000").exists(),
+            "a pass kept its log"
+        );
+        std::fs::write(&log, "window: undecided ime: host GPU starved\n").expect("undecided log");
+        let undecided =
+            keep_unless_pass(&out, "20261122-100300-000", &row, &log, Outcome::Undecided)
+                .expect("an undecided log is kept");
+        assert_eq!(
+            undecided,
+            out.join(red_logs::UNDECIDED)
+                .join("20261122-100300-000")
+                .join("window-ime.log")
+        );
+        std::fs::remove_dir_all(&out).expect("cleanup");
     }
 }

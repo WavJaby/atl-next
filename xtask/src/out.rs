@@ -21,6 +21,7 @@ use atl_layout::Layout;
 use crate::build_pool::{self, DirLock};
 use crate::git::git;
 use crate::out_prune::{self, Outcome};
+use crate::red_logs;
 use crate::unit_use;
 
 /// The pool root, workspace-relative.
@@ -63,7 +64,7 @@ pub enum Out {
         #[command(subcommand)]
         seed: crate::out_run::Seed,
     },
-    /// Deletes the build dirs, run dirs and driver probe dirs (`out/vk-driver/<id>`, `out/egl-driver/<id>`) whose checkout is gone, every base but the newest two, and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
+    /// Deletes the build dirs, run dirs and driver probe dirs (`out/vk-driver/<id>`, `out/egl-driver/<id>`) whose checkout is gone, every base but the newest two, each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs), and seeds that are neither their package's newest nor named by a live run dir (dry run unless --execute).
     ///
     /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus the trees no build dir owns (`out/egl-driver/*/cargo*`, a real `repo/target`); use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
     Prune {
@@ -1564,8 +1565,8 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, and bases beyond the keep rule; lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
-/// Also `land`'s cleanup child, after the landed worktree is gone (all of this is under the owner's standing approval).
+/// `out prune` without a flag: build dirs and driver probe dirs whose checkout is not in `live`, bases beyond the keep rule, and each live checkout's kept gate logs past [`red_logs::KEEP_RUNS`] (red_logs::prune); lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
+/// Also `land`'s cleanup child, after the landed worktree is gone. The orphans and bases are under the owner's standing approval; the kept gate logs past the keep (red_logs.rs) are not on that list, yet this land cleanup (execute) removes them too.
 pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
     let rows =
         match crate::ws_config::load(ws).and_then(|cfg| crate::disk_floor::pool_rows(ws, &cfg)) {
@@ -1703,13 +1704,15 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             }
         }
     }
+    let (kept_runs, kept_failed) = red_logs::prune(ws, live, execute)?;
+    failed += kept_failed;
     let verb = if execute {
         "removed"
     } else {
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan driver probe dir(s), {} orphan ram delta(s) and {} old base(s)",
+        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} old seed(s), {} orphan driver probe dir(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
         dirs.len(),
         runs.len(),
         seeds.len(),

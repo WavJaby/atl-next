@@ -70,6 +70,7 @@ pub mod provider_refusals;
 pub mod providers;
 pub mod prune;
 pub mod qemu;
+pub mod red_logs;
 pub mod runpath_gate;
 pub mod runtimes;
 pub mod seam_gate;
