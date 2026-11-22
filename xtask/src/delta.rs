@@ -64,10 +64,18 @@ pub enum Class {
     Check = 1,
     Native = 2,
     Cross = 3,
+    /// Not a build: one app data root in a run dir on the store (out_run.rs), same accounting.
+    Run = 4,
 }
 
 impl Class {
-    pub const ALL: [Class; 4] = [Class::Small, Class::Check, Class::Native, Class::Cross];
+    pub const ALL: [Class; 5] = [
+        Class::Small,
+        Class::Check,
+        Class::Native,
+        Class::Cross,
+        Class::Run,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -75,6 +83,7 @@ impl Class {
             Class::Check => "check",
             Class::Native => "native",
             Class::Cross => "cross",
+            Class::Run => "run",
         }
     }
 
@@ -273,6 +282,17 @@ pub enum Verdict {
     NeverFits(String),
 }
 
+impl Verdict {
+    /// The stated numbers of a non-admitting verdict.
+    pub fn reason(&self) -> String {
+        match self {
+            Verdict::Admit { need_ram } => format!("admitted, {:.2} GiB RAM", gib(*need_ram)),
+            Verdict::Wait(w) => format!("{w} (others' reservations)"),
+            Verdict::Refuse(w) | Verdict::NeverFits(w) => w.clone(),
+        }
+    }
+}
+
 /// Admission of a build growing the upper by `need_raw` bytes while others hold `reserved` RAM bytes; `margin` RAM bytes stay free. need_ram = ceil(need_raw / ratio).
 pub fn judge(s: &Stats, need_raw: u64, reserved: u64, margin: u64) -> Verdict {
     let need_ram = (need_raw * 1000).div_ceil(s.ratio_milli.max(1));
@@ -417,6 +437,34 @@ fn reserve(ws: &Path, id: &str, need_ram: u64) -> Result<Reservation> {
     use std::io::Write;
     lock.file().write_all(format!("{need_ram}\n").as_bytes())?;
     Ok(Reservation { path, _lock: lock })
+}
+
+/// An admitted reservation: the guard, the store's stats it was judged on, the RAM bytes reserved.
+pub type Admitted = (Reservation, Stats, u64);
+
+/// One admission try of `class` on `probed` (a [`probe`] result), never waiting: run dirs take the pool tier when short (out_run.rs), a wait would only stall an app start. Ok(Err(verdict)) = not admitted, Wait included.
+pub fn admit_once(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Class,
+    probed: std::result::Result<Stats, String>,
+) -> Result<std::result::Result<Admitted, Verdict>> {
+    let stats = match probed {
+        Ok(s) => s,
+        Err(why) => return Ok(Err(Verdict::NeverFits(why))),
+    };
+    let gate = lock_dir(ws).join("admit.lock");
+    let _gate = Flock::take(open_lock(&gate)?, Mode::Exclusive)?;
+    match judge(
+        &stats,
+        class.peak(cfg),
+        reserved(ws)?,
+        cfg.ram_margin_gib.value * GIB,
+    ) {
+        Verdict::Admit { need_ram } => Ok(Ok((reserve(ws, id, need_ram)?, stats, need_ram))),
+        other => Ok(Err(other)),
+    }
 }
 
 /// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits.

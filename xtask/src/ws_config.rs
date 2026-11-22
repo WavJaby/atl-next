@@ -31,6 +31,7 @@
 //! peak_check_gib = 4.8
 //! peak_native_gib = 9
 //! peak_cross_gib = 20
+//! peak_run_gib = 2     # one app data root (seed copy + one launch) in a run dir on the store (out_run.rs)
 //! ```
 
 use std::collections::BTreeMap;
@@ -111,7 +112,8 @@ pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
-pub const DEFAULT_PEAK_MIB: [u64; 4] = [2048, 4915, 9216, 20480];
+/// run: store growth of one app data root from a seed copy through one launch (out_run.rs; the large case, WeChat): RUN_PEAK_DERIVATION.
+pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 2048];
 
 /// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +123,7 @@ pub struct DeltaConfig {
     /// Thousandths: 1950 = 1.95 raw bytes per RAM byte.
     pub ratio_milli: Setting<u64>,
     /// MiB per `delta::Class`, in `Class::ALL` order.
-    pub peak_mib: [Setting<u64>; 4],
+    pub peak_mib: [Setting<u64>; 5],
 }
 
 /// `[disk]`: free-space floors in GiB (`disk_floor`).
@@ -388,7 +390,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.delta.peak_mib[class as usize] = Setting::file(mib);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.peak_{{small,check,native,cross}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.peak_{{small,check,native,cross,run}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }

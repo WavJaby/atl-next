@@ -978,7 +978,9 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
         Entry::Absent | Entry::Other => {}
     }
     let dir = dir_of(ws, &id);
-    let run = crate::out_run::run_dir_of(ws, &id);
+    let store = crate::ws_config::load(ws)?.delta.ram_store.value;
+    let run = crate::out_run::locate(ws, &store, &id)?
+        .map_or_else(|| crate::out_run::run_dir_of(ws, &id), |(d, _)| d);
     if present(&dir)? || present(&run)? {
         let Some(_lock) = build_pool::try_lock_dir(ws, &id)? else {
             bail!(
@@ -1394,20 +1396,19 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             } else {
                 println!("out: ws/{id}: not made yet: the next build command makes it");
             }
-            let run = crate::out_run::run_dir_of(&ws, &id);
-            match crate::out_run::record(&run)? {
-                Some(rec) => println!(
+            let cfg = crate::ws_config::load(&ws)?;
+            match crate::out_run::locate(&ws, &cfg.delta.ram_store.value, &id)? {
+                Some((run, rec)) => println!(
                     "run={} ({}; {} seeded data root(s))",
                     run.display(),
                     rec.tier,
                     rec.uses.len()
                 ),
                 None => println!(
-                    "run={}: not made yet (`cargo xtask out show --run` or `out seed use` makes it)",
-                    run.display()
+                    "run=: not made yet (`cargo xtask out show --run` or `out seed use` makes it, on the ram store when class run fits, else {})",
+                    crate::out_run::run_dir_of(&ws, &id).display()
                 ),
             }
-            let cfg = crate::ws_config::load(&ws)?;
             let store = &cfg.delta.ram_store;
             match crate::delta::probe(&store.value, &cfg.delta)? {
                 Ok(s) => println!("delta store {}: {}", store.value.display(), s.line()),
@@ -1466,6 +1467,19 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 );
             }
             println!();
+            let runs = [
+                "run-dir-ram",
+                "run-dir-pool",
+                "run-ram",
+                "run-pool",
+                "run-full",
+            ]
+            .map(|n| {
+                let v = std::fs::read_to_string(p.join(format!("{n}.count")))
+                    .map_or("0".to_owned(), |t| t.trim().to_owned());
+                format!("{n} {v}")
+            });
+            println!("run counts: {}", runs.join(", "));
         }
         Out::Tier { tier, execute } => return set_tier(root, &ws, tier == "ram", *execute),
         Out::Prune {
@@ -1519,6 +1533,8 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
             bail!("no ram tier for ws/{id}: {why}");
         }
     }
+    // the run dir follows the explicit choice too (off = exact baseline); its data is regenerable
+    crate::out_run::set_tier(root, ws, &cfg.delta, ram, execute)?;
     if now == want {
         println!("out tier: ws/{id} is on tier {want} already");
         return Ok(ExitCode::SUCCESS);
@@ -1601,7 +1617,8 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             },
         }
     }
-    let (runs, seeds) = crate::out_run::orphans(ws, live)?;
+    let store = crate::ws_config::load(ws)?.delta.ram_store.value;
+    let (runs, seeds) = crate::out_run::orphans(ws, &store, live)?;
     for (id, path) in &runs {
         if !execute {
             println!("orphan run/{id}: {} (checkout gone)", path.display());
@@ -1656,7 +1673,6 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         }
     }
     // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
-    let store = crate::ws_config::load(ws)?.delta.ram_store.value;
     let mut keep = live.clone();
     keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
     let strays = crate::delta::orphan_store_dirs(&store, ws, &keep);

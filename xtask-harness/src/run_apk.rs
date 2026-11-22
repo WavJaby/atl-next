@@ -284,6 +284,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     println!("run-apk: data root {}", data_root.display());
+    // a run dir's data root (out show --run, out seed use): its tier's line + counter, a ram run's store reservation held until the run ends
+    let _admitted = xtask::out_run::admit_run(root, &data_root)?;
     let rt = rt.with_data_root(&data_root).for_user_launch();
     Ok(run_on(&rt, args, foreign.as_ref(), pin.as_ref(), files, steps)?.code())
 }
