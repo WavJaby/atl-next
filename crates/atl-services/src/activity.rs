@@ -55,6 +55,7 @@ use binder::{
 
 use crate::activity_start::{self, Refusal};
 use crate::activity_task::{ActivityTasks, Back};
+use crate::am_handler::AmHandler;
 use crate::broadcast::{
     self, BroadcastFilter, Broadcasts, ExportRefusal, IntentKey, StickyRefusal,
 };
@@ -662,6 +663,8 @@ struct Inner {
     bind_services: bool,
     /// Removed Tasks whose processes wait for the top's activityDestroyed or the timeout (Task.mKillProcessesOnDestroyed)
     kill_armed: Mutex<std::collections::BTreeSet<TaskId>>,
+    /// the activity service's delayed messages (am_handler.rs): the removeTask kill timer, keyed by the Task; the message is the Task too
+    handler: AmHandler<TaskId, TaskId>,
     /// bindApplication's `services` (mAppBindArgs, [`common_services`]), built at the first bind
     common_services: std::sync::OnceLock<Map>,
 }
@@ -813,6 +816,15 @@ impl ActivityManager {
                     service_calls: active_services::Outbox::new(),
                     bind_services,
                     kill_armed: Mutex::default(),
+                    handler: {
+                        let inner = inner.clone();
+                        AmHandler::spawn("ActivityHandler", move |task: TaskId| {
+                            if let Some(inner) = inner.upgrade() {
+                                inner.kill_task_processes_on_timeout(task);
+                            }
+                        })
+                        .expect("starting the ActivityHandler thread")
+                    },
                     common_services: std::sync::OnceLock::new(),
                 }
             }),
@@ -1204,26 +1216,19 @@ impl ActivityManager {
             self.inner.kill_task_processes(task);
             return;
         }
-        self.inner
+        // AOSP posts the timeout only for a Task not armed yet (ActivityTaskSupervisor :1865-1869, !mKillProcessesOnDestroyed): a repeat removeTask keeps the first deadline
+        let newly_armed = self
+            .inner
             .kill_armed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(task);
-        let inner = Arc::downgrade(&self.inner);
-        let spawned = std::thread::Builder::new()
-            .name(format!("kill-task-{}", task.raw()))
-            .spawn(move || {
-                std::thread::sleep(KILL_TASK_PROCESSES_TIMEOUT);
-                if let Some(inner) = inner.upgrade() {
-                    inner.kill_task_processes_on_timeout(task);
-                }
-            });
-        if let Err(e) = spawned {
-            log(format_args!(
-                "remove task {}: no timer thread: {e}",
-                task.raw()
-            ));
-            self.inner.kill_task_processes(task);
+        if newly_armed {
+            self.inner.handler.post(
+                task,
+                task,
+                std::time::Instant::now() + KILL_TASK_PROCESSES_TIMEOUT,
+            );
         }
     }
 }
@@ -1266,6 +1271,7 @@ impl Inner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&task);
+        self.handler.remove(&task);
         let (Some(package), Some(uid)) = (self.tasks.package(task), self.tasks.owner(task)) else {
             return;
         };
