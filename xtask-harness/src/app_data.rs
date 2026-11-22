@@ -80,7 +80,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        run_apk::STAGE,
+        "app-data",
         false,
     )?;
     let out = rt.out.clone();

@@ -83,7 +83,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "broadcast-art",
+        "broadcast",
         args.verbose,
     )?;
     let work = rt.out.join("broadcast");

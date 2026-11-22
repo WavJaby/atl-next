@@ -60,7 +60,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "system-scan-art",
+        "system-scan",
         args.verbose,
     )?;
     let work = rt.out.join("system-scan");

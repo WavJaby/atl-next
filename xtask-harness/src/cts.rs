@@ -233,7 +233,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "cts-art",
+        "cts",
         args.verbose,
     )?
     // keystore2 + KeyMint run on every device; CtsKeystoreTestCases and any module touching AndroidKeyStore need them

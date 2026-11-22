@@ -76,7 +76,7 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
-    /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-hold/root/log/`.
+    /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-<stage>-hold/root/log/`.
     #[arg(long, value_name = "SECONDS")]
     hold: Option<u64>,
     /// The headless compositor's output, WxH (default: GATE_OUTPUT, 1920x1200). Stages gtk, portrait and app-id only: their expectations follow the display.
@@ -2447,6 +2447,22 @@ fn hold_report(app_log: &Path, marker: &str, secs: u64, atld_exited: bool) -> Ex
     }
 }
 
+/// The window run's key: its work dir `<out>/<key>` and the runtime's `<key>-art` / `<key>-fonts` (atld_run.rs `Runtime::new`). Named as its check row (`window-surface-view`, `window-webview-overlay-touch`; check_gates.rs `Row::name`), so side-by-side rows never share a dir. `--esc-back` is not in the name, as in `Row::name`; a hold adds `-hold`.
+pub fn work_key(args: &Args) -> String {
+    let stage =
+        clap::ValueEnum::to_possible_value(&args.stage).expect("every stage has a CLI name");
+    let mut key = format!("window-{}", stage.get_name());
+    if args.tap_origin != webview_overlay::TapOrigin::Mouse {
+        let tap = clap::ValueEnum::to_possible_value(&args.tap_origin)
+            .expect("every tap origin has a CLI name");
+        key = format!("{key}-{}", tap.get_name());
+    }
+    if args.hold.is_some() {
+        key.push_str("-hold");
+    }
+    key
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(self_test());
@@ -2454,6 +2470,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = Layout::of(root)?;
     // host CPU pressure through the run: the cadence checks tell a starved host from a client that missed frames
     let sampler = Sampler::start();
+    let key = work_key(args);
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
         root,
@@ -2461,7 +2478,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "window-art",
+        &key,
         args.verbose,
     )?
     .with_gralloc(root)?
@@ -2474,12 +2491,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.output.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Portrait | Stage::AppId) {
         anyhow::bail!("--output needs stage gtk, portrait or app-id");
     }
-    let work_dir = if args.hold.is_some() {
-        "window-hold"
-    } else {
-        "window"
-    };
-    let work = rt.out.join(work_dir);
+    let work = rt.out.join(&key);
     let mut proxy = None;
     // declared before atld, so dropped after it; a hold keeps the desktop's compositor
     let mut nested = None;
@@ -3686,13 +3698,14 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         ),
         Display::NestedX11 | Display::Headless => Display::Headless,
     };
+    let key = work_key(&args);
     let rt = Runtime::new(
         root,
         "window",
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "window-art",
+        &key,
         args.verbose,
     )?
     .with_gralloc(root)?
@@ -3708,7 +3721,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         None => rt,
     };
     let rt = rt.with_app_env(&[format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG)]);
-    let work = rt.out.join("window");
+    let work = rt.out.join(&key);
     let apk = rt.apk.build(
         &root.join(fixture(args.stage)),
         &work.join("apk"),

@@ -109,7 +109,7 @@ fn judge(root: &Path, args: &Args, site: remote::Site) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "gl-art",
+        "gl",
         args.verbose,
     )?
     .with_gralloc(root)?

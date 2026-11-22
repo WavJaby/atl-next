@@ -69,14 +69,14 @@ impl<'a> Gate<'a> {
         java_out: Option<PathBuf>,
         (break_blank, break_input): (bool, bool),
     ) -> Result<Self> {
-        // staged as run-apk: the drives are run-apk runs, and their remote record (Runtime::record_inputs) is run-apk's
+        // gate run-apk: the drives are run-apk runs, and their remote record (Runtime::record_inputs) is run-apk's; the work dir is drive-gate's
         let rt = Runtime::new(
             root,
             "run-apk",
             host,
             out.as_deref(),
             java_out.as_deref(),
-            run_apk::STAGE,
+            "drive-gate",
             false,
         )?;
         let work = rt.out.join("drive-gate");

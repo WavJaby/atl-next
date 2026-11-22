@@ -69,7 +69,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        "es1-art",
+        "es1-angle",
         args.verbose,
     )?
     .with_gralloc(root)?

@@ -338,6 +338,8 @@ pub struct Runtime {
     framework_res: PathBuf,
     /// The pinned test fonts atld reads as the desktop's (test_fonts.rs): its FONTCONFIG_FILE and `--font-data`.
     fonts: crate::test_fonts::TestFonts,
+    /// `<out>/<key>-fonts`: where [`Runtime::with_sans_serif`] restages the set.
+    fonts_dir: PathBuf,
     /// [`Runtime::for_user_launch`]: atld reads the desktop's own fontconfig, not the pinned set (`--font-data` stays AOSP's).
     desktop_fonts: bool,
     /// AOSP's keyboards dir: its [`tree::KEYBOARD_FILES`] are linked into /system (the input service loads the maps, the app's input thread the layout).
@@ -804,7 +806,7 @@ impl Signer {
 }
 
 impl Runtime {
-    /// Stages ART into `<out>/<stage>`, builds the cargo binaries, checks every input exists; the test fonts are written to `<out>/fonts`. `gate` names the caller in gate_goals.rs GATES:
+    /// Stages ART into `<out>/<key>-art` and the test fonts into `<out>/<key>-fonts`, builds the cargo binaries, checks every input exists. `key` is the gate's work dir name (`<out>/<key>`): the runtime stages beside that dir, never into it, because a gate may wipe its own work dir. `gate` names the caller in gate_goals.rs GATES:
     /// the build dir is refused up front unless built with its goals.
     pub fn new(
         root: &Path,
@@ -812,18 +814,21 @@ impl Runtime {
         host: &str,
         out: Option<&Path>,
         java_out: Option<&Path>,
-        stage: &str,
+        key: &str,
         verbose: bool,
     ) -> Result<Runtime> {
         let layout = Layout::of(root)?;
         let out = crate::build_state::gate_out(root, out, host, gate)?;
+        // check_gates.rs `runtime_work` reads this line: which work dir the row's runtime staged under
+        println!("runtime: work={key}");
         // a cross host's graph builds its own Java outputs and build-side tools (aapt2 under `build/`) into its out dir; the build dir's are the build machine's graph's
         let java_out = match (java_out, xtask::native::cross_host_of(root, &out)?) {
             (None, Some(_)) => out.clone(),
             (java_out, _) => out::out_dir(root, java_out)?,
         };
+        let stage = format!("{key}-art");
         let art = xtask::timing::phase("runtime: host art", || {
-            HostArt::new(root, host, Some(&java_out), &out, stage, verbose)
+            HostArt::new(root, host, Some(&java_out), &out, &stage, verbose)
         })?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
         ensure!(
@@ -866,8 +871,8 @@ impl Runtime {
             "missing input {}",
             framework_res.display()
         );
-        let fonts =
-            crate::test_fonts::stage(&layout, &out.join("fonts"), crate::test_fonts::ROBOTO.2)?;
+        let fonts_dir = out.join(format!("{key}-fonts"));
+        let fonts = crate::test_fonts::stage(&layout, &fonts_dir, crate::test_fonts::ROBOTO.2)?;
         let keychars = tree::keyboards(&layout);
         let mut platform_files = platform_rows(&out, &layout.src().join("aosp"))?;
         platform_files.push(settings_provider_row(&out)?);
@@ -928,6 +933,7 @@ impl Runtime {
             api_impl,
             framework_res,
             fonts,
+            fonts_dir,
             desktop_fonts: false,
             keychars,
             gralloc: None,
@@ -1069,7 +1075,7 @@ impl Runtime {
 
     /// Restages the test fonts with `family` preferred for sans-serif (the font gate's deliberate break: the mono font).
     pub fn with_sans_serif(mut self, layout: &Layout, family: &str) -> Result<Self> {
-        self.fonts = crate::test_fonts::stage(layout, &self.out.join("fonts"), family)?;
+        self.fonts = crate::test_fonts::stage(layout, &self.fonts_dir, family)?;
         Ok(self)
     }
 

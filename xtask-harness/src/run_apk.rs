@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
-//! Staging is the window gate's: the runtime (Runtime::new, gralloc, the display), the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
+//! Staging is the window gate's runtime setup (Runtime::new, gralloc, the display) under run-apk's own key (`<out>/run-apk`, `run-apk-art`, `run-apk-fonts`): the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
 //! Every run starts from a clean install (owner 2026-11-22): a fresh, empty data root `<run dir>/<name>` (xtask out_run.rs `fresh_root`, `cargo xtask out show --run`; name = the row, or `apk-<file stem>`), emptied at the run's start, the APK installed into it. Nothing is carried from an earlier run.
 //! `--reuse-data-root DIR` is the explicit opt-in for a human relaunching on one root (and the app-data gate's launches): atld `--data-root DIR`, kept across launches, `--clear-data` = `pm clear` of the package. The line `run-apk: data root: fresh|reused <path>` names which, so no report can hide a reused root.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
@@ -33,8 +33,6 @@ use xtask::timing;
 
 /// The app process's log line for a presented frame (atl-composer ui_window.rs, debug level: UI mode enables it).
 pub(crate) const PRESENT_LINE: &str = "atl-composer: ui: present";
-/// The staged runtime's name, shared with the window gate: one ART install for both.
-pub(crate) const STAGE: &str = "window-art";
 /// What a remote run returns under its scratch dir besides the logs: atld's log, its exit code (`atld.rc`) and its end time (`end.ms`, the target's clock).
 const END_FILES: [&str; 3] = ["atld.log", "atld.rc", "end.ms"];
 /// How long past the target's limit the transfer may run (its tar and ssh) before it is stopped and the run fails.
@@ -1096,7 +1094,7 @@ fn runtime(
         &args.host,
         args.out.as_deref(),
         args.java_out.as_deref(),
-        STAGE,
+        "run-apk",
         args.verbose,
     )?;
     let foreign = foreign_abi(rt.abis(), &args.host, files)?;

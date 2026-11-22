@@ -140,9 +140,10 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
         let phases = phases_field(&text);
         ends.count(phases.as_ref());
         let measured = format!(
-            "peak={}MiB{}",
+            "peak={}MiB{} work={}",
             peak.kib / 1024,
-            phases.map(|p| format!(" {}", p.field)).unwrap_or_default()
+            phases.map(|p| format!(" {}", p.field)).unwrap_or_default(),
+            runtime_work(&text).unwrap_or("-")
         );
         let outcome = Outcome::of_exit(status.code());
         let line = match outcome {
@@ -326,6 +327,13 @@ fn keep_unless_pass(
 }
 
 /// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
+/// The work dir a row's runtime staged under: its `runtime: work=<key>` line (atld_run.rs `Runtime::new`). None for a row that runs no atld runtime.
+fn runtime_work(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("runtime: work="))
+        .map(str::trim)
+}
+
 fn undecided_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let prefix = format!("{cmd}: {UNDECIDED_WORD}");
     text.lines().rev().find(|l| l.starts_with(&prefix))
@@ -464,6 +472,68 @@ mod tests {
             Row::new(&["platform-ui"], false, false).argv("h", "o"),
             ["platform-ui"]
         );
+    }
+
+    /// A window run's argv parsed as `window::Args`: the `window` word is the bin name, as in `xtask test window ...`.
+    #[derive(clap::Parser)]
+    struct WindowRow {
+        #[command(flatten)]
+        args: crate::window::Args,
+    }
+
+    fn window_key(tail: &[&str]) -> String {
+        let argv: Vec<&str> = ["window", "--host", "x86_64", "--out", "/tmp/out"]
+            .into_iter()
+            .chain(tail.iter().copied())
+            .collect();
+        let row = WindowRow::try_parse_from(argv).unwrap_or_else(|e| panic!("{e}"));
+        crate::window::work_key(&row.args)
+    }
+
+    /// Each window row's work key is its row name, and no two rows share one: rows run side by side only in distinct dirs.
+    #[test]
+    fn window_rows_name_their_own_work_dirs() {
+        let rows: Vec<&Row> = ROWS.iter().filter(|r| r.cmd() == "window").collect();
+        let mut keys = std::collections::BTreeSet::new();
+        for row in &rows {
+            let argv = row.argv("x86_64", "/tmp/out");
+            let parsed =
+                WindowRow::try_parse_from(argv).unwrap_or_else(|e| panic!("{}: {e}", row.name()));
+            let key = crate::window::work_key(&parsed.args);
+            assert_eq!(key, row.name());
+            assert!(keys.insert(key), "{}: shares its work dir", row.name());
+        }
+        assert_eq!(keys.len(), rows.len());
+    }
+
+    /// A tap origin other than the mouse default and a hold each change the key; `--esc-back` does not, as in `Row::name`.
+    #[test]
+    fn work_keys_name_tap_origin_and_hold() {
+        assert_eq!(
+            window_key(&["--stage", "webview-overlay"]),
+            "window-webview-overlay"
+        );
+        assert_eq!(
+            window_key(&["--stage", "webview-overlay", "--esc-back"]),
+            "window-webview-overlay"
+        );
+        assert_eq!(
+            window_key(&["--stage", "webview-overlay", "--tap-origin", "mouse-finger"]),
+            "window-webview-overlay-mouse-finger"
+        );
+        assert_eq!(
+            window_key(&["--stage", "gtk", "--hold", "5"]),
+            "window-gtk-hold"
+        );
+    }
+
+    #[test]
+    fn runtime_work_reads_the_runtime_line() {
+        assert_eq!(
+            runtime_work("runtime: host art 1.2s\nruntime: work=window-ime\nwindow: pass\n"),
+            Some("window-ime")
+        );
+        assert_eq!(runtime_work("sandbox: ok\n"), None);
     }
 
     /// The red log outlives the next check's overwrite of the gate's log; an undecided one goes to its own bucket; a pass keeps nothing.
