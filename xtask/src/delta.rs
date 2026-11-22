@@ -516,14 +516,27 @@ fn admit(
 
 /// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker (not for land: its units' paths are its own, as out::make), the checkout's mtimes restored from the base when `restore` (out::make's rule). Err when there is no base (a build from zero is the pool tier's).
 pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path, restore: bool) -> Result<Record> {
+    let _pin = bases_lock(ws)?;
+    let base = out::pick_base(root, ws)?.context("no base to lay a ram delta over")?;
+    lay_ram(root, ws, id, store, &base, restore)
+}
+
+/// [`make_ram`] over base/`base`; the caller holds [`bases_lock`] since it chose `base`.
+fn lay_ram(
+    root: &Path,
+    ws: &Path,
+    id: &str,
+    store: &Path,
+    base: &str,
+    restore: bool,
+) -> Result<Record> {
     let dir = out::dir_of(ws, id);
     ensure!(
         !out::present(&dir)?,
         "{} exists: drop it first (`cargo xtask out tier`)",
         dir.display()
     );
-    let _pin = bases_lock(ws)?;
-    let base = out::pick_base(root, ws)?.context("no base to lay a ram delta over")?;
+    let base = base.to_owned();
     let rec = Record {
         base: base.clone(),
         store: store.to_owned(),
