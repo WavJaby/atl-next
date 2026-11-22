@@ -392,6 +392,9 @@ struct Ids {
     commits: Arc<Commits>,
     /// The proxy-wide [`Tile`].
     tile: Arc<Tile>,
+    /// The interfaces whose globals this connection is not told of ([`Withheld`]; empty outside a security context), and the proxy-wide policy whose count it adds to.
+    hidden: Vec<String>,
+    withheld: Arc<Withheld>,
 }
 
 impl Ids {
@@ -893,6 +896,13 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
         throttle: Arc::clone(&hub.counters.throttle),
         commits: Arc::clone(&hub.counters.commits),
         tile: Arc::clone(&hub.counters.tile),
+        // the sandbox policy as it stands when the connection opens: a context's connections only
+        hidden: if hub.in_context {
+            hub.counters.withheld.interfaces()
+        } else {
+            Vec::new()
+        },
+        withheld: Arc::clone(&hub.counters.withheld),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
@@ -913,13 +923,6 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
         Arc::clone(&hub.injections),
         Arc::clone(&hub.window),
     );
-    // the sandbox policy as it stands when the connection opens: a context's connections only
-    let hidden = if hub.in_context {
-        hub.counters.withheld.interfaces()
-    } else {
-        Vec::new()
-    };
-    let withheld = (hidden, Arc::clone(&hub.counters.withheld));
     thread::spawn(move || {
         let _ = server_to_client(
             &server,
@@ -929,7 +932,6 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
             &events_s,
             &injections,
             &window,
-            &withheld,
         );
         let _ = client.shutdown(std::net::Shutdown::Both);
     });
@@ -1060,11 +1062,15 @@ fn server_to_client(
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
-    (hidden, withheld): &(Vec<String>, Arc<Withheld>),
 ) -> Result<()> {
-    let (presented, throttle) = {
+    let (presented, throttle, hidden, withheld) = {
         let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
-        (Arc::clone(&ids.presented), Arc::clone(&ids.throttle))
+        (
+            Arc::clone(&ids.presented),
+            Arc::clone(&ids.throttle),
+            ids.hidden.clone(),
+            Arc::clone(&ids.withheld),
+        )
     };
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
