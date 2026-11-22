@@ -134,11 +134,14 @@ pub fn ram_run_dir_of(store: &Path, id: &str) -> PathBuf {
 }
 
 /// Checkout `id`'s run dir and record: the pool's first (one is made only when no ram dir was found, so one beside a ram dir means the store was away when it was made: the ram dir is stale), then the store's when its record names workspace `ws`.
-pub fn locate(ws: &Path, store: &Path, id: &str) -> Result<Option<(PathBuf, Record)>> {
+pub fn locate(ws: &Path, store: Option<&Path>, id: &str) -> Result<Option<(PathBuf, Record)>> {
     let pool = run_dir_of(ws, id);
     if let Some(rec) = record(&pool)? {
         return Ok(Some((pool, rec)));
     }
+    let Some(store) = store else {
+        return Ok(None);
+    };
     let ram = ram_run_dir_of(store, id);
     // an unreadable record in the shared store (another workspace's, a crash) is not ours
     match record(&ram) {
@@ -168,6 +171,7 @@ fn choose(
     ws: &Path,
     id: &str,
     cfg: &crate::ws_config::DeltaConfig,
+    store: &Path,
     probed: std::result::Result<delta::Stats, String>,
 ) -> Result<(bool, String)> {
     Ok(
@@ -177,7 +181,7 @@ fn choose(
                 format!(
                     "class run fits: {:.2} GiB RAM per data root; store {}: {}",
                     need_ram as f64 / GIB,
-                    cfg.ram_store.value.display(),
+                    store.display(),
                     stats.line()
                 ),
             ),
@@ -200,19 +204,18 @@ fn make(
     id: &str,
     pool_only: Option<&str>,
 ) -> Result<PathBuf> {
-    let store = &cfg.ram_store.value;
+    let store = cfg.ram_store.value.as_deref();
     if let Some((dir, _)) = locate(ws, store, id)? {
         return Ok(dir);
     }
-    let (ram, why) = if let Some(why) = pool_only {
-        (false, why.to_owned())
-    } else {
-        choose(ws, id, cfg, delta::probe(store, cfg)?)?
+    let (ram, why) = match (pool_only, store) {
+        (Some(why), _) => (false, why.to_owned()),
+        (None, Some(store)) => choose(ws, id, cfg, store, delta::probe(store, cfg)?)?,
+        (None, None) => (false, delta::NO_STORE.to_owned()),
     };
-    let (dir, rec) = if ram {
-        (ram_run_dir_of(store, id), Record::ram(ws))
-    } else {
-        (run_dir_of(ws, id), Record::pool())
+    let (dir, rec) = match (ram, store) {
+        (true, Some(store)) => (ram_run_dir_of(store, id), Record::ram(ws)),
+        _ => (run_dir_of(ws, id), Record::pool()),
     };
     // stderr: `out show --run` prints only the path on stdout
     eprintln!("out: run {} ({why})", rec.tier);
@@ -283,10 +286,13 @@ fn list(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
 pub type Dirs = Vec<(String, PathBuf)>;
 
 /// The run dirs `out prune` removes: those whose id is not in `live`, and ram ones beside a pool run dir of the same id ([`locate`] reads the pool's).
-pub fn orphans(ws: &Path, store: &Path, live: &BTreeSet<String>) -> Result<Dirs> {
+pub fn orphans(ws: &Path, store: Option<&Path>, live: &BTreeSet<String>) -> Result<Dirs> {
     let pool = run_dirs(ws)?;
     let pool_ids: BTreeSet<&str> = pool.iter().map(|(id, _)| id.as_str()).collect();
-    let ram = ram_run_dirs(store, ws)?;
+    let ram = match store {
+        Some(store) => ram_run_dirs(store, ws)?,
+        None => Vec::new(),
+    };
     let stale_ram: Vec<_> = ram
         .iter()
         .filter(|(id, _)| pool_ids.contains(id.as_str()) || !live.contains(id))
@@ -335,7 +341,7 @@ fn fresh_at(
     let mut dir = make(ws, &cfg.delta, id, None)?;
     let rec = record(&dir)?.context("run dir lost its record")?;
     if rec.is_ram() {
-        let probed = delta::probe(&cfg.delta.ram_store.value, &cfg.delta)?;
+        let probed = delta::probe_store(cfg.delta.ram_store.value.as_deref(), &cfg.delta)?;
         if let Err(v) = delta::admit_once(ws, id, &cfg.delta, delta::Class::Run, probed)? {
             if matches!(v, delta::Verdict::Refuse(_)) {
                 out::count(ws, "run-full");
@@ -367,7 +373,7 @@ pub fn set_tier(
     execute: bool,
 ) -> Result<()> {
     let id = out::checkout_id(root)?;
-    let Some((dir, rec)) = locate(ws, &cfg.ram_store.value, &id)? else {
+    let Some((dir, rec)) = locate(ws, cfg.ram_store.value.as_deref(), &id)? else {
         return Ok(());
     };
     let want = if ram { TIER_RAM } else { TIER_POOL };
@@ -404,13 +410,18 @@ pub struct RunAdmission {
 }
 
 /// Which run dir holds `data_root`: (id, ram?) when it lies inside one of workspace `ws`'s (either tier), else None (a gate's own root, the user's).
-pub fn run_dir_holding(ws: &Path, store: &Path, data_root: &Path) -> Option<(String, bool)> {
+pub fn run_dir_holding(
+    ws: &Path,
+    store: Option<&Path>,
+    data_root: &Path,
+) -> Option<(String, bool)> {
     let p = std::path::absolute(data_root).ok()?;
     let p = std::fs::canonicalize(&p).unwrap_or(p);
-    for (base, ram) in [
-        (out::pool(ws).join(RUN_DIRS), false),
-        (store.join(RAM_RUN_DIRS), true),
-    ] {
+    let mut bases = vec![(out::pool(ws).join(RUN_DIRS), false)];
+    if let Some(store) = store {
+        bases.push((store.join(RAM_RUN_DIRS), true));
+    }
+    for (base, ram) in bases {
         let base = std::fs::canonicalize(&base).unwrap_or(base);
         if let Ok(rest) = p.strip_prefix(&base)
             && let Some(std::path::Component::Normal(id)) = rest.components().next()
@@ -431,18 +442,23 @@ pub fn run_dir_holding(ws: &Path, store: &Path, data_root: &Path) -> Option<(Str
 pub fn admit_run(root: &Path, data_root: &Path) -> Result<Option<RunAdmission>> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let cfg = crate::ws_config::load(&ws)?.delta;
-    let Some((id, ram)) = run_dir_holding(&ws, &cfg.ram_store.value, data_root) else {
+    let Some((id, ram)) = run_dir_holding(&ws, cfg.ram_store.value.as_deref(), data_root) else {
         return Ok(None);
     };
     let mut reservation = None;
     if ram {
-        let probed = delta::probe(&cfg.ram_store.value, &cfg)?;
+        let store = cfg
+            .ram_store
+            .value
+            .as_deref()
+            .context("a ram run dir without delta.ram_store")?;
+        let probed = delta::probe(store, &cfg)?;
         match delta::admit_once(&ws, &id, &cfg, delta::Class::Run, probed)? {
             Ok((r, stats, need_ram)) => {
                 println!(
                     "out: run ram (app run in run/{id}, {:.2} GiB RAM reserved; store {}: {})",
                     need_ram as f64 / GIB,
-                    cfg.ram_store.value.display(),
+                    store.display(),
                     stats.line()
                 );
                 reservation = Some(r);
@@ -477,7 +493,8 @@ impl Drop for RunAdmission {
             return;
         }
         self._reservation = None;
-        let Ok(Ok(stats)) = delta::probe(&self.cfg.ram_store.value, &self.cfg) else {
+        let Ok(Ok(stats)) = delta::probe_store(self.cfg.ram_store.value.as_deref(), &self.cfg)
+        else {
             return;
         };
         // full by the store's own accounting: land's hold is not fullness, so none here
@@ -586,10 +603,10 @@ mod tests {
         assert_eq!(dir, ram_run_dir_of(&store, "r"));
         assert_eq!(record(&dir).unwrap(), Some(Record::ram(&ws)));
         assert_eq!(counter(&ws, "run-dir-ram"), 1);
-        assert_eq!(locate(&ws, &store, "r").unwrap().unwrap().0, dir);
+        assert_eq!(locate(&ws, Some(&store), "r").unwrap().unwrap().0, dir);
         // another workspace never sees it
         assert!(
-            locate(Path::new("/elsewhere"), &store, "r")
+            locate(Path::new("/elsewhere"), Some(&store), "r")
                 .unwrap()
                 .is_none()
         );
@@ -612,7 +629,7 @@ mod tests {
             ratio_measured: true,
         };
         let def = cfg_at(&store, "");
-        let (ram, why) = choose(&ws, "f", &def, Ok(full)).unwrap();
+        let (ram, why) = choose(&ws, "f", &def, &store, Ok(full)).unwrap();
         assert!(!ram && why.contains("RAM free"), "{why}");
         assert_eq!(counter(&ws, "run-full"), 1);
         let _ = std::fs::remove_dir_all(&ws);
@@ -632,9 +649,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("wx/apps")).unwrap();
         std::fs::remove_dir_all(&store).unwrap();
         std::fs::create_dir_all(&store).unwrap();
-        assert!(locate(&ws, &store, "r").unwrap().is_none());
+        assert!(locate(&ws, Some(&store), "r").unwrap().is_none());
         let live = BTreeSet::from(["r".to_owned()]);
-        assert!(orphans(&ws, &store, &live).unwrap().is_empty());
+        assert!(orphans(&ws, Some(&store), &live).unwrap().is_empty());
         assert!(!run_dir_of(&ws, "r").exists());
         assert_eq!(make(&ws, &cfg, "r", None).unwrap(), dir);
         let _ = std::fs::remove_dir_all(&ws);
@@ -664,7 +681,7 @@ mod tests {
         std::fs::create_dir_all(&theirs).unwrap();
         write_record(&theirs, &Record::ram(Path::new("/other"))).unwrap();
         let live = BTreeSet::from(["live".to_owned(), "both".to_owned()]);
-        let got = orphans(&ws, &store, &live).unwrap();
+        let got = orphans(&ws, Some(&store), &live).unwrap();
         assert_eq!(
             got,
             [
@@ -675,15 +692,19 @@ mod tests {
         );
         // which run dir holds a data root: the tier and id of its run dir, nothing for a path outside every run dir
         assert_eq!(
-            run_dir_holding(&ws, &store, &ram_run_dir_of(&store, "live").join("wx")),
+            run_dir_holding(
+                &ws,
+                Some(&store),
+                &ram_run_dir_of(&store, "live").join("wx")
+            ),
             Some(("live".to_owned(), true))
         );
         assert_eq!(
-            run_dir_holding(&ws, &store, &run_dir_of(&ws, "both").join("wx")),
+            run_dir_holding(&ws, Some(&store), &run_dir_of(&ws, "both").join("wx")),
             Some(("both".to_owned(), false))
         );
-        assert_eq!(run_dir_holding(&ws, &store, &theirs.join("wx")), None);
-        assert_eq!(run_dir_holding(&ws, &store, &ws.join("data")), None);
+        assert_eq!(run_dir_holding(&ws, Some(&store), &theirs.join("wx")), None);
+        assert_eq!(run_dir_holding(&ws, Some(&store), &ws.join("data")), None);
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&store);
     }

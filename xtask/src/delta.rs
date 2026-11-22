@@ -8,7 +8,7 @@
 //! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits (the line names the holders).
 //! A process still holding it when the command returns (a daemon a build spawned: sccache server, gradle, kotlin) may still use the overlay, so the outer command ends it ([`end_holders`]): the mount and everything using it end with the command.
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
-//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]).
+//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends the build to the pool; an existing ram dir is dropped first ([`fall_to_pool`]).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -186,6 +186,20 @@ impl Stats {
 
 fn gib(b: u64) -> f64 {
     b as f64 / GIB as f64
+}
+
+/// The reason of a tier decision with `delta.ram_store` unset: no RAM tier.
+pub const NO_STORE: &str = "no delta.ram_store in workspace.toml: RAM tier off";
+
+/// [`probe`] of the configured store; unset = Err([`NO_STORE`]).
+pub fn probe_store(
+    store: Option<&Path>,
+    cfg: &DeltaConfig,
+) -> Result<std::result::Result<Stats, String>> {
+    match store {
+        Some(path) => probe(path, cfg),
+        None => Ok(Err(NO_STORE.to_owned())),
+    }
 }
 
 /// The store at `path`: Ok(stats) when it is RAM-backed, Err(reason) when not (the pool tier's stated reason).
@@ -553,18 +567,20 @@ pub fn fits_now(
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
-    store: &Path,
+    store: Option<&Path>,
 ) -> Result<std::result::Result<String, String>> {
-    Ok(match admit_once(ws, id, cfg, class, probe(store, cfg)?)? {
-        Ok((_released, stats, need_ram)) => Ok(format!(
-            "{} build fits, {:.2} GiB RAM; store {}: {}",
-            class.name(),
-            gib(need_ram),
-            store.display(),
-            stats.line()
-        )),
-        Err(v) => Err(format!("{} build: {}", class.name(), v.reason())),
-    })
+    Ok(
+        match admit_once(ws, id, cfg, class, probe_store(store, cfg)?)? {
+            Ok((_released, stats, need_ram)) => Ok(format!(
+                "{} build fits, {:.2} GiB RAM; store {}: {}",
+                class.name(),
+                gib(need_ram),
+                store.map_or_else(|| "unset".to_owned(), |p| p.display().to_string()),
+                stats.line()
+            )),
+            Err(v) => Err(format!("{} build: {}", class.name(), v.reason())),
+        },
+    )
 }
 
 /// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits / Held.
@@ -667,6 +683,11 @@ pub fn drop_ram(ws: &Path, id: &str, rec: &Record) -> Result<()> {
     let Some(_m) = try_mount_lock(ws, id)? else {
         bail!("ws/{id}: its ram delta is mounted by a running command: not removed");
     };
+    remove_ram(ws, id, rec)
+}
+
+/// [`drop_ram`] under the mount lock the caller holds.
+fn remove_ram(ws: &Path, id: &str, rec: &Record) -> Result<()> {
     let sd = rec.dir(id);
     if out::present(&sd)? {
         remove_tree(&sd)?;
@@ -769,7 +790,7 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     let cfg = crate::ws_config::load(&ws)?;
     let id = out::checkout_id(root)?;
     let dir = out::dir_of(&ws, &id);
-    let mut rec = record(&dir)?;
+    let rec = record(&dir)?;
     let pool = |reason: &str| -> Result<Option<ExitCode>> {
         println!("out: delta pool ({reason})");
         out::count(&ws, "delta-pool");
@@ -778,39 +799,18 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     if rec.is_none() && out::present(&dir)? {
         return pool(&format!("ws/{id} is a pool dir"));
     }
-    let store = rec
-        .as_ref()
-        .map_or_else(|| cfg.delta.ram_store.value.clone(), |r| r.store.clone());
+    // an existing ram dir keeps its store; a new one takes the configured store, and an unset store is the pool
+    let Some(store) = rec.as_ref().map_or_else(
+        || cfg.delta.ram_store.value.clone(),
+        |r| Some(r.store.clone()),
+    ) else {
+        return pool(NO_STORE);
+    };
     let admitted = admit(&ws, &id, &cfg.delta, class, || probe(&store, &cfg.delta))?;
     let (reservation, stats, need_ram) = match admitted {
         Ok(a) => a,
-        Err(Verdict::Refuse(why)) if rec.is_some() => {
-            out::count(&ws, "delta-refused");
-            println!("out: delta refused ({why})");
-            bail!(
-                "ws/{id} is a ram delta and its store is full ({why}): not started. Free room: `cargo xtask out prune --execute` (gone worktrees' deltas), or move this checkout to the pool: `cargo xtask out tier pool --execute`"
-            );
-        }
-        // land first: the hold is standing, so an existing ram dir is refused (waiting is pointless) and a new dir takes the pool
-        Err(Verdict::Held(why)) if rec.is_some() => {
-            out::count(&ws, "delta-refused");
-            println!("out: delta refused ({why})");
-            bail!(
-                "ws/{id} is a ram delta and the store's free room is held for land ({why}): not started. Move this checkout to the pool: `cargo xtask out tier pool --execute`"
-            );
-        }
-        Err(Verdict::Held(why)) => return pool(&why),
-        Err(Verdict::Refuse(why) | Verdict::NeverFits(why) | Verdict::Wait(why)) => {
-            if let Some(r) = rec.take() {
-                drop_ram(&ws, &id, &r)?;
-                println!(
-                    "out: ws/{id}: ram delta dropped: {} build {why}",
-                    class.name()
-                );
-            }
-            return pool(&format!("{} build: {why}", class.name()));
-        }
         Err(Verdict::Admit { .. }) => bail!("delta admission returned Admit as a refusal"),
+        Err(v) => return fall_to_pool(&ws, &id, class, rec, v),
     };
     match rec {
         Some(r) => {
@@ -871,6 +871,34 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     end_holders(&ws, &id, &lock_path, std::process::id())?;
     drop(reservation);
     Ok(Some(code))
+}
+
+/// The pool tier for a build that admission does not admit: the same remedy for every verdict (Refuse, Held, NeverFits). An existing ram dir is dropped first and the caller makes the pool dir from base; its upper is regenerable build output. A dir mounted by a command of this checkout is live state: not dropped, the build stops (`delta-refused`). One line names the verdict; `delta-dropped` counts a drop, `delta-pool` every pool build.
+fn fall_to_pool(
+    ws: &Path,
+    id: &str,
+    class: Class,
+    rec: Option<Record>,
+    v: Verdict,
+) -> Result<Option<ExitCode>> {
+    let why = format!("{} build: {}", class.name(), v.reason());
+    let Some(r) = rec else {
+        println!("out: delta pool ({why})");
+        out::count(ws, "delta-pool");
+        return Ok(None);
+    };
+    // the lock stays held across the removal: a second take here would conflict with it (flock per open file)
+    let Some(_mount) = try_mount_lock(ws, id)? else {
+        out::count(ws, "delta-refused");
+        bail!(
+            "ws/{id}: {why}; its ram delta is in use by a running command of this checkout: not dropped, the build did not start (run it again when that command ends)"
+        );
+    };
+    remove_ram(ws, id, &r)?;
+    println!("out: delta pool (ws/{id} ram delta dropped: {why})");
+    out::count(ws, "delta-dropped");
+    out::count(ws, "delta-pool");
+    Ok(None)
 }
 
 /// A process sharing the locked open file of a mount lock: it inherited the fd from the outer command.
@@ -1505,6 +1533,152 @@ mod tests {
         std::fs::remove_dir_all(&store).unwrap();
     }
 
+    /// Value of counter `name` of workspace `ws` (0 when never counted).
+    fn count_of(ws: &Path, name: &str) -> u64 {
+        std::fs::read_to_string(out::pool(ws).join(format!("{name}.count")))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Checkout `c`'s ram dir over base `b` in `store`, laid as make_ram lays it: the mount point with its record, and the store dir with upper, work and owner.
+    fn ram_dir_fixture(ws: &Path, store: &Path) -> Record {
+        let rec = Record {
+            base: "b".into(),
+            store: store.to_owned(),
+        };
+        let sd = rec.dir("c");
+        std::fs::create_dir_all(sd.join("upper")).unwrap();
+        std::fs::create_dir_all(sd.join("work")).unwrap();
+        std::fs::write(sd.join(OWNER), format!("{}\n", ws.display())).unwrap();
+        let dir = out::dir_of(ws, "c");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(RECORD), rec.text()).unwrap();
+        rec
+    }
+
+    /// Held from admission, not a built verdict: the land-hold store of `land_hold_keeps_room_for_land` (10 GiB limit, 3 used) holds a check. An existing ram dir falls to the pool: dropped now, counted, nothing refused.
+    #[test]
+    fn held_ram_delta_falls_to_pool() {
+        let pid = std::process::id();
+        let ws = std::env::temp_dir().join(format!("xtask-delta-held-{pid}"));
+        let store = std::env::temp_dir().join(format!("xtask-delta-held-store-{pid}"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let rec = ram_dir_fixture(&ws, &store);
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let Err(v) = admit(&ws, "c", &cfg, Class::Check, || {
+            Ok(Ok(stats(10.0, 3.0, 1950)))
+        })
+        .unwrap() else {
+            panic!("the check was admitted: no hold, so no fall to test");
+        };
+        assert!(matches!(v, Verdict::Held(_)), "{v:?}");
+        assert!(
+            fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!out::dir_of(&ws, "c").exists());
+        assert!(!rec.dir("c").exists());
+        assert_eq!(count_of(&ws, "delta-dropped"), 1);
+        assert_eq!(count_of(&ws, "delta-pool"), 1);
+        assert_eq!(count_of(&ws, "delta-refused"), 0);
+        std::fs::remove_dir_all(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Refuse from admission: the store's RAM is full by its own accounting (8 GiB limit, 7.5 used), so a check cannot fit whatever is reserved. The ram dir falls to the pool as Held does.
+    #[test]
+    fn refused_ram_delta_falls_to_pool() {
+        let pid = std::process::id();
+        let ws = std::env::temp_dir().join(format!("xtask-delta-refused-{pid}"));
+        let store = std::env::temp_dir().join(format!("xtask-delta-refused-store-{pid}"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let rec = ram_dir_fixture(&ws, &store);
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let Err(v) = admit(&ws, "c", &cfg, Class::Check, || {
+            Ok(Ok(stats(8.0, 7.5, 1950)))
+        })
+        .unwrap() else {
+            panic!("the check was admitted on a full store");
+        };
+        assert!(matches!(v, Verdict::Refuse(_)), "{v:?}");
+        assert!(
+            fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!out::dir_of(&ws, "c").exists());
+        assert!(!rec.dir("c").exists());
+        assert_eq!(count_of(&ws, "delta-dropped"), 1);
+        assert_eq!(count_of(&ws, "delta-refused"), 0);
+        std::fs::remove_dir_all(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// The same Held verdict while a command of this checkout still has the dir mounted (its mount lock held by a live process): the upper is live state, so nothing is dropped and the build stops, counted `delta-refused`.
+    #[test]
+    fn ram_delta_in_use_stops_the_build() {
+        let pid = std::process::id();
+        let ws = std::env::temp_dir().join(format!("xtask-delta-busy-{pid}"));
+        let store = std::env::temp_dir().join(format!("xtask-delta-busy-store-{pid}"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let rec = ram_dir_fixture(&ws, &store);
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let (mut holder, mut bystander) = lingering_holder(&ws, "c");
+        let verdict = admit(&ws, "c", &cfg, Class::Check, || {
+            Ok(Ok(stats(10.0, 3.0, 1950)))
+        })
+        .unwrap();
+        let got = match verdict {
+            Err(v) => fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v),
+            Ok(_) => panic!("the check was admitted: no hold, so no stop to test"),
+        };
+        let _ = holder.kill();
+        let _ = bystander.kill();
+        let _ = holder.wait();
+        let _ = bystander.wait();
+        let msg = format!("{:#}", got.expect_err("a mounted ram dir is not dropped"));
+        assert!(msg.contains("in use by a running command"), "{msg}");
+        assert!(out::dir_of(&ws, "c").exists());
+        assert!(rec.dir("c").join("upper").is_dir());
+        assert_eq!(count_of(&ws, "delta-refused"), 1);
+        assert_eq!(count_of(&ws, "delta-dropped"), 0);
+        std::fs::remove_dir_all(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// `delta.ram_store` has no default: unset is no RAM tier, with the reason the probe names; a file's value is the store.
+    #[test]
+    fn no_ram_store_by_default() {
+        let d = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        assert_eq!(d.ram_store.value, None);
+        assert_eq!(d.ram_store.origin, crate::ws_config::Origin::Default);
+        assert_eq!(probe_store(None, &d).unwrap(), Err(NO_STORE.to_owned()));
+        let set = crate::ws_config::parse(
+            "[delta]\nram_store = \"/z\"\n",
+            Path::new("/w/workspace.toml"),
+        )
+        .unwrap()
+        .delta;
+        assert_eq!(set.ram_store.value.as_deref(), Some(Path::new("/z")));
+        assert_eq!(set.ram_store.origin, crate::ws_config::Origin::File);
+    }
+
     /// Probe: a dir on a disk filesystem is not RAM-backed; /dev/shm (tmpfs on Linux) is, with ratio 1.
     #[test]
     fn probe_tells_ram_from_disk() {
@@ -1544,7 +1718,7 @@ mod tests {
         .delta;
         assert_eq!(Class::Check.peak(&cfg), 4 * GIB);
         assert_eq!(cfg.ratio_milli.value, 3500);
-        assert_eq!(cfg.ram_store.value, Path::new("/z"));
+        assert_eq!(cfg.ram_store.value.as_deref(), Some(Path::new("/z")));
         // defaults: D3 derivations (ws_config DEFAULT_PEAK_MIB)
         let d = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()

@@ -74,7 +74,7 @@ pub enum Out {
     },
     /// Remakes this checkout's build dir on delta tier `ram` or `pool` (delta.rs), dropping the current dir (dry run unless --execute).
     ///
-    /// Build commands choose the tier when they make a dir: `ram` for a child when `delta.ram_store` is RAM-backed and its build class fits, else `pool`; a dir keeps its tier after that. `pool` is the baseline. Refused while a command of the checkout runs.
+    /// Build commands choose the tier when they make a dir: `ram` for a child when `delta.ram_store` is set, RAM-backed and its build class fits, else `pool`. A ram dir keeps its tier while the store admits it; one the store refuses, holds for land or never fits is dropped and remade on the pool by the next build (`delta-dropped`). `pool` is the baseline. Refused while a command of the checkout runs.
     Tier {
         /// `ram` or `pool`.
         #[arg(value_parser = ["ram", "pool"])]
@@ -990,7 +990,7 @@ pub fn leave(root: &Path, ws: &Path) -> Result<String> {
     }
     let dir = dir_of(ws, &id);
     let store = crate::ws_config::load(ws)?.delta.ram_store.value;
-    let run = crate::out_run::locate(ws, &store, &id)?
+    let run = crate::out_run::locate(ws, store.as_deref(), &id)?
         .map_or_else(|| crate::out_run::run_dir_of(ws, &id), |(d, _)| d);
     if present(&dir)? || present(&run)? {
         let Some(_lock) = build_pool::try_lock_dir(ws, &id)? else {
@@ -1146,7 +1146,15 @@ pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
     let rec = crate::delta::record(&dir)?;
     // the configured store: the new dir's tier is decided now, wherever the old upper lives
     let store = cfg.delta.ram_store.value.clone();
-    let fits = || crate::delta::fits_now(ws, id, &cfg.delta, crate::delta::Class::Native, &store);
+    let fits = || {
+        crate::delta::fits_now(
+            ws,
+            id,
+            &cfg.delta,
+            crate::delta::Class::Native,
+            store.as_deref(),
+        )
+    };
     if keep_pool
         && rec.is_none()
         && present(&dir)?
@@ -1193,13 +1201,18 @@ pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
     // the carried gate state was built from the land's earlier content: no mtime restore under it
     let laid = (|| -> Result<String> {
         Ok(match fits()? {
-            Ok(why) => match crate::delta::make_ram(land, ws, id, &store, !kept) {
-                Ok(_) => format!("ram ({why})"),
-                Err(e) => {
-                    make(land, !kept)?;
-                    format!("pool (ram dir not made: {e:#})")
+            Ok(why) => {
+                let store = store
+                    .as_deref()
+                    .context("a ram tier verdict without delta.ram_store")?;
+                match crate::delta::make_ram(land, ws, id, store, !kept) {
+                    Ok(_) => format!("ram ({why})"),
+                    Err(e) => {
+                        make(land, !kept)?;
+                        format!("pool (ram dir not made: {e:#})")
+                    }
                 }
-            },
+            }
             Err(why) => {
                 make(land, !kept)?;
                 format!("pool ({why})")
@@ -1596,17 +1609,22 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 println!("out: ws/{id}: not made yet: the next build command makes it");
             }
             let cfg = crate::ws_config::load(&ws)?;
-            match crate::out_run::locate(&ws, &cfg.delta.ram_store.value, &id)? {
+            match crate::out_run::locate(&ws, cfg.delta.ram_store.value.as_deref(), &id)? {
                 Some((run, rec)) => println!("run={} ({})", run.display(), rec.tier),
                 None => println!(
                     "run=: not made yet (`cargo xtask out show --run` or an app run makes it, on the ram store when class run fits, else {})",
                     crate::out_run::run_dir_of(&ws, &id).display()
                 ),
             }
-            let store = &cfg.delta.ram_store;
-            match crate::delta::probe(&store.value, &cfg.delta)? {
+            let shown = cfg
+                .delta
+                .ram_store
+                .value
+                .as_deref()
+                .map_or_else(|| "unset".to_owned(), |p| p.display().to_string());
+            match crate::delta::probe_store(cfg.delta.ram_store.value.as_deref(), &cfg.delta)? {
                 Ok(s) => {
-                    println!("delta store {}: {}", store.value.display(), s.line());
+                    println!("delta store {shown}: {}", s.line());
                     let h = crate::delta::hold_now(&ws, &cfg.delta, &s)?;
                     println!(
                         "land hold: {:.2} GiB RAM / {:.2} GiB raw (class native peak at the store ratio; 0 = land's reservation stands in or native never fits)",
@@ -1614,7 +1632,7 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                         h.raw as f64 / (1u64 << 30) as f64
                     );
                 }
-                Err(why) => println!("delta store {}: unusable: {why}", store.value.display()),
+                Err(why) => println!("delta store {shown}: unusable: {why}"),
             }
             for c in crate::delta::Class::ALL {
                 print!(
@@ -1729,7 +1747,10 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
     };
     let want = if ram { "ram" } else { "pool" };
     let cfg = crate::ws_config::load(ws)?;
-    if ram && let Err(why) = crate::delta::probe(&cfg.delta.ram_store.value, &cfg.delta)? {
+    if ram
+        && let Err(why) =
+            crate::delta::probe_store(cfg.delta.ram_store.value.as_deref(), &cfg.delta)?
+    {
         bail!("no ram tier for ws/{id}: {why}");
     }
     // the run dir follows the explicit choice too (off = exact baseline); its data is regenerable
@@ -1755,7 +1776,13 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
         }
     }
     if ram {
-        crate::delta::make_ram(root, ws, &id, &cfg.delta.ram_store.value, true)?;
+        let store = cfg
+            .delta
+            .ram_store
+            .value
+            .as_deref()
+            .context("ram tier without delta.ram_store")?;
+        crate::delta::make_ram(root, ws, &id, store, true)?;
     } else {
         make(root, true)?;
     }
@@ -1817,7 +1844,7 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         }
     }
     let store = crate::ws_config::load(ws)?.delta.ram_store.value;
-    let runs = crate::out_run::orphans(ws, &store, live)?;
+    let runs = crate::out_run::orphans(ws, store.as_deref(), live)?;
     for (id, path) in &runs {
         if !execute {
             println!("orphan run/{id}: {} (checkout gone)", path.display());
@@ -1852,7 +1879,10 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
     // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
     let mut keep = live.clone();
     keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
-    let strays = crate::delta::orphan_store_dirs(&store, ws, &keep);
+    // an unset store has no dirs to sweep: a store removed from workspace.toml keeps its strays until the line is back
+    let strays = store
+        .as_deref()
+        .map_or_else(Vec::new, |s| crate::delta::orphan_store_dirs(s, ws, &keep));
     for (id, path) in &strays {
         if !execute {
             println!("orphan ram delta {id}: {} (checkout gone)", path.display());

@@ -24,7 +24,7 @@
 //! pool_backing = "/mnt/e/WSL/atl-pool.vhdx"  # file backing the pool's filesystem, as seen in the guest; absent = growth check skipped
 //! pool_backing_margin = 2      # host drive under pool_backing must keep this much past the file's worst-case growth
 //! [delta]              # RAM tier of build-dir deltas (delta.rs)
-//! ram_store = "/mnt/atl-zram"  # filesystem holding children's overlay uppers; used only when RAM-backed (zram or tmpfs)
+//! ram_store = "/mnt/atl-zram"  # filesystem holding children's overlay uppers; used only when RAM-backed (zram or tmpfs); absent = no RAM tier, every build takes the pool
 //! ram_margin_gib = 1   # store RAM kept free past every reservation
 //! ratio_default = 1.95 # raw/RAM ratio assumed while the zram device holds < 1 GiB
 //! ratio_run = 1.37     # cap on the raw/RAM ratio of class run (app data compresses worse than a build)
@@ -106,8 +106,6 @@ pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
 /// Covers the dynamic vhdx's own metadata (BAT + sector bitmaps, well under 1% of a 90 GiB disk = <1 GiB) and other Windows writers to that drive while a build runs (~1 GiB) [est].
 pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
 
-/// `delta.ram_store`: the maintainer's boot unit mounts the zram-backed ext4 there (plan ram-delta D7); absent or not RAM-backed -> every child gets the pool tier, one logged reason per build.
-pub const DEFAULT_RAM_STORE: &str = "/mnt/atl-zram";
 /// `delta.ram_margin_gib`: zram reports `mem_limit` as an I/O error in ext4, not ENOSPC, so admission stops short of it by this much (~one small build's RAM at lzo-rle, 2 GiB x 0.54).
 pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
@@ -123,7 +121,8 @@ pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 797];
 /// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaConfig {
-    pub ram_store: Setting<PathBuf>,
+    /// `delta.ram_store`: the filesystem holding the ram tier's uppers (plan ram-delta D7: the zram-backed ext4 the owner's boot unit mounts). No default: unset = no RAM tier, every build and run dir takes the pool.
+    pub ram_store: Setting<Option<PathBuf>>,
     pub ram_margin_gib: Setting<u64>,
     /// Thousandths: 1950 = 1.95 raw bytes per RAM byte.
     pub ratio_milli: Setting<u64>,
@@ -303,7 +302,7 @@ fn defaults(path: PathBuf) -> WsConfig {
             pool_backing_margin: Setting::default(DEFAULT_POOL_BACKING_MARGIN),
         },
         delta: DeltaConfig {
-            ram_store: Setting::default(PathBuf::from(DEFAULT_RAM_STORE)),
+            ram_store: Setting::default(None),
             ram_margin_gib: Setting::default(DEFAULT_RAM_MARGIN_GIB),
             ratio_milli: Setting::default(DEFAULT_RATIO_MILLI),
             ratio_run_milli: Setting::default(DEFAULT_RATIO_RUN_MILLI),
@@ -381,7 +380,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     if !Path::new(p).is_absolute() {
                         bail!("{at} must be an absolute path, not {p:?}");
                     }
-                    cfg.delta.ram_store = Setting::file(PathBuf::from(p));
+                    cfg.delta.ram_store = Setting::file(Some(PathBuf::from(p)));
                 }
                 ("delta", "ram_margin_gib") => {
                     cfg.delta.ram_margin_gib = Setting::file(gib(value, &at)?);
