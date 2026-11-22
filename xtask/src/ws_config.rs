@@ -112,7 +112,11 @@ pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
-/// run 1612: store growth of one app data root, seed copy + one launch's peak (out_run.rs), sized by the large case, WeChat 8.0 (seed com.tencent.mm-3182; ext4 used on the zram store, 2 s samples, 2026-11-22): copy 797.8 MiB + launch peak 813.7 MiB (max of 5 launches; atld rewrites the 741 MiB apk/ each launch, design T3). Small case fossify-math: 7 MiB root, negligible.
+/// run 1612: store growth of one app data root = seed copy + worst launch (out_run.rs). Copy: WeChat 8.0 (seed com.tencent.mm-3182), 797.9 MiB ext4 used on the zram store (2 s samples, 2026-11-22).
+/// Normal launch from a seed whose installed APK equals the session's: `install skipped: unchanged`, root grows 0.1-0.4 MiB per launch (du); store peak +49.1 MiB in launch 1 is an upper bound (other writers share the store).
+/// Reinstall launch (installed APK differs from the session's: same versionCode, other bytes, or an install-format change): apk/ (741 MiB) rewritten, peak 813.7 MiB (T2, every launch rewrote apk/: same write path).
+/// Seeds are keyed by package + versionCode only, so the reinstall stays reachable: 797.9 + 813.7 = 1611.6 -> 1612. Lower (est ~850 MiB) only once a seed carries the APK identity.
+/// Small case fossify-math: 7 MiB root, negligible.
 pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 1612];
 
 /// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
