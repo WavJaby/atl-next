@@ -304,10 +304,13 @@ pub struct Need {
 }
 
 impl Need {
-    /// `class`'s peak on `s`: ram = ceil(raw / ratio).
+    /// `class`'s peak on `s`: ram = ceil(raw / ratio); class run's ratio is capped at `delta.ratio_run` (app data compresses worse than the build uppers the device ratio mostly measures).
     pub fn of(class: Class, cfg: &DeltaConfig, s: &Stats) -> Need {
         let raw = class.peak(cfg);
-        let ratio = s.ratio_milli;
+        let ratio = match class {
+            Class::Run => s.ratio_milli.min(cfg.ratio_run_milli.value),
+            _ => s.ratio_milli,
+        };
         Need {
             raw,
             ram: (raw * 1000).div_ceil(ratio.max(1)),
@@ -1187,6 +1190,21 @@ mod tests {
             judge(&roomy, check, 0, hold_for("child", &cfg, &roomy, false), GIB),
             Verdict::Held(_)
         ));
+    }
+
+    /// Class run takes min(device ratio, delta.ratio_run 1.37): 797 MiB = 835_715_072 B -> ceil(835_715_072_000 / 1370) = 610_011_002 B at device 1.95 (not 428_571_833 at 1.95); tmpfs 1.0 stays 1.0.
+    #[test]
+    fn run_class_reserves_at_the_app_data_ratio() {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml")).expect("cfg").delta;
+        let run = Need::of(Class::Run, &cfg, &stats(10.0, 0.0, 1950));
+        assert_eq!((run.raw, run.ram), (835_715_072, 610_011_002));
+        let t = stats(10.0, 0.0, 1000);
+        assert_eq!(Need::of(Class::Run, &cfg, &t).ram, 835_715_072);
+        // build classes keep the device ratio
+        assert_eq!(
+            Need::of(Class::Check, &cfg, &stats(10.0, 0.0, 1950)).ram,
+            2_642_949_252
+        );
     }
 
     /// Red control: a full store refuses in the admission step, so the build (here a closure that would record its start) never runs.

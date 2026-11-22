@@ -27,6 +27,7 @@
 //! ram_store = "/mnt/atl-zram"  # filesystem holding children's overlay uppers; used only when RAM-backed (zram or tmpfs)
 //! ram_margin_gib = 1   # store RAM kept free past every reservation
 //! ratio_default = 1.95 # raw/RAM ratio assumed while the zram device holds < 1 GiB
+//! ratio_run = 1.37     # cap on the raw/RAM ratio of class run (app data compresses worse than a build)
 //! peak_small_gib = 2   # per build class: upper growth reserved before the build starts
 //! peak_check_gib = 4.8
 //! peak_native_gib = 9
@@ -111,6 +112,8 @@ pub const DEFAULT_RAM_STORE: &str = "/mnt/atl-zram";
 pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
+/// `delta.ratio_run` in thousandths: lzo-rle zram raw/RAM of one app data root, WeChat 8.0 clean install + launch on the zram store (2026-11-22): 796.6 MiB raw / 581 MiB zram RAM = 1.371. The device ratio mixes in build uppers (1.95), which would under-reserve a run (0.78 GiB / 1.95 = 0.40 reserved, 0.57 used); class run takes min(device ratio, this).
+pub const DEFAULT_RATIO_RUN_MILLI: u64 = 1370;
 /// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
 /// run 797: store growth of one app data root = clean install + launch of the largest known app into an empty root (every app run starts so, out_run.rs `fresh_root`).
 /// WeChat 8.0 (versionCode 3182) on the zram store, ext4 used from the minimum after the previous root's removal to the run's peak (2 s samples, 2026-11-22): 796.5 and 796.6 MiB in the two windows no other writer touched; peak = end, so no install transient above the final root (du 792.8 MiB) at that resolution. 796.6 -> 797.
@@ -124,6 +127,8 @@ pub struct DeltaConfig {
     pub ram_margin_gib: Setting<u64>,
     /// Thousandths: 1950 = 1.95 raw bytes per RAM byte.
     pub ratio_milli: Setting<u64>,
+    /// Thousandths: cap on class run's ratio (`DEFAULT_RATIO_RUN_MILLI`).
+    pub ratio_run_milli: Setting<u64>,
     /// MiB per `delta::Class`, in `Class::ALL` order.
     pub peak_mib: [Setting<u64>; 5],
 }
@@ -301,6 +306,7 @@ fn defaults(path: PathBuf) -> WsConfig {
             ram_store: Setting::default(PathBuf::from(DEFAULT_RAM_STORE)),
             ram_margin_gib: Setting::default(DEFAULT_RAM_MARGIN_GIB),
             ratio_milli: Setting::default(DEFAULT_RATIO_MILLI),
+            ratio_run_milli: Setting::default(DEFAULT_RATIO_RUN_MILLI),
             peak_mib: DEFAULT_PEAK_MIB.map(Setting::default),
         },
     }
@@ -385,6 +391,11 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     ensure!(milli >= 1000, "{at} must be at least 1.0, not {value}");
                     cfg.delta.ratio_milli = Setting::file(milli);
                 }
+                ("delta", "ratio_run") => {
+                    let milli = thousandths(value, &at)?;
+                    ensure!(milli >= 1000, "{at} must be at least 1.0, not {value}");
+                    cfg.delta.ratio_run_milli = Setting::file(milli);
+                }
                 ("delta", k) if crate::delta::Class::from_key(k).is_some() => {
                     let class = crate::delta::Class::from_key(k).context("checked above")?;
                     let mib = thousandths(value, &at)? * 1024 / 1000;
@@ -392,7 +403,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.delta.peak_mib[class as usize] = Setting::file(mib);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.peak_{{small,check,native,cross,run}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.ratio_run, delta.peak_{{small,check,native,cross,run}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
