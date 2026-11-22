@@ -620,6 +620,8 @@ impl Roots {
 const BASE_MARK: &str = "@BASE@";
 /// `timeout -k`: KILL this many seconds after the limit's TERM.
 const KILL_GRACE: u64 = 10;
+/// How often the host's control-pipe keeper checks whether the transfer has ended ([`RemoteRun::spawn`]); only bounds how long the pipe outlives a finished run, not the run.
+const CONTROL_POLL: Duration = Duration::from_secs(1);
 /// The run script's name in the run's scratch dir.
 const REMOTE_SCRIPT: &str = "remote-run.sh";
 
@@ -757,9 +759,11 @@ impl Plan {
     }
 
     /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, in the background so its process group can be ended after it; then its logs and end record (`atld.rc`: the exit code, `end.ms`: the end's time on the target's clock) as a tar on stdout. The script's exit is the tar's.
+    /// Control channel: the whole script is one `{ }` group, so the shell has read all of it before running any; what stays on stdin is the host's open control pipe (`spawn`). A watchdog reads it (fd 7):
+    /// EOF while atld runs = the connection or the host is gone, and it TERMs atld, so the run ends the normal way (atld's orderly stop, the group kill, the sink holder) within atld's stop grace.
     fn script(&self, base: &str) -> String {
         let mut s = format!(
-            "# xtask remote run {}: written by remote.rs, do not edit\ncd {} || exit 2\nset -u\nBASE=$(pwd)\n",
+            "# xtask remote run {}: written by remote.rs, do not edit\n{{\ncd {} || exit 2\nset -u\nBASE=$(pwd)\nexec 7<&0\n",
             self.tag,
             sh_quote(base)
         );
@@ -871,15 +875,21 @@ mkdir -p {pw_dir}
             s.push_str(&format!(" {key}={}", word(value)));
         }
         let args: Vec<String> = self.args.iter().map(|a| word(a)).collect();
-        // background: `$!` is timeout's pid, which timeout makes its process group's id; the group is ended after the run, so an app that stayed in it leaves no window behind
+        // background: `$!` is setsid's pid, which execs timeout as its session's and process group's leader (an async list's child is no group leader without job control, so setsid does not fork);
+        // the group is ended after the run, so an app that stayed in it leaves no window behind. `--foreground`: the limit TERMs atld alone, which stops its daemons in order; without it timeout
+        // TERMs the whole group and the daemons die before atld's stop, read as "system process ... died during the run" (measured: a group child of plain timeout dies, of --foreground lives)
         s.push_str(&format!(
-            " timeout -k {KILL_GRACE} {} {} {} < /dev/null > {} 2>&1 &\n",
+            " setsid timeout --foreground -k {KILL_GRACE} {} {} {} < /dev/null 7<&- > {} 2>&1 &\n",
             self.limit,
             word(&self.program),
             args.join(" "),
             word(&out_path(&format!("{}/atld.log", self.scratch)))
         ));
         s.push_str("pid=$!\n");
+        // the control watchdog: timeout passes the TERM on to atld
+        s.push_str(
+            "( cat <&7 > /dev/null 2>&1; kill -TERM \"$pid\" 2>/dev/null ) > /dev/null 2>&1 &\nWD=$!\n",
+        );
         // the samples end with atld; the last one may miss a stream's final second, not its route
         if self.audio.is_some() {
             let every = crate::audio_pcm::ROUTE_SAMPLE.as_secs();
@@ -893,7 +903,8 @@ mkdir -p {pw_dir}
                 scratch_file(ATLD_PID)
             ));
         }
-        s.push_str("wait \"$pid\"\nrc=$?\n");
+        // the watchdog's cat stays until the host closes the pipe: it reads only, so the session still ends
+        s.push_str("wait \"$pid\"\nrc=$?\nkill \"$WD\" 2>/dev/null || true\n");
         // the agent stopped atld (or saw it end); it ends after joining its probe, bounded by its own timeout
         if self.agent.is_some() {
             s.push_str(&format!(
@@ -965,6 +976,8 @@ mkdir -p {pw_dir}
             }
             s.push('\n');
         }
+        // exit inside the group: after it the shell would read stdin for more, and the control pipe stays open until the transfer ends
+        s.push_str("exit\n}\n");
         s
     }
 }
@@ -975,7 +988,7 @@ impl RemoteRun {
         self.display != Display::Headless
     }
 
-    /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> < plan | tar -x` (`sh -s` for `local:`), and its end is the run's. `root` and `scratch` lie under the out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
+    /// Starts `cmd` (atld's command, host paths) on the target as one run. The child is the transfer, `<transport> | tar -x` (`sh -s` for `local:`) with the plan on its stdin, and its end is the run's; stdin stays open as the run's control pipe ([`keep_control`]). `root` and `scratch` lie under the out dir, where the logs return. `written` are the files the command reads that this host wrote: their content goes into the plan.
     /// `session_env`: variables atld takes from the target's desktop session ([`session_env_script`]), never from this host.
     pub fn spawn(
         &self,
@@ -1041,15 +1054,14 @@ impl RemoteRun {
             audio: self.audio.clone(),
         };
         let script = scratch.join(REMOTE_SCRIPT);
-        std::fs::write(&script, plan.script(&self.base))
-            .with_context(|| format!("writing {}", script.display()))?;
+        let body = plan.script(&self.base);
+        std::fs::write(&script, &body).with_context(|| format!("writing {}", script.display()))?;
         let transport = match &self.host {
             Host::Ssh(alias) => format!("ssh {} {} sh -s", ssh_opts_sh(), sh_quote(alias)),
             Host::Local(_) => "sh -s".to_owned(),
         };
         let transfer = format!(
-            "{transport} < {} | tar -x -C {}",
-            sh_quote(&script.display().to_string()),
+            "{transport} | tar -x -C {}",
             sh_quote(&roots.out.display().to_string())
         );
         let mut log = std::fs::OpenOptions::new()
@@ -1058,13 +1070,16 @@ impl RemoteRun {
             .open(&self.log)
             .with_context(|| format!("opening {}", self.log.display()))?;
         writeln!(log, "== run {tag} on {}", self.host.label())?;
-        Command::new("sh")
+        let (control, keep) = std::io::pipe().context("making the run's control pipe")?;
+        let child = Command::new("sh")
             .args(["-c", &transfer])
-            .stdin(Stdio::null())
+            .stdin(control)
             .stdout(Stdio::null())
             .stderr(log.try_clone()?)
             .spawn()
-            .context("starting the transfer to the target")
+            .context("starting the transfer to the target")?;
+        keep_control(keep, body.into_bytes(), child.id());
+        Ok(child)
     }
 
     /// The error for a run whose transfer ended `end`. The cause is the transcript's lines after the run's header (the script's own message comes first, then the transfer's), up to three.
@@ -1318,6 +1333,28 @@ fn feed_and_wait(mut child: Child, script: &str) -> Result<Output> {
         .join()
         .map_err(|_| anyhow!("the script writer panicked"))??;
     Ok(out)
+}
+
+/// Writes a run's `plan` into its transfer's stdin from a thread, then holds the pipe open until the transfer `pid` has ended (gone or a zombie): the target's watchdog reads EOF only when the
+/// connection drops or this process dies ([`Plan::script`]). Held here, not in the `Child`: `Child::wait` closes the child's stdin first, which would end a run its caller merely waits for.
+fn keep_control(mut keep: std::io::PipeWriter, plan: Vec<u8>, pid: u32) {
+    std::thread::spawn(move || {
+        // a write error = the transport ended before reading it all; the run's end carries the cause
+        if keep.write_all(&plan).is_err() {
+            return;
+        }
+        while process_live(pid) {
+            std::thread::sleep(CONTROL_POLL);
+        }
+    });
+}
+
+/// Whether `pid` runs: `/proc/<pid>/stat` exists and its state (after the command's closing paren) is not `Z`.
+fn process_live(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+    })
 }
 
 fn ssh(alias: &str) -> Command {
@@ -2801,9 +2838,11 @@ mod tests {
         };
         let want = concat!(
             "# xtask remote run gl/run: written by remote.rs, do not edit\n",
+            "{\n",
             "cd 'atl-next-run/x9' || exit 2\n",
             "set -u\n",
             "BASE=$(pwd)\n",
+            "exec 7<&0\n",
             "exec 9>>.run.lock\n",
             "flock -n 9 || { echo \"remote run gl/run: busy, another run, check or prune holds $(pwd)\" >&2; exit 6; }\n",
             "test -f '.bundle-abc123' || { echo \"remote run gl/run: stale: another push replaced the bundle\" >&2; exit 7; }\n",
@@ -2813,10 +2852,13 @@ mod tests {
             "{\"apk\": \"@BASE@/out/gl/apk/x.apk\"}\n",
             "ATL_EOF\n",
             "[ -x \"$BASE/out/cargo/release/atld\" ] || { echo \"remote run gl/run: out/cargo/release/atld is not an executable\" >&2; exit 4; }\n",
-            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" FONTCONFIG_FILE=\"$BASE/out/gl/run/scratch/fonts.conf\" timeout -k 10 120 \"$BASE/out/cargo/release/atld\" \"--root\" \"$BASE/out/gl/run/root\" < /dev/null > \"$BASE/out/gl/run/scratch/atld.log\" 2>&1 &\n",
+            "env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" FONTCONFIG_FILE=\"$BASE/out/gl/run/scratch/fonts.conf\" setsid timeout --foreground -k 10 120 \"$BASE/out/cargo/release/atld\" \"--root\" \"$BASE/out/gl/run/root\" < /dev/null 7<&- > \"$BASE/out/gl/run/scratch/atld.log\" 2>&1 &\n",
             "pid=$!\n",
+            "( cat <&7 > /dev/null 2>&1; kill -TERM \"$pid\" 2>/dev/null ) > /dev/null 2>&1 &\n",
+            "WD=$!\n",
             "wait \"$pid\"\n",
             "rc=$?\n",
+            "kill \"$WD\" 2>/dev/null || true\n",
             "kill -KILL -- \"-$pid\" 2>/dev/null || true\n",
             "printf '%s\\n' \"$rc\" > \"$BASE/out/gl/run/scratch/atld.rc\"\n",
             "date +%s%3N > \"$BASE/out/gl/run/scratch/end.ms\"\n",
@@ -2824,12 +2866,156 @@ mod tests {
             "{ cat /sys/devices/system/cpu/possible /sys/devices/system/cpu/online; nproc; env -i PATH=/usr/bin:/bin sh -c @ZONE_SH@; } > \"$BASE/out/gl/run/scratch/host.facts\"\n",
             "cat /proc/cpuinfo > \"$BASE/out/gl/run/scratch/cpuinfo\"\n",
             "tar -c -C \"$BASE/out\" --ignore-failed-read 'gl/run/root/log' 'gl/run/scratch/atld.log' 'gl/run/scratch/atld.rc' 'gl/run/scratch/end.ms' 'gl/run/scratch/host.facts' 'gl/run/scratch/cpuinfo'\n",
+            "exit\n",
+            "}\n",
         );
         // no TZ row in env: the zone probe runs without TZ, as atld does
         assert_eq!(
             plan.script("atl-next-run/x9"),
             want.replace("@ZONE_SH@", &sh_quote(ZONE_SH))
         );
+    }
+
+    /// The sink name of the drop tests' runs.
+    const DROP_SINK: &str = "atl-run-apk-drop";
+
+    /// A muted headless run's script for [`run_live`]: a fake atld at `out/cargo/atld` (args: its scratch dir) under `limit` s, the bundle marker [`stale_sh`] wants in `dir`.
+    /// Fake atld: a daemon child in its process group that records a TERM it receives (`daemon-term`); atld's TERM handler stops it by SIGKILL, so `daemon-term` exists only when
+    /// somebody else TERMed the group. Fake pw-cli: `ls Node` shows the sink; the holder reads its line and stays, as pw-cli 1.4 does after EOF.
+    fn drop_fixture(dir: &Path, limit: u64) -> String {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("out/cargo")).unwrap();
+        std::fs::write(dir.join(format!(".bundle-{TEST_SHA}")), "").unwrap();
+        let exe = |path: PathBuf, text: &str| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        };
+        exe(
+            dir.join("out/cargo/atld"),
+            "#!/bin/sh\nsh -c 'trap \"echo term > $1/daemon-term; exit 0\" TERM; while :; do sleep 0.1; done' sh \"$1\" &\nd=$!\necho \"$$ $d\" > \"$1/pids\"\ntrap 'kill -KILL $d; exit 143' TERM\nwhile :; do sleep 0.1; done\n",
+        );
+        exe(
+            dir.join("bin/pw-cli"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = ls ]; then echo '  node.name = \"{DROP_SINK}\"'; exit 0; fi\necho $$ > \"$FAKE_DIR/holder.pid\"\ncat > /dev/null\nexec sleep 600\n"
+            ),
+        );
+        Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
+            audio: Some(RunAudio {
+                sink: Some(DROP_SINK.to_owned()),
+            }),
+            tag: "run-apk/drop".to_owned(),
+            root: "run-apk/root".to_owned(),
+            scratch: "run-apk/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/atld".to_owned(),
+            args: vec!["@BASE@/out/run-apk/scratch".to_owned()],
+            files: Vec::new(),
+            lib_dirs: Vec::new(),
+            limit,
+            display: Display::Headless,
+            agent: None,
+        }
+        .script(&dir.display().to_string())
+    }
+
+    /// Starts `script` as the `local:` transport does (`sh -s`, the script then the open control pipe on stdin) and waits until the fake atld and the holder have written their pids.
+    /// Returns the child, its stdin (the control pipe: drop it to cut the connection) and the pids (atld, daemon, holder).
+    fn run_live(dir: &Path, script: &str) -> (Child, std::process::ChildStdin, [u32; 3]) {
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", dir.join("bin").display()),
+            )
+            .env("FAKE_DIR", dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut control = child.stdin.take().unwrap();
+        control.write_all(script.as_bytes()).unwrap();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        for _ in 0..100 {
+            if let (Some(p), Some(h)) = (read("out/run-apk/scratch/pids"), read("holder.pid")) {
+                let mut n = p
+                    .split_whitespace()
+                    .chain([h.trim()])
+                    .map(|w| w.parse().unwrap());
+                let pids = [n.next().unwrap(), n.next().unwrap(), n.next().unwrap()];
+                return (child, control, pids);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the fake run did not start in {}", dir.display());
+    }
+
+    /// Waits up to `s` seconds for `child` to exit; its status.
+    fn exit_within(child: &mut Child, s: u64) -> ExitStatus {
+        for _ in 0..s * 10 {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the run script did not end within {s} s");
+    }
+
+    /// A dropped connection mid-run (the control pipe closes; here the `local:` transport's stdin): the watchdog TERMs atld and the run ends the normal way, long before its 60 s limit:
+    /// atld, its daemon and the sink holder gone, the end record written. The run did not end while the pipe stayed open.
+    #[test]
+    fn run_ends_when_its_control_pipe_closes() {
+        let dir = std::env::temp_dir().join(format!("atl-remote-drop-{}", std::process::id()));
+        let script = drop_fixture(&dir, 60);
+        let (mut child, control, pids) = run_live(&dir, &script);
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            child.try_wait().unwrap().is_none() && pids.iter().all(|&p| process_live(p)),
+            "the run ended with its control pipe open"
+        );
+        drop(control);
+        exit_within(&mut child, 5);
+        // the holder goes once its timeout passes the kill on: allow it a moment
+        std::thread::sleep(Duration::from_millis(500));
+        let left: Vec<u32> = pids.into_iter().filter(|&p| process_live(p)).collect();
+        assert!(left.is_empty(), "left after the drop: {left:?} of {pids:?}");
+        let rc = std::fs::read_to_string(dir.join("out/run-apk/scratch/atld.rc")).unwrap();
+        assert_ne!(rc.trim(), "124", "the limit, not the drop, ended the run");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The planned end of a bounded run (the limit, `atld.rc` 124) with the control pipe still open: the script ends by itself (it reads no more stdin), and the limit's TERM reached atld
+    /// alone, which stopped its daemon in order; a TERM to the whole group would have killed the daemon first, read as "system process ... died during the run". A daemon that really dies
+    /// mid-run is still atld's own verdict line (atld_run.rs `system_deaths`).
+    #[test]
+    fn hold_limit_terms_atld_alone() {
+        let dir = std::env::temp_dir().join(format!("atl-remote-limit-{}", std::process::id()));
+        let script = drop_fixture(&dir, 2);
+        let (mut child, control, pids) = run_live(&dir, &script);
+        exit_within(&mut child, 8);
+        let rc = std::fs::read_to_string(dir.join("out/run-apk/scratch/atld.rc")).unwrap();
+        assert_eq!(rc.trim(), "124");
+        assert!(
+            !dir.join("out/run-apk/scratch/daemon-term").exists(),
+            "the limit's TERM reached the daemon"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let left: Vec<u32> = pids.into_iter().filter(|&p| process_live(p)).collect();
+        assert!(
+            left.is_empty(),
+            "left after the limit: {left:?} of {pids:?}"
+        );
+        drop(control);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A session run: after the launcher check, the one `wayland-*` socket of the desktop session is found, and atld's environment names it. The count check is what refuses a second compositor's socket.
@@ -2868,7 +3054,7 @@ mod tests {
             ),
             "{s}"
         );
-        assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" RUST_LOG=\"info\" timeout -k 10 300 "), "{s}");
+        assert!(s.contains(" XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" LD_LIBRARY_PATH=\"$BASE/lib\" WAYLAND_DISPLAY=\"$WL\" RUST_LOG=\"info\" setsid timeout --foreground -k 10 300 "), "{s}");
     }
 
     /// A nested run: labwc starts on the X11 session found read-only, the run waits for its socket, atld gets it, labwc ends after atld's group and its log rides in the tar. Break: a Session-mode script has no labwc and no X11 lookup.
@@ -2900,7 +3086,7 @@ mod tests {
             "WLR_BACKENDS=x11 labwc -C \"$BASE/out/app/scratch/labwc\" < /dev/null > \"$BASE/out/app/scratch/labwc.log\" 2>&1 &\nLW=$!\n",
         );
         let wait = at("while wl_scan; [ \"$WL_N\" -eq 0 ]");
-        let atld = at(" WAYLAND_DISPLAY=\"$WL\" timeout -k 10 60 ");
+        let atld = at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout --foreground -k 10 60 ");
         let group = at("kill -KILL -- \"-$pid\"");
         let end = at("kill -TERM \"$LW\"");
         assert!(
@@ -2908,7 +3094,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            s.ends_with(" 'app/scratch/cpuinfo' 'app/scratch/labwc.log'\n"),
+            s.ends_with(" 'app/scratch/cpuinfo' 'app/scratch/labwc.log'\nexit\n}\n"),
             "{s}"
         );
         let session = Plan {
@@ -2920,7 +3106,7 @@ mod tests {
         // a plain session run (run-apk, no agent) maps its window: the D1 switch comes before atld, like the proxied agent's
         let switch = s.find("\nws_go \"$WS_RUN\"\n").expect(&s);
         let atld = s
-            .find(" WAYLAND_DISPLAY=\"$WL\" timeout -k 10 60 ")
+            .find(" WAYLAND_DISPLAY=\"$WL\" setsid timeout --foreground -k 10 60 ")
             .expect(&s);
         assert!(
             s.find("trap ws_back EXIT\n").expect(&s) < switch && switch < atld,
@@ -3160,7 +3346,7 @@ esac
             " timeout -k 10 300 \"$BASE/out/cargo/debug/xtask-harness\" \"window-live\" --upstream \"$WL_DIR/$WL\" --listen \"$GATE_SOCK\" -- \"--stage\" \"widgets\" < /dev/null > \"$BASE/out/window/scratch/agent.log\" 2>&1 &\nAG=$!\n",
         );
         let wait = at("while [ ! -S \"$GATE_SOCK\" ]");
-        let atld = at(" WAYLAND_DISPLAY=\"$GATE_SOCK\" timeout -k 10 240 ");
+        let atld = at(" WAYLAND_DISPLAY=\"$GATE_SOCK\" setsid timeout --foreground -k 10 240 ");
         let pid = at("printf '%s\\n' \"$pid\" > \"$BASE/out/window/scratch/atld.pid\"\n");
         let agent_rc =
             at("wait \"$AG\"\nprintf '%s\\n' \"$?\" > \"$BASE/out/window/scratch/agent.rc\"\n");
@@ -3177,7 +3363,7 @@ esac
         assert!(!s.contains("WAYLAND_DISPLAY=\"$WL\""), "{s}");
         assert!(
             s.ends_with(
-                " 'window/scratch/live.json' 'window/scratch/agent.rc' 'window/scratch/agent.log'\n"
+                " 'window/scratch/live.json' 'window/scratch/agent.rc' 'window/scratch/agent.log'\nexit\n}\n"
             ),
             "{s}"
         );
