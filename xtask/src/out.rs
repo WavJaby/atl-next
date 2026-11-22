@@ -436,6 +436,12 @@ pub fn probe(src: &Path, dst_parent: &Path) -> Result<Tier> {
 
 /// Copies dir `src` to the absent `dst` with the probed tier, through a temp name renamed into place; `base` (when given) goes to `dst/.base`; top-level entries of `src` named in `skip` are left out. Returns the tier.
 pub fn copy_tree(src: &Path, dst: &Path, base: Option<&str>, skip: &[&str]) -> Result<Tier> {
+    // outside its namespace a ram dir is its empty mount point: a copy of it would be a base holding only the record
+    ensure!(
+        !src.join(crate::delta::RECORD).exists(),
+        "{} is a ram dir's mount point (delta.rs): its content is lower + upper, never this dir",
+        src.display()
+    );
     if let Some(ws) = pool_ws(dst) {
         crate::disk_floor::pool_gate(ws, &crate::ws_config::load(ws)?)?;
     }
@@ -1018,7 +1024,8 @@ fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
     copy_tree(src, dst, None, &[BOOTSTRAP_DIR])
 }
 
-/// Land's Publish: copies `ws/land` to `base/<HEAD of land>` under its exclusive lock (no build runs in it), through a temp name renamed into place. Returns the summary line.
+/// Land's Publish: `ws/land` becomes `base/<HEAD of land>` under its exclusive lock (no build runs in it), through a temp name renamed into place; then the dir is laid again ([`relay_land`]). Returns the summary line.
+/// A pool dir is copied ([`copy_base`]). A ram dir (delta.rs) is published without mounting it: its lower reflinked, its upper applied (delta_publish.rs), so the data written to the pool is the upper's, the base's new content. Both leave out the gate state ([`BOOTSTRAP_DIR`]).
 pub fn publish(land: &Path) -> Result<String> {
     land_id(land)?;
     let ws = Layout::of(land)?.workspace().to_owned();
@@ -1034,63 +1041,224 @@ pub fn publish(land: &Path) -> Result<String> {
         "{} does not exist: nothing to publish",
         src.display()
     );
-    let Some(_lock) = build_pool::try_lock_dir(&ws, id)? else {
-        bail!(
-            "{} is held by a running process: not published",
-            src.display()
-        );
+    let line = {
+        let Some(_lock) = build_pool::try_lock_dir(&ws, id)? else {
+            bail!(
+                "{} is held by a running process: not published",
+                src.display()
+            );
+        };
+        let parent = dst.parent().context("base has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        // the mtimes ws/land was built against, into the base: a child's new dir restores them (`checkout_stamps`)
+        let stamps = crate::checkout_stamps::record(land)?;
+        match crate::delta::record(&src)? {
+            Some(rec) => publish_ram(&ws, &rec, &dst, &stamps)?,
+            None => {
+                let file = src.join(crate::checkout_stamps::FILE);
+                std::fs::write(&file, stamps)
+                    .with_context(|| format!("writing {}", file.display()))?;
+                let tier = copy_base(&src, &dst)?;
+                count_tier(&ws, tier);
+                format!("out: base/{head} from ws/{id} ({})", tier.name())
+            }
+        }
     };
-    let parent = dst.parent().context("base has no parent")?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // the mtimes ws/land was built against, into the copy: a child's new dir restores them (`checkout_stamps`)
-    let stamps = src.join(crate::checkout_stamps::FILE);
-    std::fs::write(&stamps, crate::checkout_stamps::record(land)?)
-        .with_context(|| format!("writing {}", stamps.display()))?;
-    let tier = copy_base(&src, &dst)?;
-    count_tier(&ws, tier);
-    Ok(format!("out: base/{head} from ws/{id} ({})", tier.name()))
+    // the base is out: a failed relay costs only the next land a fresh dir
+    Ok(match relay_land(land, &ws, true) {
+        Ok(laid) => format!("{line}; {laid}"),
+        Err(e) => format!("{line}; ws/{id} not laid again: {e:#}"),
+    })
 }
 
-/// Land's reset after a failed verify: deletes `ws/land` under its exclusive lock and copies it again from the newest base that is an ancestor of the land worktree's HEAD ([`ensure`]). The land's own gate state is carried over: [`copy_base`] leaves it out of bases. Returns the create line.
+/// [`publish`] of ram dir `rec` of land as `dst`. Refused while the delta is mounted (an upper is stable only unmounted), or when its lower or upper is gone or the upper was laid over another base: a base is never made from a part.
+fn publish_ram(
+    ws: &Path,
+    rec: &crate::delta::Record,
+    dst: &Path,
+    stamps: &str,
+) -> Result<String> {
+    let id = LAND_ID;
+    let Some(_mounted) = crate::delta::try_mount_lock(ws, id)? else {
+        bail!("ws/{id}'s ram delta is mounted by a running command: not published");
+    };
+    let lower = base_of(ws, &rec.base);
+    let upper = rec.dir(id).join("upper");
+    ensure!(
+        lower.is_dir(),
+        "base/{} under ws/{id}'s delta is gone: not published",
+        rec.base
+    );
+    let on = std::fs::read_to_string(upper.join(BASE_FILE)).with_context(|| {
+        format!(
+            "ws/{id}'s upper {} is gone or unmarked (store emptied, e.g. a WSL restart): not published",
+            upper.display()
+        )
+    })?;
+    ensure!(
+        on.trim() == rec.base,
+        "ws/{id}'s upper lies over base/{}, its record names base/{}: not published",
+        on.trim(),
+        rec.base
+    );
+    let started = std::time::Instant::now();
+    let file = crate::checkout_stamps::FILE;
+    let (tier, done) =
+        crate::delta_publish::publish(&lower, &upper, dst, &[BOOTSTRAP_DIR], &|tmp| {
+            std::fs::write(tmp.join(file), stamps)
+                .with_context(|| format!("writing {}", tmp.join(file).display()))
+        })?;
+    count_tier(ws, tier);
+    count(ws, "publish-ram");
+    Ok(format!(
+        "out: {} from base/{} ({}) + ws/{id}'s ram upper in {:.1} s: {}",
+        dst.strip_prefix(pool(ws)).unwrap_or(dst).display(),
+        rec.base,
+        tier.name(),
+        started.elapsed().as_secs_f64(),
+        done.line()
+    ))
+}
+
+/// Land's reset after a failed verify: `ws/land` laid again from the newest base that is an ancestor of the land worktree's HEAD ([`relay_land`]): no failed branch's outputs stay in the dir the next base comes from. Returns the line.
 pub fn recopy(land: &Path) -> Result<String> {
     land_id(land)?;
     let ws = Layout::of(land)?.workspace().to_owned();
-    let dir = dir_of(&ws, LAND_ID);
-    // aside at the pool root, which no id lists: the copy below would otherwise delete the gate state with the dir
-    let aside = pool(&ws).join(format!(".{LAND_ID}-{BOOTSTRAP_DIR}-{}", std::process::id()));
+    relay_land(land, &ws, false)
+}
+
+/// Lays land's dir again over the newest base that is an ancestor of the land worktree's HEAD (after Publish: the base just published; after a failed verify: the base before the branch), carrying its gate state ([`BOOTSTRAP_DIR`], which bases leave out: its cargo units key on the land checkout).
+/// Tier: ram when the store probes RAM-backed and one admission try of class native (land's next build) fits, never waiting; else pool. `keep_pool`: a pool dir that would stay pool is kept as it is (after Publish it equals the base: nothing to redo).
+/// A ram dir's upper then holds only the next land's delta: publishing moved the last one into the base. The worktree's `target` link follows the tier at once (ram: the boot dir), since land's next cargo bootstrap runs before any xtask settles it.
+pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
+    let id = LAND_ID;
+    let dir = dir_of(ws, id);
+    let cfg = crate::ws_config::load(ws)?;
+    let rec = crate::delta::record(&dir)?;
+    // the configured store: the new dir's tier is decided now, wherever the old upper lives
+    let store = cfg.delta.ram_store.value.clone();
+    let fits = || {
+        crate::delta::fits_now(ws, id, &cfg.delta, crate::delta::Class::Native, &store)
+    };
+    if keep_pool
+        && rec.is_none()
+        && present(&dir)?
+        && let Err(why) = fits()?
+    {
+        return Ok(format!("ws/{id} stays on tier pool ({why})"));
+    }
+    let pid = std::process::id();
+    // aside on the filesystem it lives on, so moving it is a rename; no id lists these names
+    let (state, aside) = match &rec {
+        Some(r) => (
+            r.dir(id).join("upper").join(BOOTSTRAP_DIR),
+            r.store.join(format!(".{id}-{BOOTSTRAP_DIR}-{pid}")),
+        ),
+        None => (
+            dir.join(BOOTSTRAP_DIR),
+            pool(ws).join(format!(".{id}-{BOOTSTRAP_DIR}-{pid}")),
+        ),
+    };
     let mut kept = false;
     if present(&dir)? {
-        let Some(_lock) = build_pool::try_lock_dir(&ws, LAND_ID)? else {
+        let Some(_lock) = build_pool::try_lock_dir(ws, id)? else {
             bail!(
-                "{} is held by a running process: not re-copied",
+                "{} is held by a running process: not laid again",
                 dir.display()
             );
         };
-        let state = dir.join(BOOTSTRAP_DIR);
         if present(&state)? {
             std::fs::rename(&state, &aside)
                 .with_context(|| format!("moving {} aside", state.display()))?;
             kept = true;
         }
-        remove_build_dir(&dir)?;
+        match &rec {
+            Some(r) => crate::delta::drop_ram(ws, id, r)?,
+            None => remove_build_dir(&dir)?,
+        }
     }
     // the carried gate state was built from the land's earlier content: no mtime restore under it
-    let dir = match prepare_with(land, !kept) {
-        Ok(dir) => dir,
+    let laid = (|| -> Result<String> {
+        Ok(match fits()? {
+            Ok(why) => match crate::delta::make_ram(land, ws, id, &store, !kept) {
+                Ok(_) => format!("ram ({why})"),
+                Err(e) => {
+                    make(land, !kept)?;
+                    format!("pool (ram dir not made: {e:#})")
+                }
+            },
+            Err(why) => {
+                make(land, !kept)?;
+                format!("pool ({why})")
+            }
+        })
+    })();
+    let laid = match laid {
+        Ok(l) => l,
         Err(e) => {
             if kept {
-                let _ = remove_build_dir(&aside);
+                let _ = std::fs::remove_dir_all(&aside);
             }
             return Err(e);
         }
     };
+    let ram = crate::delta::record(&dir)?;
     if kept {
-        std::fs::rename(&aside, dir.join(BOOTSTRAP_DIR))
-            .with_context(|| format!("restoring {}", aside.display()))?;
+        let to = match &ram {
+            Some(r) => r.dir(id).join("upper").join(BOOTSTRAP_DIR),
+            None => dir.join(BOOTSTRAP_DIR),
+        };
+        place(&aside, &to)?;
     }
-    let base = std::fs::read_to_string(dir.join(BASE_FILE))
-        .map_or("no base".to_owned(), |c| format!("base/{}", c.trim()));
-    Ok(format!("ws/{LAND_ID} re-copied from {base}"))
+    if ram.is_some() {
+        link_target(land, &dir)?;
+    } else {
+        // a link to the boot dir or to this dir's target stays valid; settle_target moves it at the next command's end
+        let target = target_of(&dir);
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("creating {}", target.display()))?;
+    }
+    let base = match &ram {
+        Some(r) => r.base.clone(),
+        None => std::fs::read_to_string(dir.join(BASE_FILE))
+            .map_or("no base".to_owned(), |c| c.trim().to_owned()),
+    };
+    Ok(format!(
+        "ws/{id} laid over base/{base} on tier {laid}{}",
+        if kept {
+            "; gate state carried"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// Moves dir `from` to the absent `to`: a rename on one filesystem, else a copy (`cp -a`) and removal.
+fn place(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let ok = Command::new("cp")
+        .arg("-a")
+        .arg("--")
+        .arg(from)
+        .arg(to)
+        .status()
+        .context("running cp")?
+        .success();
+    ensure!(ok, "cp -a {} -> {} failed", from.display(), to.display());
+    std::fs::remove_dir_all(from).with_context(|| format!("removing {}", from.display()))
+}
+
+/// Points the checkout's `target` at what its build dir `dir` needs now: a ram dir's boot target (cargo's bootstrap runs outside the namespace), a pool dir's own `target/` ([`settle_target`]'s rule, applied at once).
+fn link_target(root: &Path, dir: &Path) -> Result<()> {
+    let want = if dir.join(crate::delta::RECORD).exists() {
+        boot_of(&target_of(dir)).context("build dir path has no boot target")?
+    } else {
+        target_of(dir)
+    };
+    apply_steps(&link_steps(&root.join(TARGET), &want)?)
 }
 
 /// `native`'s refresh after a rebase: when a base newer than the one `ws/<id>` came from (`.base`) is an ancestor of HEAD, the dir is replaced by a copy of it. Returns the line to print; None = nothing to do.
@@ -1214,13 +1382,20 @@ fn wants_refresh(changed: usize, min: u32) -> bool {
 }
 
 /// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
+/// Land's Enter calls it: a missing land dir is laid with the tier rule of [`relay_land`]; a ram dir needs nothing (its `target` link names the boot dir, which exists).
 pub fn prepare(root: &Path) -> Result<PathBuf> {
-    prepare_with(root, true)
-}
-
-/// [`prepare`]; `restore` as in [`make`].
-fn prepare_with(root: &Path, restore: bool) -> Result<PathBuf> {
-    let (_, dir) = make(root, restore)?;
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let id = checkout_id(root)?;
+    let dir = dir_of(&ws, &id);
+    if crate::delta::record(&dir)?.is_some() {
+        link_target(root, &dir)?;
+        return Ok(dir);
+    }
+    if id == LAND_ID && !present(&dir)? {
+        println!("out: {}", relay_land(root, &ws, false)?);
+        return Ok(dir);
+    }
+    let (_, dir) = make(root, true)?;
     let target = target_of(&dir);
     std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
     Ok(dir)
@@ -1492,9 +1667,6 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
     let want = if ram { "ram" } else { "pool" };
     let cfg = crate::ws_config::load(ws)?;
     if ram {
-        if let Some(why) = crate::delta::role_reason(&id) {
-            bail!("ws/{id} stays on the pool tier: {why}");
-        }
         if let Err(why) = crate::delta::probe(&cfg.delta.ram_store.value, &cfg.delta)? {
             bail!("no ram tier for ws/{id}: {why}");
         }
@@ -1522,7 +1694,7 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
         }
     }
     if ram {
-        crate::delta::make_ram(root, ws, &id, &cfg.delta.ram_store.value)?;
+        crate::delta::make_ram(root, ws, &id, &cfg.delta.ram_store.value, true)?;
     } else {
         make(root, true)?;
     }
@@ -1653,10 +1825,13 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
 mod tests {
     use super::*;
 
+    /// A scratch workspace whose delta store is absent (pool tier): a test never reaches the host's store, which every workspace shares by id (2026-11-21 and 2026-11-22: scratch runs wrote and deleted store dirs of live ids).
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xtask-out-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("scratch");
+        let toml = format!("[delta]\nram_store = \"{}\"\n", d.join("no-ram-store").display());
+        std::fs::write(d.join("workspace.toml"), toml).expect("workspace.toml");
         d
     }
 
@@ -1869,6 +2044,111 @@ mod tests {
         release_holds(&b).expect("release b");
         std::fs::remove_dir_all(&a).expect("cleanup a");
         std::fs::remove_dir_all(&b).expect("cleanup b");
+    }
+
+    /// Land on the ram tier, end to end without a build tool: laid over base/A, a "build" through the mounted overlay (modify, delete, replace a dir, gate state), publish -> base/B equals the merged view the build saw (minus gate state and `.base`, plus the stamps), ws/land laid again over base/B with the gate state carried and an otherwise empty upper; recopy keeps ram; with the store gone recopy falls back to the pool and keeps the gate state; a pool dir that would stay pool is kept by publish.
+    #[test]
+    fn land_on_ram_publishes_and_lays_again() {
+        let ws = scratch("land-ram");
+        let store = Path::new("/dev/shm").join(format!("xtask-out-{}-land-ram", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).expect("store");
+        // tiny peaks: the tier rule, not this host's free RAM, is under test
+        let toml = |store: &Path| {
+            format!(
+                "[delta]\nram_store = \"{}\"\npeak_native_gib = 0.01\nram_margin_gib = 0\n",
+                store.display()
+            )
+        };
+        std::fs::write(ws.join("workspace.toml"), toml(&store)).expect("toml");
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let g = |dir: &Path, args: &[&str]| git(Some(dir), args).expect("git");
+        let commit = |msg: &str| {
+            g(&repo, &["add", "-A"]);
+            g(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]);
+            g(&repo, &["rev-parse", "HEAD"])
+        };
+        g(&repo, &["init", "-q", "-b", "main"]);
+        put(&repo.join("f"));
+        let a = commit("a");
+        let land = ws.join("wt").join("land");
+        g(&repo, &["worktree", "add", "-q", "--detach", land.to_str().expect("utf-8"), &a]);
+        assert_eq!(checkout_id(&land).expect("id"), LAND_ID);
+        let base_a = base_of(&ws, &a);
+        for p in ["target/debug/own", "gone", "dir/x", "kept"] {
+            put(&base_a.join(p));
+        }
+        let laid = relay_land(&land, &ws, false).expect("lay");
+        assert!(laid.contains("tier ram"), "{laid}");
+        let dir = dir_of(&ws, LAND_ID);
+        let rec = crate::delta::record(&dir).expect("record").expect("a ram dir");
+        assert_eq!(rec.base, a);
+        assert!(!rec.dir(LAND_ID).join("fresh").exists(), "land's units are its own");
+        assert_eq!(entry(&land.join(TARGET)).expect("entry"), Entry::Link(boot_of(&target_of(&dir)).expect("boot")));
+        // the build, through the overlay as stage mount mounts it; the merged listing taken there
+        let merged = ws.join("merged.list");
+        let list = "find . -mindepth 1 \\( -type d -printf '%P d %m %T@\\n' \\) -o -printf '%P %y %m %T@ %s\\n' | LC_ALL=C sort";
+        let build = format!(
+            "set -e; mount -t overlay overlay -o \"$1\" \"$2\"; cd \"$2\"; echo more >> target/debug/own; touch -d 2001-01-01 target/debug/own; rm gone; rm -rf dir && mkdir dir && echo y > dir/y; mkdir -p bootstrap/debug && echo s > bootstrap/debug/state; {list} > \"$3\""
+        );
+        let ok = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--", "sh", "-c"])
+            .arg(&build)
+            .arg("sh")
+            .arg(crate::delta::mount_options(&ws, LAND_ID, &rec).expect("opts"))
+            .arg(&dir)
+            .arg(&merged)
+            .status()
+            .expect("unshare")
+            .success();
+        assert!(ok, "build in the overlay");
+        put(&repo.join("g"));
+        let b = commit("b");
+        g(&land, &["checkout", "-q", "--detach", &b]);
+        let line = publish(&land).expect("publish");
+        assert!(line.contains("ram upper") && line.contains("tier ram"), "{line}");
+        let base_b = base_of(&ws, &b);
+        let out = Command::new("sh").arg("-c").arg(format!("cd \"$1\" && {list}")).arg("sh").arg(&base_b).output().expect("find");
+        let strip = |text: &str, extra: &str| -> String {
+            text.lines()
+                .filter(|l| !l.starts_with("bootstrap") && !l.starts_with(".base ") && !l.starts_with(extra))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+        let got = String::from_utf8(out.stdout).expect("utf-8");
+        let want = std::fs::read_to_string(&merged).expect("merged");
+        assert!(want.contains("dir/y f") && !want.contains("gone") && want.contains("bootstrap/debug/state"), "{want}");
+        assert_eq!(strip(&got, crate::checkout_stamps::FILE), strip(&want, "-"), "base/B vs the merged view");
+        assert!(base_b.join(crate::checkout_stamps::FILE).is_file() && !base_b.join(BOOTSTRAP_DIR).exists() && !base_b.join(BASE_FILE).exists());
+        // laid again: over base/B, gate state carried, nothing else of the old upper
+        let rec = crate::delta::record(&dir).expect("record").expect("still ram");
+        assert_eq!(rec.base, b);
+        let upper = rec.dir(LAND_ID).join("upper");
+        let mut names: Vec<_> = std::fs::read_dir(&upper).expect("upper").flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, [BASE_FILE, BOOTSTRAP_DIR]);
+        assert!(upper.join("bootstrap/debug/state").is_file());
+        // reset after a failed verify: ram again, gate state kept
+        let line = recopy(&land).expect("recopy");
+        assert!(line.contains("tier ram") && line.contains("gate state carried"), "{line}");
+        // the store gone: the pool tier, gate state copied off the store
+        std::fs::write(ws.join("workspace.toml"), toml(&ws.join("no-ram-store"))).expect("toml");
+        let line = recopy(&land).expect("recopy to pool");
+        assert!(line.contains("tier pool") && line.contains("gate state carried"), "{line}");
+        assert!(crate::delta::record(&dir).expect("record").is_none());
+        assert!(dir.join("bootstrap/debug/state").is_file() && dir.join("dir/y").is_file());
+        assert!(!rec.dir(LAND_ID).exists(), "the old store dir stays behind");
+        // a pool dir that stays pool is kept as it is by publish
+        put(&repo.join("h"));
+        let c = commit("c");
+        g(&land, &["checkout", "-q", "--detach", &c]);
+        let line = publish(&land).expect("publish pool");
+        assert!(line.contains("stays on tier pool"), "{line}");
+        assert!(base_of(&ws, &c).join("dir/y").is_file());
+        let _ = Command::new("chmod").args(["-R", "u+rwx"]).arg(&store).status();
+        std::fs::remove_dir_all(&store).expect("cleanup store");
+        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     /// The land's gate state is its own: publish leaves it out of the base (other checkouts would reuse it as fresh), and recopy puts the land's back, so the next land's gate runs warm.

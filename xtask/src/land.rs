@@ -179,6 +179,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.build_dir {
+        // the build record lies in the build dir: a ram dir shows it only inside its namespace
+        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small)? {
+            return Ok(code);
+        }
         match build_dir_staleness(root)? {
             None => println!("{BUILD_DIR_CURRENT}"),
             Some(why) => println!("{BUILD_DIR_STALE}{why}"),
@@ -1544,6 +1548,12 @@ mod tests {
             let wt = root.join("ws").join("wt").join("task");
             let land = root.join("ws").join(LAND_WT);
             std::fs::create_dir_all(&repo).unwrap();
+            // never the host's delta store: Enter lays a missing land dir with the tier rule (out::relay_land)
+            let toml = format!(
+                "[delta]\nram_store = \"{}\"\n",
+                root.join("no-ram-store").display()
+            );
+            std::fs::write(root.join("ws").join("workspace.toml"), toml).unwrap();
             // HEAD of the bare remote must name main, or a clone of it has no branch to push onto
             git(
                 Some(&root),

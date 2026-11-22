@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Build-dir delta store: where a checkout's writes on top of its base go. One interface, two capability tiers, chosen by probing (never by host name):
 //! `ram` = overlayfs, lower `base/<commit>` on the pool, upper + work in `<delta.ram_store>/<id>/` when that store is RAM-backed (zram block device or tmpfs) and the build class fits it; `pool` = the reflinked/copied dir of out.rs, the baseline that works everywhere.
-//! Slice 1: only children use `ram`; the main checkout and land keep `pool` (land publishes from a materialised pool dir). The decision is recorded once: a ram dir's mount point `out/pool/ws/<id>` holds only [`RECORD`]; a pool dir has none.
+//! Every checkout may use `ram`, main and land included: land publishes a ram dir without mounting it (lower reflinked + upper applied, delta_publish.rs) and lays its dir again after each publish or reset (out::relay_land). A dir made before keeps its tier. The decision is recorded once: a ram dir's mount point `out/pool/ws/<id>` holds only [`RECORD`]; a pool dir has none.
 //! Every outer build command prints `out: delta ram|pool (<reason>)` and counts `pool/delta-<outcome>.count`.
 //!
 //! Mount (unprivileged; plan ram-delta D4): the outer command re-executes as `unshare --user --map-root-user --mount` (stage `mount`: uid 0 in that userns mounts the overlay at the real dir path), which runs `unshare --user --map-user=<uid>` (stage `in`: the caller's uid, no capabilities, as bwrap demands) and continues into the build namespace (tree.rs), whose bind of the dir over `out/build` then shows the overlay.
@@ -336,15 +336,6 @@ pub fn judge(s: &Stats, need_raw: u64, reserved: u64, margin: u64) -> Verdict {
     Verdict::Admit { need_ram }
 }
 
-/// Why checkout `id` stays on the pool whatever the store: None = a child, eligible.
-pub fn role_reason(id: &str) -> Option<&'static str> {
-    match id {
-        out::MAIN_ID => Some("the main checkout: pool in slice 1"),
-        out::LAND_ID => Some("land publishes from a pool dir"),
-        _ => None,
-    }
-}
-
 /// The class of a build command (cli.rs).
 pub fn class_for_native(root: &Path, host: &str) -> Result<Class> {
     let arches = crate::arches::load(root)?;
@@ -468,6 +459,26 @@ pub fn admit_once(
     }
 }
 
+/// Whether a build of `class` by `id` would be admitted on `store` now: one try, its reservation released at once (out::relay_land picks land's tier with it). Ok(the admitted line) or Err(why not).
+pub fn fits_now(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Class,
+    store: &Path,
+) -> Result<std::result::Result<String, String>> {
+    Ok(match admit_once(ws, id, cfg, class, probe(store, cfg)?)? {
+        Ok((_released, stats, need_ram)) => Ok(format!(
+            "{} build fits, {:.2} GiB RAM; store {}: {}",
+            class.name(),
+            gib(need_ram),
+            store.display(),
+            stats.line()
+        )),
+        Err(v) => Err(format!("{} build: {}", class.name(), v.reason())),
+    })
+}
+
 /// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits.
 fn admit(
     ws: &Path,
@@ -503,8 +514,8 @@ fn admit(
     }
 }
 
-/// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker, the checkout's mtimes restored from the base. Err when there is no base (a build from zero is the pool tier's).
-pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path) -> Result<Record> {
+/// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker (not for land: its units' paths are its own, as out::make), the checkout's mtimes restored from the base when `restore` (out::make's rule). Err when there is no base (a build from zero is the pool tier's).
+pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path, restore: bool) -> Result<Record> {
     let dir = out::dir_of(ws, id);
     ensure!(
         !out::present(&dir)?,
@@ -531,7 +542,9 @@ pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path) -> Result<Record
     std::fs::create_dir_all(sd.join("work"))?;
     std::fs::write(sd.join(OWNER), format!("{}\n", ws.display()))?;
     std::fs::write(sd.join("upper").join(out::BASE_FILE), format!("{base}\n"))?;
-    std::fs::write(sd.join(FRESH), "")?;
+    if id != out::LAND_ID {
+        std::fs::write(sd.join(FRESH), "")?;
+    }
     let parent = dir.parent().context("build dir has no parent")?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".{id}.tmp-{}", std::process::id()));
@@ -539,7 +552,11 @@ pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path) -> Result<Record
     std::fs::write(tmp.join(RECORD), rec.text())?;
     std::fs::rename(&tmp, &dir)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dir.display()))?;
-    let stamps = out::restore_stamps(root, &out::base_of(ws, &base))?;
+    let stamps = if restore {
+        out::restore_stamps(root, &out::base_of(ws, &base))?
+    } else {
+        "mtimes kept: outputs carried in".to_owned()
+    };
     println!(
         "out: ws/{id} ram delta over base/{base} in {}; {stamps}",
         sd.display()
@@ -633,7 +650,7 @@ pub fn refresh(
         ));
     }
     drop_ram(ws, id, rec)?;
-    make_ram(root, ws, id, &rec.store)?;
+    make_ram(root, ws, id, &rec.store, true)?;
     Ok(format!(
         "out: refresh ws/{id} ram delta from base/{} to base/{pick} ({why}); the upper was dropped (a delta of the old base)",
         rec.base
@@ -662,9 +679,6 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     };
     if rec.is_none() && out::present(&dir)? {
         return pool(&format!("ws/{id} is a pool dir"));
-    }
-    if let Some(why) = role_reason(&id) {
-        return pool(why);
     }
     let store = rec
         .as_ref()
@@ -697,11 +711,11 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
                 out::count(&ws, "delta-lost");
                 println!("out: ws/{id} ram delta lost ({why}): remade");
                 drop_ram(&ws, &id, &r)?;
-                make_ram(root, &ws, &id, &store)?;
+                make_ram(root, &ws, &id, &store, true)?;
             }
         }
         None => {
-            if let Err(e) = make_ram(root, &ws, &id, &store) {
+            if let Err(e) = make_ram(root, &ws, &id, &store, true) {
                 return pool(&format!("{e:#}"));
             }
         }
@@ -1278,14 +1292,6 @@ mod tests {
         let keep = std::collections::BTreeSet::from(["mine".to_owned()]);
         assert!(orphan_store_dirs(&store, me, &keep).is_empty());
         std::fs::remove_dir_all(&store).unwrap();
-    }
-
-    /// Tier choice: the role rule names main and land; any other id is a child.
-    #[test]
-    fn roles() {
-        assert!(role_reason("repo").is_some());
-        assert!(role_reason("land").is_some());
-        assert_eq!(role_reason("ram-delta-s1"), None);
     }
 
     /// Probe: a dir on a disk filesystem is not RAM-backed; /dev/shm (tmpfs on Linux) is, with ratio 1.
