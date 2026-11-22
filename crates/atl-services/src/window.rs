@@ -65,6 +65,8 @@ const COMPAT_SCALE_NONE: f32 = 1.0;
 const ADD_BAD_APP_TOKEN: i32 = -1;
 /// WindowManagerGlobal.ADD_BAD_SUBWINDOW_TOKEN: a sub-window whose token is no window's.
 const ADD_BAD_SUBWINDOW_TOKEN: i32 = -2;
+/// WindowManagerService.getInitialDisplayDensity / getBaseDisplayDensity (:6170, :6181): the answer for a display id with no DisplayContent.
+const NO_DISPLAY_DENSITY: i32 = -1;
 
 /// The UI agent of the process that opened a session (ui_agent.rs): the registry holds one per app process (ui_agents.rs), and a session's windows are its process's (Session.java:130-141), so
 /// a session asks the agent of the process that opened it, whatever other processes of its uid registered.
@@ -309,6 +311,17 @@ impl IWindowManager for WindowManager {
         Ok(1.0)
     }
 
+    /// WindowManagerService.getInitialDisplayDensity:6158-6171: the display's initial density (DisplayContent.mInitialDisplayDensity), -1 for a display that does not exist. No framework
+    /// caller; apps reach it by reflection (@UnsupportedAppUsage) to compare it with the current density. The one display has no forced density, so initial = current = the display model's dpi.
+    fn r#getInitialDisplayDensity(&self, display_id: i32) -> binder::Result<i32> {
+        Ok(initial_display_density(&self.tasks, display_id))
+    }
+
+    /// WindowManagerService.getBaseDisplayDensity:6174-6182: DisplayContent.mBaseDisplayDensity = the initial density while no density is forced (none is here), -1 for no display.
+    fn r#getBaseDisplayDensity(&self, display_id: i32) -> binder::Result<i32> {
+        self.r#getInitialDisplayDensity(display_id)
+    }
+
     /// WindowManagerService.getWindowInsets:9749: the display's insets for window metrics (InsetsPolicy.getInsetsForWindowMetrics: the display's raw InsetsState, here [`display_insets`], what
     /// addToDisplayAsUser and relayout also give), and DisplayPolicy.areSystemBarsForcedConsumedLw: false (no system bars to force). Another display id has no DisplayContent: AOSP throws
     /// InvalidDisplayException there; refused and counted as IllegalArgumentException.
@@ -389,6 +402,14 @@ fn add_result(
         res |= ADD_FLAG_APP_VISIBLE;
     }
     res
+}
+
+/// The initial density of display `display_id` (getInitialDisplayDensity): the display model's dpi for the one display, [`NO_DISPLAY_DENSITY`] for any other id.
+fn initial_display_density<C: Clone + PartialEq>(tasks: &Tasks<C>, display_id: i32) -> i32 {
+    if display_id != activity::DEFAULT_DISPLAY {
+        return NO_DISPLAY_DENSITY;
+    }
+    tasks.display().dpi
 }
 
 /// The display's bounds: the insets' display frame (InsetsState is the display's, DisplayContent).
@@ -991,6 +1012,21 @@ mod tests {
         assert_eq!(add_result(false, tasks.in_touch_mode(), true) & 0x1, 0);
         tasks.set_in_touch_mode(true);
         assert_eq!(add_result(false, tasks.in_touch_mode(), true) & 0x1, 0x1);
+    }
+
+    /// The one display answers the density it was built with (a display model at 320 dpi -> 320, not a constant); any other display id answers -1 (WindowManagerService.java:6170).
+    #[test]
+    fn initial_density_is_the_display_models() {
+        let display = DisplayModel {
+            dpi: 320,
+            ..DisplayModel::default()
+        };
+        let tasks = Tasks::<u32>::new(display, None);
+        assert_eq!(
+            initial_display_density(&tasks, activity::DEFAULT_DISPLAY),
+            320
+        );
+        assert_eq!(initial_display_density(&tasks, 1), -1);
     }
 
     /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.

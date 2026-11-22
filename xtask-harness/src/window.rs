@@ -900,6 +900,21 @@ const REQUESTED_LINE: &str = "AtlWindow: requested orientation";
 /// The fixture's process configuration (Application resources + Resources.getSystem()) at onCreate and at each onConfigurationChanged (Main.java logProcessConfiguration).
 const PROCESS_CREATED_LINE: &str = "AtlWindow: process configuration created";
 const PROCESS_CHANGED_LINE: &str = "AtlWindow: process configuration changed";
+/// The fixture's IWindowManager.getInitialDisplayDensity(0), called by reflection at onCreate (Main.java logInitialDensity).
+const INITIAL_DENSITY_LINE: &str = "AtlWindow: initial display density";
+
+/// Sub-gate `initial-density`: getInitialDisplayDensity of the default display is the gate display's dpi (WindowManagerService.getInitialDisplayDensity:6158-6162 = DisplayContent's initial
+/// density; no density is forced on the gate's display). An unanswered transaction reads 0 in the AIDL proxy: WeChat then mis-sizes its phone Welcome screen.
+fn initial_density_check(app: &str, display: DisplayModel) -> Result<String, String> {
+    let want = display.dpi.to_string();
+    match app.lines().find(|l| l.contains(INITIAL_DENSITY_LINE)) {
+        Some(line) if word(line, "density") == Some(want.as_str()) => {
+            Ok(format!("getInitialDisplayDensity(0) = {want}"))
+        }
+        Some(line) => Err(format!("{}: want density={want}", line.trim())),
+        None => Err("the fixture never asked getInitialDisplayDensity".to_owned()),
+    }
+}
 
 /// Sub-gates `process-opened` / `process-reshaped`: the process configuration `line` (Application's and Resources.getSystem()'s) is a window of `size` px on `display`: dp = px / (dpi / 160),
 /// rounded (DisplayContent.computeScreenAppConfiguration), portrait when width <= height. AOSP: the process follows its activity launched last (WindowProcessController.updateActivityConfigurationListener),
@@ -1033,6 +1048,7 @@ fn orientation_checks(app: &str, display: DisplayModel) -> Vec<Sub> {
             "process-reshaped",
             process_config_check(line_of(PROCESS_CHANGED_LINE, true), want, display),
         ),
+        ("initial-density", initial_density_check(app, display)),
     ]
 }
 
@@ -4027,8 +4043,10 @@ mod tests {
             process("created", 1440, 900, 2),
             process("changed", 750, 900, 1),
         );
+        // the display's 160 dpi; an unanswered transaction reads 0 in the AIDL proxy
+        let initial = "AtlWindow: initial display density=160\n";
         let good = format!(
-            "{created}{proc_created}{requested}{}{told}{proc_changed}{}",
+            "{created}{proc_created}{initial}{requested}{}{told}{proc_changed}{}",
             layout(1440, 900, 2),
             layout(750, 900, 1)
         );
@@ -4044,7 +4062,10 @@ mod tests {
             "{:?}",
             orientation_checks(&good, display)
         );
-        let kept = format!("{created}{proc_created}{requested}{}", layout(1440, 900, 2));
+        let kept = format!(
+            "{created}{proc_created}{initial}{requested}{}",
+            layout(1440, 900, 2)
+        );
         assert_eq!(failed(&kept), vec!["reshaped", "told", "process-reshaped"]);
         let relaunched = format!("{good}{created}");
         assert_eq!(failed(&relaunched), vec!["told"]);
@@ -4064,6 +4085,10 @@ mod tests {
             "system=1920x1200 systemOrientation=2",
         );
         assert_eq!(failed(&system_stale), vec!["process-reshaped"]);
+        let unanswered = good.replace("density=160", "density=0");
+        assert_eq!(failed(&unanswered), vec!["initial-density"]);
+        let never_asked = good.replace(initial, "");
+        assert_eq!(failed(&never_asked), vec!["initial-density"]);
     }
 
     /// Every layout must be the portrait size as content and as window frame, on the gate's display; one layout at another size fails the sub-gate.

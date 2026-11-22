@@ -54,6 +54,7 @@ public class Main extends Activity {
         Log.i(TAG, "onCreate reached");
         logDensity("created", getResources().getConfiguration());
         logProcessConfiguration("created");
+        logInitialDensity();
         // the title reaches the window's attributes only through them: Window.setTitle leaves the default (the component name)
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
         attrs.setTitle(WINDOW_TITLE);
@@ -203,6 +204,20 @@ public class Main extends Activity {
         android.content.res.Configuration sys = android.content.res.Resources.getSystem().getConfiguration();
         Log.i(TAG, "process configuration " + when + " app=" + app.screenWidthDp + "x" + app.screenHeightDp + " appOrientation=" + app.orientation
                 + " system=" + sys.screenWidthDp + "x" + sys.screenHeightDp + " systemOrientation=" + sys.orientation);
+    }
+
+    /**
+     * IWindowManager.getInitialDisplayDensity(DEFAULT_DISPLAY) reached by reflection, as apps reach it (@UnsupportedAppUsage; no framework caller): WeChat compares it with the current density
+     * (xtask-harness/src/window.rs stage orientation). An unanswered transaction reads as 0 in the AIDL proxy, so the value is logged, never only success.
+     */
+    private void logInitialDensity() {
+        try {
+            Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
+            Object density = wm.getClass().getMethod("getInitialDisplayDensity", int.class).invoke(wm, 0);
+            Log.i(TAG, "initial display density=" + density);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            Log.i(TAG, "initial display density error=" + (e.getCause() != null ? e.getCause() : e));
+        }
     }
 
     /** The density this instance sees (xtask-harness/src/window.rs move_checks): the Configuration's and the resources' DisplayMetrics, which must agree. */
