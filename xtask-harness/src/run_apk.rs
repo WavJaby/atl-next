@@ -841,7 +841,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     } else {
         stem
     };
-    let logs = rt
+    let row_logs = rt
         .out
         .join(remote::REMOTE_DIR)
         .join(target.log_dir())
@@ -858,7 +858,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             m.name,
             limit.as_secs(),
             a.hold,
-            logs.display()
+            row_logs.join("<n>").display()
         );
         if observe_on {
             println!(
@@ -874,9 +874,8 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         println!("{}", verdict::gate("remote run-apk", &problems));
         return Ok(ExitCode::FAILURE);
     }
-    // what an earlier run left here is not this run's: a run that ends before its logs return reads none of it
-    let _ = std::fs::remove_dir_all(&logs);
-    std::fs::create_dir_all(&logs).with_context(|| format!("creating {}", logs.display()))?;
+    // a dir of its own: an earlier run's logs and shots stay, and a run that ends before its logs return reads none of them
+    let logs = next_run_dir(&row_logs)?;
     for name in END_FILES {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
@@ -982,6 +981,20 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         &logs.join("atld.log"),
         &logs,
     ))
+}
+
+/// Makes and returns `row/<n>`, n = 1 + the highest numbered dir there (1 in a new row): one dir per remote run of a row, so a rerun keeps the earlier run's logs and shots.
+fn next_run_dir(row: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(row).with_context(|| format!("creating {}", row.display()))?;
+    let last = std::fs::read_dir(row)
+        .with_context(|| format!("reading {}", row.display()))?
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let dir = row.join((last + 1).to_string());
+    // create_dir, not _all: an existing dir is an error, never reused
+    std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// `audio-route:` over the remote run's `pw-dump` samples (`<n>.json` in `dir`, in sample order) and its atld pid ([`remote::PW_ATLD_PID`]). Judged after the run: a remote run is not
@@ -1711,6 +1724,22 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two runs of one row get two dirs; the first run's file stays. Files and non-numbered names (a pre-numbering run's `transcript.log`, `shots`) do not count.
+    #[test]
+    fn a_rerun_of_a_row_keeps_the_earlier_run() {
+        let row = std::env::temp_dir().join(format!("atl-run-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&row);
+        std::fs::create_dir_all(row.join("shots")).unwrap();
+        std::fs::write(row.join("transcript.log"), "old").unwrap();
+        let first = next_run_dir(&row).unwrap();
+        assert_eq!(first, row.join("1"));
+        std::fs::write(first.join("shot.png"), "x").unwrap();
+        std::fs::create_dir(row.join("7")).unwrap();
+        assert_eq!(next_run_dir(&row).unwrap(), row.join("8"));
+        assert!(first.join("shot.png").exists());
+        std::fs::remove_dir_all(&row).unwrap();
+    }
 
     /// Every print_summary block is forwarded (API, prop, a future family); other atld lines are not.
     #[test]
