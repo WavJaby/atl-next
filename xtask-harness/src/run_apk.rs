@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
-use crate::audio_pcm::{RouteSampler, Routing, route_verdict, stream_routes};
+use crate::audio_pcm::{RouteSampler, Routing, RunClients, route_verdict, stream_routes};
 use crate::manifest::Manifest;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
@@ -89,6 +89,10 @@ pub struct Args {
     /// Deliberate-failure check of --drive: the harness's window proxy drops every injected pointer, touch and key event (harness-side; no product path), so the script's first `expect-changed` after input must fail.
     #[arg(long, requires = "drive")]
     break_input: bool,
+    /// Deliberate-failure check of `audio-route:` (headless runs): the app's streams target a second null sink of the run, not the judged one, so the first sample that shows a stream
+    /// must stop the run and fail it. Nothing reaches a device sink.
+    #[arg(long, conflicts_with = "hold")]
+    break_route: bool,
     /// Runs the row's tracked scenario `xtask-harness/scenarios/<ROW>.drive` (scenarios.rs) on a fresh data root `<build dir>/scenario/<ROW>/data`, emptied first; shots stay in memory.
     /// Prints `scenario: ok|FAILED <row> host= cpu= guest= <k> judged, <s> skipped (<reasons>), <n> checkpoints fps= tier= <secs>s [FPS NOT JUDGED: ..] [unreachable: ..]` (scenarios.rs `Verdict::line`).
     #[arg(long, conflicts_with_all = ["drive", "hold", "pointer", "data_root", "clear_data"])]
@@ -222,6 +226,7 @@ impl Args {
             drive: None,
             break_blank_capture,
             break_input,
+            break_route: false,
             tilt_keys: false,
             mouse_touch: false,
             esc_back: false,
@@ -573,15 +578,28 @@ pub(crate) fn run_on(
         ),
         None => None,
     };
-    let rt = match &audio {
-        Some(routing) => {
+    // --break-route: a second null sink of the run, which the streams target instead of the judged one
+    let decoy = match (&audio, args.break_route) {
+        (Some(routing), true) => Some(Routing::setup(&format!("{}-elsewhere", routing.name()))?),
+        _ => None,
+    };
+    let rt = match (&audio, &decoy) {
+        (Some(routing), None) => {
             println!(
                 "run-apk: audio into the run's own null sink {}",
                 routing.name()
             );
             rt.with_audio_routing(routing)
         }
-        None => rt,
+        (Some(routing), Some(decoy)) => {
+            println!(
+                "run-apk: --break-route: audio into {} while {} is judged",
+                decoy.name(),
+                routing.name()
+            );
+            rt.with_audio_routing(decoy)
+        }
+        (None, _) => rt,
     };
     let m = timing::phase("run: package", || package(&rt, &files, pin, &args.target))?;
     // the name becomes the log and data paths below: refuse a name that is no package name before any is built
@@ -609,8 +627,22 @@ pub(crate) fn run_on(
     let script_ms = args.pointer.as_deref().map_or(0, script_wait_ms);
     let started = Instant::now();
     let mut atld = timing::phase("run: atld start", || rt.start_atld(&run))?;
-    // the route of a muted run is checked, not assumed
-    let sampler = audio.as_ref().map(|_| RouteSampler::start());
+    // the route of a muted run is checked, not assumed: each sample as it is taken, and a stream of this run linked anywhere but its sink ends the run (the boot loop or the drive script) at that sample
+    let sampler = audio.as_ref().map(|routing| {
+        let run = RunClients {
+            atld_pid: atld.id(),
+            pulse_pid: routing.pulse_pid(),
+        };
+        RouteSampler::start(run, Some(routing.name().to_owned()))
+    });
+    let route_stopped = std::cell::Cell::new(false);
+    let leaked = || {
+        let now = sampler.as_ref().is_some_and(RouteSampler::leaked);
+        if now {
+            route_stopped.set(true);
+        }
+        now
+    };
     let booted = Instant::now();
     let mut resumed_at = None;
     let mut presented_at = None;
@@ -619,6 +651,9 @@ pub(crate) fn run_on(
     let mut complete = false;
     let mut driven = None;
     loop {
+        if leaked() {
+            break;
+        }
         let services = read(&services_log);
         if resumed_at.is_none() && last_resumed(&services).is_some() {
             resumed_at = Some(Instant::now());
@@ -644,7 +679,7 @@ pub(crate) fn run_on(
                     services_log: &services_log,
                     atld_log: &atld_log,
                     log_dir: &log_dir,
-                    alive: &|| !run.app_ended(),
+                    alive: &|| !run.app_ended() && !leaked(),
                     break_blank: args.break_blank_capture,
                     shots: match (&args.keep_shots, args.scenario) {
                         (Some(dir), _) => drive::Shots::Into(dir.clone()),
@@ -698,11 +733,12 @@ pub(crate) fn run_on(
             Ok(())
         })?;
     }
+    let stopped = route_stopped.get();
     let route = sampler.map(|s| {
         let sink = audio.as_ref().map(Routing::name);
-        stream_routes(&s.finish(), &m.name, sink)
+        s.finish()
             .map_err(|e| format!("audio-route: {e:#}"))
-            .and_then(|r| route_verdict(&r, sink))
+            .and_then(|r| route_verdict(&r, sink, stopped))
     });
     let app = read(&app_log);
     let services = read(&services_log);
@@ -716,6 +752,11 @@ pub(crate) fn run_on(
         app_end: app_end(&services, &read(&run.atld_log())),
     };
     let scripted = args.pointer.is_some() || steps.is_some();
+    // printed on its own too, as the remote run's: an earlier failure (a drive's, a scenario's) must not hide where the sound went
+    if let Some(r) = &route {
+        println!("run-apk: {}", r.as_ref().unwrap_or_else(|e| e));
+    }
+    let leak = route.as_ref().and_then(|r| r.as_ref().err().cloned());
     let outcome = check_delivery(foreign, &m.name, &app)
         .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
         .and_then(|ok| {
@@ -725,8 +766,10 @@ pub(crate) fn run_on(
             Some(r) => r.map(|line| format!("{ok}; {line}")),
             None => Ok(ok),
         });
-    // the drive's failure first: it says what the script could not do, the verdict only what the app did
+    // a run the route check stopped: its leak first, it is why the app or the script did not finish. Else the drive's failure first: it says what the script could not do, the verdict
+    // only what the app did
     let outcome = match (&driven, steps.is_some()) {
+        _ if stopped => Err(leak.unwrap_or_else(|| "audio-route: the run was stopped".into())),
         (Some(drive::Outcome { error: Some(e), .. }), _) => Err(format!("drive: {e:#}")),
         (None, true) => outcome.and(Err("the script never ran".to_owned())),
         _ => outcome,
@@ -775,6 +818,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         drive: None,
         break_blank_capture: false,
         break_input: false,
+        break_route: false,
         tilt_keys: a.tilt_keys,
         mouse_touch: a.mouse_touch,
         esc_back: a.esc_back,
@@ -943,11 +987,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         display_node_check(&read(&run.scratch.join("atld.log"))).map(|gpu| format!("{ok}; {gpu}"))
     });
     // printed on its own too: an earlier failure must not hide where the sound went
-    let route = remote_route(
-        &run.scratch.join(remote::PW_SAMPLES),
-        &m.name,
-        audio.sink.as_deref(),
-    );
+    let route = remote_route(&run.scratch.join(remote::PW_SAMPLES), audio.sink.as_deref());
     println!("remote run-apk: {}", route.as_ref().unwrap_or_else(|e| e));
     let outcome = outcome.and_then(|ok| route.map(|r| format!("{ok}; {r}")));
     copy_logs(&run, &logs)?;
@@ -964,8 +1004,9 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     ))
 }
 
-/// `audio-route:` over the remote run's `pw-dump` samples (`<n>.json` in `dir`, in sample order).
-fn remote_route(dir: &Path, package: &str, sink: Option<&str>) -> Result<String, String> {
+/// `audio-route:` over the remote run's `pw-dump` samples (`<n>.json` in `dir`, in sample order) and its atld pid ([`remote::PW_ATLD_PID`]). Judged after the run: a remote run is not
+/// stopped at a leak (its samples come back with its logs).
+fn remote_route(dir: &Path, sink: Option<&str>) -> Result<String, String> {
     let mut files: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
         .map(|d| {
             d.filter_map(|e| {
@@ -982,9 +1023,24 @@ fn remote_route(dir: &Path, package: &str, sink: Option<&str>) -> Result<String,
         .filter_map(|(_, p)| std::fs::read_to_string(p).ok())
         .filter(|t| serde_json::from_str::<serde_json::Value>(t).is_ok())
         .collect();
-    stream_routes(&dumps, package, sink)
+    // the run's streams are its atld's contexts' (no pulse server of the run's own runs there)
+    let pid_file = dir.join(remote::PW_ATLD_PID);
+    let atld_pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "audio-route: no atld pid in {}: the run's streams cannot be told from others, the route was not checked",
+                pid_file.display()
+            )
+        })?;
+    let run = RunClients {
+        atld_pid,
+        pulse_pid: None,
+    };
+    stream_routes(&dumps, &run, sink)
         .map_err(|e| format!("audio-route: {e:#}"))
-        .and_then(|r| route_verdict(&r, sink))
+        .and_then(|r| route_verdict(&r, sink, false))
 }
 
 /// Index into `supported` of the ABI AOSP's `NativeLibraryHelper.findSupportedAbi` picks: the lowest index any `lib/<abi>/<file>.so` entry matches. The harness's own reading of the zip, needed before the

@@ -390,9 +390,10 @@ pub struct Runtime {
     pipewire_remote: Option<PathBuf>,
     /// atld's `PULSE_SERVER` (where atld finds the pulse socket `share-sound` grants the web process).
     pulse_server: PulseServer,
-    /// atld's `PIPEWIRE_PROPS` (libpipewire's launcher variable, read by every `pw_stream_new`): a run's own sink as its streams' target ([`Runtime::with_audio_routing`]); unset = the
-    /// session's routing (WirePlumber's default sink).
-    stream_target: Option<String>,
+    /// Where atld's streams play ([`StreamTarget`]): a sink of the runtime's own unless a run names its routing or is the user's launch.
+    stream_target: StreamTarget,
+    /// The runtime's own null sink ([`StreamTarget::OwnSink`]), made by the first atld start on this host and shared by the runtime's copies; it goes with the last copy.
+    own_sink: std::sync::Arc<std::sync::Mutex<Option<crate::audio_pcm::Routing>>>,
     /// The Wayland socket atld's children connect to (the window gate's proxy); the environment's when unset.
     wayland: Option<PathBuf>,
     /// Apps run under atld's app seccomp filter (atl-broker seccomp.rs) unless this is cleared (`--no-app-seccomp`, the deliberate-failure check).
@@ -946,8 +947,9 @@ impl Runtime {
             media_player_service: true,
             audio_break_mix: false,
             pipewire_remote: None,
-            pulse_server: PulseServer::GateDefault,
-            stream_target: None,
+            pulse_server: PulseServer::Absent,
+            stream_target: StreamTarget::OwnSink,
+            own_sink: Default::default(),
             wayland: None,
             app_seccomp: true,
             break_render_path: false,
@@ -1073,10 +1075,12 @@ impl Runtime {
 
     /// The user's launch (run-apk, local or remote): atld sees the desktop as an installed atld does, one builder so no run-apk path takes only part of it (remote run-apk once missed the fonts and read the pinned set on the target).
     /// - fonts: the desktop's own fontconfig config, not the pinned set (no CJK, emoji or other script face: that text was boxes). Gates keep the pinned set: their text must not depend on the host.
-    /// - audio: the session's `PULSE_SERVER`, set or unset: the login environment's audio server choice holds (Linux convention).
+    /// - audio: the session's routing (WirePlumber's default sink) and the session's `PULSE_SERVER`, set or unset: the login environment's audio server choice holds (Linux convention). A muted
+    ///   user launch (remote run-apk without `--audible`) names its sink after this ([`Runtime::with_remote_audio_sink`]).
     pub fn for_user_launch(mut self) -> Self {
         self.desktop_fonts = true;
         self.pulse_server = PulseServer::Session;
+        self.stream_target = StreamTarget::Session;
         self
     }
 
@@ -1350,16 +1354,10 @@ impl Runtime {
         self
     }
 
-    /// atld starts with `PULSE_SERVER` = `server` (libpulse's syntax, `unix:<path>`): the desktop's pulse server, whose socket `share-sound` grants the web process.
-    pub fn with_pulse_server(mut self, server: std::ffi::OsString) -> Self {
-        self.pulse_server = PulseServer::Named(server);
-        self
-    }
-
     /// Every stream the run creates plays into `routing`'s sink, never the session's: atld's own PipeWire streams by target (`PIPEWIRE_PROPS`), the web process's pulse streams through the
     /// run's pulse server when `routing` has one ([`crate::audio_pcm::Routing::with_pulse`]). For runs nobody listens to: gates and driven runs.
     pub fn with_audio_routing(mut self, routing: &crate::audio_pcm::Routing) -> Self {
-        self.stream_target = Some(routing.stream_props());
+        self.stream_target = StreamTarget::Props(routing.stream_props());
         if let Some(server) = routing.pulse_server() {
             self.pulse_server = PulseServer::Named(server);
         }
@@ -1369,13 +1367,15 @@ impl Runtime {
     /// A remote run's muted routing (remote.rs `RunAudio`): every PipeWire stream targets `sink`, the null sink the target makes for the run (audio_pcm.rs `holder_sh`). No pulse server
     /// of the run's own runs there, so the web process gets none ([`Runtime::without_pulse_server`]): its sound fails instead of reaching the session's sink.
     pub fn with_remote_audio_sink(mut self, sink: &str) -> Self {
-        self.stream_target = Some(crate::audio_pcm::stream_props(sink));
+        self.stream_target = StreamTarget::Props(crate::audio_pcm::stream_props(sink));
         self.without_pulse_server()
     }
 
-    /// atld starts with `PULSE_SERVER` naming a socket that does not exist: the desktop has no pulse server, so `share-sound` grants the web process nothing (the window gate's webview sound break).
-    pub fn without_pulse_server(self) -> Self {
-        self.with_pulse_server("unix:/nonexistent/atl-test/pulse/native".into())
+    /// atld starts with `PULSE_SERVER` naming a socket that does not exist: the desktop has no pulse server, so `share-sound` grants the web process nothing (every run's default; the window
+    /// gate's webview sound break).
+    pub fn without_pulse_server(mut self) -> Self {
+        self.pulse_server = PulseServer::Absent;
+        self
     }
 
     /// Removes the web engine module from the run's library dir (staged anew by every [`Runtime::new`]): a host without WebKit, for the app gate's engine break.
@@ -2157,7 +2157,7 @@ impl Runtime {
             cmd.env("PIPEWIRE_REMOTE", socket);
         }
         self.pulse_server.apply(&mut cmd);
-        if let Some(props) = &self.stream_target {
+        if let Some(props) = self.stream_props()? {
             cmd.env("PIPEWIRE_PROPS", props);
         }
         if let Some(socket) = &self.wayland {
@@ -2302,23 +2302,38 @@ fn check_code_policy(manifest_xml: &str, has_dex: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where atld's streams play: its `PIPEWIRE_PROPS` (libpipewire's launcher variable, read by every `pw_stream_new`; atl-broker app_env.rs forwards it to every app process).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamTarget {
+    /// Every run's default: a null sink of the runtime's own ([`Runtime::own_sink`]), so no gate plays into the session's sink by omission (2026-11-22: `test app`'s AAudio rows played into
+    /// wslg-sink). On a remote site, or a host with no PipeWire socket, [`crate::audio_pcm::NO_SINK`]: the streams fail rather than play.
+    OwnSink,
+    /// A run's own routing: these properties ([`crate::audio_pcm::stream_props`]).
+    Props(String),
+    /// Unset: the session's routing (WirePlumber's default sink) -- only the user's launch ([`Runtime::for_user_launch`]).
+    Session,
+}
+
 /// Where atld's `PULSE_SERVER` comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PulseServer {
-    /// Removed = libpulse's default socket. The gates' desktop is one audio server, PipeWire: a session PULSE_SERVER (WSLg sets unix:/mnt/wslg/PulseServer, its own PulseAudio, downstream of
-    /// PipeWire) would send the web process's audio past the graph the app's own audio plays into, and leak sound to the user's server.
-    GateDefault,
-    /// Set to this value (libpulse's syntax): a gate that judges the sound names its own server.
+    /// Every run's default: a socket that does not exist, so `share-sound` grants the web process nothing and its sound fails. Unset would be libpulse's default socket, the session's
+    /// pipewire-pulse, whose streams carry no run target and play into the session's sink.
+    Absent,
+    /// Set to this value (libpulse's syntax): a run's own pulse server (audio_pcm.rs `Routing::with_pulse`).
     Named(std::ffi::OsString),
     /// The session's value, untouched (run-apk: the user's launch).
     Session,
 }
 
+/// [`PulseServer::Absent`]'s value.
+const NO_PULSE_SERVER: &str = "unix:/nonexistent/atl-test/pulse/native";
+
 impl PulseServer {
     fn apply(&self, cmd: &mut Command) {
         match self {
-            PulseServer::GateDefault => {
-                cmd.env_remove("PULSE_SERVER");
+            PulseServer::Absent => {
+                cmd.env("PULSE_SERVER", NO_PULSE_SERVER);
             }
             PulseServer::Named(server) => {
                 cmd.env("PULSE_SERVER", server);
@@ -2327,15 +2342,49 @@ impl PulseServer {
         }
     }
 
-    /// The variables a remote run takes from the target's desktop session (remote.rs `session_env_script`): Session's PULSE_SERVER, as a desktop launch there inherits it. GateDefault needs no
-    /// entry (the target's `env -i` leaves a removed variable absent), Named is an explicit value.
+    /// The variables a remote run takes from the target's desktop session (remote.rs `session_env_script`): Session's PULSE_SERVER, as a desktop launch there inherits it. Absent and Named
+    /// are explicit values.
     fn remote_session_env(&self) -> &'static [&'static str] {
         match self {
             PulseServer::Session => &["PULSE_SERVER"],
-            PulseServer::GateDefault | PulseServer::Named(_) => &[],
+            PulseServer::Absent | PulseServer::Named(_) => &[],
         }
     }
 }
+
+impl Runtime {
+    /// atld's `PIPEWIRE_PROPS` per [`StreamTarget`], None = unset; makes the runtime's own sink at the first call that needs it.
+    fn stream_props(&self) -> Result<Option<String>> {
+        Ok(match &self.stream_target {
+            StreamTarget::Session => None,
+            StreamTarget::Props(p) => Some(p.clone()),
+            StreamTarget::OwnSink => {
+                let here = matches!(self.site, remote::Site::Host)
+                    && atl_platform_host::app_access::pipewire_socket().is_some();
+                if !here {
+                    return Ok(Some(crate::audio_pcm::stream_props(
+                        crate::audio_pcm::NO_SINK,
+                    )));
+                }
+                let mut own = self
+                    .own_sink
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("the runtime's own sink lock is poisoned"))?;
+                if own.is_none() {
+                    *own = Some(crate::audio_pcm::Routing::setup(&format!(
+                        "atl-run-{}-{}",
+                        std::process::id(),
+                        RUNTIME_SINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ))?);
+                }
+                own.as_ref().map(crate::audio_pcm::Routing::stream_props)
+            }
+        })
+    }
+}
+
+/// Runtimes of this process that made their own sink: the sink names' second part, unique within the process.
+static RUNTIME_SINKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -2355,9 +2404,10 @@ mod tests {
         assert!(system_deaths("atld: stopped keystore2\n").is_empty());
     }
 
-    /// The command's PULSE_SERVER per state: Command::get_envs lists an explicit set as Some(value), an explicit removal as None, and an untouched (inherited) variable not at all.
+    /// The command's PULSE_SERVER per state: Command::get_envs lists an explicit set as Some(value) and an untouched (inherited) variable not at all. Absent is set, never removed: removed
+    /// = libpulse's default socket = the session's sink.
     #[test]
-    fn pulse_server_states_set_remove_or_inherit() {
+    fn pulse_server_states_set_or_inherit() {
         let of = |state: PulseServer| {
             let mut cmd = Command::new("true");
             state.apply(&mut cmd);
@@ -2367,7 +2417,7 @@ mod tests {
         };
         let named = std::ffi::OsString::from("unix:/run/user/1000/atl-pipewire-pulse");
         assert_eq!(of(PulseServer::Named(named.clone())), Some(Some(named)));
-        assert_eq!(of(PulseServer::GateDefault), Some(None));
+        assert_eq!(of(PulseServer::Absent), Some(Some(NO_PULSE_SERVER.into())));
         assert_eq!(of(PulseServer::Session), None);
     }
 

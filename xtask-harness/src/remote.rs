@@ -398,6 +398,8 @@ pub struct RunAudio {
 
 /// The scratch subdir holding a run's `pw-dump` samples, `<n>.json`.
 pub const PW_SAMPLES: &str = "pw";
+/// The file in [`PW_SAMPLES`] naming the target's atld pid, which the `audio-route:` check attributes the run's streams by (audio_pcm.rs `RunClients`).
+pub const PW_ATLD_PID: &str = "atld.pid";
 
 /// The window gate's live half on the target (window.rs `agent`, the harness's hidden `window-live`): started before atld, it proxies atld's window to the target's compositor, drives the stage and stops
 /// atld through its control socket; it writes `live.json` for the judge here. Host paths, relocated by [`RemoteRun::spawn`].
@@ -890,11 +892,12 @@ mkdir -p {pw_dir}
         s.push_str(
             "( cat <&7 > /dev/null 2>&1; kill -TERM \"$pid\" 2>/dev/null ) > /dev/null 2>&1 &\nWD=$!\n",
         );
-        // the samples end with atld; the last one may miss a stream's final second, not its route
+        // the samples end with atld; the last one may miss a stream's final second, not its route. atld = timeout's only child (`$pid` is timeout): its pid names the run's PipeWire
+        // contexts (audio_pcm.rs RunClients), written to [`PW_ATLD_PID`] once it shows
         if self.audio.is_some() {
             let every = crate::audio_pcm::ROUTE_SAMPLE.as_secs();
             s.push_str(&format!(
-                "( n=0; while kill -0 \"$pid\" 2>/dev/null; do XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" pw-dump > {pw_dir}/$n.json 2>/dev/null; n=$((n + 1)); sleep {every}; done ) &\nPWS=$!\n"
+                "( n=0; while kill -0 \"$pid\" 2>/dev/null; do [ -s {pw_dir}/{PW_ATLD_PID} ] || pgrep -P \"$pid\" > {pw_dir}/{PW_ATLD_PID}; XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" pw-dump > {pw_dir}/$n.json 2>/dev/null; n=$((n + 1)); sleep {every}; done ) &\nPWS=$!\n"
             ));
         }
         if self.agent.is_some() {

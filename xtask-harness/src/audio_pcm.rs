@@ -445,6 +445,11 @@ impl Routing {
         Ok(self)
     }
 
+    /// The pid of the run's pulse server, when [`Routing::with_pulse`] started one: its PipeWire clients carry it as `pipewire.sec.pid` (the server's own connection, SO_PEERCRED).
+    pub(crate) fn pulse_pid(&self) -> Option<u32> {
+        self.pulse.as_ref().map(|p| p.child.id())
+    }
+
     /// The run's pulse server in libpulse's syntax (`unix:<socket>`), when [`Routing::with_pulse`] started one.
     pub(crate) fn pulse_server(&self) -> Option<std::ffi::OsString> {
         self.pulse.as_ref().map(|p| {
@@ -455,10 +460,15 @@ impl Routing {
     }
 }
 
-/// `{ target.object=<sink> node.dont-fallback=true }` in PipeWire's SPA-JSON.
+/// `{ target.object=<sink> node.dont-fallback=true node.dont-move=true }` in PipeWire's SPA-JSON. WirePlumber 0.5.8 `linking/find-defined-target.lua`: a non-numeric target.object
+/// matches node.name only; dont-fallback -> a missing target destroys the stream (or keeps it waiting), never the default sink; dont-move -> a default-metadata `target.object` (a user's
+/// move, e.g. pavucontrol) is not read, else it replaces the stream's own target.
 pub(crate) fn stream_props(sink: &str) -> String {
-    format!("{{ target.object=\"{sink}\" node.dont-fallback=true }}")
+    format!("{{ target.object=\"{sink}\" node.dont-fallback=true node.dont-move=true }}")
 }
+
+/// A sink name no node has: a run with no sink of its own on its host (a remote gate) targets it, so its streams fail (dont-fallback) instead of reaching the session's sink.
+pub(crate) const NO_SINK: &str = "atl-no-sink";
 
 impl Drop for Routing {
     fn drop(&mut self) {
@@ -757,8 +767,96 @@ pub(crate) fn identity_check(
     if wrong { Err(detail) } else { Ok(detail) }
 }
 
-/// Where a run's app streams played, read from `pw-dump` samples taken during the run: the `audio-route:` check. App stream = an `Stream/Output/Audio` node of a client made through
-/// one of atld's security contexts (`pipewire.sec.engine=atl`), or whose `application.id` is the app's (`<package>` or the window's `atl.<package>`).
+/// The PipeWire clients that are one run's: the `audio-route:` check attributes app streams by these only, so a concurrent run or gate (another atld, its contexts) never counts as this run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RunClients {
+    /// The run's atld: its security contexts' instance ids are `<atld pid>.<n>` (atl-platform-host-linux pipewire_context.rs `Manager::create`), copied by PipeWire onto every client of the
+    /// context and unchangeable by it -- so every app or system process of the run, whatever tier the contexts have.
+    pub(crate) atld_pid: u32,
+    /// The run's own pipewire-pulse ([`Routing::pulse_pid`]): the web process's streams come from its connection, whose `pipewire.sec.pid` is that server's pid.
+    pub(crate) pulse_pid: Option<u32>,
+}
+
+impl RunClients {
+    /// Whether a client with props `p` is the run's. pw-dump writes a prop value that parses as a number as a JSON number: instance id `4242.3` arrives as 4242.3, pid as an integer.
+    fn owns(&self, p: &serde_json::Value) -> bool {
+        let instance = &p["pipewire.sec.instance-id"];
+        let atld = instance
+            .as_str()
+            .and_then(|s| s.split('.').next()?.parse::<u64>().ok())
+            .or_else(|| instance.as_f64().map(|f| f.trunc() as u64));
+        let in_context =
+            p["pipewire.sec.engine"] == "atl" && atld == Some(u64::from(self.atld_pid));
+        let pid = &p["pipewire.sec.pid"];
+        let pid = pid
+            .as_u64()
+            .or_else(|| pid.as_str().and_then(|s| s.parse().ok()));
+        in_context || (self.pulse_pid.is_some() && pid == self.pulse_pid.map(u64::from))
+    }
+}
+
+/// One `pw-dump` sample judged for one run ([`sample_routes`]).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SampleRoutes {
+    /// An app stream of the run was linked into the run's own sink.
+    pub(crate) into_run_sink: bool,
+    /// Every other node an app stream of the run was linked into, `node.name (media.class)`.
+    pub(crate) elsewhere: std::collections::BTreeSet<String>,
+}
+
+/// Where the run's app streams were linked in one `pw-dump` JSON array: app stream = a `Stream/Output/Audio` node whose client is one of `run`'s; `run_sink`: the run's own sink's node name,
+/// None for an audible run (every link then counts as elsewhere).
+pub(crate) fn sample_routes(
+    text: &str,
+    run: &RunClients,
+    run_sink: Option<&str>,
+) -> Result<SampleRoutes> {
+    use serde_json::Value;
+    let objects: Vec<Value> = serde_json::from_str(text)?;
+    let props = |o: &Value| o["info"]["props"].clone();
+    let of_type = |ty: &'static str| objects.iter().filter(move |o| o["type"] == ty);
+    let clients: Vec<u64> = of_type("PipeWire:Interface:Client")
+        .filter(|o| run.owns(&props(o)))
+        .filter_map(|o| o["id"].as_u64())
+        .collect();
+    let nodes: std::collections::HashMap<u64, Value> = of_type("PipeWire:Interface:Node")
+        .filter_map(|o| Some((o["id"].as_u64()?, props(o))))
+        .collect();
+    let is_app_stream = |p: &Value| {
+        p["media.class"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("Stream/Output/Audio"))
+            && p["client.id"]
+                .as_u64()
+                .is_some_and(|c| clients.contains(&c))
+    };
+    let mut sample = SampleRoutes::default();
+    for link in of_type("PipeWire:Interface:Link") {
+        let info = &link["info"];
+        let (Some(out), Some(input)) = (
+            info["output-node-id"].as_u64(),
+            info["input-node-id"].as_u64(),
+        ) else {
+            continue;
+        };
+        if !nodes.get(&out).is_some_and(is_app_stream) {
+            continue;
+        }
+        let target = nodes.get(&input).cloned().unwrap_or(Value::Null);
+        let name = target["node.name"].as_str().unwrap_or("?");
+        if Some(name) == run_sink {
+            sample.into_run_sink = true;
+        } else {
+            sample.elsewhere.insert(format!(
+                "{name} ({})",
+                target["media.class"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    Ok(sample)
+}
+
+/// Where a run's app streams played over the `pw-dump` samples taken during the run: the `audio-route:` check ([`sample_routes`] per sample).
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct StreamRoutes {
     pub(crate) samples: usize,
@@ -766,65 +864,32 @@ pub(crate) struct StreamRoutes {
     pub(crate) into_run_sink: usize,
     /// Every other node an app stream was linked into, `node.name (media.class)`.
     pub(crate) elsewhere: std::collections::BTreeSet<String>,
+    /// The first sample (0-based) that showed a link elsewhere.
+    pub(crate) first_elsewhere: Option<usize>,
 }
 
-/// [`StreamRoutes`] over `dumps` (each one `pw-dump`'s JSON array); `run_sink`: the run's own sink's node name, None for an audible run (every link then counts as elsewhere).
+impl StreamRoutes {
+    fn add(&mut self, s: SampleRoutes) {
+        if !s.elsewhere.is_empty() {
+            self.first_elsewhere.get_or_insert(self.samples);
+        }
+        self.into_run_sink += usize::from(s.into_run_sink);
+        self.elsewhere.extend(s.elsewhere);
+        self.samples += 1;
+    }
+}
+
+/// [`StreamRoutes`] over `dumps` (each one `pw-dump`'s JSON array).
 pub(crate) fn stream_routes(
     dumps: &[String],
-    package: &str,
+    run: &RunClients,
     run_sink: Option<&str>,
 ) -> Result<StreamRoutes> {
-    use serde_json::Value;
     let mut routes = StreamRoutes::default();
-    let window_id = format!("atl.{package}");
     for (n, text) in dumps.iter().enumerate() {
-        let objects: Vec<Value> =
-            serde_json::from_str(text).with_context(|| format!("pw-dump sample {n}"))?;
-        let props = |o: &Value| o["info"]["props"].clone();
-        let of_type = |ty: &'static str| objects.iter().filter(move |o| o["type"] == ty);
-        let atl_clients: Vec<u64> = of_type("PipeWire:Interface:Client")
-            .filter(|o| props(o)["pipewire.sec.engine"] == "atl")
-            .filter_map(|o| o["id"].as_u64())
-            .collect();
-        let nodes: std::collections::HashMap<u64, Value> = of_type("PipeWire:Interface:Node")
-            .filter_map(|o| Some((o["id"].as_u64()?, props(o))))
-            .collect();
-        let is_app_stream = |p: &Value| {
-            p["media.class"]
-                .as_str()
-                .is_some_and(|c| c.starts_with("Stream/Output/Audio"))
-                && (p["client.id"]
-                    .as_u64()
-                    .is_some_and(|c| atl_clients.contains(&c))
-                    || p["application.id"]
-                        .as_str()
-                        .is_some_and(|a| a == package || a == window_id))
-        };
-        let mut into_run_sink = false;
-        for link in of_type("PipeWire:Interface:Link") {
-            let info = &link["info"];
-            let (Some(out), Some(input)) = (
-                info["output-node-id"].as_u64(),
-                info["input-node-id"].as_u64(),
-            ) else {
-                continue;
-            };
-            if !nodes.get(&out).is_some_and(is_app_stream) {
-                continue;
-            }
-            let target = nodes.get(&input).cloned().unwrap_or(Value::Null);
-            let name = target["node.name"].as_str().unwrap_or("?");
-            if Some(name) == run_sink {
-                into_run_sink = true;
-            } else {
-                routes.elsewhere.insert(format!(
-                    "{name} ({})",
-                    target["media.class"].as_str().unwrap_or("?")
-                ));
-            }
-        }
-        routes.samples += 1;
-        routes.into_run_sink += usize::from(into_run_sink);
+        routes.add(
+            sample_routes(text, run, run_sink).with_context(|| format!("pw-dump sample {n}"))?,
+        );
     }
     Ok(routes)
 }
@@ -832,24 +897,33 @@ pub(crate) fn stream_routes(
 /// Time between two `pw-dump` samples of a run's graph (local [`RouteSampler`], remote.rs's script): a stream that lives at least this long is seen.
 pub(crate) const ROUTE_SAMPLE: Duration = Duration::from_secs(2);
 
-/// `pw-dump` of this host's graph every [`ROUTE_SAMPLE`] on a thread of its own, from [`RouteSampler::start`] to [`RouteSampler::finish`]: a local run's samples for [`stream_routes`].
+/// `pw-dump` of this host's graph every [`ROUTE_SAMPLE`] on a thread of its own, from [`RouteSampler::start`] to [`RouteSampler::finish`], each sample judged as it is taken
+/// ([`sample_routes`]): a local run's [`StreamRoutes`], and [`RouteSampler::leaked`] as soon as one sample shows an app stream linked elsewhere, so the run stops there (bounded exposure).
 pub(crate) struct RouteSampler {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: thread::JoinHandle<Vec<String>>,
+    leaked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: thread::JoinHandle<Result<StreamRoutes>>,
 }
 
 impl RouteSampler {
-    pub(crate) fn start() -> Self {
+    pub(crate) fn start(run: RunClients, run_sink: Option<String>) -> Self {
         use std::sync::atomic::Ordering;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
+        let leaked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (flag, leak) = (stop.clone(), leaked.clone());
         let thread = thread::spawn(move || {
-            let mut dumps = Vec::new();
+            let mut routes = StreamRoutes::default();
             while !flag.load(Ordering::Relaxed) {
                 if let Ok(out) = Command::new("pw-dump").stderr(Stdio::null()).output()
                     && out.status.success()
                 {
-                    dumps.push(String::from_utf8_lossy(&out.stdout).into_owned());
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let sample = sample_routes(&text, &run, run_sink.as_deref())
+                        .with_context(|| format!("pw-dump sample {}", routes.samples))?;
+                    if !sample.elsewhere.is_empty() {
+                        leak.store(true, Ordering::Relaxed);
+                    }
+                    routes.add(sample);
                 }
                 // in short steps: finish returns within one of them
                 let next = Instant::now() + ROUTE_SAMPLE;
@@ -857,21 +931,36 @@ impl RouteSampler {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
-            dumps
+            Ok(routes)
         });
-        RouteSampler { stop, thread }
+        RouteSampler {
+            stop,
+            leaked,
+            thread,
+        }
     }
 
-    /// Stops sampling; the samples taken (none if the thread failed).
-    pub(crate) fn finish(self) -> Vec<String> {
+    /// Whether a sample so far showed an app stream of the run linked elsewhere: the run stops when it does.
+    pub(crate) fn leaked(&self) -> bool {
+        self.leaked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stops sampling; the routes of the samples taken.
+    pub(crate) fn finish(self) -> Result<StreamRoutes> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.thread.join().unwrap_or_default()
+        self.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the route sampler thread panicked"))?
     }
 }
 
 /// The `audio-route:` verdict: red when an app stream was linked anywhere but the run's own sink, or when no sample was taken (the route was not checked); an app that played nothing is
-/// green but says so, since then nothing was measured.
-pub(crate) fn route_verdict(r: &StreamRoutes, run_sink: Option<&str>) -> Result<String, String> {
+/// green but says so, since then nothing was measured. `stopped`: the run was ended at the first such sample ([`RouteSampler::leaked`]), said in the verdict.
+pub(crate) fn route_verdict(
+    r: &StreamRoutes,
+    run_sink: Option<&str>,
+    stopped: bool,
+) -> Result<String, String> {
     let sink = run_sink.unwrap_or("none (audible run)");
     if r.samples == 0 {
         return Err(format!(
@@ -884,7 +973,18 @@ pub(crate) fn route_verdict(r: &StreamRoutes, run_sink: Option<&str>) -> Result<
     );
     if !r.elsewhere.is_empty() {
         let names: Vec<&str> = r.elsewhere.iter().map(String::as_str).collect();
-        return Err(format!("{head}; linked elsewhere: {}", names.join(", ")));
+        let first = r.first_elsewhere.map_or(String::new(), |n| {
+            format!(" (first in sample {}", n + 1)
+                + if stopped {
+                    "; the run was stopped there)"
+                } else {
+                    ")"
+                }
+        });
+        return Err(format!(
+            "{head}; linked elsewhere: {}{first}",
+            names.join(", ")
+        ));
     }
     if r.into_run_sink == 0 {
         return Ok(format!(
@@ -1029,16 +1129,59 @@ pub(crate) fn out_of_range(x: &[f32]) -> usize {
 mod tests {
     use super::*;
 
-    /// A pw-dump sample: an atld-context client 7 with stream 30, another client 8 with stream 31, the run's sink 10, a device sink 11; `links` = (output node, input node).
+    /// The run of the fixtures below: atld 4242, its pulse server 77.
+    const RUN: RunClients = RunClients {
+        atld_pid: 4242,
+        pulse_pid: Some(77),
+    };
+
+    /// A pw-dump sample, ids as the samples taken on WSL write them (instance id as a JSON number, sec.pid an integer): client 7 = a context of the run's atld (`4242.0`) with stream 30;
+    /// client 8 = a plain client with stream 31 and stream 32 (the window's application.id of the run's package, which proves nothing: another run of that package carries it too);
+    /// client 9 = a context of another atld (`5555.1`, sighting: a concurrent gate) with stream 33; client 12 = the run's pulse server's connection with stream 34; client 13 = a context of the
+    /// run's atld written as a string (`4242.12`) with stream 35. The run's sink 10, a device sink 11, another run's sink 14; `links` = (output node, input node).
     fn dump(links: &[(u64, u64)]) -> String {
+        let client = |id: u32, props: &str| {
+            format!(
+                r#"{{ "id": {id}, "type": "PipeWire:Interface:Client", "info": {{ "props": {{ {props} }} }} }}"#
+            )
+        };
+        let stream = |id: u32, props: &str| {
+            format!(
+                r#"{{ "id": {id}, "type": "PipeWire:Interface:Node", "info": {{ "props": {{ "media.class": "Stream/Output/Audio", {props} }} }} }}"#
+            )
+        };
+        let sink = |id: u32, name: &str| {
+            format!(
+                r#"{{ "id": {id}, "type": "PipeWire:Interface:Node", "info": {{ "props": {{ "media.class": "Audio/Sink", "node.name": "{name}" }} }} }}"#
+            )
+        };
         let mut objects = vec![
-            r#"{ "id": 7, "type": "PipeWire:Interface:Client", "info": { "props": { "pipewire.sec.engine": "atl" } } }"#.to_owned(),
-            r#"{ "id": 8, "type": "PipeWire:Interface:Client", "info": { "props": { "application.name": "player" } } }"#.to_owned(),
-            r#"{ "id": 30, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 7 } } }"#.to_owned(),
-            r#"{ "id": 31, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 8 } } }"#.to_owned(),
-            r#"{ "id": 32, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 8, "application.id": "atl.com.x" } } }"#.to_owned(),
-            r#"{ "id": 10, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Audio/Sink", "node.name": "atl-run" } } }"#.to_owned(),
-            r#"{ "id": 11, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Audio/Sink", "node.name": "alsa_output.speakers" } } }"#.to_owned(),
+            client(
+                7,
+                r#""pipewire.sec.engine": "atl", "pipewire.sec.instance-id": 4242.0"#,
+            ),
+            client(
+                8,
+                r#""application.name": "player", "pipewire.sec.pid": 4242"#,
+            ),
+            client(
+                9,
+                r#""pipewire.sec.engine": "atl", "pipewire.sec.instance-id": 5555.1"#,
+            ),
+            client(12, r#""pipewire.sec.pid": 77"#),
+            client(
+                13,
+                r#""pipewire.sec.engine": "atl", "pipewire.sec.instance-id": "4242.12""#,
+            ),
+            stream(30, r#""client.id": 7"#),
+            stream(31, r#""client.id": 8"#),
+            stream(32, r#""client.id": 8, "application.id": "atl.com.x""#),
+            stream(33, r#""client.id": 9"#),
+            stream(34, r#""client.id": 12"#),
+            stream(35, r#""client.id": 13"#),
+            sink(10, "atl-run"),
+            sink(11, "alsa_output.speakers"),
+            sink(14, "atl-other-run"),
         ];
         for (i, (o, n)) in links.iter().enumerate() {
             objects.push(format!(r#"{{ "id": {}, "type": "PipeWire:Interface:Link", "info": {{ "output-node-id": {o}, "input-node-id": {n} }} }}"#, 100 + i));
@@ -1048,39 +1191,73 @@ mod tests {
 
     #[test]
     fn route_into_the_run_sink_is_green() {
-        // the other client's stream into the speakers is not the run's: the user's own audio
+        // the plain client's streams into the speakers are not the run's (the user's own audio, or another app of that package), nor is another atld's stream into its own sink
         let r = stream_routes(
-            &[dump(&[(30, 10), (31, 11)]), dump(&[])],
-            "com.x",
+            &[dump(&[(30, 10), (31, 11), (32, 11), (33, 14)]), dump(&[])],
+            &RUN,
             Some("atl-run"),
         )
         .unwrap();
         assert_eq!((r.samples, r.into_run_sink, r.elsewhere.len()), (2, 1, 0));
-        assert!(route_verdict(&r, Some("atl-run")).is_ok());
+        assert!(route_verdict(&r, Some("atl-run"), false).is_ok());
+    }
+
+    /// Sightings 1-3 of 2026-11-22: a concurrent gate's (another atld's) stream into the session's sink, or another run's stream into its sink, is not this run's.
+    #[test]
+    fn another_atlds_stream_is_not_the_runs() {
+        let r = stream_routes(
+            &[dump(&[(33, 11)]), dump(&[(33, 14)])],
+            &RUN,
+            Some("atl-run"),
+        )
+        .unwrap();
+        assert_eq!((r.into_run_sink, r.elsewhere.len()), (0, 0));
     }
 
     #[test]
     fn route_into_a_device_sink_is_red() {
-        // by context client, then by the window's application.id on a client of no context
-        for stream in [30, 32] {
-            let r = stream_routes(&[dump(&[(stream, 11)])], "com.x", Some("atl-run")).unwrap();
+        // a context client of the run (number or string instance id), the run's pulse server's connection
+        for stream in [30, 34, 35] {
+            let r = stream_routes(&[dump(&[(stream, 11)])], &RUN, Some("atl-run")).unwrap();
             assert_eq!(
                 r.elsewhere.iter().next().map(String::as_str),
-                Some("alsa_output.speakers (Audio/Sink)")
+                Some("alsa_output.speakers (Audio/Sink)"),
+                "stream {stream}"
             );
-            assert!(route_verdict(&r, Some("atl-run")).is_err());
+            assert!(route_verdict(&r, Some("atl-run"), false).is_err());
         }
         // audible: no run sink, every link is elsewhere
-        let r = stream_routes(&[dump(&[(30, 10)])], "com.x", None).unwrap();
-        assert!(route_verdict(&r, None).is_err());
+        let r = stream_routes(&[dump(&[(30, 10)])], &RUN, None).unwrap();
+        assert!(route_verdict(&r, None, false).is_err());
+    }
+
+    /// The verdict names the first sample that showed the leak (1-based: the third of three here) and, for a run stopped there, says so.
+    #[test]
+    fn leak_verdict_names_its_first_sample_and_the_stop() {
+        let r = stream_routes(
+            &[dump(&[(30, 10)]), dump(&[(30, 10)]), dump(&[(30, 11)])],
+            &RUN,
+            Some("atl-run"),
+        )
+        .unwrap();
+        assert_eq!(r.first_elsewhere, Some(2));
+        let stopped = route_verdict(&r, Some("atl-run"), true).unwrap_err();
+        assert!(
+            stopped.ends_with(
+                "linked elsewhere: alsa_output.speakers (Audio/Sink) (first in sample 3; the run was stopped there)"
+            ),
+            "{stopped}"
+        );
+        let ran_on = route_verdict(&r, Some("atl-run"), false).unwrap_err();
+        assert!(ran_on.ends_with("(first in sample 3)"), "{ran_on}");
     }
 
     #[test]
     fn no_sample_is_red_and_no_stream_says_so() {
-        assert!(route_verdict(&StreamRoutes::default(), Some("atl-run")).is_err());
-        let r = stream_routes(&[dump(&[])], "com.x", Some("atl-run")).unwrap();
+        assert!(route_verdict(&StreamRoutes::default(), Some("atl-run"), false).is_err());
+        let r = stream_routes(&[dump(&[])], &RUN, Some("atl-run")).unwrap();
         assert!(
-            route_verdict(&r, Some("atl-run"))
+            route_verdict(&r, Some("atl-run"), false)
                 .unwrap()
                 .contains("nothing measured")
         );
