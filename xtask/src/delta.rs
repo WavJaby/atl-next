@@ -327,7 +327,13 @@ pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land_live: bool) -> Hold
         return Hold::default();
     }
     let native = Need::of(Class::Native, cfg, s);
-    match judge(s, native, 0, Hold::default(), cfg.ram_margin_gib.value * GIB) {
+    match judge(
+        s,
+        native,
+        0,
+        Hold::default(),
+        cfg.ram_margin_gib.value * GIB,
+    ) {
         Verdict::NeverFits(_) => Hold::default(),
         _ => native,
     }
@@ -480,7 +486,13 @@ fn reserved(ws: &Path) -> Result<(u64, bool)> {
 }
 
 /// The verdict for `class` by `id` on `stats` against the live reservations and land's hold; the caller holds the admit gate. Counts `delta-land-hold` on a [`Verdict::Held`].
-fn judge_now(ws: &Path, id: &str, cfg: &DeltaConfig, class: Class, stats: &Stats) -> Result<Verdict> {
+fn judge_now(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Class,
+    stats: &Stats,
+) -> Result<Verdict> {
     let (others, land_live) = reserved(ws)?;
     let hold = hold_for(id, cfg, stats, land_live);
     let v = judge(
@@ -1109,7 +1121,13 @@ mod tests {
         ));
         // used 5.0: free 3.0 < 2.46 + 1 -> refused before starting, whatever is reserved
         assert!(matches!(
-            judge(&stats(8.0, 5.0, 1950), raw(&stats(8.0, 5.0, 1950), check), 0, Hold::default(), GIB),
+            judge(
+                &stats(8.0, 5.0, 1950),
+                raw(&stats(8.0, 5.0, 1950), check),
+                0,
+                Hold::default(),
+                GIB
+            ),
             Verdict::Refuse(_)
         ));
         // cross 20 GiB at 1.95 = 10.26 GiB RAM > limit 8 - margin: never fits -> pool tier; also > fs size 16
@@ -1134,14 +1152,19 @@ mod tests {
             ram_limit: 64 * GIB,
             ..stats(64.0, 0.0, 4000)
         };
-        assert!(matches!(judge(&big, raw(&big, 15 * GIB), 0, Hold::default(), GIB), Verdict::Refuse(_)));
+        assert!(matches!(
+            judge(&big, raw(&big, 15 * GIB), 0, Hold::default(), GIB),
+            Verdict::Refuse(_)
+        ));
     }
 
     /// Land first, hand arithmetic: zram limit 10 GiB, used 3, margin 1 -> RAM free 7 GiB = 7_516_192_768 B; ratio 1.95.
     /// native 9216 MiB = 9_663_676_416 B -> ram ceil(9_663_676_416_000 / 1950) = 4_955_731_496 B (4.62 GiB, plan S3 "land hold 4.62"); check 2_642_949_252 B (admission_arithmetic).
     #[test]
     fn land_hold_keeps_room_for_land() {
-        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml")).expect("cfg").delta;
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .expect("cfg")
+            .delta;
         let s = stats(10.0, 3.0, 1950);
         let native = Hold {
             raw: 9 * GIB,
@@ -1151,10 +1174,7 @@ mod tests {
         let check = Need::of(Class::Check, &cfg, &s);
         assert_eq!(check.ram, 2_642_949_252);
         // with the hold: 2.46 + 4.62 + 1 = 8.07 GiB > 7 free -> held (a new dir takes the pool)
-        assert!(matches!(
-            judge(&s, check, 0, native, GIB),
-            Verdict::Held(_)
-        ));
+        assert!(matches!(judge(&s, check, 0, native, GIB), Verdict::Held(_)));
         // land's own admission ignores the hold: 4.62 + 1 = 5.62 <= 7
         assert_eq!(hold_for(out::LAND_ID, &cfg, &s, false), Hold::default());
         let land = Need::of(Class::Native, &cfg, &s);
@@ -1187,7 +1207,13 @@ mod tests {
             ..stats(64.0, 0.0, 1950)
         };
         assert!(matches!(
-            judge(&roomy, check, 0, hold_for("child", &cfg, &roomy, false), GIB),
+            judge(
+                &roomy,
+                check,
+                0,
+                hold_for("child", &cfg, &roomy, false),
+                GIB
+            ),
             Verdict::Held(_)
         ));
     }
@@ -1195,7 +1221,9 @@ mod tests {
     /// Class run takes min(device ratio, delta.ratio_run 1.37): 797 MiB = 835_715_072 B -> ceil(835_715_072_000 / 1370) = 610_011_002 B at device 1.95 (not 428_571_833 at 1.95); tmpfs 1.0 stays 1.0.
     #[test]
     fn run_class_reserves_at_the_app_data_ratio() {
-        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml")).expect("cfg").delta;
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .expect("cfg")
+            .delta;
         let run = Need::of(Class::Run, &cfg, &stats(10.0, 0.0, 1950));
         assert_eq!((run.raw, run.ram), (835_715_072, 610_011_002));
         let t = stats(10.0, 0.0, 1000);
