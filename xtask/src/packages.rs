@@ -731,13 +731,17 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
 
 /// Copies cdylib `lib<lib>.so` of `package` from cargo's `release` dir to `<out>/crates/<package>/lib`, the dir every runtime library path holds (host_art `stage_art`, stage_env `lib_env`): a loader `dlopen`s it by name as Android's linker finds a library.
 /// A copy, not a link: the runpath gate and the stage read it there, and cargo rewrites its own output in place.
+/// Copied to a per-process tmp, then renamed: running app processes map this file (check's parallel gates rebuild packages while other gates' apps run), and an in-place copy changed
+/// its pages under them (system_server SIGSEGV in `create_vm` at a garbage address).
 fn install_cdylib(release: &Path, out: &Path, package: &str, lib: &str) -> Result<PathBuf> {
     let file = format!("lib{lib}.so");
     let dir = out.join("crates").join(package).join("lib");
     std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
     let to = dir.join(&file);
-    std::fs::copy(release.join(&file), &to)
-        .with_context(|| format!("installing {} to {}", file, to.display()))?;
+    let tmp = dir.join(format!(".{file}.{}.tmp", std::process::id()));
+    std::fs::copy(release.join(&file), &tmp)
+        .with_context(|| format!("installing {} to {}", file, tmp.display()))?;
+    std::fs::rename(&tmp, &to).with_context(|| format!("installing {}", to.display()))?;
     Ok(to)
 }
 

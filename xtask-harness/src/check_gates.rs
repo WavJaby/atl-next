@@ -169,6 +169,35 @@ struct Done {
     note: String,
     /// what ended a window row's watch
     end: Option<String>,
+    /// rows holding their grant when this one was admitted, itself included (0: never admitted)
+    running: usize,
+}
+
+/// Rows admitted (grant held) at the moment, and the most at once: a row enters after its grant, so rows queued for the pool are not counted.
+#[derive(Default)]
+struct Admitted {
+    live: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl Admitted {
+    fn enter(&self) -> Entered<'_> {
+        let count = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(count, Ordering::SeqCst);
+        Entered { count, of: self }
+    }
+}
+
+/// One admitted row; leaves on drop.
+struct Entered<'a> {
+    count: usize,
+    of: &'a Admitted,
+}
+
+impl Drop for Entered<'_> {
+    fn drop(&mut self) {
+        self.of.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows (`<row> <why>`), neither pass nor fail ([`Outcome`]).
@@ -190,10 +219,14 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
         host,
         out: out_arg,
     };
-    let run_one = |row: &Row| -> Done {
+    let run_one = |row: &Row, admitted: &Admitted| -> Done {
         // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
-        let gated = build_pool::acquire(&ws, root, row.class)
-            .and_then(|grant| at.row(row).map(|done| (done, grant)));
+        let gated = build_pool::acquire_quiet_stdout(&ws, root, row.class).and_then(|grant| {
+            let entered = admitted.enter();
+            let mut done = at.row(row)?;
+            done.running = entered.count;
+            Ok((done, grant))
+        });
         gated.map(|(done, _grant)| done).unwrap_or_else(|e| {
             let line = format!("error: {e:#}");
             Done {
@@ -202,6 +235,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
                 note: format!("{}: {line}", row.name()),
                 line: format!("gates: {} FAILED (0.0s) {line}", row.name()),
                 end: None,
+                running: 0,
             }
         })
     };
@@ -270,25 +304,21 @@ fn with_lane(line: &str, lane: Lane, running: usize) -> String {
     }
 }
 
-/// Runs `rows` with `run_one` (which takes the row's grant itself): parallel rows concurrently, each once its `after` rows ended, then serial rows one at a time, alone.
-/// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` (rows running when it started, itself included).
+/// Runs `rows` with `run_one` (which takes the row's grant itself, then enters `Admitted`): parallel rows concurrently, each once its `after` rows ended, then serial rows one at a time, alone.
+/// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` ([`Done::running`]).
 fn run_lanes(
     rows: &[Row],
-    run_one: &(dyn Fn(&Row) -> Done + Sync),
+    run_one: &(dyn Fn(&Row, &Admitted) -> Done + Sync),
     emit: &mut dyn FnMut(&Done),
 ) -> LaneStats {
     let started = Instant::now();
     let names: Vec<String> = rows.iter().map(Row::name).collect();
     let ended = Mutex::new(vec![false; rows.len()]);
     let wake = Condvar::new();
-    let running = AtomicUsize::new(0);
-    let max_at_once = AtomicUsize::new(0);
+    let admitted = Admitted::default();
     let start_one = |i: usize| -> Done {
-        let at_start = running.fetch_add(1, Ordering::SeqCst) + 1;
-        max_at_once.fetch_max(at_start, Ordering::SeqCst);
-        let mut done = run_one(&rows[i]);
-        running.fetch_sub(1, Ordering::SeqCst);
-        done.line = with_lane(&done.line, rows[i].lane, at_start);
+        let mut done = run_one(&rows[i], &admitted);
+        done.line = with_lane(&done.line, rows[i].lane, done.running);
         done
     };
     let mut results: Vec<Option<Done>> = (0..rows.len()).map(|_| None).collect();
@@ -342,7 +372,7 @@ fn run_lanes(
         sum: results.iter().flatten().map(|d| d.took).sum(),
         parallel: rows.iter().filter(|r| r.lane == Lane::Parallel).count(),
         serial: rows.iter().filter(|r| r.lane == Lane::Serial).count(),
-        max_at_once: max_at_once.load(Ordering::SeqCst),
+        max_at_once: admitted.max.load(Ordering::SeqCst),
     }
 }
 
@@ -421,6 +451,7 @@ impl RowRun<'_> {
             line,
             note,
             end: phases.map(|p| p.end),
+            running: 0,
         })
     }
 }
@@ -659,7 +690,8 @@ mod tests {
         ];
         let t0 = Instant::now();
         let spans = Mutex::new(Vec::new());
-        let run_one = |row: &Row| -> Done {
+        let run_one = |row: &Row, admitted: &Admitted| -> Done {
+            let entered = admitted.enter();
             let from = t0.elapsed();
             // the stager is slowest, so a reader that ignored its edge would start first
             std::thread::sleep(Duration::from_millis(if row.name() == "slow-stager" {
@@ -682,6 +714,7 @@ mod tests {
                 line: format!("gates: {} x (0.1s peak=0MiB) v", row.name()),
                 note: row.name(),
                 end: None,
+                running: entered.count,
             }
         };
         let mut seen = Vec::new();

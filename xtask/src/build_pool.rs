@@ -216,6 +216,13 @@ pub fn acquire(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
     })
 }
 
+/// [`acquire`], its `pool: ...` lines on stderr: for a caller whose stdout is a verdict channel (check_gates.rs: the gates step's stdout leads check's failure text).
+pub fn acquire_quiet_stdout(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
+    acquire_with(ws, who, class, Tier::of(who), POLL, &mut |line| {
+        eprintln!("{line}")
+    })
+}
+
 fn acquire_with(
     ws: &Path,
     who: &Path,
