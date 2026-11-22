@@ -2,7 +2,7 @@
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's runtime setup (Runtime::new, gralloc, the display) under run-apk's own key (`<out>/run-apk`, `run-apk-art`, `run-apk-fonts`): the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
 //! Every run starts from a clean install (owner 2026-11-22): a fresh, empty data root `<run dir>/<name>` (xtask out_run.rs `fresh_root`, `cargo xtask out show --run`; name = the row, or `apk-<file stem>`), emptied at the run's start, the APK installed into it. Nothing is carried from an earlier run.
-//! `--reuse-data-root DIR` is the explicit opt-in for a human relaunching on one root (and the app-data gate's launches): atld `--data-root DIR`, kept across launches, `--clear-data` = `pm clear` of the package. The line `run-apk: data root: fresh|reused <path>` names which, so no report can hide a reused root.
+//! `--reuse-data-root DIR` is the explicit opt-in for a human relaunching on one root (and the app-data gate's launches): atld `--data-root DIR`, kept across launches, `--clear-data` = `pm clear` of the package. `--user-data` is the same on atld's default root (the user's own, `atl_platform_host::user_data_root`), for a human play session only. The line `run-apk: data root: fresh|reused <path>` names which, so no report can hide a reused root.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
@@ -94,7 +94,7 @@ pub struct Args {
     break_route: bool,
     /// Runs the row's tracked scenario `xtask-harness/scenarios/<ROW>.drive` (scenarios.rs) on a fresh data root, as every run; shots stay in memory.
     /// Prints `scenario: ok|FAILED <row> host= cpu= guest= <k> judged, <s> skipped (<reasons>), <n> checkpoints fps= tier= <secs>s [FPS NOT JUDGED: ..] [unreachable: ..]` (scenarios.rs `Verdict::line`).
-    #[arg(long, conflicts_with_all = ["drive", "hold", "pointer", "reuse_data_root"])]
+    #[arg(long, conflicts_with_all = ["drive", "hold", "pointer", "reuse_data_root", "user_data"])]
     scenario: bool,
     /// With --scenario: one more run under each of the scenario's `control` breaks, which must end FAILED at a checkpoint (`control:` line); one that passes, or fails elsewhere, turns the scenario red.
     #[arg(long, requires = "scenario")]
@@ -133,6 +133,9 @@ pub struct Args {
     /// Default: a fresh, empty root in this checkout's run dir, the APK installed into it (every test run). The run's line says `data root: reused` unless DIR is new or empty.
     #[arg(long, value_name = "DIR")]
     reuse_data_root: Option<PathBuf>,
+    /// For a human play session on the main build: launches on the user's own data root (atld's default, `$XDG_DATA_HOME/atl`, else `~/.local/share/atl`), kept across launches as after a release install. Tests and agents do not use it.
+    #[arg(long, conflicts_with_all = ["reuse_data_root", "clear_data"])]
+    user_data: bool,
 }
 
 /// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
@@ -234,6 +237,7 @@ impl Args {
             app_env: Vec::new(),
             clear_data: false,
             reuse_data_root: None,
+            user_data: false,
             scenario: false,
             controls: false,
             network: None,
@@ -290,9 +294,22 @@ fn data_root_name(target: &str) -> String {
     format!("apk-{stem}")
 }
 
-/// The data root of a run: a fresh one in the run dir (with the run dir's lock, held for the run), or `--reuse-data-root`'s. Prints `run-apk: data root: fresh|reused <path>`.
+/// `--user-data`'s dir: atld's default data root, the rule an installed ATL keeps its data by (atl-platform-host `user_data_root`, which reads the environment).
+fn user_data_dir() -> Result<PathBuf> {
+    atl_platform_host::user_data_root()
+        .context("--user-data: no data dir: neither XDG_DATA_HOME nor HOME names an absolute dir")
+}
+
+/// The data root of a run: a fresh one in the run dir (with the run dir's lock, held for the run), or the reused one of `--reuse-data-root DIR` / `--user-data`. Prints `run-apk: data root: fresh|reused <path>`.
 fn data_root(root: &Path, args: &Args) -> Result<(PathBuf, Option<xtask::build_pool::DirLock>)> {
-    Ok(match &args.reuse_data_root {
+    let reused = if args.user_data {
+        Some((user_data_dir()?, "--user-data"))
+    } else {
+        args.reuse_data_root
+            .clone()
+            .map(|d| (d, "--reuse-data-root"))
+    };
+    Ok(match reused {
         None => {
             let (dir, held) = xtask::out_run::fresh_root(root, &data_root_name(&args.target))?;
             println!(
@@ -301,24 +318,24 @@ fn data_root(root: &Path, args: &Args) -> Result<(PathBuf, Option<xtask::build_p
             );
             (dir, Some(held))
         }
-        Some(d) => {
-            let entries = match std::fs::read_dir(d) {
+        Some((d, flag)) => {
+            let entries = match std::fs::read_dir(&d) {
                 Ok(rd) => rd.count(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
                 Err(e) => return Err(e).with_context(|| format!("reading {}", d.display())),
             };
             if entries == 0 {
                 println!(
-                    "run-apk: data root: fresh {} (--reuse-data-root, new or empty)",
+                    "run-apk: data root: fresh {} ({flag}, new or empty)",
                     d.display()
                 );
             } else {
                 println!(
-                    "run-apk: data root: reused {} (--reuse-data-root: {entries} entries from earlier runs, NOT a clean install)",
+                    "run-apk: data root: reused {} ({flag}: {entries} entries from earlier runs, NOT a clean install)",
                     d.display()
                 );
             }
-            (d.clone(), None)
+            (d, None)
         }
     })
 }
@@ -800,6 +817,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         app_env: Vec::new(),
         clear_data: false,
         reuse_data_root: None,
+        user_data: false,
         scenario: false,
         controls: false,
         network: None,
@@ -1722,6 +1740,45 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--user-data` takes no value and conflicts with every other data-root choice: a reused DIR, `--clear-data` (the owner's saves are never one flag away) and a scenario's fresh root.
+    #[test]
+    fn user_data_conflicts_with_other_data_roots() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: Args,
+        }
+        let parse = |extra: &[&str]| {
+            let argv = ["run-apk", "row-a", "--host", "x86_64"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            Cli::try_parse_from(argv).map(|c| c.args)
+        };
+        let alone = parse(&["--user-data"]).expect("--user-data parses alone");
+        assert!(alone.user_data && alone.reuse_data_root.is_none() && !alone.clear_data);
+        for extra in [
+            &["--user-data", "--reuse-data-root", "/tmp/dir"][..],
+            &["--user-data", "--clear-data"][..],
+            &[
+                "--user-data",
+                "--clear-data",
+                "--reuse-data-root",
+                "/tmp/dir",
+            ][..],
+            &["--user-data", "--scenario"][..],
+        ] {
+            match parse(extra) {
+                Err(e) => assert_eq!(
+                    e.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{extra:?}"
+                ),
+                Ok(_) => panic!("{extra:?} must not parse"),
+            }
+        }
+    }
 
     /// Two runs of one row get two dirs; the first run's file stays. Files and non-numbered names (a pre-numbering run's `transcript.log`, `shots`) do not count.
     #[test]

@@ -53,4 +53,17 @@ mod tests {
         assert_eq!(root(None, Some("")), None);
         assert_eq!(root(None, None), None);
     }
+
+    /// `XDG_DATA_HOME` naming a temp dir (passed in, not set in the process): the root is that dir's `atl`, whatever `HOME` says.
+    #[test]
+    fn temp_data_home_names_the_root() {
+        let xdg = std::env::temp_dir().join("atl-data-home-test");
+        assert_eq!(
+            data_root_in(
+                Some(xdg.clone().into_os_string()),
+                Some(OsString::from("/home/u"))
+            ),
+            Some(xdg.join("atl"))
+        );
+    }
 }
