@@ -1061,6 +1061,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(line, "ready\n", "fixture {}", path.display());
+        // "ready" is printed by the shell before its exec: wait for the exec itself, or a reader of /proc/<pid>/cmdline still sees the `sh -c ...` line (seen once under load). No timeout: the exec always follows.
+        let cmdline = format!("/proc/{}/cmdline", c.id());
+        while !std::fs::read(&cmdline).unwrap().starts_with(b"sleep\0") {
+            std::thread::yield_now();
+        }
         c
     }
 
