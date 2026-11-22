@@ -5,7 +5,8 @@
 //! Every outer build command prints `out: delta ram|pool (<reason>)` and counts `pool/delta-<outcome>.count`.
 //!
 //! Mount (unprivileged; plan ram-delta D4): the outer command re-executes as `unshare --user --map-root-user --mount` (stage `mount`: uid 0 in that userns mounts the overlay at the real dir path), which runs `unshare --user --map-user=<uid>` (stage `in`: the caller's uid, no capabilities, as bwrap demands) and continues into the build namespace (tree.rs), whose bind of the dir over `out/build` then shows the overlay.
-//! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits.
+//! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits (the line names the holders).
+//! A process still holding it when the command returns (a daemon a build spawned: sccache server, gradle, kotlin) may still use the overlay, so the outer command ends it ([`end_holders`]): the mount and everything using it end with the command.
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
 //! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]).
 
@@ -713,13 +714,17 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
         stats.line()
     );
     out::count(&ws, "delta-ram");
+    let lock_path = mount_lock_path(&ws, &id);
     let lock = match try_mount_lock(&ws, &id)? {
         Some(l) => l,
         None => {
-            println!("out: ws/{id} ram delta in use by another command of this checkout, waiting");
+            let held_by = holders(&lock_path, std::process::id())?;
+            println!(
+                "out: ws/{id} ram delta in use by another command of this checkout ({}), waiting",
+                holders_text(&held_by)
+            );
             out::count(&ws, "delta-wait");
-            let p = mount_lock_path(&ws, &id);
-            Flock::take(open_lock(&p)?, Mode::Exclusive)?
+            Flock::take(open_lock(&lock_path)?, Mode::Exclusive)?
         }
     };
     // every process of the namespace inherits the fd, and the lock is never unlocked by hand: it lives while any of them does (crate::flock's unlock-on-drop would free it for all)
@@ -741,8 +746,134 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     .args(std::env::args_os().skip(1))
     .env(ENV, format!("mount:{uid}:{gid}"));
     let code = run(cmd, "unshare (delta mount namespace)")?;
+    // the namespace's processes may still use the overlay (a daemon a build spawned: sccache server, gradle, ...); the mount ends with the command, so they do too
+    end_holders(&ws, &id, &lock_path, std::process::id())?;
     drop(reservation);
     Ok(Some(code))
+}
+
+/// A process sharing the locked open file of a mount lock: it inherited the fd from the outer command.
+#[derive(Debug, PartialEq)]
+pub struct Holder {
+    pub pid: u32,
+    /// `/proc/<pid>/cmdline` with spaces, or `comm` when that is empty.
+    pub cmd: String,
+}
+
+/// Processes holding the flock on `lock` through its locked open file description: an fd on the file's inode whose fdinfo carries an exclusive FLOCK line.
+/// A process that merely opened the file (a failed `try_mount_lock` of another command) has its own description without the lock and is not one. `except` = the caller. Unreadable /proc entries (other users, exited) are skipped.
+fn holders(lock: &Path, except: u32) -> Result<Vec<Holder>> {
+    let meta = std::fs::metadata(lock).with_context(|| format!("stat {}", lock.display()))?;
+    let (dev, ino) = (meta.dev(), meta.ino());
+    let mut found = Vec::new();
+    for e in std::fs::read_dir("/proc")
+        .context("reading /proc")?
+        .flatten()
+    {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == except {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::metadata(fd.path()).is_ok_and(|m| m.dev() == dev && m.ino() == ino)
+                && std::fs::read_to_string(e.path().join("fdinfo").join(fd.file_name())).is_ok_and(
+                    |t| {
+                        t.lines().any(|l| {
+                            l.starts_with("lock:") && l.contains("FLOCK") && l.contains("WRITE")
+                        })
+                    },
+                )
+        });
+        if holds {
+            let cmd = std::fs::read(e.path().join("cmdline"))
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .replace('\0', " ")
+                        .trim()
+                        .to_owned()
+                })
+                .unwrap_or_default();
+            let cmd = if cmd.is_empty() {
+                std::fs::read_to_string(e.path().join("comm"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            } else {
+                cmd
+            };
+            found.push(Holder { pid, cmd });
+        }
+    }
+    Ok(found)
+}
+
+fn holders_text(h: &[Holder]) -> String {
+    if h.is_empty() {
+        return "no holder visible in /proc: another user's process, or it just ended".to_owned();
+    }
+    let list: Vec<String> = h
+        .iter()
+        .map(|h| format!("pid {} `{}`", h.pid, h.cmd))
+        .collect();
+    format!("held by {}", list.join(", "))
+}
+
+/// How long a holder left at command end gets after SIGTERM before SIGKILL: a daemon's own shutdown (sccache server measured 34 ms from SIGTERM to exit; JVM daemons run shutdown hooks), not build work, which has ended.
+const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Poll step while holders exit: well under the measured 34 ms sccache exit, so the wait adds little past the last exit.
+const EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Ends every process still holding mount lock `lock` of checkout `id` (except the caller): SIGTERM, then SIGKILL past [`TERM_GRACE`]. Returns once none holds it, so the next command of the checkout takes the lock at once.
+/// Counter `delta-linger` (once per command that left any). Err when a holder survives SIGKILL past the grace (uninterruptible sleep), naming it.
+fn end_holders(ws: &Path, id: &str, lock: &Path, except: u32) -> Result<usize> {
+    let first = holders(lock, except)?;
+    if first.is_empty() {
+        return Ok(0);
+    }
+    println!(
+        "out: ws/{id}: ending {} process(es) left in the ram delta namespace at command end: {}",
+        first.len(),
+        holders_text(&first)
+    );
+    out::count(ws, "delta-linger");
+    let signal_all = |sig: rustix::process::Signal, h: &[Holder]| {
+        for p in h {
+            if let Some(pid) = i32::try_from(p.pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                // gone between listing and signalling: nothing to end
+                let _ = rustix::process::kill_process(pid, sig);
+            }
+        }
+    };
+    let wait_gone = || -> Result<Vec<Holder>> {
+        let until = std::time::Instant::now() + TERM_GRACE;
+        loop {
+            let left = holders(lock, except)?;
+            if left.is_empty() || std::time::Instant::now() >= until {
+                return Ok(left);
+            }
+            std::thread::sleep(EXIT_POLL);
+        }
+    };
+    signal_all(rustix::process::Signal::TERM, &first);
+    let left = wait_gone()?;
+    if !left.is_empty() {
+        signal_all(rustix::process::Signal::KILL, &left);
+        let left = wait_gone()?;
+        ensure!(
+            left.is_empty(),
+            "ws/{id}: {} survived SIGKILL; the ram delta stays locked until it ends",
+            holders_text(&left)
+        );
+    }
+    Ok(first.len())
 }
 
 /// Why ram dir `rec` cannot be mounted (its upper or base is gone, e.g. a WSL restart emptied the store); None = intact.
@@ -906,6 +1037,97 @@ mod tests {
         }
         assert!(matches!(got, Err(Verdict::Refuse(_))), "{:?}", got.err());
         assert!(!started);
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A `sleep 300` whose fd 9 is open on `path`, flocked exclusive when `lock`; returns once the fd is set up (the child says so on stdout).
+    /// The child opens and locks the file itself: an inheritable fd in this test process would leak into children other tests spawn meanwhile.
+    fn sleeper_on(path: &Path, lock: bool) -> std::process::Child {
+        let script = if lock {
+            r#"exec 9<>"$1"; flock -nx 9 || exit 1; echo ready; exec sleep 300"#
+        } else {
+            r#"exec 9<>"$1"; echo ready; exec sleep 300"#
+        };
+        let mut c = Command::new("sh")
+            .args(["-c", script, "sh"])
+            .arg(path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(c.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        assert_eq!(line, "ready\n", "fixture {}", path.display());
+        c
+    }
+
+    /// Fixture of a lingering daemon: a process alone holding checkout `id`'s mount lock, as a daemon left by a build does after the outer command closed its fd.
+    /// Plus a bystander that opened the file without locking it (a failed try of another command): never a holder.
+    fn lingering_holder(ws: &Path, id: &str) -> (std::process::Child, std::process::Child) {
+        let p = mount_lock_path(ws, id);
+        drop(open_lock(&p).unwrap());
+        let bystander = sleeper_on(&p, false);
+        (sleeper_on(&p, true), bystander)
+    }
+
+    #[test]
+    fn wait_line_names_the_holder() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-holder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let (mut holder, mut bystander) = lingering_holder(&ws, "c");
+        let got = holders(&mount_lock_path(&ws, "c"), std::process::id()).unwrap();
+        let text = holders_text(&got);
+        let _ = holder.kill();
+        let _ = bystander.kill();
+        let _ = holder.wait();
+        let _ = bystander.wait();
+        assert_eq!(
+            got,
+            [Holder {
+                pid: holder.id(),
+                cmd: "sleep 300".to_owned()
+            }]
+        );
+        assert!(
+            text.contains(&format!("pid {} `sleep 300`", holder.id())),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A daemon left holding the lock blocks the next command (red before end_holders existed); once end_holders returns, the lock is free at once: its return is the bound, no wait time is assumed.
+    #[test]
+    fn lingering_holder_ends_with_the_command() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-linger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let (mut holder, mut bystander) = lingering_holder(&ws, "c");
+        assert!(
+            try_mount_lock(&ws, "c").unwrap().is_none(),
+            "fixture holds the lock"
+        );
+        let ended = end_holders(&ws, "c", &mount_lock_path(&ws, "c"), std::process::id());
+        let free = try_mount_lock(&ws, "c").unwrap().is_some();
+        let bystander_alive = bystander.try_wait().unwrap().is_none();
+        let _ = holder.kill();
+        let _ = bystander.kill();
+        let _ = holder.wait();
+        let _ = bystander.wait();
+        assert_eq!(ended.unwrap(), 1);
+        assert!(free, "lock still held after end_holders");
+        assert!(
+            bystander_alive,
+            "a process that only opened the file was ended"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out::pool(&ws).join("delta-linger.count"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
         std::fs::remove_dir_all(&ws).unwrap();
     }
 
