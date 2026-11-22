@@ -12,6 +12,9 @@ publish.workspace = true
 
 [dependencies]
 atl-platform-types = { path = "../atl-platform-types" }
+# DefaultNetwork's wire form: atld reads the network outside the sandbox and hands it to the system services (`--network`)
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

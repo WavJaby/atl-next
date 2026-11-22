@@ -557,6 +557,8 @@ name = "atl-platform-host-api"
 version = "0.0.0"
 dependencies = [
  "atl-platform-types",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

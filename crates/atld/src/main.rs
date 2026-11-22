@@ -396,6 +396,18 @@ fn host_display() -> DisplayModel {
     }
 }
 
+/// The host's default network, read here (outside every sandbox, as a native program reads it: GIO reaches NetworkManager) once at start for the system services' `--network`.
+/// Unreadable = none, said so; the services log the network they got (`connectivity:`).
+fn host_network() -> Option<atl_platform_host::DefaultNetwork> {
+    use atl_platform_host::NetworkSource;
+    atl_platform_host::PlatformNetwork
+        .default_network()
+        .unwrap_or_else(|e| {
+            log(format_args!("network: {e}; no default network"));
+            None
+        })
+}
+
 /// A package to install, as xtask writes it: one install session.
 #[derive(Deserialize)]
 struct PackageSource {
@@ -2973,6 +2985,9 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
+    if let Some(n) = host_network() {
+        services_args.extend(["--network".into(), n.to_arg().into()]);
+    }
     if let Some(tag) = &locale {
         services_args.extend(["--locale".into(), tag.into()]);
     }

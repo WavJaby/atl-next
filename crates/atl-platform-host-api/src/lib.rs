@@ -98,7 +98,7 @@ pub struct NetworkError(
 );
 
 /// The kind of link the default route leaves through, as the host's driver reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LinkKind {
     /// A wireless LAN interface.
     Wifi,
@@ -107,7 +107,7 @@ pub enum LinkKind {
 }
 
 /// The system's verdict on reaching the Internet over the default route, as the desktop's network monitor reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Connectivity {
     /// A route exists but the Internet is known not to be reachable.
     Limited,
@@ -118,7 +118,9 @@ pub enum Connectivity {
 }
 
 /// The host's default network: the link its default route leaves through.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Read where a native program runs, never inside an app sandbox: GIO's monitor there reaches no NetworkManager (no system bus is shown) and falls to another backend; GLib 2.90's systemd one
+/// answers "local" (offline) on a host whose link NetworkManager manages (measured on Arch 2026-11-22). atld reads it and the system services take it as [`DefaultNetwork::to_arg`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DefaultNetwork {
     /// The interface name (`eth0`, `wlp2s0`).
     pub interface: String,
@@ -138,6 +140,18 @@ pub struct DefaultNetwork {
     pub connectivity: Connectivity,
     /// Whether the system considers it metered.
     pub metered: bool,
+}
+
+impl DefaultNetwork {
+    /// The `--network` form: one JSON object.
+    pub fn to_arg(&self) -> String {
+        serde_json::to_string(self).expect("a DefaultNetwork always serializes")
+    }
+
+    /// The network of a [`DefaultNetwork::to_arg`] string.
+    pub fn parse_arg(s: &str) -> Result<Self, String> {
+        serde_json::from_str(s).map_err(|e| format!("--network {s}: {e}"))
+    }
 }
 
 /// The host's network state, as a native desktop program sees it. Shaped by its one implementation: the kernel's route tables, the resolver file, GIO's network monitor.
@@ -614,5 +628,36 @@ mod tests {
                 "{tz}"
             );
         }
+    }
+
+    /// atld's `--network` comes back as the same network in the services, every field (v4 + v6 addresses, the optional ones absent and present).
+    #[test]
+    fn a_network_survives_its_arg_form() {
+        let full = DefaultNetwork {
+            interface: "wlp2s0".into(),
+            kind: LinkKind::Wifi,
+            hw_address: Some("02:00:00:00:00:01".into()),
+            mtu: Some(1500),
+            gateways: vec!["192.0.2.1".parse().unwrap(), "fe80::1".parse().unwrap()],
+            dns: vec!["192.0.2.53".parse().unwrap()],
+            search: Some("example.net lan".into()),
+            connectivity: Connectivity::Portal,
+            metered: true,
+        };
+        let bare = DefaultNetwork {
+            interface: "eth0".into(),
+            kind: LinkKind::Ethernet,
+            hw_address: None,
+            mtu: None,
+            gateways: Vec::new(),
+            dns: Vec::new(),
+            search: None,
+            connectivity: Connectivity::Full,
+            metered: false,
+        };
+        for n in [full, bare] {
+            assert_eq!(DefaultNetwork::parse_arg(&n.to_arg()), Ok(n));
+        }
+        assert!(DefaultNetwork::parse_arg("eth0").is_err());
     }
 }

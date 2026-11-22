@@ -64,6 +64,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// The host's default network as atld read it at start, outside the sandbox (atl_platform_host::DefaultNetwork::to_arg, one JSON object). Omitted: no default network (offline).
+    #[arg(long, value_parser = atl_platform_host::DefaultNetwork::parse_arg)]
+    network: Option<atl_platform_host::DefaultNetwork>,
     /// The desktop's UI language as a BCP-47 tag (atld: atl_platform_host::ui_locale). Omitted: none, and the global configuration takes activity.rs DEFAULT_LOCALE.
     #[arg(long)]
     locale: Option<String>,
@@ -409,15 +412,8 @@ fn main() -> Result<()> {
     )
     .context("addService clipboard")?;
     if !a.omit_service.iter().any(|s| s == CONNECTIVITY) {
-        // the host's default network through the platform layer, read once at start; unreadable = none, said so
-        use atl_platform_host::NetworkSource;
-        let network = match atl_platform_host::PlatformNetwork.default_network() {
-            Ok(n) => n,
-            Err(e) => {
-                writeln!(std::io::stderr(), "connectivity: {e}; no default network")?;
-                None
-            }
-        };
+        // the host's default network as atld read it (--network): from inside the sandbox the platform layer's monitor reaches no NetworkManager (DefaultNetwork doc)
+        let network = a.network.clone();
         match &network {
             Some(n) => writeln!(
                 std::io::stderr(),
