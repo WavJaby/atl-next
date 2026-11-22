@@ -81,6 +81,8 @@ impl Placement {
 struct WindowEntry<C> {
     task: TaskId,
     client: C,
+    /// the pid of the session that added it (Session.mPid): whose process configuration its MergedConfiguration carries as global
+    pid: i32,
     placement: Placement,
 }
 
@@ -93,6 +95,8 @@ struct State<C> {
     /// WindowToken -> Task (an activity token: ActivityRecord.task; a toast token: the caller's Task). A token is an identity: compared by equality.
     tokens: Vec<(C, TaskId)>,
     windows: Vec<WindowEntry<C>>,
+    /// pid -> the Task whose configuration the process carries (WindowProcessController.mConfigActivityRecord's Task); a process not listed carries the global configuration.
+    process_tasks: Vec<(i32, TaskId)>,
     /// The last `ClientWindowFrames.seq` handed out, global across windows.
     seq: i32,
     /// The display's touch mode (DisplayContent.mInTouchMode): starts at config_defaultInTouchMode, changed only by IWindowManager.setInTouchMode.
@@ -110,6 +114,7 @@ impl<C> State<C> {
             last_id: 0,
             tokens: Vec::new(),
             windows: Vec::new(),
+            process_tasks: Vec::new(),
             seq: 0,
             in_touch_mode: DEFAULT_IN_TOUCH_MODE,
         }
@@ -305,16 +310,63 @@ impl<C: Clone + PartialEq> Tasks<C> {
             .map(|(_, task)| *task)
     }
 
-    /// Records a window of `task`; a client already recorded is not recorded twice.
-    pub fn add_window(&self, task: TaskId, client: C, placement: Placement) {
+    /// Records a window of `task` added by the process `pid`; a client already recorded is not recorded twice.
+    pub fn add_window(&self, task: TaskId, client: C, pid: i32, placement: Placement) {
         let mut st = self.lock();
         if !st.windows.iter().any(|w| w.client == client) {
             st.windows.push(WindowEntry {
                 task,
                 client,
+                pid,
                 placement,
             });
         }
+    }
+
+    /// The pid of the process that added the window `client`, if recorded.
+    pub fn window_pid(&self, client: &C) -> Option<i32> {
+        self.lock()
+            .windows
+            .iter()
+            .find(|w| w.client == *client)
+            .map(|w| w.pid)
+    }
+
+    /// The Task whose configuration the process `pid` carries; None: the global one.
+    pub fn process_task(&self, pid: i32) -> Option<TaskId> {
+        self.lock()
+            .process_tasks
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .map(|(_, t)| *t)
+    }
+
+    /// Sets the Task the process `pid` follows (None: the global configuration, and how a dead process is forgotten). True when that changed it.
+    pub fn set_process_task(&self, pid: i32, task: Option<TaskId>) -> bool {
+        let mut st = self.lock();
+        let at = st.process_tasks.iter().position(|(p, _)| *p == pid);
+        if at.map(|i| st.process_tasks[i].1) == task {
+            return false;
+        }
+        match (at, task) {
+            (Some(i), Some(t)) => st.process_tasks[i].1 = t,
+            (Some(i), None) => {
+                st.process_tasks.swap_remove(i);
+            }
+            (None, Some(t)) => st.process_tasks.push((pid, t)),
+            (None, None) => {}
+        }
+        true
+    }
+
+    /// The pids of the processes that follow `task`.
+    pub fn processes_following(&self, task: TaskId) -> Vec<i32> {
+        self.lock()
+            .process_tasks
+            .iter()
+            .filter(|(_, t)| *t == task)
+            .map(|(p, _)| *p)
+            .collect()
     }
 
     /// The placement of the window whose client is `client`, if recorded.
@@ -527,14 +579,37 @@ mod tests {
             t.new_task(7, "com.example.app", three_quarters()),
         );
         let p = Placement::default();
-        t.add_window(main, 100, p);
-        t.add_window(second, 200, p);
-        t.add_window(main, 100, p);
+        t.add_window(main, 100, 40, p);
+        t.add_window(second, 200, 41, p);
+        t.add_window(main, 100, 42, p);
         assert_eq!(t.windows_of(main), vec![(100, p)]);
         assert_eq!(t.windows_of(second), vec![(200, p)]);
+        assert_eq!(t.window_pid(&100), Some(40), "the first add is kept");
         t.remove_window(&100);
         assert!(t.windows_of(main).is_empty());
+        assert_eq!(t.window_pid(&100), None);
         assert_eq!(t.windows_of(second), vec![(200, p)]);
+    }
+
+    /// A process follows one Task at a time; following none (or dying) drops it; only a real change reports true.
+    #[test]
+    fn a_process_follows_one_task() {
+        let t = tasks();
+        let (main, second) = (
+            t.new_task(7, "com.example.app", three_quarters()),
+            t.new_task(7, "com.example.app", three_quarters()),
+        );
+        assert_eq!(t.process_task(40), None);
+        assert!(t.set_process_task(40, Some(main)));
+        assert!(!t.set_process_task(40, Some(main)), "unchanged");
+        assert!(t.set_process_task(41, Some(main)));
+        assert_eq!(t.processes_following(main), vec![40, 41]);
+        assert!(t.set_process_task(40, Some(second)));
+        assert_eq!(t.process_task(40), Some(second));
+        assert_eq!(t.processes_following(main), vec![41]);
+        assert!(t.set_process_task(41, None));
+        assert!(!t.set_process_task(41, None), "unchanged");
+        assert!(t.processes_following(main).is_empty());
     }
 
     /// A relayout's placement replaces the add's, and `resized` reads it back per window.
@@ -542,7 +617,7 @@ mod tests {
     fn placement_follows_relayout() {
         let t = tasks();
         let main = t.new_task(7, "com.example.app", three_quarters());
-        t.add_window(main, 100, Placement::default());
+        t.add_window(main, 100, 40, Placement::default());
         let popup = Placement {
             r#type: 1000,
             requested: (196, 160),

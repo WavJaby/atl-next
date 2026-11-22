@@ -568,8 +568,12 @@ impl IWindowSession for Session {
         } else {
             (InputChannel::default(), None)
         };
-        self.tasks
-            .add_window(task, window.as_binder(), Placement::of(attrs));
+        self.tasks.add_window(
+            task,
+            window.as_binder(),
+            self.agent.process.pid,
+            Placement::of(attrs),
+        );
         self.lock().push(Window {
             client: window.as_binder(),
             title: attrs.title.clone().unwrap_or_default(),
@@ -724,7 +728,8 @@ impl IWindowSession for Session {
         *out_relayout_result = Some(WindowRelayoutResult {
             frames,
             merged_configuration: MergedConfiguration {
-                global: activity::global_configuration(&display, self.tasks.locale()),
+                // WindowState.getProcessGlobalConfiguration: the session's process configuration (ViewRootImpl hands a differing global to the process)
+                global: activity::process_configuration(&self.tasks, self.agent.process.pid),
                 override_config: activity::sent_task_override(&self.tasks, &display, task, size),
                 merged: activity::task_configuration(&display, self.tasks.locale(), size),
             },
@@ -884,13 +889,18 @@ pub fn notify_resized(tasks: &Tasks<SpIBinder>, task: TaskId) -> usize {
     let Ok(size) = size_of(tasks, task, "resized") else {
         return 0;
     };
-    let merged = MergedConfiguration {
-        global: activity::global_configuration(&display, tasks.locale()),
-        override_config: activity::sent_task_override(tasks, &display, task, size),
-        merged: activity::task_configuration(&display, tasks.locale(), size),
-    };
     let clients = tasks.windows_of(task);
     for (client, placement) in &clients {
+        // global = the window's process configuration (WindowState.getProcessGlobalConfiguration); ViewRootImpl hands a differing one to the process
+        let global = match tasks.window_pid(client) {
+            Some(pid) => activity::process_configuration(tasks, pid),
+            None => activity::global_configuration(&display, tasks.locale()),
+        };
+        let merged = MergedConfiguration {
+            global,
+            override_config: activity::sent_task_override(tasks, &display, task, size),
+            merged: activity::task_configuration(&display, tasks.locale(), size),
+        };
         let window = match client
             .clone()
             .into_interface::<dyn atl_aidl::mangled::_7_android_4_view_7_IWindow>()

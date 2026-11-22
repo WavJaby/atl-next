@@ -75,6 +75,8 @@ struct Record<K, O, L, I, R> {
     finishing: bool,
     /// Taken by the Launch step.
     launch: Option<L>,
+    /// When the Launch step was taken, in machine-wide launch order (0: not launched yet): the order WindowProcessController.mActivities adds records in (setProcess at realStartActivityLocked).
+    started: u64,
     /// The result owed to the caller, taken by `finish`.
     owed: Option<ResultTo<K>>,
     /// ActivityRecord.newIntents: intents not sent at once (record not resumed or paused), delivered before its next Resume (TaskFragment.java:1691-1693).
@@ -131,6 +133,8 @@ pub struct Machine<K, O, L, I, R> {
     destroying: Vec<(TaskId, K, O)>,
     /// The userLeaving of the pauses the current start causes (ActivityTaskSupervisor.mUserLeaving); true outside a NO_USER_ACTION start.
     user_leaving: bool,
+    /// The last launch order handed out ([`Record::started`]).
+    launches: u64,
 }
 
 impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
@@ -140,6 +144,7 @@ impl<K, O, L, I, R> Default for Machine<K, O, L, I, R> {
             tasks: BTreeMap::new(),
             hidden: BTreeSet::new(),
             user_leaving: true,
+            launches: 0,
         }
     }
 }
@@ -175,6 +180,7 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R: Cancelled<K>> Machine<K, O, L, I, 
             phase: Phase::Created,
             finishing: false,
             launch: Some(launch),
+            started: 0,
             owed: push.owed,
             pending: Vec::new(),
             results: Vec::new(),
@@ -424,6 +430,23 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R: Cancelled<K>> Machine<K, O, L, I, 
             .any(|r| !r.finishing && of(&r.owner))
     }
 
+    /// The Task of the record whose configuration the process of the owners `of` matches carries (WindowProcessController.updateActivityConfigurationListener): its non-finishing record
+    /// launched last. None: no such record, the process carries the global configuration. AOSP drops a record from the process at its destroy; here a finishing one is skipped at once
+    /// (its Destroy follows its stop). Every record in a Task is launched (push launches its top at once, hidden or shown), so the launch order covers them all.
+    pub fn process_top(&self, of: impl Fn(&O) -> bool) -> Option<TaskId> {
+        self.tasks
+            .iter()
+            .flat_map(|(task, records)| records.iter().map(move |r| (*task, r)))
+            .filter(|(_, r)| !r.finishing && of(&r.owner))
+            .max_by_key(|(_, r)| r.started)
+            .map(|(task, _)| task)
+    }
+
+    /// Every owner of a record in a Task, bottom -> top per Task (an owner may repeat).
+    pub fn owners(&self) -> impl Iterator<Item = &O> {
+        self.tasks.values().flatten().map(|r| &r.owner)
+    }
+
     /// No record anywhere, in a Task or destroying: no app has an activity.
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty() && self.destroying.is_empty()
@@ -518,6 +541,8 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R: Cancelled<K>> Machine<K, O, L, I, 
                 .launch
                 .take()
                 .expect("a Created record holds its launch payload");
+            self.launches += 1;
+            r.started = self.launches;
             r.phase = Phase::Stopping;
             out.push(r.command(vec![Step::Launch(launch), Step::Stop]));
         }
@@ -525,14 +550,18 @@ impl<K: Clone + PartialEq, O: Clone, L, I, R: Cancelled<K>> Machine<K, O, L, I, 
         if let Some(i) = top.filter(|_| !hidden) {
             let r = &mut records[i];
             let steps = match r.phase {
-                Phase::Created => Some(vec![
-                    Step::Launch(
-                        r.launch
-                            .take()
-                            .expect("a Created record holds its launch payload"),
-                    ),
-                    Step::Resume,
-                ]),
+                Phase::Created => {
+                    self.launches += 1;
+                    r.started = self.launches;
+                    Some(vec![
+                        Step::Launch(
+                            r.launch
+                                .take()
+                                .expect("a Created record holds its launch payload"),
+                        ),
+                        Step::Resume,
+                    ])
+                }
                 Phase::Stopped => Some(vec![Step::Start, Step::Resume]),
                 Phase::Paused => Some(vec![Step::Resume]),
                 _ => None,
@@ -624,6 +653,32 @@ mod tests {
         fn cancelled(_: &super::ResultTo<u32>) -> Self {
             "cancelled"
         }
+    }
+
+    /// WindowProcessController.updateActivityConfigurationListener: the process follows its non-finishing record launched last, across Tasks; none (finishing, other owner) -> None.
+    #[test]
+    fn process_top_is_the_live_record_launched_last() {
+        let mut m = Machine::new();
+        let of_app = |o: &&str| *o == APP;
+        assert_eq!(m.process_top(of_app), None, "no record: global");
+        m.push(task(1), SPLASH, APP, "splash");
+        assert_eq!(m.process_top(of_app), Some(task(1)));
+        m.resumed(&SPLASH);
+        m.push(task(2), MAIN, APP, "main");
+        assert_eq!(m.process_top(of_app), Some(task(2)), "launched last");
+        // moving Task 1's record to its top does not re-add it (mActivities keeps its add order)
+        m.move_to_top(&SPLASH);
+        assert_eq!(m.process_top(of_app), Some(task(2)));
+        // the record launched last finishes: the process falls back to the one before
+        m.finish(&MAIN, |_| "done");
+        assert_eq!(m.process_top(of_app), Some(task(1)));
+        assert_eq!(m.process_top(|o| *o == "other"), None, "another process");
+        m.finish(&SPLASH, |_| "done");
+        assert_eq!(
+            m.process_top(of_app),
+            None,
+            "every record finishing: global"
+        );
     }
 
     /// A clear-top finish answers the cleared record's own owed result RESULT_CANCELED (finishIfPossible): to its caller, at once when that caller is resumed, else with its next resume.

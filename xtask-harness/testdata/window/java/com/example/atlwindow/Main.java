@@ -53,6 +53,7 @@ public class Main extends Activity {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "onCreate reached");
         logDensity("created", getResources().getConfiguration());
+        logProcessConfiguration("created");
         // the title reaches the window's attributes only through them: Window.setTitle leaves the default (the component name)
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
         attrs.setTitle(WINDOW_TITLE);
@@ -193,6 +194,15 @@ public class Main extends Activity {
         super.onConfigurationChanged(newConfig);
         Log.i(TAG, "configuration changed screenWidthDp=" + newConfig.screenWidthDp + " orientation=" + newConfig.orientation);
         logDensity("changed", newConfig);
+        logProcessConfiguration("changed");
+    }
+
+    /** The process's configuration: the Application's resources and Resources.getSystem(), which AOSP keeps equal to the configuration of the activity launched last (xtask-harness/src/window.rs stage orientation). */
+    private void logProcessConfiguration(String when) {
+        android.content.res.Configuration app = getApplicationContext().getResources().getConfiguration();
+        android.content.res.Configuration sys = android.content.res.Resources.getSystem().getConfiguration();
+        Log.i(TAG, "process configuration " + when + " app=" + app.screenWidthDp + "x" + app.screenHeightDp + " appOrientation=" + app.orientation
+                + " system=" + sys.screenWidthDp + "x" + sys.screenHeightDp + " systemOrientation=" + sys.orientation);
     }
 
     /** The density this instance sees (xtask-harness/src/window.rs move_checks): the Configuration's and the resources' DisplayMetrics, which must agree. */

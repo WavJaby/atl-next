@@ -268,6 +268,28 @@ pub(crate) fn task_configuration(
     config
 }
 
+/// The configuration of the process `pid` (WindowProcessController.getConfiguration): the configuration of the Task it follows ([`Tasks::process_task`], its activity launched last, kept by
+/// activity_task), else the global one. The one source of bindApplication's, LaunchActivityItem.curConfig, ConfigurationChangeItem and the global part of a window's MergedConfiguration.
+/// activityType stays undefined and seq the global's (0), as WindowProcessController.resolveOverrideConfiguration leaves them.
+pub(crate) fn process_configuration<C: Clone + PartialEq>(
+    tasks: &Tasks<C>,
+    pid: i32,
+) -> Configuration {
+    let display = tasks.display();
+    match tasks.process_task(pid).and_then(|t| tasks.size(t)) {
+        Some(size) => task_configuration(&display, tasks.locale(), size),
+        None => global_configuration(&display, tasks.locale()),
+    }
+}
+
+/// WindowProcessController.dispatchConfiguration:1770: a process configuration as its ConfigurationChangeItem (device 0: the default display's).
+pub(crate) fn configuration_change_item(configuration: Configuration) -> ClientTransactionItem {
+    ClientTransactionItem::ConfigurationChange(Box::new(ConfigurationChangeItem {
+        configuration,
+        device_id: DEVICE_ID_DEFAULT,
+    }))
+}
+
 /// The plain form of a configuration: the fields config_diff reads, as the parcelable holds them (undefined stays as the parcel has it).
 impl From<&Configuration> for Config {
     fn from(c: &Configuration) -> Self {
@@ -325,13 +347,13 @@ pub(crate) fn resume_item(token: SpIBinder) -> ResumeActivityItem {
     }
 }
 
-/// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): `intent` as the start sent it, the global configuration, the controller every activity names. Built by activity_task when the machine's Launch step is sent.
+/// The LaunchActivityItem of `p`'s `activity` (ActivityTaskSupervisor.realStartActivityLocked's launch): `intent` as the start sent it, the controller every activity names. Built by activity_task when the machine's Launch step is sent.
+/// `process_config` = curConfig, the process's configuration (prepareConfigurationForLaunchingActivity:1868, [`process_configuration`]), already following this activity;
 /// `task_override` = the activity's merged override configuration (ActivityTaskSupervisor.java:1001 `r.getMergedOverrideConfiguration()`): its freeform Task's, so onCreate lays out at the Task's size, not the display's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_item(
     packages: &Packages,
-    display: &DisplayModel,
-    locale: Option<&str>,
+    process_config: Configuration,
     task_override: Configuration,
     controller: &SpIBinder,
     p: &PackageRecord,
@@ -344,7 +366,7 @@ pub(crate) fn launch_item(
     LaunchActivityItem {
         activity_token: Some(token),
         ident,
-        cur_config: Some(global_configuration(display, locale)),
+        cur_config: Some(process_config),
         override_config: Some(task_override),
         device_id: DEVICE_ID_DEFAULT,
         proc_state: PROCESS_STATE_TOP,
@@ -861,36 +883,19 @@ impl ActivityManager {
         Arc::clone(&self.inner.atm)
     }
 
-    /// The display changed (registry SET_DISPLAY): the new global configuration to every attached process, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
-    /// (WindowProcessController.dispatchConfiguration:1773: ConfigurationChangeItem, device 0). Needed: a Task's override leaves density to the global configuration (task_override), so without it
-    /// an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
+    /// The display changed (registry SET_DISPLAY): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
+    /// (each WindowProcessController's onConfigurationChanged -> dispatchConfiguration): the new global one, or its Task's on the new display ([`process_configuration`]). Needed: a Task's
+    /// override leaves density to the global configuration (task_override), so without it an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
     pub(crate) fn global_configuration_changed(&self) -> usize {
-        let config = global_configuration(&self.inner.tasks.display(), self.inner.tasks.locale());
-        let threads: Vec<_> = self
+        let pids: Vec<i32> = self
             .inner
             .state()
             .processes
             .iter()
-            .filter_map(|p| p.attached.as_ref().map(|a| a.thread.clone()))
+            .filter(|p| p.attached.is_some())
+            .map(|p| p.pid)
             .collect();
-        let mut told = 0;
-        for thread in threads {
-            let transaction = ClientTransaction {
-                items: vec![Some(ClientTransactionItem::ConfigurationChange(Box::new(
-                    ConfigurationChangeItem {
-                        configuration: config.clone(),
-                        device_id: 0,
-                    },
-                )))],
-            };
-            match thread.r#scheduleTransaction(Some(&transaction)) {
-                Ok(()) => told += 1,
-                Err(e) => log(format_args!(
-                    "scheduleTransaction (global configuration): {e}"
-                )),
-            }
-        }
-        told
+        self.inner.dispatch_process_configuration(&pids)
     }
 
     /// forceStopPackageLocked for a reason outside a binder call of this service (PMS's PACKAGE_CHANGED without DONT_KILL_APP): the package's processes leave the table and are killed.
@@ -1257,12 +1262,49 @@ impl Inner {
         ));
         self.kill(&pids);
     }
+    /// WindowProcessController.dispatchConfiguration:1743-1771 to each attached process of `pids`: its configuration now ([`process_configuration`]) as a ConfigurationChangeItem. Returns the processes told.
+    fn dispatch_process_configuration(&self, pids: &[i32]) -> usize {
+        let threads: Vec<_> = {
+            let st = self.state();
+            pids.iter()
+                .filter_map(|pid| {
+                    let p = st.processes.iter().find(|p| p.pid == *pid)?;
+                    Some((*pid, p.attached.as_ref()?.thread.clone()))
+                })
+                .collect()
+        };
+        let mut told = 0;
+        for (pid, thread) in threads {
+            let transaction = ClientTransaction {
+                items: vec![Some(configuration_change_item(process_configuration(
+                    &self.tasks,
+                    pid,
+                )))],
+            };
+            match thread.r#scheduleTransaction(Some(&transaction)) {
+                Ok(()) => told += 1,
+                Err(e) => log(format_args!(
+                    "scheduleTransaction (process configuration): {e}"
+                )),
+            }
+        }
+        told
+    }
+
     /// ActivityRecord.ensureActivityConfiguration for each activity of `task`, at the Task's size now. Reported is recorded before the send, as AOSP's mLastReportedConfiguration.
     /// Each activity is a record of the lifecycle machine (activity_task Owner): one started by startActivity gets the change as the launcher one does; the steps after a relaunch come from its phase.
+    /// First the processes that follow `task` get their new configuration: the activity's configuration change reaches its process's listener before the activity's own item (AOSP queues both).
     fn task_resized(&self, task: TaskId) {
         let Some(size) = self.tasks.size(task) else {
             return;
         };
+        let told = self.dispatch_process_configuration(&self.tasks.processes_following(task));
+        if told > 0 {
+            log(format_args!(
+                "process configuration of task {} sent to {told} process(es)",
+                task.raw()
+            ));
+        }
         let display = self.tasks.display();
         let over = sent_task_override(&self.tasks, &display, task, size);
         let new = Config::from(&task_configuration(&display, self.tasks.locale(), size));
@@ -1323,7 +1365,8 @@ impl Inner {
                             Box::new(ActivityRelaunchItem {
                                 activity_token: Some(token.clone()),
                                 config: Some(MergedConfiguration {
-                                    global: global_configuration(&display, self.tasks.locale()),
+                                    // ActivityRecord.getProcessGlobalConfiguration:8617: the process's
+                                    global: process_configuration(&self.tasks, entry.pid),
                                     override_config: over.clone(),
                                     merged: task_configuration(&display, self.tasks.locale(), size),
                                 }),
@@ -1633,6 +1676,8 @@ impl Inner {
                 return;
             };
             let mut rec = st.processes.remove(i);
+            // WindowProcessController.destroy: its configuration listener goes
+            self.tasks.set_process_task(pid, None);
             if let Some(a) = &rec.attached {
                 last_app = self
                     .atm
@@ -2141,7 +2186,13 @@ impl IActivityManager for ActivityManager {
             .as_binder()
             .link_to_death(&mut death)
             .map_err(|e| illegal_state(&format!("linkToDeath: {e:?}")))?;
-        // what attachApplicationLocked passes for a plain app start (no profiler, backup or sdk sandbox): nulls, the global configuration, the default compat info,
+        // preBindApplication:6792-6809: a process started for its launch binds with its Task's configuration, any other with the global one
+        let launch_task = st.processes[i]
+            .launch_activity
+            .then_some(st.processes[i].task)
+            .flatten();
+        let bind_config = inner.atm.bind_configuration(pid, launch_task);
+        // what attachApplicationLocked passes for a plain app start (no profiler, backup or sdk sandbox): nulls, the process configuration (above), the default compat info,
         // the process's providers (generateApplicationProvidersLocked; ActivityThread installs them before Application.onCreate), no disabled compat changes; coreSettings never null (empty: ATL writes no keys, gl-honesty D5) (attachApplicationLocked passes
         // mCoreSettingsObserver.getCoreSettingsLocked(), and ActivityThread.updateDebugViewAttributeState reads it unconditionally); its keys are AOSP's own; ATL writes none (gl-honesty D5).
         // An instrumentation passes its class, arguments, watcher and UiAutomation connection (:4723-4737).
@@ -2182,10 +2233,7 @@ impl IActivityManager for ActivityManager {
             false,
             false,
             false,
-            Some(&global_configuration(
-                &inner.tasks.display(),
-                inner.tasks.locale(),
-            )),
+            Some(&bind_config),
             Some(&CompatibilityInfo::default()),
             // :4773 getCommonServicesLocked
             Some(inner.common_services.get_or_init(common_services)),
@@ -2235,10 +2283,10 @@ impl IActivityManager for ActivityManager {
             && let Some(p) = inner.packages.by_name(&package)
             && let Some(activity) = inner.packages.launcher(p)
         {
-            // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app starts with the global configuration and no override.
+            // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app was bound with its Task's configuration (bind_configuration).
             inner
                 .atm
-                .launch_launcher(thread.clone(), uid, &package, activity, task);
+                .launch_launcher(thread.clone(), pid, uid, &package, activity, task);
         }
         // :4933 mBroadcastQueue.onApplicationAttachedLocked, after the activity attach: the deliveries that waited for this process, in order
         let mut st = inner.state();

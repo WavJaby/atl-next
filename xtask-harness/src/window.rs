@@ -897,11 +897,58 @@ const CONFIG_PORTRAIT: i32 = 1;
 const REQUESTED_PORTRAIT: i32 = 1;
 /// The fixture's line after its setRequestedOrientation (Main.java requestOrientation).
 const REQUESTED_LINE: &str = "AtlWindow: requested orientation";
+/// The fixture's process configuration (Application resources + Resources.getSystem()) at onCreate and at each onConfigurationChanged (Main.java logProcessConfiguration).
+const PROCESS_CREATED_LINE: &str = "AtlWindow: process configuration created";
+const PROCESS_CHANGED_LINE: &str = "AtlWindow: process configuration changed";
+
+/// Sub-gates `process-opened` / `process-reshaped`: the process configuration `line` (Application's and Resources.getSystem()'s) is a window of `size` px on `display`: dp = px / (dpi / 160),
+/// rounded (DisplayContent.computeScreenAppConfiguration), portrait when width <= height. AOSP: the process follows its activity launched last (WindowProcessController.updateActivityConfigurationListener),
+/// so not the display's size.
+fn process_config_check(
+    line: Option<&str>,
+    size: (i32, i32),
+    display: DisplayModel,
+) -> Result<String, String> {
+    let density = display.dpi as f32 / DENSITY_DEFAULT as f32;
+    let dp = |px: i32| (px as f32 / density + 0.5) as i32;
+    let want_dp = (dp(size.0), dp(size.1));
+    let orientation = if want_dp.0 <= want_dp.1 {
+        CONFIG_PORTRAIT
+    } else {
+        CONFIG_LANDSCAPE
+    };
+    let Some(line) = line else {
+        return Err("the fixture never logged its process configuration".to_owned());
+    };
+    let seen = |key: &str, okey: &str| {
+        (
+            word(line, key).and_then(parse_wxh),
+            word(line, okey).and_then(|o| o.parse::<i32>().ok()),
+        )
+    };
+    let want = (Some(want_dp), Some(orientation));
+    let (app, system) = (
+        seen("app", "appOrientation"),
+        seen("system", "systemOrientation"),
+    );
+    if app == want && system == want {
+        Ok(format!(
+            "application + system {}x{} dp orientation {orientation}",
+            want_dp.0, want_dp.1
+        ))
+    } else {
+        Err(format!(
+            "application {app:?}, system {system:?}; want {want_dp:?} dp orientation {orientation} (a {}x{} px window)",
+            size.0, size.1
+        ))
+    }
+}
 
 /// Stage `orientation` sub-gates on the app's log, against values worked out from AOSP and the gate's display, not read from the services:
 /// `requested`: getRequestedOrientation returns the request. `opened`: the first layout is the landscape opening size (AOSP's ideal size, [`opening_size_i32`]), so the change is the request's.
 /// `reshaped`: the last layout is AOSP's portrait size for the display ([`portrait_expected`]) as content and window frame, in a portrait configuration. `told`: the activity (size and orientation
 /// declared) got the change as onConfigurationChanged with a portrait orientation and the portrait width in dp (px / (dpi / 160), rounded), and was created once (no relaunch).
+/// `process-opened` / `process-reshaped`: the process configuration at onCreate is the opening window's, after the reshape the portrait window's ([`process_config_check`]).
 fn orientation_checks(app: &str, display: DisplayModel) -> Vec<Sub> {
     let opening = opening_size_i32(display);
     let want = portrait_expected((display.width, display.height));
@@ -965,11 +1012,27 @@ fn orientation_checks(app: &str, display: DisplayModel) -> Vec<Sub> {
             "{creates} onCreate, portrait change (screenWidthDp={want_dp}) told: {told_portrait}"
         ))
     };
+    let line_of = |key: &str, last: bool| {
+        let mut lines = app.lines().filter(move |l| l.contains(key));
+        if last {
+            lines.next_back()
+        } else {
+            lines.next()
+        }
+    };
     vec![
         ("requested", requested),
         ("opened", opened),
         ("reshaped", reshaped),
         ("told", told),
+        (
+            "process-opened",
+            process_config_check(line_of(PROCESS_CREATED_LINE, false), opening, display),
+        ),
+        (
+            "process-reshaped",
+            process_config_check(line_of(PROCESS_CHANGED_LINE, true), want, display),
+        ),
     ]
 }
 
@@ -3954,8 +4017,18 @@ mod tests {
         let requested = "AtlWindow: requested orientation set=1 get=1\n";
         let created = "AtlWindow: onCreate reached\n";
         let told = "AtlWindow: configuration changed screenWidthDp=750 orientation=1\n";
+        // the process follows the activity: 1440x900 dp landscape at onCreate, 750x900 dp portrait after the reshape (160 dpi: dp = px)
+        let process = |when: &str, w: i32, h: i32, o: i32| {
+            format!(
+                "AtlWindow: process configuration {when} app={w}x{h} appOrientation={o} system={w}x{h} systemOrientation={o}\n"
+            )
+        };
+        let (proc_created, proc_changed) = (
+            process("created", 1440, 900, 2),
+            process("changed", 750, 900, 1),
+        );
         let good = format!(
-            "{created}{requested}{}{told}{}",
+            "{created}{proc_created}{requested}{}{told}{proc_changed}{}",
             layout(1440, 900, 2),
             layout(750, 900, 1)
         );
@@ -3971,12 +4044,26 @@ mod tests {
             "{:?}",
             orientation_checks(&good, display)
         );
-        let kept = format!("{created}{requested}{}", layout(1440, 900, 2));
-        assert_eq!(failed(&kept), vec!["reshaped", "told"]);
+        let kept = format!("{created}{proc_created}{requested}{}", layout(1440, 900, 2));
+        assert_eq!(failed(&kept), vec!["reshaped", "told", "process-reshaped"]);
         let relaunched = format!("{good}{created}");
         assert_eq!(failed(&relaunched), vec!["told"]);
         let ignored = good.replace("get=1", "get=-1");
         assert_eq!(failed(&ignored), vec!["requested"]);
+        // the process kept the display's configuration (1920x1200 dp): both process sub-gates fail, the activity's pass
+        let display_process = good
+            .replace(&proc_created, &process("created", 1920, 1200, 2))
+            .replace(&proc_changed, &process("changed", 1920, 1200, 2));
+        assert_eq!(
+            failed(&display_process),
+            vec!["process-opened", "process-reshaped"]
+        );
+        // Resources.getSystem() left behind while the Application followed: still a failure
+        let system_stale = good.replace(
+            "system=750x900 systemOrientation=1",
+            "system=1920x1200 systemOrientation=2",
+        );
+        assert_eq!(failed(&system_stale), vec!["process-reshaped"]);
     }
 
     /// Every layout must be the portrait size as content and as window frame, on the gate's display; one layout at another size fails the sub-gate.

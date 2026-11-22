@@ -24,8 +24,8 @@ use atl_parcelables::parts::{
 use binder::{BinderFeatures, FromIBinder, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::activity::{
-    ActivityManager, global_configuration, launch_item, log, resume_item, security,
-    sent_task_override, task_configuration,
+    ActivityManager, configuration_change_item, global_configuration, launch_item, log,
+    process_configuration, resume_item, security, sent_task_override, task_configuration,
 };
 use crate::activity_stack::{Cancelled, Push};
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
@@ -78,6 +78,8 @@ pub(crate) fn device_configuration_info(
 #[derive(Clone)]
 pub(crate) struct Owner {
     pub thread: Strong<dyn IApplicationThread>,
+    /// the pid of the process the activity runs in (ActivityRecord.app): the process whose configuration follows it ([`Machine::process_top`])
+    pub pid: i32,
     pub uid: u32,
     pub package: String,
     /// the affinity of the activity's task: its taskAffinity, else the package name (see [`affinity_of`])
@@ -292,10 +294,11 @@ impl ActivityTasks {
         }
     }
 
-    /// The transaction item of one step of `token`'s record. None: a launch of a package that is no longer installed (counted, never reached).
+    /// The transaction item of one step of `token`'s record, which runs in the process `pid`. None: a launch of a package that is no longer installed (counted, never reached).
     fn item(
         &self,
         token: &SpIBinder,
+        pid: i32,
         step: Step<Launch, ReferrerIntent, ResultInfo>,
     ) -> Option<ClientTransactionItem> {
         let activity_token = Some(token.clone());
@@ -317,8 +320,7 @@ impl ActivityTasks {
                 let display = self.tasks.display();
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
                     &self.packages,
-                    &display,
-                    self.tasks.locale(),
+                    process_configuration(&*self.tasks, pid),
                     sent_task_override(&*self.tasks, &display, task, size),
                     &self.controller,
                     p,
@@ -364,7 +366,27 @@ impl ActivityTasks {
     }
 
     /// One transaction per command, in the order the machine decided. Called under the machine lock.
-    fn send(&self, commands: Vec<Cmd>) {
+    fn send(&self, m: &Lifecycle, commands: Vec<Cmd>) {
+        for (pid, thread) in self.follow_process_tops(m) {
+            // ActivityTaskSupervisor.java:838-846: a launch carries the process configuration (curConfig), the change is not sent apart
+            let launched = commands.iter().any(|c| {
+                c.owner.pid == pid && c.steps.iter().any(|s| matches!(s, Step::Launch(_)))
+            });
+            if launched {
+                continue;
+            }
+            let transaction = ClientTransaction {
+                items: vec![Some(configuration_change_item(process_configuration(
+                    &*self.tasks,
+                    pid,
+                )))],
+            };
+            if let Err(e) = thread.r#scheduleTransaction(Some(&transaction)) {
+                log(format_args!(
+                    "scheduleTransaction (process configuration): {e}"
+                ));
+            }
+        }
         for command in commands {
             log(format_args!(
                 "activity send {} {} at={}",
@@ -384,10 +406,11 @@ impl ActivityTasks {
                     atl_diag::wall_stamp()
                 ));
             }
+            let pid = command.owner.pid;
             let items = command
                 .steps
                 .into_iter()
-                .filter_map(|step| self.item(&command.token, step))
+                .filter_map(|step| self.item(&command.token, pid, step))
                 .map(Some)
                 .collect();
             let transaction = ClientTransaction { items };
@@ -401,10 +424,45 @@ impl ActivityTasks {
         }
     }
 
+    /// WindowProcessController.updateActivityConfigurationListener after the machine decided: each process with a record follows its record launched last (Machine::process_top), recorded in
+    /// Tasks (what process_configuration reads). Returns the processes whose followed Task changed, with the thread to tell them by.
+    /// A process with no record in any Task is left as it is: it may be bound for its first launch (bind_configuration) and not pushed yet; one whose records all went keeps its last Task
+    /// until it dies (activity.rs forgets it then) where AOSP returns it to the global configuration -- not observable while the services end a process whose Task emptied (kill_task_processes).
+    fn follow_process_tops(&self, m: &Lifecycle) -> Vec<(i32, Strong<dyn IApplicationThread>)> {
+        let mut seen: Vec<i32> = Vec::new();
+        let mut changed = Vec::new();
+        for owner in m.owners() {
+            if seen.contains(&owner.pid) {
+                continue;
+            }
+            seen.push(owner.pid);
+            let Some(top) = m.process_top(|o| o.pid == owner.pid) else {
+                continue;
+            };
+            if self.tasks.set_process_task(owner.pid, Some(top)) {
+                log(format_args!(
+                    "process {} configuration follows task {}",
+                    owner.pid,
+                    top.raw()
+                ));
+                changed.push((owner.pid, owner.thread.clone()));
+            }
+        }
+        changed
+    }
+
+    /// bindApplication's configuration (ActivityTaskManagerService.preBindApplication:6792-6809): a process started for the launch of an activity into `task` follows that Task from the
+    /// bind, so its Application starts with the configuration its activity will have; any other process (`task` None) gets the global one. Set either way: a reused pid starts clean.
+    pub(crate) fn bind_configuration(&self, pid: i32, task: Option<TaskId>) -> Configuration {
+        self.tasks.set_process_task(pid, task);
+        process_configuration(&*self.tasks, pid)
+    }
+
     /// finishAttachApplication's launcher: the process's Task (made at its start, `task`), its record pushed, its launch sent. Returns the record's token.
     pub(crate) fn launch_launcher(
         &self,
         thread: Strong<dyn IApplicationThread>,
+        pid: i32,
         uid: u32,
         package: &str,
         decl: &ActivityInfo,
@@ -414,6 +472,7 @@ impl ActivityTasks {
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
             thread,
+            pid,
             uid,
             package: package.to_owned(),
             affinity: affinity_of(decl, package),
@@ -454,15 +513,17 @@ impl ActivityTasks {
         };
         let commands = m.push_with(task, token.clone(), owner, launch, push);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         token
     }
 
     /// startActivity: validate, then the new record goes on top of the caller's activity's Task and is sent its launch. Ok: the START code (0 started, else refused).
     /// A foreign resultTo (not one of this caller's records) is a SecurityException; with no resultTo record the start goes into the caller's Task of the activity's affinity (activity_start::check).
+    /// The new record runs in the caller's process (`calling_pid`).
     pub(crate) fn start(
         &self,
         caller: &Strong<dyn IApplicationThread>,
+        calling_pid: i32,
         calling_uid: u32,
         calling_package: &str,
         args: StartArgs<'_>,
@@ -552,7 +613,7 @@ impl ActivityTasks {
                 Some(data),
             );
             self.note_settle(&m);
-            self.send(commands);
+            self.send(&m, commands);
             return Ok(activity_start::START_SUCCESS);
         }
         // the Task the start goes into: the source's; with no source record, the caller's Task whose root has the activity's affinity (ActivityStarter.getReusableIntentActivity -> findTask)
@@ -616,7 +677,7 @@ impl ActivityTasks {
                 // a refused start answers the result it owes as cancelled (ActivityStarter.java:1220-1222)
                 let cancelled = cancel_owed(&mut m, owed.as_ref());
                 self.note_settle(&m);
-                self.send(cancelled);
+                self.send(&m, cancelled);
                 return Ok(code);
             }
             Err(Refusal::Security(msg)) => return Err(security(msg)),
@@ -629,14 +690,14 @@ impl ActivityTasks {
         let (Some(task), Some(intent)) = (source_task, intent) else {
             commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
             self.note_settle(&m);
-            self.send(commands);
+            self.send(&m, commands);
             return Ok(activity_start::START_CANCELED);
         };
         if let (Then::Deliver { .. }, false) = (plan.then, reuse) {
             atl_diag::refused(ATM, "startActivity (reuse refused: --no-new-intent)");
             commands.extend(cancel_owed(&mut m, owed.take().as_ref()));
             self.note_settle(&m);
-            self.send(commands);
+            self.send(&m, commands);
             return Ok(activity_start::START_CANCELED);
         }
         let token_at = |i: usize| records[i].0.clone();
@@ -678,13 +739,14 @@ impl ActivityTasks {
                     .unwrap_or_default(),
             );
             self.note_settle(&m);
-            self.send(commands);
+            self.send(&m, commands);
             return Ok(plan.code());
         }
         let token = token::new();
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
             thread: caller.clone(),
+            pid: calling_pid,
             uid: calling_uid,
             package: calling_package.to_owned(),
             affinity: affinity_of(decl, calling_package),
@@ -710,7 +772,7 @@ impl ActivityTasks {
         };
         commands.extend(m.push_with(task, token, owner, launch, push));
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         Ok(plan.code())
     }
 
@@ -780,7 +842,7 @@ impl ActivityTasks {
         ));
         let commands = m.resumed(token);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         true
     }
 
@@ -800,7 +862,7 @@ impl ActivityTasks {
         ));
         let commands = m.paused(token);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         true
     }
 
@@ -820,7 +882,7 @@ impl ActivityTasks {
         ));
         let commands = m.stopped(token);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         true
     }
 
@@ -836,7 +898,7 @@ impl ActivityTasks {
         ));
         let commands = m.set_visible(task, visible);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
     }
 
     /// finishActivity: the record is finishing and its result (`code`, `data`) goes to its caller (ActivityRecord.finishActivityResults); false when the token names no record.
@@ -861,7 +923,7 @@ impl ActivityTasks {
         match m.finish(token, result) {
             Some(commands) => {
                 self.note_settle(&m);
-                self.send(commands);
+                self.send(&m, commands);
                 true
             }
             None => false,
@@ -873,9 +935,11 @@ impl ActivityTasks {
         let mut m = self.machine();
         let steps = m.relaunch(token);
         self.note_settle(&m);
+        // a relaunch ends with Resume at most (Machine::relaunch): no Launch, so the pid is never read
+        let pid = m.owner(token).map_or(0, |o| o.pid);
         steps
             .into_iter()
-            .filter_map(|step| self.item(token, step))
+            .filter_map(|step| self.item(token, pid, step))
             .map(Some)
             .collect()
     }
@@ -893,7 +957,7 @@ impl ActivityTasks {
         }
     }
 
-    /// ActivityTaskManagerService.getGlobalConfigurationForCallingPid: one display, so every caller's is the global one.
+    /// ActivityTaskManagerService.getGlobalConfiguration (a caller's own is process_configuration).
     fn global_configuration(&self) -> Configuration {
         global_configuration(&self.tasks.display(), self.tasks.locale())
     }
@@ -993,7 +1057,7 @@ impl ActivityTasks {
         ));
         let commands = m.remove_task(task);
         self.note_settle(&m);
-        self.send(commands);
+        self.send(&m, commands);
         wait
     }
 
@@ -1115,7 +1179,13 @@ impl IActivityTaskManager for ActivityTaskService {
             result_who,
             resolved_type,
         };
-        self.atm.start(caller, calling_uid, calling_package, args)
+        self.atm.start(
+            caller,
+            ThreadState::get_calling_pid(),
+            calling_uid,
+            calling_package,
+            args,
+        )
     }
 
     fn r#getActivityClientController(
@@ -1126,8 +1196,9 @@ impl IActivityTaskManager for ActivityTaskService {
     }
 
     fn r#getDeviceConfigurationInfo(&self) -> binder::Result<Option<ConfigurationInfo>> {
+        // getGlobalConfigurationForCallingPid: the caller's process configuration
         Ok(Some(device_configuration_info(
-            &self.atm.global_configuration(),
+            &process_configuration(&*self.atm.tasks, ThreadState::get_calling_pid()),
             self.gl_es_version,
         )))
     }
@@ -1148,6 +1219,8 @@ mod tests {
     const LAUNCHER: &str = "com.example.player.Main";
     const VIDEO: &str = "com.example.player.Video";
     const UID: u32 = 10_123;
+    /// the app process's pid: any value, the tests' app runs one process
+    const PID: i32 = 4242;
     /// the request code of a startActivityForResult
     const REQUEST_CODE: i32 = 1131;
 
@@ -1245,7 +1318,7 @@ mod tests {
                 height: 800,
             },
         );
-        atm.launch_launcher(thread.clone(), UID, PACKAGE, &decl(LAUNCHER), task)
+        atm.launch_launcher(thread.clone(), PID, UID, PACKAGE, &decl(LAUNCHER), task)
     }
 
     /// The intent of the LaunchActivityItem scheduled for `class`, as the app thread received it.
@@ -1292,7 +1365,7 @@ mod tests {
                 height: 900,
             },
         );
-        atm.launch_launcher(thread, UID, PACKAGE, &decl(LAUNCHER), task);
+        atm.launch_launcher(thread, PID, UID, PACKAGE, &decl(LAUNCHER), task);
         let over = scheduled
             .lock()
             .expect("transactions lock")
@@ -1316,6 +1389,63 @@ mod tests {
         );
     }
 
+    /// preBindApplication + prepareConfigurationForLaunchingActivity: a process started for a launch binds with its Task's configuration and its launch's curConfig is the same; a process
+    /// started for no launch binds with the display's. Values: 320 dpi = density 2, so a 562x900 Task is 281x450 dp portrait (1), the 1920x1200 display 960x600 dp landscape (2).
+    #[test]
+    fn bind_and_launch_carry_the_process_configuration_of_its_task() {
+        let mut record = crate::packages::fixture::record(PACKAGE);
+        record.uid = UID;
+        record.info.activities = Some(vec![Some(decl(LAUNCHER))]);
+        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
+        let display = DisplayModel {
+            width: 1920,
+            height: 1200,
+            dpi: 320,
+            ..DisplayModel::default()
+        };
+        let atm = ActivityTasks::new(
+            Arc::clone(&packages),
+            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Tasks::new(display, None)),
+            token::new(),
+        );
+        let task = atm.tasks.new_task(
+            UID,
+            PACKAGE,
+            TaskSize {
+                width: 562,
+                height: 900,
+            },
+        );
+        let dp = |c: &Configuration| (c.screen_width_dp, c.screen_height_dp, c.orientation);
+        assert_eq!(dp(&atm.bind_configuration(PID + 1, None)), (960, 600, 2));
+        let bound = atm.bind_configuration(PID, Some(task));
+        assert_eq!(dp(&bound), (281, 450, 1));
+        let (thread, scheduled) = app_thread();
+        atm.launch_launcher(thread, PID, UID, PACKAGE, &decl(LAUNCHER), task);
+        let cur = scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .find_map(|item| match item {
+                ClientTransactionItem::LaunchActivity(launch) => launch.cur_config.clone(),
+                _ => None,
+            })
+            .expect("a LaunchActivityItem with a curConfig");
+        assert_eq!(dp(&cur), (281, 450, 1));
+        assert_eq!(atm.tasks.process_task(PID), Some(task));
+        // the launch carried it: no ConfigurationChangeItem of its own (ActivityTaskSupervisor.java:838-846)
+        let changes = scheduled
+            .lock()
+            .expect("transactions lock")
+            .iter()
+            .flat_map(|t| t.items.iter().flatten())
+            .filter(|item| matches!(item, ClientTransactionItem::ConfigurationChange(_)))
+            .count();
+        assert_eq!(changes, 0);
+    }
+
     /// The start an app's startActivity carries (ZVideoPlayer: setClass + putExtra, no action, no flags) is the intent the fresh launch of its activity delivers: the caller's fields, extras included.
     #[test]
     fn fresh_start_delivers_the_caller_intent() {
@@ -1334,6 +1464,7 @@ mod tests {
         let status = atm
             .start(
                 &thread,
+                PID,
                 UID,
                 PACKAGE,
                 StartArgs {
@@ -1416,6 +1547,7 @@ mod tests {
         let status = atm
             .start(
                 &thread,
+                PID,
                 UID,
                 PACKAGE,
                 StartArgs {
@@ -1614,6 +1746,7 @@ mod tests {
     ) -> i32 {
         atm.start(
             thread,
+            PID,
             UID,
             PACKAGE,
             StartArgs {
