@@ -59,6 +59,8 @@ struct Shared {
     frame_requested: Cell<Option<i64>>,
     on_event: Slot<dyn FnMut(InputEvent)>,
     on_resize: Slot<dyn FnMut(PhysSize)>,
+    /// The content's last allocated size (physical px), None before the first layout: `on_resize` set after it reports it (the window opens and lays out at the compositor's first configure before the session wires it).
+    size: Cell<Option<PhysSize>>,
     on_monitor: Slot<dyn FnMut(Monitor)>,
     on_close_requested: Slot<dyn FnMut()>,
     /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
@@ -561,6 +563,7 @@ impl Window for GtkWindow {
             frame_requested: Cell::new(None),
             on_event: Slot::new(),
             on_resize: Slot::new(),
+            size: Cell::new(None),
             pointer_at: Cell::new((0.0, 0.0)),
             pointer_time: Cell::new(None),
             clock: RefCell::default(),
@@ -646,7 +649,10 @@ impl Window for GtkWindow {
             glib::Propagation::Stop
         });
         let resized = Rc::clone(&shared);
-        view.connect_allocation(move |size| resized.on_resize.call(|f| f(size)));
+        view.connect_allocation(move |size| {
+            resized.size.set(Some(size));
+            resized.on_resize.call(|f| f(size));
+        });
         window.set_child(Some(&view));
         let text_input = GtkTextInput::new(&view);
         let this = GtkWindow {
@@ -813,6 +819,10 @@ impl Window for GtkWindow {
 
     fn on_resize<F: FnMut(PhysSize) + 'static>(&self, on_resize: F) {
         self.shared.on_resize.set(Box::new(on_resize));
+        // a size allocated before the callback was set is reported now
+        if let Some(size) = self.shared.size.get() {
+            self.shared.on_resize.call(|f| f(size));
+        }
     }
 
     fn on_close_requested<F: FnMut() + 'static>(&self, on_close_requested: F) {
