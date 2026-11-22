@@ -19,6 +19,7 @@ extern crate atl_diag_plain as atl_diag;
 pub mod activity_stack;
 pub mod activity_start;
 pub mod alarm_table;
+pub mod alarm_timer;
 pub mod app_id;
 pub mod bound_services;
 pub mod broadcast;

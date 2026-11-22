@@ -1,28 +1,41 @@
 // SPDX-License-Identifier: MIT
-//! The `alarm` service (Context.ALARM_SERVICE): IAlarmManager-lite. Set alarms are kept in a table (alarm_table.rs) and dropped by cancel, as AlarmManagerService keeps them (set :2684, remove :2900, removeAll :2911).
-//! Without this service AlarmManager's constructor gets a null proxy and every call NPEs (SystemServiceRegistry.java:380-388). Nothing is delivered yet: each accepted set is counted as `set (stored, never fires)`, so the gap shows in the log.
-//! Not modelled: delivery (doAlarm, wake, quota, idle, batching); the exact-alarm grant (an exact alarm without it throws SecurityException, AlarmManagerService.java:2794-2808); app-start gating.
+//! The `alarm` service (Context.ALARM_SERVICE): IAlarmManager. Set alarms are held in a table (alarm_table.rs) and delivered when due (alarm_timer.rs): an operation is sent through its IIntentSender (pending_intent.rs), a listener gets doAlarm with a completion callback, which AlarmManager's ListenerWrapper reports completion through (AlarmManager.java:371-386).
+//! One thread waits on the timers, takes the due alarms under the table lock and delivers them outside it. Every change to the table re-arms the timers under that same lock, so the timers always hold the table's earliest triggers.
+//! A _WAKEUP type delivers like its non-wakeup type: a desktop program does not wake the machine from suspend. An inexact alarm fires at its trigger (the window start); nothing is batched.
+//! Not modelled: doze, battery saver, app standby, quota, the exact-alarm grant (an exact alarm without it throws SecurityException, AlarmManagerService.java:2794-2808), app-start gating, EXTRA_ALARM_COUNT in the delivered intent (:5359).
+//! A delivery that fails (a listener or an operation whose process is gone) is counted and dropped; no process is started for it.
 //! WorkSource and AlarmManager.AlarmClockInfo have no codec: a non-null one is refused and counted by atl-parcelables, so no alarm clock is ever held and getNextAlarmClock answers null (AOSP would answer the user's next clock, :3703).
 //! Counted UNKNOWN (the stub default): canScheduleExactAlarms, hasScheduleExactAlarm, getNextWakeFromIdleTime, and setTime / setTimeZone / getConfigVersion after their permission check.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use atl_aidl::aidl::android::app::IAlarmCompleteListener::{
+    BnAlarmCompleteListener, IAlarmCompleteListener,
+};
 use atl_aidl::aidl::android::app::IAlarmManager::{
     BnAlarmManager, EnforcePermission, IAlarmManager,
 };
+use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_aidl::mangled::_7_android_3_app_14_IAlarmListener as IAlarmListener;
 use atl_parcelables::android::app::AlarmManager_AlarmClockInfo as AlarmClockInfo;
 use atl_parcelables::android::app::PendingIntent;
 use atl_parcelables::android::os::WorkSource;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
-use crate::alarm_table::{Alarm, AlarmTable};
+use crate::activity::log;
+use crate::alarm_table::{Alarm, AlarmTable, Clock, ELAPSED_REALTIME, RTC_WAKEUP};
+use crate::alarm_timer::{self, Timers};
 use crate::packages::Packages;
 use crate::packages::Permissions;
 use atl_services_types::permission;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAlarmManager";
+
+/// AlarmManagerService.Constants: DEFAULT_MIN_INTERVAL = 60 * 1000, DEFAULT_MAX_INTERVAL = 365 * INTERVAL_DAY (:726-727).
+const INTERVAL_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const MIN_INTERVAL_MS: i64 = 60 * 1000;
+const MAX_INTERVAL_MS: i64 = 365 * INTERVAL_DAY_MS;
 
 /// Keys are binders: a PendingIntent by its IIntentSender's, a listener by its own (PendingIntent.equals and the listener compare these).
 type Table = AlarmTable<SpIBinder, SpIBinder>;
@@ -31,6 +44,7 @@ struct Inner {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
     table: Mutex<Table>,
+    timers: Timers,
 }
 
 impl Inner {
@@ -41,6 +55,17 @@ impl Inner {
     /// The caller is `package`'s uid, or system / root (notification.rs's rule). AlarmManagerService compares the package's uid (:2694, :2918).
     fn owns(&self, uid: u32, package: &str) -> bool {
         permission::is_system_or_root(uid) || self.packages.is_same_app(package, uid)
+    }
+
+    /// Arms the timers to the table's earliest trigger on each clock. Called with the table lock held, so the arms follow the table's order.
+    fn rearm(&self, table: &Table) {
+        if let Err(e) = self.timers.arm(
+            table.next_due(Clock::Boottime),
+            table.next_due(Clock::Realtime),
+        ) {
+            atl_diag::refused(INTERFACE, "timer arm failed");
+            log(format_args!("alarm: timer arm: {e}"));
+        }
     }
 }
 
@@ -68,6 +93,17 @@ fn not_owner(package: &str, uid: u32) -> Status {
     )
 }
 
+/// setImpl's interval check (AlarmManagerService.java:2173-2186): a positive interval under the minimum is raised to it, one over the maximum is lowered.
+fn clamp_interval(interval: i64) -> i64 {
+    if interval > 0 && interval < MIN_INTERVAL_MS {
+        MIN_INTERVAL_MS
+    } else if interval > MAX_INTERVAL_MS {
+        MAX_INTERVAL_MS
+    } else {
+        interval
+    }
+}
+
 impl IAlarmManager for AlarmService {
     /// @EnforcePermission (setTime, setTimeZone, getConfigVersion): root / system, or a caller whose install-time grants hold the permissions (Permissions::holds, rule A).
     fn r#enforce_permission(
@@ -93,7 +129,7 @@ impl IAlarmManager for AlarmService {
         ))
     }
 
-    /// set (:2684): the caller must be the package's uid, and a repeating alarm takes no listener (:2701). Stored under its key, replacing the alarm that key held (setImplLocked:2271).
+    /// set (:2684): the caller must be the package's uid, and a repeating alarm takes no listener (:2701). Neither or both of operation and listener is dropped (setImpl:2156). Stored under its key, replacing the alarm that key held (setImplLocked:2271), and the timers re-armed.
     #[allow(clippy::too_many_arguments)]
     fn r#set(
         &self,
@@ -120,18 +156,33 @@ impl IAlarmManager for AlarmService {
                 Some("Repeating alarms cannot use AlarmReceivers".to_owned()),
             ));
         }
-        self.0.lock().set(Alarm {
+        if operation.is_some() == listener.is_some() {
+            atl_diag::refused(
+                INTERFACE,
+                "set (operation and listener both or neither: dropped)",
+            );
+            return Ok(());
+        }
+        if !(RTC_WAKEUP..=ELAPSED_REALTIME).contains(&kind) {
+            return Err(Status::new_exception_str(
+                ExceptionCode::ILLEGAL_ARGUMENT,
+                Some(format!("Invalid alarm type {kind}")),
+            ));
+        }
+        let mut table = self.0.lock();
+        table.set(Alarm {
             uid,
             package: package.to_owned(),
             kind,
-            trigger: trigger_at_time,
+            trigger: trigger_at_time.max(0),
             window: window_length,
-            interval,
+            interval: clamp_interval(interval),
             flags,
             operation: operation.map(|p| p.target.clone()),
             listener: listener.map(|l| l.as_binder()),
         });
-        atl_diag::answered(INTERFACE, "set (stored, never fires)");
+        self.0.rearm(&table);
+        atl_diag::answered(INTERFACE, "set (delivered when due)");
         Ok(())
     }
 
@@ -143,7 +194,9 @@ impl IAlarmManager for AlarmService {
     ) -> binder::Result<()> {
         let operation = operation.map(|p| p.target.clone());
         let listener = listener.map(|l| l.as_binder());
-        self.0.lock().remove(operation.as_ref(), listener.as_ref());
+        let mut table = self.0.lock();
+        table.remove(operation.as_ref(), listener.as_ref());
+        self.0.rearm(&table);
         atl_diag::answered(INTERFACE, "remove");
         Ok(())
     }
@@ -158,7 +211,9 @@ impl IAlarmManager for AlarmService {
         if !self.0.owns(uid, package) {
             return Err(not_owner(package, uid));
         }
-        self.0.lock().remove_all(uid, package);
+        let mut table = self.0.lock();
+        table.remove_all(uid, package);
+        self.0.rearm(&table);
         atl_diag::answered(INTERFACE, "removeAll");
         Ok(())
     }
@@ -170,15 +225,93 @@ impl IAlarmManager for AlarmService {
     }
 }
 
-/// The service's binder, for `addService`: the packages decide who owns a package name, the permissions the @EnforcePermission methods.
+/// The timer thread (module doc): the due alarms are taken and the timers re-armed under the table lock, then the due ones are delivered with no lock held.
+fn run(inner: Arc<Inner>) {
+    loop {
+        if let Err(e) = inner.timers.wait() {
+            atl_diag::refused(INTERFACE, "timer wait failed: alarms stop");
+            log(format_args!("alarm: timer wait: {e}"));
+            return;
+        }
+        let due = {
+            let mut table = inner.lock();
+            let due = table.take_due(alarm_timer::now());
+            inner.rearm(&table);
+            due
+        };
+        for alarm in &due {
+            if let Some(operation) = &alarm.operation {
+                send(operation);
+            } else if let Some(listener) = &alarm.listener {
+                do_alarm(listener);
+            }
+        }
+    }
+}
+
+/// PendingIntent.send with no intent (AlarmManagerService's mPendingIntent.send): the record's request intent through IIntentSender.send, called in-process on the local binder (pending_intent.rs).
+fn send(operation: &SpIBinder) {
+    let result = match operation.clone().into_interface::<dyn IIntentSender>() {
+        Ok(sender) => sender.r#send(0, None, None, None, None, None, None),
+        Err(e) => Err(e.into()),
+    };
+    match result {
+        Ok(()) => {
+            atl_diag::sent(INTERFACE, "alarm operation");
+        }
+        Err(e) => {
+            atl_diag::refused(INTERFACE, "alarm operation dropped");
+            log(format_args!("alarm: operation: {e}"));
+        }
+    }
+}
+
+/// OnAlarmListener's delivery (IAlarmListener.doAlarm, oneway): the app's onAlarm runs on its executor, then alarmComplete comes back to Completion.
+fn do_alarm(listener: &SpIBinder) {
+    let result = match listener.clone().into_interface::<dyn IAlarmListener>() {
+        Ok(listener) => {
+            let completion =
+                BnAlarmCompleteListener::new_binder(Completion, BinderFeatures::default());
+            listener.r#doAlarm(Some(&completion))
+        }
+        Err(e) => Err(e.into()),
+    };
+    match result {
+        Ok(()) => {
+            atl_diag::sent(INTERFACE, "doAlarm");
+        }
+        Err(e) => {
+            atl_diag::refused(INTERFACE, "alarm listener dropped");
+            log(format_args!("alarm: listener: {e}"));
+        }
+    }
+}
+
+/// The completion callback each doAlarm is handed. Nothing waits on it: no wake lock is held (module doc), so it only counts.
+struct Completion;
+
+impl Interface for Completion {}
+
+impl IAlarmCompleteListener for Completion {
+    fn r#alarmComplete(&self, _who: Option<&SpIBinder>) -> binder::Result<()> {
+        atl_diag::answered(INTERFACE, "alarmComplete");
+        Ok(())
+    }
+}
+
+/// The service's binder, for `addService`: the packages decide who owns a package name, the permissions the @EnforcePermission methods. Starts the timer thread (one per service).
 pub fn new_binder(packages: Arc<Packages>, permissions: Arc<Permissions>) -> SpIBinder {
-    BnAlarmManager::new_binder(
-        AlarmService(Arc::new(Inner {
-            packages,
-            permissions,
-            table: Mutex::new(AlarmTable::default()),
-        })),
-        BinderFeatures::default(),
-    )
-    .as_binder()
+    let timers = Timers::new().expect("alarm timerfd");
+    let inner = Arc::new(Inner {
+        packages,
+        permissions,
+        table: Mutex::new(AlarmTable::default()),
+        timers,
+    });
+    let timer_inner = Arc::clone(&inner);
+    std::thread::Builder::new()
+        .name("alarm-timer".to_owned())
+        .spawn(move || run(timer_inner))
+        .expect("alarm timer thread");
+    BnAlarmManager::new_binder(AlarmService(inner), BinderFeatures::default()).as_binder()
 }

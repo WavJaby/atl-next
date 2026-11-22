@@ -1,7 +1,49 @@
 // SPDX-License-Identifier: MIT
-//! The alarms the `alarm` service holds (alarm.rs): what AlarmManagerService keeps per set alarm, for matching and removal. Nothing is delivered yet, so no clock is converted and no quota, idle or batching rule applies.
+//! The alarms the `alarm` service holds (alarm.rs): what AlarmManagerService keeps per set alarm, for matching, removal and delivery.
 //! Matching is AlarmManagerService's: an alarm with an operation matches that operation (PendingIntent identity), one without matches its listener (Alarm.java:171-175). A set replaces the alarm already held for its key (setImplLocked:2271).
+//! take_due is the due test and the re-arm of a repeating alarm (AlarmManagerService.java:4228-4243, the recurrence after a delivery). A one-shot leaves the table when it is due.
+//! Clocks: RTC_WAKEUP and RTC triggers are wall-clock ms (CLOCK_REALTIME); ELAPSED_REALTIME(_WAKEUP) are CLOCK_BOOTTIME ms (SystemClock.elapsedRealtime). Both are read live at each take_due, so a clock set moves the RTC alarms with it: a forward set makes them due at once, a backward one holds them.
 //! Generic over the key types, so the tests run without the binder; alarm.rs keys it by the operation's and the listener's binders.
+
+/// AlarmManager's clock types (AlarmManager.java:118-139). setImpl refuses any other type (AlarmManagerService.java:2188).
+pub const RTC_WAKEUP: i32 = 0;
+pub const RTC: i32 = 1;
+pub const ELAPSED_REALTIME_WAKEUP: i32 = 2;
+pub const ELAPSED_REALTIME: i32 = 3;
+
+/// The two time bases an alarm trigger is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clock {
+    /// CLOCK_REALTIME ms: RTC_WAKEUP, RTC
+    Realtime,
+    /// CLOCK_BOOTTIME ms: ELAPSED_REALTIME_WAKEUP, ELAPSED_REALTIME
+    Boottime,
+}
+
+/// The clock an AlarmManager type reads; None for a type AlarmManager refuses.
+pub fn clock_of(kind: i32) -> Option<Clock> {
+    match kind {
+        RTC_WAKEUP | RTC => Some(Clock::Realtime),
+        ELAPSED_REALTIME_WAKEUP | ELAPSED_REALTIME => Some(Clock::Boottime),
+        _ => None,
+    }
+}
+
+/// Both clocks read at one instant, in ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Now {
+    pub realtime: i64,
+    pub boottime: i64,
+}
+
+impl Now {
+    fn at(self, clock: Clock) -> i64 {
+        match clock {
+            Clock::Realtime => self.realtime,
+            Clock::Boottime => self.boottime,
+        }
+    }
+}
 
 /// One set alarm: the arguments of AlarmManagerService's set (:2684-2688), the creator uid and package, and the keys.
 #[derive(Debug, Clone, PartialEq)]
@@ -9,7 +51,7 @@ pub struct Alarm<O, L> {
     /// the creator uid (`creatorUid`) and the package it was set for (`sourcePackage`)
     pub uid: u32,
     pub package: String,
-    /// AlarmManager's type, trigger and window in its own clock (unconverted), the interval (0 = one-shot) and the flags, as set
+    /// AlarmManager's type, the trigger in its clock's ms (as set, clamped to >= 0), the window (not used: delivery is at the trigger), the interval (0 = one-shot) and the flags
     pub kind: i32,
     pub trigger: i64,
     pub window: i64,
@@ -61,6 +103,55 @@ impl<O: PartialEq, L: PartialEq> AlarmTable<O, L> {
         self.alarms.retain(|a| a.uid != uid || a.package != package);
         before - self.alarms.len()
     }
+
+    /// The earliest trigger held on `clock`, the next time the timer must wake for it (alarm_timer.rs); None when no alarm is held on it.
+    pub fn next_due(&self, clock: Clock) -> Option<i64> {
+        self.alarms
+            .iter()
+            .filter(|a| clock_of(a.kind) == Some(clock))
+            .map(|a| a.trigger)
+            .min()
+    }
+}
+
+impl<O: Clone + PartialEq, L: Clone + PartialEq> AlarmTable<O, L> {
+    /// The alarms due at `now`, in the order they fell due (boot-equivalent ms, then set order). A one-shot leaves the table. A repeating one stays, its trigger moved to its next recurrence after `now`; the delivered copy keeps the trigger it was due at.
+    pub fn take_due(&mut self, now: Now) -> Vec<Alarm<O, L>> {
+        let mut due = Vec::new();
+        let mut kept = Vec::with_capacity(self.alarms.len());
+        for mut alarm in std::mem::take(&mut self.alarms) {
+            let Some(clock) = clock_of(alarm.kind) else {
+                kept.push(alarm);
+                continue;
+            };
+            if alarm.trigger > now.at(clock) {
+                kept.push(alarm);
+            } else if alarm.interval > 0 {
+                due.push(alarm.clone());
+                alarm.trigger = next_recurrence(alarm.trigger, alarm.interval, now.at(clock));
+                kept.push(alarm);
+            } else {
+                due.push(alarm);
+            }
+        }
+        self.alarms = kept;
+        due.sort_by_key(|a| boot_equivalent(now, a));
+        due
+    }
+}
+
+/// The first recurrence after `now`, from the trigger `requested` the alarm was due at: count = 1 + (now - requested) / interval, next = requested + count * interval (AlarmManagerService.java:4233-4236). AOSP's count accumulates over deliveries; from the latest requested time it is the same.
+fn next_recurrence(requested: i64, interval: i64, now: i64) -> i64 {
+    let count = (now - requested) / interval + 1;
+    requested + count * interval
+}
+
+/// A trigger on the boot clock: a wall-clock trigger is shifted by the realtime-boottime offset now (AlarmManagerService.convertToElapsed). The order key of take_due, not a deadline.
+fn boot_equivalent<O, L>(now: Now, alarm: &Alarm<O, L>) -> i64 {
+    match clock_of(alarm.kind) {
+        Some(Clock::Realtime) => alarm.trigger - (now.realtime - now.boottime),
+        _ => alarm.trigger,
+    }
 }
 
 impl<O: PartialEq, L: PartialEq> Alarm<O, L> {
@@ -91,6 +182,26 @@ mod tests {
             operation: op,
             listener,
         }
+    }
+
+    /// An operation alarm of `kind` due at `trigger` ms on its clock, repeating every `interval` ms (0 = one-shot).
+    fn timed(op: u32, kind: i32, trigger: i64, interval: i64) -> Alarm<u32, u32> {
+        Alarm {
+            kind,
+            trigger,
+            interval,
+            ..alarm(10123, "com.example", Some(op), None)
+        }
+    }
+
+    /// A boot clock reading with the realtime clock at `realtime`.
+    fn now(realtime: i64, boottime: i64) -> Now {
+        Now { realtime, boottime }
+    }
+
+    /// Operations of the delivered alarms, in delivery order.
+    fn ops(due: &[Alarm<u32, u32>]) -> Vec<Option<u32>> {
+        due.iter().map(|a| a.operation).collect()
     }
 
     /// set, then remove by the same operation: one alarm dropped, the table empty.
@@ -142,5 +253,86 @@ mod tests {
         t.set(alarm(10123, "com.other", Some(4), None));
         assert_eq!(t.remove_all(10123, "com.example"), 2);
         assert_eq!(t.len(), 2);
+    }
+
+    /// Due alarms come out in the order their triggers fall due, whatever the set order: 100, 200, 300 ms of boot time.
+    #[test]
+    fn due_alarms_come_out_in_trigger_order() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, ELAPSED_REALTIME, 300, 0));
+        t.set(timed(2, ELAPSED_REALTIME, 100, 0));
+        t.set(timed(3, ELAPSED_REALTIME, 200, 0));
+        let due = t.take_due(now(0, 1000));
+        assert_eq!(ops(&due), vec![Some(2), Some(3), Some(1)]);
+        assert!(t.is_empty(), "one-shots leave the table when due");
+    }
+
+    /// An alarm is due at its trigger, not before (AOSP delivers when whenElapsed <= now).
+    #[test]
+    fn alarm_is_due_at_its_trigger_and_not_before() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, ELAPSED_REALTIME, 2000, 0));
+        assert!(t.take_due(now(0, 1999)).is_empty());
+        assert_eq!(ops(&t.take_due(now(0, 2000))), vec![Some(1)]);
+    }
+
+    /// A cancelled alarm is never delivered: removed before its trigger, the clock past it changes nothing.
+    #[test]
+    fn cancelled_alarm_is_never_delivered() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC, 2000, 0));
+        assert_eq!(t.remove(Some(&1), None), 1);
+        assert!(t.take_due(now(5000, 5000)).is_empty());
+    }
+
+    /// A repeating alarm stays after its delivery, re-armed one interval on: trigger 1000 ms, interval 60000 ms, delivered on time -> next 61000 ms.
+    #[test]
+    fn repeating_alarm_rearms_one_interval_after_an_on_time_delivery() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC_WAKEUP, 1_000, 60_000));
+        assert_eq!(ops(&t.take_due(now(1_000, 0))), vec![Some(1)]);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.next_due(Clock::Realtime), Some(61_000));
+    }
+
+    /// A late repeating delivery fires once and re-arms to the first recurrence after now: trigger 1000, interval 60000, now 151000 (2.5 intervals on) -> next 181000 (3 intervals on).
+    #[test]
+    fn late_repeating_delivery_fires_once_then_rearms_after_now() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC, 1_000, 60_000));
+        assert_eq!(ops(&t.take_due(now(151_000, 0))).len(), 1);
+        assert_eq!(t.next_due(Clock::Realtime), Some(181_000));
+        assert!(t.take_due(now(151_000, 0)).is_empty());
+    }
+
+    /// A wall-clock set forward makes an RTC alarm due at once; a boot-clock alarm is not moved by it.
+    #[test]
+    fn realtime_clock_set_forward_makes_rtc_alarm_due() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC, 5000, 0));
+        t.set(timed(2, ELAPSED_REALTIME, 5000, 0));
+        assert!(t.take_due(now(1000, 1000)).is_empty());
+        assert_eq!(ops(&t.take_due(now(9000, 1000))), vec![Some(1)]);
+        assert_eq!(t.next_due(Clock::Boottime), Some(5000));
+    }
+
+    /// A wall-clock set back does not re-deliver a repeating alarm: it re-armed to 65000 ms after its delivery at 6000 ms (trigger 5000, interval 60000), and 4000 ms is not due.
+    #[test]
+    fn realtime_clock_set_back_does_not_redeliver() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC, 5000, 60_000));
+        assert_eq!(ops(&t.take_due(now(6000, 0))), vec![Some(1)]);
+        assert!(t.take_due(now(4000, 0)).is_empty());
+        assert_eq!(t.next_due(Clock::Realtime), Some(65_000));
+    }
+
+    /// next_due reads each clock separately; an alarm of the other clock is not its trigger.
+    #[test]
+    fn next_due_is_per_clock() {
+        let mut t = AlarmTable::default();
+        t.set(timed(1, RTC_WAKEUP, 700, 0));
+        t.set(timed(2, ELAPSED_REALTIME_WAKEUP, 900, 0));
+        assert_eq!(t.next_due(Clock::Realtime), Some(700));
+        assert_eq!(t.next_due(Clock::Boottime), Some(900));
     }
 }

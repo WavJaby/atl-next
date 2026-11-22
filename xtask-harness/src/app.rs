@@ -809,7 +809,8 @@ struct Line {
 /// timezone: Main.onCreate's TimeZone.getDefault(), from persist.sys.timezone (RuntimeInit.java:252 reads it; atld sets it to the host zone). None = the run host's zone ([`HostFacts::zone_want`]: the target's on a remote run, never the build host's).
 /// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
-const LOG_LINES: [Line; 28] = [
+/// alarm: Main.alarms: both AlarmManager delivery kinds fire once: the RTC_WAKEUP PendingIntent broadcast reaches the registered receiver, and the ELAPSED_REALTIME OnAlarmListener's onAlarm runs (alarm.rs, pending_intent.rs).
+const LOG_LINES: [Line; 29] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -852,6 +853,12 @@ const LOG_LINES: [Line; 28] = [
         row: "jobrun",
         prefix: "AtlTest: jobrun: ",
         want: Want::Exact("started=9 work=atl.test.WORK delivery=1 completed=true next=null"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "alarm",
+        prefix: "AtlTest: alarm: ",
+        want: Want::Exact("broadcast=1 listener=1"),
         timing: Timing::Async,
     },
     Line {

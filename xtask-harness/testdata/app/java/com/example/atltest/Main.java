@@ -717,6 +717,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "jobscheduler: " + jobs());
         Log.i("AtlTest", "queryservices: " + queryServices());
         jobRun();
+        alarms();
         Log.i("AtlTest", "bindservice: " + bound());
         bindImplicit();
         bindMissing();
@@ -1465,6 +1466,43 @@ public class Main extends Activity {
             return r + " billing=" + billing.size();
         } catch (Throwable t) {
             return "threw " + t;
+        }
+    }
+
+    /** Both delivery kinds, one alarm each, due ALARM_DELAY_MS after the set: an RTC_WAKEUP PendingIntent broadcast to the receiver registered for ALARM_ACTION, and an ELAPSED_REALTIME OnAlarmListener on the main Looper. */
+    private static final String ALARM_ACTION = "atl.test.ALARM";
+    private static final long ALARM_DELAY_MS = 100;
+    private int alarmBroadcasts;
+    private int alarmListeners;
+
+    private void alarms() {
+        registerReceiver(new android.content.BroadcastReceiver() {
+            @Override
+            public void onReceive(android.content.Context context, Intent intent) {
+                alarmBroadcasts++;
+                reportAlarms();
+            }
+        }, new android.content.IntentFilter(ALARM_ACTION), android.content.Context.RECEIVER_NOT_EXPORTED);
+        android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+        android.app.PendingIntent pi = android.app.PendingIntent.getBroadcast(
+                this, 0, new Intent(ALARM_ACTION), android.app.PendingIntent.FLAG_IMMUTABLE);
+        am.set(android.app.AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + ALARM_DELAY_MS, pi);
+        am.set(android.app.AlarmManager.ELAPSED_REALTIME,
+                android.os.SystemClock.elapsedRealtime() + ALARM_DELAY_MS, "atl.test",
+                new android.app.AlarmManager.OnAlarmListener() {
+                    @Override
+                    public void onAlarm() {
+                        alarmListeners++;
+                        reportAlarms();
+                    }
+                },
+                new android.os.Handler(getMainLooper()));
+    }
+
+    /** The alarm line once both kinds have fired: exactly one delivery of each. */
+    private void reportAlarms() {
+        if (alarmBroadcasts == 1 && alarmListeners == 1) {
+            Log.i("AtlTest", "alarm: broadcast=1 listener=1");
         }
     }
 

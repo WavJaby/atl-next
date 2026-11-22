@@ -6,7 +6,7 @@
 //! half: registerReceiverWithFeature / unregisterReceiver, non-ordered broadcastIntentWithFeature to registered receivers and explicit-component manifest receivers, stickies, unbroadcastIntent;
 //! the rules are broadcast.rs, the sends broadcast_queue.rs). A manifest receiver whose process is not running gets it started headless (no activity launch); its deliveries wait for the attach.
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); a crash report (handleApplicationCrash) is logged; every other method is counted unimplemented (counters).
-//! PendingIntent records (getIntentSenderWithFeature, cancelIntentSender) are pending_intent.rs's; IIntentSender.send is counted, not modelled.
+//! PendingIntent records (getIntentSenderWithFeature, cancelIntentSender) are pending_intent.rs's; IIntentSender.send of a BROADCAST record is send_pending_broadcast (below), other kinds are counted, not modelled.
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
 
@@ -66,7 +66,7 @@ use crate::memory_levels;
 use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pattern_matcher;
-use crate::pending_intent::{self, PendingIntents};
+use crate::pending_intent::{self, BroadcastSink, PendingIntents};
 use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::running_processes;
@@ -627,6 +627,19 @@ impl Reporter {
     }
 }
 
+/// The broadcast path a BROADCAST PendingIntent record sends through (pending_intent.rs): send_broadcast as the record's creator. Weak, so the records do not keep the service alive.
+struct BroadcastRoute(Weak<Inner>);
+
+impl BroadcastSink for BroadcastRoute {
+    fn send_as(&self, intent: &Intent, uid: u32, user_id: i32) -> binder::Result<()> {
+        let inner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| illegal_state("PendingIntent send: the service is gone"))?;
+        ActivityManager { inner }.send_pending_broadcast(intent, uid, user_id)
+    }
+}
+
 struct Inner {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
@@ -796,7 +809,7 @@ impl ActivityManager {
                     tasks,
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
-                    pending: PendingIntents::default(),
+                    pending: PendingIntents::new(Arc::new(BroadcastRoute(inner.clone()))),
                     service_calls: active_services::Outbox::new(),
                     bind_services,
                     kill_armed: Mutex::default(),
@@ -947,6 +960,28 @@ impl ActivityManager {
             queued += 1;
         }
         queued
+    }
+
+    /// IIntentSender.send of a BROADCAST record (PendingIntentRecord.sendInner): the request intent to `user_id` as the creator `uid`, through send_broadcast (queued per receiver, no result callback). The sender pid is this process, as in broadcast_as_system.
+    fn send_pending_broadcast(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        user_id: i32,
+    ) -> binder::Result<()> {
+        const RESULT_OK: i32 = -1;
+        let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        self.send_broadcast(
+            intent,
+            None,
+            pid,
+            uid,
+            user_id,
+            &[],
+            (RESULT_OK, None, None),
+            false,
+        )
+        .map(|_| ())
     }
 
     /// A broadcast the services send as the system to every user (ActivityManager.broadcastStickyIntent(intent, USER_ALL) for `sticky`, Context.sendBroadcastAsUser(intent, UserHandle.ALL) otherwise):
@@ -2815,7 +2850,10 @@ impl IActivityManager for ActivityManager {
             flags: 0,
             user_id,
         };
-        let sender = self.inner.pending.get_or_create(key, uid, flags)?;
+        let request = intents
+            .and_then(|list| list.last())
+            .and_then(|last| last.clone());
+        let sender = self.inner.pending.get_or_create(key, uid, flags, request)?;
         atl_diag::answered(AM, "getIntentSenderWithFeature");
         Ok(sender)
     }
