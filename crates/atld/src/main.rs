@@ -981,8 +981,8 @@ fn staging_name(session: u32) -> String {
 
 impl Host {
     /// Request `Install`: stages session `session` for `uid` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
-    /// A session equal to an installed package's code (installed_code.rs) is not staged: the installer runs over that code dir where it lies, its native-library root the package's own, so AOSP's
-    /// NativeLibraryHelper finds every library already there and copies none (isFileDifferent). Log `install skipped: unchanged`.
+    /// A session equal to an installed package's code (installed_code.rs) is not staged: the installer runs over that code dir where it lies, its native-library root the package's own, with
+    /// `--installed` (PMS's boot scan: parse, the install's ABI, no library copied). Log `install skipped: unchanged`.
     fn install(&self, session: u32, uid: u32) -> Result<String> {
         ensure!(
             uid > INSTALLER_UID,
@@ -1064,10 +1064,12 @@ impl Host {
                 rights: vec![],
                 app_id: None,
                 program: i.installer.clone(),
-                args: i
-                    .vm
-                    .iter()
-                    .cloned()
+                // in place: the installer's boot-scan mode, no library copied
+                args: in_place
+                    .as_ref()
+                    .map(|_| OsString::from("--installed"))
+                    .into_iter()
+                    .chain(i.vm.iter().cloned())
                     .chain([at.clone().into_os_string(), at.join(lib).into_os_string()])
                     .collect(),
                 env: i.env.clone(),

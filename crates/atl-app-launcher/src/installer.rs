@@ -3,6 +3,7 @@
 //! the dir holds the base APK and its splits (AOSP names them `base.apk`, `split_<name>.apk`), the root receives the chosen ABI's libraries under `<root>/<isa>`. No root (a system scan: the
 //! partition is read-only, PMS copies nothing there): parse only, no ABI choice, primaryCpuAbi unset. The VM options name the api-impl dex (`-Djava.class.path=`), whose ParsingPackageUtils.Callback forwarder the full parse needs.
 //! `--feature=<name>`: a feature this device declares (PMS hasSystemFeature, the parse's `hasFeature`); the spawner passes the set atld's PackageManager answers with.
+//! `--installed`: the dir is an installed package's code and the root its own library root (PMS's boot scan of an installed package): no library is copied, the ABI is the install's choice (`Cluster::install_natives`).
 //! Steps: the app process's start up to the VM (lib.rs steps 0-3), plus `-Xhidden-api-policy:just-warn` (installer VM only: it calls `@hide` framework code from JNI); libandroid_runtime around the VM (step 5a: the framework's natives, ApkAssets and NativeLibraryHelper among them);
 //! then `ApkLiteParseUtils.parseClusterPackageLite` over the dir (`ffi::Vm::parse_cluster`, M1), the full parse (`package::parse`, M3), then the install path's native code (`Cluster::install_natives`, M2).
 //! Output on stdout: the frames of atl-services-types `installer_output` (the PackageInfo parcel with the ABI choice on its ApplicationInfo, the components' intent filters); on stderr after them
@@ -22,8 +23,9 @@ use crate::{ffi, package};
 /// ART's hidden-API enforcement off with a warning (art/runtime/parsed_options.cc `-Xhidden-api-policy:_`): the installer reaches `@hide` classes (ApkLiteParseUtils, PackageLite) from JNI. App VMs never get it.
 const HIDDEN_API_POLICY: &std::ffi::CStr = c"-Xhidden-api-policy:just-warn";
 
-const USAGE: &str = "usage: atl-installer [--feature=<name>...] [VM options...] <package dir> [<native library root>]";
+const USAGE: &str = "usage: atl-installer [--feature=<name>...] [--installed] [VM options...] <package dir> [<native library root>]";
 const FEATURE: &str = "--feature=";
+const INSTALLED: &str = "--installed";
 
 /// The parsed command line.
 struct Args {
@@ -31,15 +33,19 @@ struct Args {
     features: Vec<String>,
     dir: PathBuf,
     lib_root: Option<PathBuf>,
+    installed: bool,
 }
 
-/// argv[1..]: `--feature=` options, VM options (each one token starting with `-`), then the package dir and the native library root.
+/// argv[1..]: `--feature=` options, `--installed`, VM options (each one token starting with `-`), then the package dir and the native library root.
 fn parse(argv: Vec<OsString>) -> Result<Args> {
     let mut options = Vec::new();
     let mut features = Vec::new();
     let mut paths = Vec::new();
+    let mut installed = false;
     for a in argv.into_iter().skip(1) {
-        if let Some(f) = a.to_str().and_then(|s| s.strip_prefix(FEATURE)) {
+        if a == INSTALLED {
+            installed = true;
+        } else if let Some(f) = a.to_str().and_then(|s| s.strip_prefix(FEATURE)) {
             features.push(f.to_owned());
         } else if a.as_bytes().starts_with(b"-") {
             options.push(CString::new(a.into_vec()).context("VM option")?);
@@ -57,6 +63,7 @@ fn parse(argv: Vec<OsString>) -> Result<Args> {
         features,
         dir,
         lib_root,
+        installed,
     })
 }
 
@@ -66,6 +73,7 @@ fn run(argv: Vec<OsString>) -> Result<()> {
         features,
         dir,
         lib_root,
+        installed,
     } = parse(argv)?;
     options.push(HIDDEN_API_POLICY.to_owned());
     let start = Instant::now();
@@ -83,7 +91,7 @@ fn run(argv: Vec<OsString>) -> Result<()> {
     let parse_ms = parse_start.elapsed().as_millis();
     let natives_start = Instant::now();
     let natives = lib_root
-        .map(|root| cluster.install_natives(&root))
+        .map(|root| cluster.install_natives(&root, installed))
         .transpose()?;
     let natives_ms = natives_start.elapsed().as_millis();
     let frames = parsed.frames(
@@ -139,6 +147,15 @@ mod tests {
         assert_eq!(a.options, [c"-Xa".to_owned(), c"-Xb".to_owned()]);
         assert_eq!(a.dir, std::path::Path::new("/p"));
         assert_eq!(a.lib_root.as_deref(), Some(std::path::Path::new("/lib")));
+        assert!(!a.installed);
+        let i = parse(
+            ["x", "--installed", "-Xa", "/p", "/lib"]
+                .map(Into::into)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(i.installed);
+        assert_eq!(i.options, [c"-Xa".to_owned()]);
         let scan = parse(["x", "-Xa", "/p"].map(Into::into).to_vec()).unwrap();
         assert_eq!(
             (scan.dir.as_path(), scan.lib_root),

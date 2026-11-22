@@ -401,7 +401,11 @@ impl Cluster<'_> {
     /// `Handle.create(lite)`; the device's `Build.SUPPORTED_ABIS` (RenderScript bitcode on a 64-bit device: the 32-bit list, derivePackageAbi:481-494); with `extractNativeLibs` `copyNativeBinariesForSupportedAbi` into `lib_root/<isa>` (it finds the ABI and returns its index), else `findSupportedAbi` alone.
     /// `lib_root` stands for AOSP's cluster `<codePath>/lib` (deriveNativeLibraryPaths:209); its parent must exist (createNativeLibrarySubdir makes one level). Multi-arch packages are refused: their 32/64-bit branch depends on the aconfig flag forceMultiArchNativeLibsMatch.
     /// A no-match is `native error -113: INSTALL_FAILED_NO_MATCHING_ABIS`; a Java exception is described on stderr.
-    pub fn install_natives(&self, lib_root: &Path) -> Result<Natives> {
+    /// `installed`: the dir is an installed package's code and `lib_root` its library root, as PMS's boot scan sees it without SCAN_FIRST_BOOT_OR_UPGRADE (ScanPackageUtils:156-175, 342-349): no copy at
+    /// all, the ABI the install chose (`findSupportedAbi`: the choice `copyNativeBinariesForSupportedAbi` makes before copying). Re-copying would rewrite every ELF library on ext4, where the copy's
+    /// hole punching (NativeLibraryHelper.cpp extractNativeLibFromApk -> punchHolesInElf64) moves its mtime past the zip's, so isFileDifferent never matches it again. If the chosen ABI's dir is
+    /// missing (the device's ABI list changed since the install: AOSP's upgrade, which derives again), the derive copy runs.
+    pub fn install_natives(&self, lib_root: &Path, installed: bool) -> Result<Natives> {
         let vm = self.vm;
         let lite = vm.find_class(c"android/content/pm/parsing/PackageLite")?;
         let is_multi_arch = vm.method(lite, c"isMultiArch", c"()Z", false)?;
@@ -442,22 +446,24 @@ impl Cluster<'_> {
             c"(Lcom/android/internal/content/NativeLibraryHelper$Handle;Ljava/io/File;Ljava/lang/String;Z)I",
             true,
         )?;
-        let session_root = vm.file(lib_root)?;
-        let session = vm.call_static_int(
-            helper,
-            with_override,
-            &[
-                jni::jvalue { l: handle.obj },
-                jni::jvalue { l: session_root },
-                jni::jvalue {
-                    l: core::ptr::null_mut(),
-                },
-                jni::jvalue { z: 0 },
-            ],
-            "copyNativeBinariesWithOverride",
-        )?;
-        if session != INSTALL_SUCCEEDED {
-            return Err(native_error(session));
+        if !installed {
+            let session_root = vm.file(lib_root)?;
+            let session = vm.call_static_int(
+                helper,
+                with_override,
+                &[
+                    jni::jvalue { l: handle.obj },
+                    jni::jvalue { l: session_root },
+                    jni::jvalue {
+                        l: core::ptr::null_mut(),
+                    },
+                    jni::jvalue { z: 0 },
+                ],
+                "copyNativeBinariesWithOverride",
+            )?;
+            if session != INSTALL_SUCCEEDED {
+                return Err(native_error(session));
+            }
         }
         let build = vm.find_class(c"android/os/Build")?;
         let string_array = c"[Ljava/lang/String;";
@@ -486,7 +492,7 @@ impl Cluster<'_> {
             (abis, false)
         };
 
-        let copy = if extract {
+        let copy_for_supported = || -> Result<i32> {
             let copy = vm.method(
                 helper,
                 c"copyNativeBinariesForSupportedAbi",
@@ -505,8 +511,9 @@ impl Cluster<'_> {
                     jni::jvalue { z: 0 },
                 ],
                 "copyNativeBinariesForSupportedAbi",
-            )?
-        } else {
+            )
+        };
+        let find_supported = || -> Result<i32> {
             let find = vm.method(
                 helper,
                 c"findSupportedAbi",
@@ -518,7 +525,37 @@ impl Cluster<'_> {
                 find,
                 &[jni::jvalue { l: handle.obj }, jni::jvalue { l: list }],
                 "findSupportedAbi",
-            )?
+            )
+        };
+        // the chosen ABI's library dir `lib_root/<isa>` (deriveNativeLibraryPaths)
+        let lib_dir_of = |index: i32| -> Result<PathBuf> {
+            let abi = vm.array_get(list, index)?;
+            let runtime = vm.find_class(c"dalvik/system/VMRuntime")?;
+            let isa_of = vm.method(
+                runtime,
+                c"getInstructionSet",
+                c"(Ljava/lang/String;)Ljava/lang/String;",
+                true,
+            )?;
+            let isa = vm.call_static_object(
+                runtime,
+                isa_of,
+                &[jni::jvalue { l: abi }],
+                "VMRuntime.getInstructionSet",
+            )?;
+            Ok(lib_root.join(vm.string(isa)?.context("null instruction set")?))
+        };
+        let copy = match (extract, installed) {
+            (false, _) => find_supported()?,
+            (true, false) => copy_for_supported()?,
+            (true, true) => {
+                let found = find_supported()?;
+                if found >= 0 && !lib_dir_of(found)?.is_dir() {
+                    copy_for_supported()?
+                } else {
+                    found
+                }
+            }
         };
         if copy < 0 && copy != NO_NATIVE_LIBRARIES {
             return Err(native_error(copy));
@@ -527,20 +564,7 @@ impl Cluster<'_> {
             let abi = vm.array_get(list, copy)?;
             let primary_abi = vm.string(abi)?.context("null ABI name")?;
             let lib_dir = if extract {
-                let runtime = vm.find_class(c"dalvik/system/VMRuntime")?;
-                let isa_of = vm.method(
-                    runtime,
-                    c"getInstructionSet",
-                    c"(Ljava/lang/String;)Ljava/lang/String;",
-                    true,
-                )?;
-                let isa = vm.call_static_object(
-                    runtime,
-                    isa_of,
-                    &[jni::jvalue { l: abi }],
-                    "VMRuntime.getInstructionSet",
-                )?;
-                Some(lib_root.join(vm.string(isa)?.context("null instruction set")?))
+                Some(lib_dir_of(copy)?)
             } else {
                 None
             };

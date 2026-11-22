@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Which installed package an install session would reinstall unchanged. The data root keeps each package's code (`apps/<package>/apk`, host_layout.rs) across runs; it is the install record, and
 //! the only one: a session whose APKs equal one package's installed APKs byte for byte is that package, already installed. AOSP never re-extracts an installed package's native libraries at boot
-//! (PackageManagerService parses /data/app in place; NativeLibraryHelper copies at install only, and even then skips a library whose size, mtime and CRC already match: isFileDifferent), so atld
-//! installs such a session in place instead of restaging it into an empty dir, where every library would be copied and fsynced again.
+//! (PackageManagerService parses /data/app in place and keeps the install's ABI; NativeLibraryHelper copies at install only), so atld parses such a session in place (installer `--installed`)
+//! instead of restaging it into an empty dir, where every library would be copied and fsynced again.
 //! Identity is content, not names (session files keep their source names; the installed ones are `base.apk` / `split_<name>.apk`) and not metadata (a copied APK has a new mtime and inode).
 
 use std::fs::File;
@@ -118,7 +118,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("atl-installed-code-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("atl-installed-code-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("scratch");
         d
@@ -137,8 +138,14 @@ mod tests {
         put(&d.join("apps/p.q/apk/base.apk"), b"base");
         put(&d.join("apps/p.q/apk/split_config.x86_64.apk"), b"split");
         put(&d.join("apps/p.q/apk/lib/x86_64/liba.so"), b"lib");
-        let files = [put(&d.join("src/2319.apk"), b"split"), put(&d.join("src/0d04.apk"), b"base")];
-        assert_eq!(unchanged(&d, &files).expect("unchanged").as_deref(), Some("p.q"));
+        let files = [
+            put(&d.join("src/2319.apk"), b"split"),
+            put(&d.join("src/0d04.apk"), b"base"),
+        ];
+        assert_eq!(
+            unchanged(&d, &files).expect("unchanged").as_deref(),
+            Some("p.q")
+        );
     }
 
     /// A hard link of the installed base (atld's staging) is equal without reading it.
@@ -148,7 +155,12 @@ mod tests {
         let base = put(&d.join("apps/p.q/apk/base.apk"), b"base");
         std::fs::create_dir_all(d.join("src")).expect("dir");
         std::fs::hard_link(&base, d.join("src/a.apk")).expect("link");
-        assert_eq!(unchanged(&d, &[d.join("src/a.apk")]).expect("unchanged").as_deref(), Some("p.q"));
+        assert_eq!(
+            unchanged(&d, &[d.join("src/a.apk")])
+                .expect("unchanged")
+                .as_deref(),
+            Some("p.q")
+        );
     }
 
     /// Break: one byte changed (same size), a split missing, or a split more -> a new install.
@@ -161,8 +173,14 @@ mod tests {
         let changed = put(&d.join("src/changed.apk"), b"spliT");
         let split = put(&d.join("src/split.apk"), b"split");
         let extra = put(&d.join("src/extra.apk"), b"extra");
-        assert_eq!(unchanged(&d, &[base.clone(), changed]).expect("changed"), None);
-        assert_eq!(unchanged(&d, std::slice::from_ref(&base)).expect("fewer"), None);
+        assert_eq!(
+            unchanged(&d, &[base.clone(), changed]).expect("changed"),
+            None
+        );
+        assert_eq!(
+            unchanged(&d, std::slice::from_ref(&base)).expect("fewer"),
+            None
+        );
         assert_eq!(unchanged(&d, &[base, split, extra]).expect("more"), None);
     }
 
@@ -172,7 +190,10 @@ mod tests {
         let d = scratch("once");
         put(&d.join("apps/p.q/apk/base.apk"), b"same");
         put(&d.join("apps/p.q/apk/split_a.apk"), b"other");
-        let files = [put(&d.join("src/a.apk"), b"same"), put(&d.join("src/b.apk"), b"same")];
+        let files = [
+            put(&d.join("src/a.apk"), b"same"),
+            put(&d.join("src/b.apk"), b"same"),
+        ];
         assert_eq!(unchanged(&d, &files).expect("once"), None);
     }
 
@@ -181,7 +202,10 @@ mod tests {
     fn a_fresh_root_has_nothing_installed() {
         let d = scratch("fresh");
         let f = put(&d.join("src/a.apk"), b"x");
-        assert_eq!(unchanged(&d, std::slice::from_ref(&f)).expect("fresh"), None);
+        assert_eq!(
+            unchanged(&d, std::slice::from_ref(&f)).expect("fresh"),
+            None
+        );
         put(&d.join("apps/p.q/data/files/a.apk"), b"x");
         assert_eq!(unchanged(&d, &[f]).expect("no code"), None);
     }
