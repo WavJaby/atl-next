@@ -31,7 +31,7 @@
 //! peak_check_gib = 4.8
 //! peak_native_gib = 9
 //! peak_cross_gib = 20
-//! peak_run_gib = 2     # one app data root (seed copy + one launch) in a run dir on the store (out_run.rs)
+//! peak_run_gib = 1.6   # one app data root (seed copy + one launch) in a run dir on the store (out_run.rs)
 //! ```
 
 use std::collections::BTreeMap;
@@ -112,8 +112,8 @@ pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
-/// run: store growth of one app data root from a seed copy through one launch (out_run.rs; the large case, WeChat): RUN_PEAK_DERIVATION.
-pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 2048];
+/// run 1612: store growth of one app data root, seed copy + one launch's peak (out_run.rs), sized by the large case, WeChat 8.0 (seed com.tencent.mm-3182; ext4 used on the zram store, 2 s samples, 2026-11-22): copy 797.8 MiB + launch peak 813.7 MiB (max of 5 launches; atld rewrites the 741 MiB apk/ each launch, design T3). Small case fossify-math: 7 MiB root, negligible.
+pub const DEFAULT_PEAK_MIB: [u64; 5] = [2048, 4915, 9216, 20480, 1612];
 
 /// `[delta]`: the RAM tier of build-dir deltas (delta.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]

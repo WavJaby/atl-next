@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(make(&ws, &huge, "h", None).unwrap(), run_dir_of(&ws, "h"));
         assert_eq!(counter(&ws, "run-dir-pool"), 2);
         assert_eq!(counter(&ws, "run-full"), 0);
-        // full by its own accounting: zram limit 10 GiB with 9.5 used, a 2 GiB class at ratio 1.95 needs 1.03 + 1 margin > 0.5 free
+        // full by its own accounting: zram limit 10 GiB with 9.5 used, the default class (1612 MiB) at ratio 1.95 needs 0.81 + 1 margin > 0.5 free
         let full = delta::Stats {
             backing: delta::Backing::Zram,
             fs_size: 20 << 30,
