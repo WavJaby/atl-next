@@ -159,9 +159,10 @@ impl Step {
         }
     }
 
-    /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles `cargo`, runtime gates `harness`, the rest `light`.
-    fn class(self) -> Class {
-        match self {
+    /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles `cargo`, runtime gates `harness`, the rest `light`. None: `gates`, whose rows each take their own grant (check_gates.rs), so the step holds none (a holder above them would refuse their nested admission).
+    fn class(self) -> Option<Class> {
+        Some(match self {
+            Step::Gates => return None,
             Step::Clippy
             | Step::Test
             | Step::Bootstrap
@@ -170,11 +171,9 @@ impl Step {
             | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
             // tables: its scenario half builds and runs the harness
-            Step::Tables | Step::GlProxies | Step::DriveTap | Step::Gates | Step::HostFonts => {
-                Class::Harness
-            }
+            Step::Tables | Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
             _ => Class::Light,
-        }
+        })
     }
 
     /// Why the step has nothing to check here, when its input is absent: printed and counted, not a failure.
@@ -440,18 +439,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             format!("skipped: {why}")
         } else {
             // one grant per step, around its own work only: check itself holds nothing between steps (no hold-and-wait)
-            let run = build_pool::acquire(&ws, root, step.class()).and_then(|grant| {
-                wait = grant.waited;
-                started = Instant::now();
-                eprintln!(
-                    "check: {} pool {} cpu {} of {}",
-                    step.name(),
-                    grant.class,
-                    grant.cpu,
-                    grant.cpu_of
-                );
-                step.run(root, &out)
-            });
+            let run = match step.class() {
+                None => step.run(root, &out),
+                Some(class) => build_pool::acquire(&ws, root, class).and_then(|grant| {
+                    wait = grant.waited;
+                    started = Instant::now();
+                    eprintln!(
+                        "check: {} pool {} cpu {} of {}",
+                        step.name(),
+                        grant.class,
+                        grant.cpu,
+                        grant.cpu_of
+                    );
+                    step.run(root, &out)
+                }),
+            };
             match run {
                 Ok(done) => {
                     let n = done.undecided.len();

@@ -29,9 +29,9 @@ pub fn stage_with(
     let dir = out.join(dir);
     std::fs::create_dir_all(&dir)?;
     let built = release.join(format!("lib{}.so", package.replace('-', "_")));
-    // a running process maps this file: replace it by rename, never rewrite it in place (that changed pages under a live process)
+    // a running process maps this file: replace it by rename, never rewrite it in place (that changed pages under a live process); the tmp name is per process, since check's parallel gates stage the same cdylib at once
     let dst = dir.join(name);
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::copy(&built, &tmp).with_context(|| format!("installing {}", built.display()))?;
     std::fs::rename(&tmp, &dst).with_context(|| format!("installing {}", dst.display()))?;
     Ok(dir)

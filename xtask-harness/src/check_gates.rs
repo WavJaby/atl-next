@@ -6,24 +6,70 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use atl_layout::Layout;
+use xtask::build_pool::{self, Class};
 use xtask::red_logs;
 
 use crate::verdict::{Outcome, UNDECIDED_WORD};
 use crate::window::{PHASES_LINE, WatchEnd};
 
+/// When a row runs: beside other rows, each under its own pool grant, or alone after the parallel lane drained (a timing assertion that other rows' load would turn undecided or red).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Parallel,
+    Serial,
+}
+
+impl Lane {
+    fn word(self) -> &'static str {
+        match self {
+            Lane::Parallel => "parallel",
+            Lane::Serial => "serial",
+        }
+    }
+}
+
 /// One gate run: `xtask test <args>`, plus `--host <build machine>` when `host` and `--out <build dir>` when `out` (each only where the gate's own arguments have it).
+/// `lane`: [`Lane`]; `after`: row names that must have ended first (the row reads what they stage); `class`: the pool class of its grant, sized from its measured `peak=` (build_pool.rs `Class::default_weight`).
 pub struct Row {
     pub args: &'static [&'static str],
     pub host: bool,
     pub out: bool,
+    pub lane: Lane,
+    pub after: &'static [&'static str],
+    pub class: Class,
 }
 
 impl Row {
     const fn new(args: &'static [&'static str], host: bool, out: bool) -> Self {
-        Self { args, host, out }
+        Self {
+            args,
+            host,
+            out,
+            lane: Lane::Parallel,
+            after: &[],
+            class: Class::Harness,
+        }
+    }
+
+    const fn serial(self) -> Self {
+        Self {
+            lane: Lane::Serial,
+            ..self
+        }
+    }
+
+    const fn after(self, after: &'static [&'static str]) -> Self {
+        Self { after, ..self }
+    }
+
+    const fn class(self, class: Class) -> Self {
+        Self { class, ..self }
     }
 
     /// The gate's verdict-line name (`window: ...` for every window stage).
@@ -53,7 +99,7 @@ impl Row {
     }
 }
 
-/// The gates `check` runs, cheapest first, except where one reads what another stages.
+/// The gates `check` runs, in report order (cheapest first). Serial rows are the timing assertions (time bounds that other rows' load would break).
 pub const ROWS: &[Row] = &[
     Row::new(&["task-bind"], false, false),
     Row::new(&["sandbox"], true, true),
@@ -66,7 +112,8 @@ pub const ROWS: &[Row] = &[
     Row::new(&["vk-driver"], false, false),
     Row::new(&["nb-isa"], true, true),
     Row::new(&["ui-module"], false, true),
-    Row::new(&["platform-ui"], false, false),
+    // ping-to-pong time bounds
+    Row::new(&["platform-ui"], false, false).serial(),
     Row::new(&["compositor"], true, true),
     Row::new(&["parcel"], true, true),
     Row::new(&["provider"], true, true),
@@ -75,17 +122,19 @@ pub const ROWS: &[Row] = &[
     Row::new(&["billing"], true, true),
     Row::new(&["keystore"], true, true),
     Row::new(&["gralloc"], true, true),
-    Row::new(&["composer"], true, true),
+    // frame-time bounds
+    Row::new(&["composer"], true, true).serial(),
     Row::new(&["instrument"], true, true),
-    Row::new(&["app"], true, true),
+    // its tree peaks above the `harness` reserve
+    Row::new(&["app"], true, true).class(Class::HarnessHeavy),
     // reads the `app/` tree the app gate stages (its refusal otherwise: "missing <out>/app/root/system/lib64/x86_64 ... run `xtask test app`")
-    Row::new(&["nb-identity"], false, true),
+    Row::new(&["nb-identity"], false, true).after(&["app"]),
     // needs what nb-identity needs (the staged `app/`)
-    Row::new(&["sles-bridge"], false, true),
+    Row::new(&["sles-bridge"], false, true).after(&["app"]),
     Row::new(&["window", "--stage", "surface-view"], true, true),
     Row::new(&["window", "--stage", "ime"], true, true),
     // a GPU-starved host (window render over the hold bound) makes it `undecided`: neither pass nor fail, named on check's verdict line
-    Row::new(&["window", "--stage", "slow-display"], true, true),
+    Row::new(&["window", "--stage", "slow-display"], true, true).serial(),
     // the WebView's focus and key routing without the webview stage's sound route: a mouse click focuses the page, a touch tap does not; Esc -> Back reaches the game after the dismissal
     Row::new(
         &["window", "--stage", "webview-overlay", "--esc-back"],
@@ -104,76 +153,73 @@ pub const ROWS: &[Row] = &[
         true,
         true,
     ),
-    Row::new(&["window", "--stage", "ui-block"], true, true),
+    // block-time bounds
+    Row::new(&["window", "--stage", "ui-block"], true, true).serial(),
     // a tiling compositor's first configure differs from the requested size: the app must lay out at the configured one
     Row::new(&["window", "--stage", "tiled"], true, true),
 ];
 
+/// One row's result, held until every row before it in the table has reported: the `gates:` lines stay in table order whatever ends first.
+struct Done {
+    outcome: Outcome,
+    took: f64,
+    /// the `gates:` line less its lane fields ([`run_lanes`] adds them)
+    line: String,
+    /// `<row> (log <path>): <verdict>` when red, `<row> <why>` when undecided
+    note: String,
+    /// what ended a window row's watch
+    end: Option<String>,
+}
+
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows (`<row> <why>`), neither pass nor fail ([`Outcome`]).
+/// Each row takes its own pool grant (memory admission decides how many run at once); no grant is held around the step ([`run_lanes`]).
 pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let exe = std::env::current_exe().context("the harness's own path")?;
+    let ws = Layout::of(root)?.workspace().to_owned();
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
     let run = red_logs::run_id();
     let task = red_logs::task_dir(root)?;
+    let at = RowRun {
+        exe: &exe,
+        root,
+        logs: &logs,
+        task: &task,
+        run: &run,
+        host,
+        out: out_arg,
+    };
+    let run_one = |row: &Row| -> Done {
+        // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
+        let gated = build_pool::acquire(&ws, root, row.class)
+            .and_then(|grant| at.row(row).map(|done| (done, grant)));
+        gated.map(|(done, _grant)| done).unwrap_or_else(|e| {
+            let line = format!("error: {e:#}");
+            Done {
+                outcome: Outcome::Fail,
+                took: 0.0,
+                note: format!("{}: {line}", row.name()),
+                line: format!("gates: {} FAILED (0.0s) {line}", row.name()),
+                end: None,
+            }
+        })
+    };
     let mut failed = Vec::new();
     let mut undecided = Vec::new();
     let mut ends = WatchTally::default();
-    for row in ROWS {
-        let log = logs.join(format!("{}.log", row.name()));
-        let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
-        let argv = row.argv(host, out_arg);
-        let started = Instant::now();
-        let mut child = Command::new(&exe)
-            .current_dir(root)
-            .arg("test")
-            .args(&argv)
-            .stdout(file.try_clone()?)
-            .stderr(file)
-            .spawn()
-            .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
-        let peak = peak_while(&mut child)?;
-        let status = peak.status;
-        let took = started.elapsed().as_secs_f64();
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
-        let phases = phases_field(&text);
-        ends.count(phases.as_ref());
-        let measured = format!(
-            "peak={}MiB{} work={}",
-            peak.kib / 1024,
-            phases.map(|p| format!(" {}", p.field)).unwrap_or_default(),
-            runtime_work(&text).unwrap_or("-")
-        );
-        let outcome = Outcome::of_exit(status.code());
-        let line = match outcome {
-            Outcome::Undecided => undecided_line(&text, row.cmd()),
-            Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
-        }
-        .unwrap_or("no verdict line");
-        let kept = keep_unless_pass(&task, &run, row, &log, outcome);
-        let at = kept.as_ref().unwrap_or(&log);
-        let note = kept
-            .as_ref()
-            .map(|k| format!(" (log {})", k.display()))
-            .unwrap_or_default();
-        eprintln!(
-            "gates: {} {} ({took:.1}s {measured}) {line}{note}",
-            row.name(),
-            match outcome {
-                Outcome::Pass => "ok",
-                Outcome::Fail => "FAILED",
-                Outcome::Undecided => "undecided",
-            }
-        );
-        match outcome {
+    let stats = run_lanes(ROWS, &run_one, &mut |done| {
+        eprintln!("{}", done.line);
+        ends.count(done.end.as_deref());
+        match done.outcome {
             Outcome::Pass => {}
             // the path leads: check quotes its first error at 160 chars (verdict.rs FIRST_ERROR_CHARS), and the verdict line lands in it
-            Outcome::Fail => failed.push(format!("{} (log {}): {line}", row.name(), at.display())),
-            Outcome::Undecided => undecided.push(undecided_note(row, line)),
+            Outcome::Fail => failed.push(done.note.clone()),
+            Outcome::Undecided => undecided.push(done.note.clone()),
         }
-    }
+    });
     eprintln!("gates: watch ends {}", ends.line());
+    eprintln!("gates: {}", stats.line());
     if failed.is_empty() {
         return Ok(undecided);
     }
@@ -191,6 +237,192 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     // stdout leads the step's failure text (xtask harness.rs check_step), so check's first-error line is this one, not the first gate's progress line
     println!("gates: FAILED {summary}");
     bail!("{summary}")
+}
+
+/// Wall time of a gates step against the sum of its rows' times, and the widest the parallel lane ran.
+#[derive(Debug, Default)]
+struct LaneStats {
+    wall: f64,
+    sum: f64,
+    parallel: usize,
+    serial: usize,
+    max_at_once: usize,
+}
+
+impl LaneStats {
+    fn line(&self) -> String {
+        format!(
+            "lanes wall {:.1}s, row sum {:.1}s (parallel {} rows, max {} at once; serial {} rows)",
+            self.wall, self.sum, self.parallel, self.max_at_once, self.serial
+        )
+    }
+}
+
+/// `line` with `lane=<lane> running=<k>` added at the end of its first parenthesised field group (`gates: <row> ok (<s> ... lane=parallel running=3) ...`).
+fn with_lane(line: &str, lane: Lane, running: usize) -> String {
+    let field = format!(" lane={} running={running}", lane.word());
+    match line
+        .find(" (")
+        .and_then(|open| line[open..].find(')').map(|close| open + close))
+    {
+        Some(close) => format!("{}{field}{}", &line[..close], &line[close..]),
+        None => format!("{line}{field}"),
+    }
+}
+
+/// Runs `rows` with `run_one` (which takes the row's grant itself): parallel rows concurrently, each once its `after` rows ended, then serial rows one at a time, alone.
+/// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` (rows running when it started, itself included).
+fn run_lanes(
+    rows: &[Row],
+    run_one: &(dyn Fn(&Row) -> Done + Sync),
+    emit: &mut dyn FnMut(&Done),
+) -> LaneStats {
+    let started = Instant::now();
+    let names: Vec<String> = rows.iter().map(Row::name).collect();
+    let ended = Mutex::new(vec![false; rows.len()]);
+    let wake = Condvar::new();
+    let running = AtomicUsize::new(0);
+    let max_at_once = AtomicUsize::new(0);
+    let start_one = |i: usize| -> Done {
+        let at_start = running.fetch_add(1, Ordering::SeqCst) + 1;
+        max_at_once.fetch_max(at_start, Ordering::SeqCst);
+        let mut done = run_one(&rows[i]);
+        running.fetch_sub(1, Ordering::SeqCst);
+        done.line = with_lane(&done.line, rows[i].lane, at_start);
+        done
+    };
+    let mut results: Vec<Option<Done>> = (0..rows.len()).map(|_| None).collect();
+    let mut next = 0;
+    let mut flush = |results: &[Option<Done>], next: &mut usize| {
+        while let Some(Some(done)) = results.get(*next) {
+            emit(done);
+            *next += 1;
+        }
+    };
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        for (i, row) in rows.iter().enumerate() {
+            if row.lane != Lane::Parallel {
+                continue;
+            }
+            let tx = tx.clone();
+            let (ended, wake, names, start_one) = (&ended, &wake, &names, &start_one);
+            scope.spawn(move || {
+                // `after` names are checked against the table by a test (`after_names_earlier_parallel_rows`)
+                let deps: Vec<usize> = row
+                    .after
+                    .iter()
+                    .filter_map(|a| names.iter().position(|n| n == a))
+                    .collect();
+                let mut e = ended.lock().unwrap_or_else(|p| p.into_inner());
+                while deps.iter().any(|&d| !e[d]) {
+                    e = wake.wait(e).unwrap_or_else(|p| p.into_inner());
+                }
+                drop(e);
+                let done = start_one(i);
+                ended.lock().unwrap_or_else(|p| p.into_inner())[i] = true;
+                wake.notify_all();
+                let _ = tx.send((i, done));
+            });
+        }
+        drop(tx);
+        for (i, done) in rx {
+            results[i] = Some(done);
+            flush(&results, &mut next);
+        }
+    });
+    for (i, row) in rows.iter().enumerate() {
+        if row.lane == Lane::Serial {
+            results[i] = Some(start_one(i));
+            flush(&results, &mut next);
+        }
+    }
+    LaneStats {
+        wall: started.elapsed().as_secs_f64(),
+        sum: results.iter().flatten().map(|d| d.took).sum(),
+        parallel: rows.iter().filter(|r| r.lane == Lane::Parallel).count(),
+        serial: rows.iter().filter(|r| r.lane == Lane::Serial).count(),
+        max_at_once: max_at_once.load(Ordering::SeqCst),
+    }
+}
+
+/// What every row's run shares: the harness binary, the checkout, the log dir, the red-log task dir and run id, the host and build dir arguments.
+struct RowRun<'a> {
+    exe: &'a Path,
+    root: &'a Path,
+    logs: &'a Path,
+    task: &'a Path,
+    run: &'a str,
+    host: &'a str,
+    out: &'a str,
+}
+
+impl RowRun<'_> {
+    /// One row as its own `xtask test` process, its output in `<logs>/<row>.log`; a red or undecided log is kept ([`keep_unless_pass`]).
+    /// Called on the thread holding the row's grant: its job count reaches the gate's cargo runs (xtask `grant_jobs`).
+    fn row(&self, row: &Row) -> Result<Done> {
+        let log = self.logs.join(format!("{}.log", row.name()));
+        let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
+        let argv = row.argv(self.host, self.out);
+        let started = Instant::now();
+        let mut cmd = Command::new(self.exe);
+        xtask::grant_jobs(&mut cmd);
+        let mut child = cmd
+            .current_dir(self.root)
+            .arg("test")
+            .args(&argv)
+            .stdout(file.try_clone()?)
+            .stderr(file)
+            .spawn()
+            .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
+        let peak = peak_while(&mut child)?;
+        let took = started.elapsed().as_secs_f64();
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let phases = phases_field(&text);
+        let measured = format!(
+            "peak={}MiB{} work={}",
+            peak.kib / 1024,
+            phases
+                .as_ref()
+                .map(|p| format!(" {}", p.field))
+                .unwrap_or_default(),
+            runtime_work(&text).unwrap_or("-")
+        );
+        let outcome = Outcome::of_exit(peak.status.code());
+        let verdict = match outcome {
+            Outcome::Undecided => undecided_line(&text, row.cmd()),
+            Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
+        }
+        .unwrap_or("no verdict line");
+        let kept = keep_unless_pass(self.task, self.run, row, &log, outcome);
+        let at = kept.as_ref().unwrap_or(&log);
+        let kept_note = kept
+            .as_ref()
+            .map(|k| format!(" (log {})", k.display()))
+            .unwrap_or_default();
+        let line = format!(
+            "gates: {} {} ({took:.1}s {measured}) {verdict}{kept_note}",
+            row.name(),
+            match outcome {
+                Outcome::Pass => "ok",
+                Outcome::Fail => "FAILED",
+                Outcome::Undecided => "undecided",
+            }
+        );
+        let note = match outcome {
+            Outcome::Undecided => undecided_note(row, verdict),
+            Outcome::Pass | Outcome::Fail => {
+                format!("{} (log {}): {verdict}", row.name(), at.display())
+            }
+        };
+        Ok(Done {
+            outcome,
+            took,
+            line,
+            note,
+            end: phases.map(|p| p.end),
+        })
+    }
 }
 
 /// How often a row's process tree is sampled for its memory. A gate runs for seconds (a cold start alone 12-15 s), so 5 samples a second see its plateau; a spike shorter than this is missed,
@@ -292,9 +524,9 @@ struct WatchTally {
 }
 
 impl WatchTally {
-    fn count(&mut self, phases: Option<&Phases>) {
-        let Some(p) = phases else { return };
-        match WatchEnd::ALL.iter().position(|w| w.word() == p.end) {
+    fn count(&mut self, end: Option<&str>) {
+        let Some(end) = end else { return };
+        match WatchEnd::ALL.iter().position(|w| w.word() == end) {
             Some(i) => self.counts[i] += 1,
             None => self.unknown += 1,
         }
@@ -401,6 +633,114 @@ mod tests {
         }
     }
 
+    /// Every `after` name is a parallel row earlier in the table: a misspelt name would be dropped silently and the row would run before what it reads.
+    #[test]
+    fn after_names_earlier_parallel_rows() {
+        for (i, row) in ROWS.iter().enumerate() {
+            for a in row.after {
+                let at = ROWS.iter().position(|r| r.name() == *a);
+                assert!(
+                    at.is_some_and(|at| at < i && ROWS[at].lane == Lane::Parallel),
+                    "{}: after {a}",
+                    row.name()
+                );
+            }
+        }
+    }
+
+    /// A fake row set through the scheduler: the ordering edge holds, the serial row runs alone after the parallel lane, the lines come in table order, a red row stays red.
+    #[test]
+    fn lanes_order_edges_and_report_in_table_order() {
+        const FAKE: &[Row] = &[
+            Row::new(&["slow-stager"], false, false),
+            Row::new(&["reader"], false, false).after(&["slow-stager"]),
+            Row::new(&["timed"], false, false).serial(),
+            Row::new(&["red"], false, false),
+        ];
+        let t0 = Instant::now();
+        let spans = Mutex::new(Vec::new());
+        let run_one = |row: &Row| -> Done {
+            let from = t0.elapsed();
+            // the stager is slowest, so a reader that ignored its edge would start first
+            std::thread::sleep(Duration::from_millis(if row.name() == "slow-stager" {
+                150
+            } else {
+                30
+            }));
+            spans
+                .lock()
+                .expect("spans")
+                .push((row.name(), from, t0.elapsed()));
+            let outcome = if row.name() == "red" {
+                Outcome::Fail
+            } else {
+                Outcome::Pass
+            };
+            Done {
+                outcome,
+                took: 0.1,
+                line: format!("gates: {} x (0.1s peak=0MiB) v", row.name()),
+                note: row.name(),
+                end: None,
+            }
+        };
+        let mut seen = Vec::new();
+        let stats = run_lanes(FAKE, &run_one, &mut |d| {
+            seen.push((d.line.clone(), d.outcome))
+        });
+        let names: Vec<String> = seen
+            .iter()
+            .map(|(l, _)| l.split_whitespace().nth(1).expect("name").to_owned())
+            .collect();
+        assert_eq!(names, ["slow-stager", "reader", "timed", "red"]);
+        assert_eq!(seen[3].1, Outcome::Fail);
+        assert!(
+            seen[2].0.contains("lane=serial running=1)"),
+            "{}",
+            seen[2].0
+        );
+        assert!(
+            seen[0].0.contains("lane=parallel running="),
+            "{}",
+            seen[0].0
+        );
+        let spans = spans.into_inner().expect("spans");
+        let span = |n: &str| {
+            let s = spans.iter().find(|s| s.0 == n).expect("span");
+            (s.1, s.2)
+        };
+        assert!(
+            span("reader").0 >= span("slow-stager").1,
+            "reader ran before its stager"
+        );
+        let timed = span("timed");
+        for other in ["slow-stager", "reader", "red"] {
+            assert!(timed.0 >= span(other).1, "timed overlapped {other}");
+        }
+        assert_eq!((stats.parallel, stats.serial), (3, 1));
+        assert!(
+            stats.max_at_once >= 2,
+            "parallel rows did not overlap: {stats:?}"
+        );
+        assert!((stats.sum - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lane_fields_close_the_first_group() {
+        assert_eq!(
+            with_lane(
+                "gates: a ok (1.0s peak=3MiB work=-) a: ok (log x)",
+                Lane::Parallel,
+                2
+            ),
+            "gates: a ok (1.0s peak=3MiB work=- lane=parallel running=2) a: ok (log x)"
+        );
+        assert_eq!(
+            with_lane("odd", Lane::Serial, 1),
+            "odd lane=serial running=1"
+        );
+    }
+
     /// An undecided run's note for check's line: the row name and the stage's why, from the line the window judge prints.
     #[test]
     fn undecided_note_names_row_and_why() {
@@ -453,10 +793,14 @@ mod tests {
             "start->marker=12000 watch=4100 teardown=900 end=probe"
         );
         let mut t = WatchTally::default();
-        t.count(Some(&p));
-        t.count(phases_field("window: phases watch=1 end=window").as_ref());
-        t.count(phases_field("window: phases watch=1 end=odd").as_ref());
-        t.count(phases_field("sandbox: ok").as_ref());
+        t.count(Some(&p.end));
+        for text in [
+            "window: phases watch=1 end=window",
+            "window: phases watch=1 end=odd",
+            "sandbox: ok",
+        ] {
+            t.count(phases_field(text).map(|p| p.end).as_deref());
+        }
         assert_eq!(t.line(), "probe=1 window=1 ended=0 limit=0 unknown=1");
     }
 

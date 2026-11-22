@@ -211,8 +211,11 @@ pub fn placement(root: &Path, out: &Path, breaks: &[String]) -> Result<Vec<(Path
         atl_egl_driver_name(),
         &features,
     )?;
+    // tmp + rename: check's parallel gates write and read this file at once; a plain write lets a reader see it truncated
     let prop = dir.join("vendor-build.prop");
-    std::fs::write(&prop, format!("ro.hardware.egl={HARDWARE}\n"))?;
+    let tmp = dir.join(format!(".vendor-build.prop.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("ro.hardware.egl={HARDWARE}\n"))?;
+    std::fs::rename(&tmp, &prop)?;
     let vendor = |name: &str| format!("{}/{name}", atl_android_paths::VENDOR_EGL);
     Ok(vec![
         (

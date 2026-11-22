@@ -39,16 +39,19 @@ pub enum Class {
     Cargo,
     /// a runtime gate: the product's processes plus the cargo and JVM work around them
     Harness,
+    /// a runtime gate whose tree peaks above the `harness` reserve (check_gates.rs `Row::class`: the `app` gate)
+    HarnessHeavy,
     /// static checks: one CPU slot; bypasses the queue only when the head could not use it (`bypass_allowed`). Held while a check reads the checkouts' git dirs; the migrate quiet window (git_dirs.rs `migrate`) refuses on that hold.
     Light,
 }
 
 impl Class {
-    pub const ALL: [Class; 5] = [
+    pub const ALL: [Class; 6] = [
         Class::NativeFull,
         Class::NativeIncr,
         Class::Cargo,
         Class::Harness,
+        Class::HarnessHeavy,
         Class::Light,
     ];
 
@@ -59,6 +62,7 @@ impl Class {
             Class::NativeIncr => "native-incr",
             Class::Cargo => "cargo",
             Class::Harness => "harness",
+            Class::HarnessHeavy => "harness-heavy",
             Class::Light => "light",
         }
     }
@@ -94,11 +98,17 @@ impl Class {
                 cpu_max: all_but_one,
                 mem_gib: 6,
             },
-            // a runtime gate: not measured yet, placeholder
+            // a runtime gate: tree VmRSS peak (check_gates.rs `peak=`, sampled lower bound) <= 1.83 GiB over every row but `app` (webview-overlay 1830 MiB, window rows ~1 GiB, atld rows < 0.8 GiB; 2026-11-22, land-speed S0), rounded up
             Class::Harness => ClassWeight {
                 cpu_min: 4,
                 cpu_max: 6,
                 mem_gib: 2,
+            },
+            // the `app` gate: tree VmRSS peak 3976 MiB (same sample), rounded up; CPU as `harness`
+            Class::HarnessHeavy => ClassWeight {
+                cpu_min: 4,
+                cpu_max: 6,
+                mem_gib: 4,
             },
             // static checks: no measurable memory, one slot
             Class::Light => ClassWeight {
