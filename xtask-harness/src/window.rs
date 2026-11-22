@@ -355,6 +355,73 @@ fn probe_ends_run(stage: Stage) -> bool {
     )
 }
 
+/// The stages whose watch ends [`WINDOW_MS`] after their probe is done (never before marker + WINDOW_MS), not at the stage's own watch end: their probe waits for every line or event its
+/// sub-gates judge, so after it the watch only looks for a fault its last input caused, and the resume path's derivation of WINDOW_MS (a failure shows within ms) holds for that input too.
+/// The composer's counters line lags work by at most 1 s (atl-composer host.rs COUNTERS_PERIOD_NS), inside the grace. Per stage (check rows):
+/// surface-view: its last wait is the offscreen commit line, then the second settled picture; tiled: the tile rewrite and pictures come at the first draw, the probe's last wait the block's pong;
+/// ime: the relaunched window's rebind line; webview-overlay: the last Esc's back line. Not here: slow-display (warm-up / steady / block / tail phases are the assertion), ui-block (its timed
+/// commit-flow check spans the watch), and stages nobody audited for this. `--hold` keeps the fixed watch.
+fn probe_bounds_watch(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::SurfaceView | Stage::Tiled | Stage::Ime | Stage::WebViewOverlay
+    )
+}
+
+/// What ended a window stage's watch; printed on its `window: phases` line, counted by check's gates step (check_gates.rs `WatchTally`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WatchEnd {
+    /// [`WINDOW_MS`] after the probe was done ([`probe_bounds_watch`]), or the probe's own end in a [`probe_ends_run`] stage past the stage's watch.
+    Probe,
+    /// The stage's watch end, marker + its window (the timeout).
+    Window,
+    /// The app or atld ended first.
+    Ended,
+    /// [`LIMIT`] passed without the watch ending.
+    Limit,
+}
+
+impl WatchEnd {
+    pub(crate) const ALL: [WatchEnd; 4] = [Self::Probe, Self::Window, Self::Ended, Self::Limit];
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Window => "window",
+            Self::Ended => "ended",
+            Self::Limit => "limit",
+        }
+    }
+}
+
+/// The phases line's head (`window: phases start->marker=<ms> watch=<ms> teardown=<ms> end=<word>`), parsed by check_gates.rs.
+pub(crate) const PHASES_LINE: &str = "window: phases ";
+
+/// When the watch ends (ms on the log clock) and why, once known; None while a [`probe_ends_run`] probe still runs. `marker_ms`: the marker's stamp; `window_ms`: the stage's watch;
+/// `probe_done_ms`: when the loop saw the probe finished; `bounded`: [`probe_bounds_watch`] (false under `--hold`).
+fn watch_end(
+    marker_ms: u64,
+    window_ms: u64,
+    probe_done_ms: Option<u64>,
+    ends_run: bool,
+    bounded: bool,
+) -> Option<(u64, WatchEnd)> {
+    let window_end = marker_ms + window_ms;
+    match (probe_done_ms, ends_run, bounded) {
+        (None, true, _) => None,
+        (Some(done), _, true) => {
+            let early = (marker_ms + WINDOW_MS).max(done + WINDOW_MS);
+            if ends_run || early < window_end {
+                Some((early, WatchEnd::Probe))
+            } else {
+                Some((window_end, WatchEnd::Window))
+            }
+        }
+        (Some(done), true, false) if done > window_end => Some((done, WatchEnd::Probe)),
+        _ => Some((window_end, WatchEnd::Window)),
+    }
+}
+
 /// The stages whose probe takes pictures of the window through [`capture::Probe`] (the harness route, not the composer's log).
 fn takes_pictures(stage: Stage) -> bool {
     matches!(
@@ -2946,32 +3013,45 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     // the splash stage's picture, taken by this loop while the starting window shows
     let mut splash_shot = None;
     let splash_png = work.join("splash.png");
-    loop {
+    let start_ms = now_ms().saturating_sub(started.elapsed().as_millis() as u64);
+    let bounded = args.hold.is_none() && probe_bounds_watch(args.stage);
+    let ends_run = probe_ends_run(args.stage);
+    // when this loop first saw the probe finished (a stage without a probe: never)
+    let mut probe_done_ms = None;
+    let mut marker_ms = None;
+    let end = loop {
         let app = read(&app_log);
         if matches!(args.stage, Stage::Splash) {
             splash::take(&mut splash_shot, &app, &app_log, nested, &splash_png);
         }
-        // the window runs from the marker's own stamp, not from when this loop saw the marker; a stage whose probe ends the app's session runs until the probe is done too
-        let probe_running =
-            probe_ends_run(args.stage) && probe.as_ref().is_some_and(|h| !h.is_finished());
-        if !probe_running && marker_stamp(&app, marker).is_some_and(|t| now_ms() >= t + window_ms) {
-            break;
+        if probe_done_ms.is_none() && probe.as_ref().is_some_and(|h| h.is_finished()) {
+            probe_done_ms = Some(now_ms());
+        }
+        // the window runs from the marker's own stamp, not from when this loop saw the marker
+        marker_ms = marker_ms.or_else(|| marker_stamp(&app, marker));
+        if let Some((at, why)) = marker_ms
+            .and_then(|t| watch_end(t, window_ms, probe_done_ms, ends_run, bounded))
+            .filter(|(at, _)| now_ms() >= *at)
+        {
+            break (at, why);
         }
         if let Some(s) = atld.try_wait()? {
             ended = Some(s);
-            break;
+            break (now_ms(), WatchEnd::Ended);
         }
         // the app's end is the run's end for a gate, as when atld ended with it; not in the ime stage, whose probe kills the app and relaunches it (its death sub-gate), nor in the capture
         // stage, whose close ends the app (its `ended` sub-gate)
         if !matches!(args.stage, Stage::Ime | Stage::Capture) && run.app_ended() {
+            let at = now_ms();
             ended = Some(atld.stop(run)?);
-            break;
+            break (at, WatchEnd::Ended);
         }
         if started.elapsed() > LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
-            break;
+            break (now_ms(), WatchEnd::Limit);
         }
         std::thread::sleep(POLL);
-    }
+    };
+    let teardown = Instant::now();
     let mut stopped = None;
     if ended.is_none() {
         stop_apps(atld_pid);
@@ -2987,6 +3067,21 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
             .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
         None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
     };
+    // start: the launch (after the fixture's build and the stack's start); watch: marker -> the loop's end; teardown: stopping the apps and atld, joining the probe
+    let (end_ms, why) = end;
+    let phase = |ms: Option<u64>| ms.map_or("-".to_owned(), |ms| ms.to_string());
+    println!(
+        "{PHASES_LINE}start->marker={} watch={} teardown={} end={} (watch cap {window_ms} ms, probe {})",
+        phase(marker_ms.map(|t| t.saturating_sub(start_ms))),
+        phase(marker_ms.map(|t| end_ms.saturating_sub(t))),
+        teardown.elapsed().as_millis(),
+        why.word(),
+        match (bounded, ends_run) {
+            (true, _) => "bounds the watch",
+            (false, true) => "extends the watch",
+            (false, false) => "does not end it",
+        }
+    );
     Ok(LiveOut {
         liveness,
         captured,
@@ -4695,6 +4790,75 @@ mod tests {
         assert_eq!(
             parse_stamp(&stamp_text(1_793_747_156_733)),
             Some(1_793_747_156_733)
+        );
+    }
+
+    /// A bounded stage's watch ends WINDOW_MS after its probe: a crash 1.9 s after the probe's end is still in the watched log and fails, one at 2.1 s comes after the stop and is not seen.
+    /// The log is cut where the loop stops the apps (stop_apps), which is what the judge reads. The 1.9 / 2.1 s offsets straddle the 2 s grace (WINDOW_MS's own derivation) by 0.1 s.
+    #[test]
+    fn a_bounded_watch_sees_a_crash_inside_the_grace_only() {
+        const T: u64 = 1_000_000;
+        // the probe is done 6 s after the marker: 6 + 2 s ends before surface-view's 10 s watch
+        let done = T + 6_000;
+        let (end, why) = watch_end(T, GTK_WINDOW_MS, Some(done), false, true)
+            .expect("an end once the probe is done");
+        assert_eq!((end, why), (done + 2_000, WatchEnd::Probe));
+        let mark = app_line(T, "liblog/AtlWindow", "onResume reached");
+        let watched = |crash: u64| {
+            let log =
+                mark.clone() + &app_line(crash, "liblog/AndroidRuntime", "FATAL EXCEPTION: main");
+            let cut: String = log
+                .lines()
+                .filter(|l| line_stamp(l).is_some_and(|t| t <= end))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            verdict(&cut, marker(Stage::Resume), false, GTK_WINDOW_MS)
+                .fault
+                .is_some()
+        };
+        assert!(watched(done + 1_900), "a crash inside the grace passed");
+        assert!(!watched(done + 2_100), "a crash after the stop was judged");
+    }
+
+    /// The other ends: an unbounded stage keeps its window; a bounded one whose probe has not finished times out at the window; a probe-ended stage waits for its probe and may run past the window;
+    /// a probe done right after the marker still leaves the resume path's WINDOW_MS.
+    #[test]
+    fn watch_end_cases() {
+        const T: u64 = 1_000_000;
+        let w = GTK_WINDOW_MS;
+        assert_eq!(
+            watch_end(T, w, Some(T + 1_000), false, false),
+            Some((T + w, WatchEnd::Window))
+        );
+        assert_eq!(
+            watch_end(T, w, None, false, true),
+            Some((T + w, WatchEnd::Window))
+        );
+        // the probe ends 9 s in: 9 + 2 s is past the 10 s window, so the window ends it
+        assert_eq!(
+            watch_end(T, w, Some(T + 9_000), false, true),
+            Some((T + w, WatchEnd::Window))
+        );
+        assert_eq!(watch_end(T, w, None, true, true), None);
+        assert_eq!(watch_end(T, w, None, true, false), None);
+        // ime-like: a relaunch that ends 15 s in runs to 17 s, past its window
+        assert_eq!(
+            watch_end(T, w, Some(T + 15_000), true, true),
+            Some((T + 17_000, WatchEnd::Probe))
+        );
+        // unbounded probe-ended stage (aux-process): its probe's end, or the window, whichever is later
+        assert_eq!(
+            watch_end(T, w, Some(T + 15_000), true, false),
+            Some((T + 15_000, WatchEnd::Probe))
+        );
+        assert_eq!(
+            watch_end(T, w, Some(T + 3_000), true, false),
+            Some((T + w, WatchEnd::Window))
+        );
+        // a probe done before the marker: the resume path's own WINDOW_MS after the marker
+        assert_eq!(
+            watch_end(T, w, Some(T - 500), false, true),
+            Some((T + WINDOW_MS, WatchEnd::Probe))
         );
     }
 }
