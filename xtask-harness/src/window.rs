@@ -12,6 +12,7 @@
 //! Stage `gles2` (GS2.5): the GLES2 fixture with its `.so` a guest library through the native bridge; the app's readback and the harness's picture at its probes are the expectation ([`gles2::checks`]).
 //! Stage `suspended` (window lifecycle S0): the probe sends the maximized control and the suspended state through the proxy; the platform layer must log each as the toplevel's state ([`suspended::checks`]).
 //! Stage `portrait` (window bounds, slice 3): the portrait fixture in UI mode; its readback and every layout are [`portrait_expected`], AOSP's size for a portrait app on the gate's landscape output.
+//! Stage `tiled`: UI mode with the proxy's tile ([`crate::wayland_proxy::Tile`]): every compositor configure of the window, the first included, carries [`TILE`], under the requested size, as a tiling compositor's layout; the Task's bounds, every layout, screenWidthDp and the picture must be the tile's content ([`tiled_checks`]).
 //! Stage `app-id`: UI mode; the last `xdg_toplevel.set_app_id` the window sends before its first commit (the initial one, no buffer) is `atl.<package>` ([`app_id_check`]), read by the proxy ([`crate::wayland_proxy::Event::AppId`], [`crate::wayland_proxy::Event::FirstCommit`]).
 //! Stage `title`: UI mode; the window's `xdg_toplevel.set_title`s ([`crate::wayland_proxy::Event::Title`]) hold the fixture's label (recents' fallback), then end at the TaskDescription label the fixture sets after its first draw ([`title_check`]).
 
@@ -251,6 +252,8 @@ enum Stage {
     Suspended,
     /// UI mode with the portrait fixture (xtask-harness/testdata/window-portrait): the readback and every layout are [`portrait_expected`] on the gate output.
     Portrait,
+    /// UI mode, the window tiled: the proxy gives every compositor configure the size [`TILE`], the first included, as a tiling compositor sizes a window without asking it; the Task's bounds, every layout, the display metrics and the picture are the tile's content ([`tiled_checks`]).
+    Tiled,
     /// UI mode, two processes of one uid (window-aux): a `:aux` process registered before the window's first layout, killed, restarted, then a dialog; the main window's and the dialog's layers stay in the main process's compositor (xtask-harness/src/window/aux_process.rs).
     AuxProcess,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
@@ -290,6 +293,7 @@ impl Stage {
             Stage::Suspended => "suspended",
             Stage::AuxProcess => "aux-process",
             Stage::Portrait => "portrait",
+            Stage::Tiled => "tiled",
             Stage::AppId => "app-id",
             Stage::Title => "title",
             Stage::Capture => "capture",
@@ -309,6 +313,7 @@ impl Stage {
             | Stage::Gles2
             | Stage::Gles1
             | Stage::Portrait
+            | Stage::Tiled
             | Stage::AppId
             | Stage::Title
             | Stage::Splash => GTK_WINDOW_MS,
@@ -348,6 +353,7 @@ fn takes_pictures(stage: Stage) -> bool {
             | Stage::Gtk
             | Stage::Hwui
             | Stage::Portrait
+            | Stage::Tiled
             | Stage::Gles2
             | Stage::Gles1
             | Stage::Widgets
@@ -489,6 +495,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Gtk
         | Stage::Capture
         | Stage::Portrait
+        | Stage::Tiled
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -897,6 +904,91 @@ fn layout_check(app: &str, want: (i32, i32), display: (i32, i32)) -> Result<Stri
         display.0,
         display.1
     ))
+}
+
+/// Stage `tiled`'s tile, xdg_toplevel size in logical px (the gate output is scale 1): what a tiling compositor gives the window in every configure, the first included. Under the opening size (opening_size, 960x600 on the 1280x800 gate display) in both dimensions, as Hyprland gave fossify-math 1080x675 for its 1350x844 (2026-11-22), so content drawn at the opening size is cut.
+const TILE: (i32, i32) = (840, 540);
+/// The client-side decorations are a header bar only (no side borders inside the xdg geometry), far under this height: the content is the tile's width by its height less the header.
+const HEADER_MAX: i32 = 200;
+
+/// Stage `tiled` sub-gates. The content size is derived from the tile: its width exactly, its height less a header in `0..HEADER_MAX`, read off the first layout and then required everywhere. AOSP sizes the window to its bounds before the first draw (relayout), so every layout is that size, not only the last.
+fn tiled_checks(
+    app: &str,
+    services: &str,
+    display: DisplayModel,
+    rewritten: u64,
+    seen: &Mutex<capture::Seen>,
+) -> Vec<Sub> {
+    let tile = if rewritten > 0 {
+        Ok(format!(
+            "{rewritten} compositor configure(s) tiled at {}x{}",
+            TILE.0, TILE.1
+        ))
+    } else {
+        Err("the proxy tiled no configure: the window never got the tile".to_owned())
+    };
+    let content = tiled_content(app);
+    let display_size = (display.width, display.height);
+    let relayout = content
+        .clone()
+        .and_then(|want| layout_check(app, want, display_size));
+    let bounds = content.clone().and_then(|want| {
+        let bounds = task_bounds(services);
+        // the services log a change only: no line means the Task kept its opening size
+        let last = bounds.last().copied().unwrap_or(opening_size_i32(display));
+        if last == want {
+            Ok(format!("the Task's bounds {bounds:?} end at {want:?}"))
+        } else {
+            Err(format!(
+                "the Task's bounds {bounds:?} end at {last:?}, want the tile's content {want:?}"
+            ))
+        }
+    });
+    let picture = content
+        .clone()
+        .and_then(|(w, h)| capture::judged(seen, 0, (w as u32, h as u32), false));
+    let dp = content.and_then(|(w, _)| {
+        // density = dpi / DENSITY_DEFAULT, dp = px / density (exact at the gate's 160 dpi)
+        let want_dp = w * DENSITY_DEFAULT / display.dpi;
+        let dps: Vec<&str> = app
+            .lines()
+            .filter(|l| l.contains(LAYOUT_LINE))
+            .filter_map(|l| word(l, "screenWidthDp"))
+            .collect();
+        if !dps.is_empty() && dps.iter().all(|d| d.parse::<i32>().ok() == Some(want_dp)) {
+            Ok(format!("screenWidthDp {want_dp} at every layout"))
+        } else {
+            Err(format!(
+                "screenWidthDp {dps:?}, want {want_dp} at every layout"
+            ))
+        }
+    });
+    vec![
+        ("tile", tile),
+        ("mapped", gtk_window_check(app)),
+        ("relayout", relayout),
+        ("bounds", bounds),
+        ("content", picture),
+        ("display", dp),
+    ]
+}
+
+/// The tile's content size off the fixture's first layout: width = the tile's, height = the tile's less a header under [`HEADER_MAX`]. A first layout of another width is the window laid out before the tile reached the app.
+fn tiled_content(app: &str) -> Result<(i32, i32), String> {
+    let first = app
+        .lines()
+        .find(|l| l.contains(LAYOUT_LINE))
+        .ok_or("the fixture never laid out")?;
+    let (width, height) = word(first, "size")
+        .and_then(parse_wxh)
+        .ok_or_else(|| format!("no size in {first}"))?;
+    if width != TILE.0 || height > TILE.1 || height <= TILE.1 - HEADER_MAX {
+        return Err(format!(
+            "first layout {width}x{height}, want the tile's content: width {}, height {} less a header under {HEADER_MAX}",
+            TILE.0, TILE.1
+        ));
+    }
+    Ok((width, height))
 }
 
 /// Stage `app-id` sub-gate: the last `xdg_toplevel.set_app_id` sent before the window's first commit (the initial one, no buffer) is `want`. The desktop matches the window's rules on that commit; GTK's default id before it does not count, and an id sent after it is too late.
@@ -2156,6 +2248,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Stage::Gtk
         | Stage::Capture
         | Stage::Portrait
+        | Stage::Tiled
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -2199,6 +2292,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     n.control().only(0)?;
                 }
                 let p = start_proxy(&n.socket)?;
+                if matches!(args.stage, Stage::Tiled) {
+                    // before atld starts: the window's first configure is the tile's
+                    p.tile(TILE.0, TILE.1);
+                }
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
                 let feature = [
                     (args.break_z_order, "atl-composer/break-z-order"),
@@ -2540,6 +2637,8 @@ struct LiveOut {
     throttle: (u64, u64),
     /// The window surface's commit times on CLOCK_MONOTONIC ns (wayland_proxy `Commits`); None: no proxy, or a remote run (its target's clock, not carried in `live.json`).
     commits: Option<Vec<u64>>,
+    /// The compositor configures the proxy tiled (wayland_proxy `Tile`); 0 unless the stage tiles (tiled).
+    tiled: u64,
 }
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
@@ -2580,6 +2679,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     });
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
+    let tile = proxy.as_ref().map(Proxy::tiled);
     let throttle = proxy.as_ref().map(Proxy::throttle);
     let commits = proxy.as_ref().map(Proxy::commits);
     let probe = proxy.map(|p| {
@@ -2589,13 +2689,15 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         let titles_seen = Arc::clone(&titles);
         let relaunch = (run.root.clone(), format!("{package}/{activity}"));
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
-            (Stage::Gtk | Stage::Hwui | Stage::Portrait, _, _) => match &capture_probe {
-                Some(capture_probe) => {
-                    capture_probe.record_after_draw(&log);
-                    drive(p, &log)
+            (Stage::Gtk | Stage::Hwui | Stage::Portrait | Stage::Tiled, _, _) => {
+                match &capture_probe {
+                    Some(capture_probe) => {
+                        capture_probe.record_after_draw(&log);
+                        drive(p, &log)
+                    }
+                    None => Err("no capture probe".to_owned()),
                 }
-                None => Err("no capture probe".to_owned()),
-            },
+            }
             (Stage::Capture, _, _) => match &capture_probe {
                 Some(capture_probe) => {
                     capture::drive(p, &log, &services_log, capture_probe, atld_pid)
@@ -2714,6 +2816,7 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         presented: presented.map(|p| p.counts()),
         throttle: throttle.map_or((0, 0), |t| t.counts()),
         commits: commits.map(|c| c.times_ns()),
+        tiled: tile.map_or(0, |t| t.rewritten()),
     })
 }
 
@@ -2758,6 +2861,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         presented,
         throttle,
         commits,
+        tiled,
     } = out;
     let read = atl_diag::logfiles::read;
     let app_log = run.log(package);
@@ -2899,6 +3003,11 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 ),
                 ("pong", pong_check(&liveness)),
             ]
+        }
+        (Stage::Tiled, Some(_)) => {
+            let mut sub = tiled_checks(&app, &services, display, tiled, &captured);
+            sub.push(("pong", pong_check(&liveness)));
+            sub
         }
         (Stage::AppId, Some(_)) => {
             let seen = app_ids.lock().map(|seen| seen.clone()).unwrap_or_default();
@@ -3439,6 +3548,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         throttle: (0, 0),
         // the target's clock: the commits sub-gate is local only
         commits: None,
+        // the tiled stage is local: a target's own compositor sizes its window
+        tiled: 0,
     };
     judge(
         &Judged {

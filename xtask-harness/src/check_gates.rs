@@ -103,6 +103,8 @@ pub const ROWS: &[Row] = &[
         true,
     ),
     Row::new(&["window", "--stage", "ui-block"], true, true),
+    // a tiling compositor's first configure differs from the requested size: the app must lay out at the configured one
+    Row::new(&["window", "--stage", "tiled"], true, true),
 ];
 
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows (`<row> <why>`), neither pass nor fail ([`Outcome`]).

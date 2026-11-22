@@ -15,6 +15,7 @@
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
 //! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
+//! [`Proxy::tile`] rewrites the size of every `xdg_toplevel.configure` the compositor sends the window (states kept), the initial one included: a floating gate compositor stands in for a tiling one.
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
 //! Security contexts: a `wp_security_context_manager_v1.create_listener` is relayed ([`relay_context`]), so atld's per-app context sockets reach the compositor through the proxy too, under the context.
@@ -185,6 +186,24 @@ impl Commits {
     }
 }
 
+/// A tiling compositor's layout ([`Proxy::tile`]): every `xdg_toplevel.configure` the compositor sends the window carries this size (logical px) instead of its own, the initial one included, as a tiling compositor sizes a window on its first configure without asking it.
+#[derive(Debug, Default)]
+pub struct Tile {
+    size: Mutex<Option<(i32, i32)>>,
+    rewritten: AtomicU64,
+}
+
+impl Tile {
+    /// The compositor configures rewritten so far: 0 means the tile never reached the client.
+    pub fn rewritten(&self) -> u64 {
+        self.rewritten.load(Ordering::Relaxed)
+    }
+
+    fn size(&self) -> Option<(i32, i32)> {
+        self.size.lock().ok().and_then(|s| *s)
+    }
+}
+
 /// CLOCK_MONOTONIC now, ns.
 fn monotonic_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -347,6 +366,8 @@ struct Ids {
     throttle: Arc<Throttle>,
     /// The proxy-wide [`Commits`] this connection's window commits add to.
     commits: Arc<Commits>,
+    /// The proxy-wide [`Tile`].
+    tile: Arc<Tile>,
 }
 
 impl Ids {
@@ -614,6 +635,7 @@ pub struct Proxy {
     presented: Arc<Presented>,
     throttle: Arc<Throttle>,
     commits: Arc<Commits>,
+    tile: Arc<Tile>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -635,6 +657,7 @@ impl Proxy {
         let presented: Arc<Presented> = Arc::default();
         let throttle: Arc<Throttle> = Arc::default();
         let commits: Arc<Commits> = Arc::default();
+        let tile: Arc<Tile> = Arc::default();
         let hub = Hub {
             upstream: upstream.to_owned(),
             events: tx,
@@ -646,6 +669,7 @@ impl Proxy {
                 presented: Arc::clone(&presented),
                 throttle: Arc::clone(&throttle),
                 commits: Arc::clone(&commits),
+                tile: Arc::clone(&tile),
             },
         };
         thread::spawn(move || {
@@ -664,7 +688,20 @@ impl Proxy {
             presented,
             throttle,
             commits,
+            tile,
         })
+    }
+
+    /// Tiles the window at `width` x `height` logical px ([`Tile`]): call before the client connects, so its first configure is the tile's.
+    pub fn tile(&self, width: i32, height: i32) {
+        if let Ok(mut size) = self.tile.size.lock() {
+            *size = Some((width, height));
+        }
+    }
+
+    /// The tile's handle ([`Tile::rewritten`]), valid after the proxy moves.
+    pub fn tiled(&self) -> Arc<Tile> {
+        Arc::clone(&self.tile)
     }
 
     /// The window surface's commits so far ([`Commits`]); the handle stays valid after the proxy moves.
@@ -786,6 +823,7 @@ struct Counters {
     presented: Arc<Presented>,
     throttle: Arc<Throttle>,
     commits: Arc<Commits>,
+    tile: Arc<Tile>,
 }
 
 /// What every connection of one proxy shares. A security context's relayed connections ([`relay_context`]) share it too, with the proxy's context listener as their upstream.
@@ -810,6 +848,7 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
         presented: Arc::clone(&hub.counters.presented),
         throttle: Arc::clone(&hub.counters.throttle),
         commits: Arc::clone(&hub.counters.commits),
+        tile: Arc::clone(&hub.counters.tile),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
@@ -1002,8 +1041,13 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let (wm_base, seats, touch, feedbacks, callbacks) = {
+            let (wm_base, seats, touch, feedbacks, callbacks, tiled) = {
                 let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
+                // the window's toplevel exists before the compositor configures it (the client's get_toplevel came first)
+                let tiled = ids
+                    .toplevel
+                    .zip(ids.tile.size())
+                    .map(|(t, size)| (t, size, Arc::clone(&ids.tile)));
                 let of = |interface: &str| -> Vec<u32> {
                     ids.interfaces
                         .iter()
@@ -1016,6 +1060,7 @@ fn server_to_client(
                     ids.touch,
                     of(WP_PRESENTATION_FEEDBACK),
                     ids.frame_callbacks.clone(),
+                    tiled,
                 )
             };
             // feedback objects the compositor destroyed (presented / discarded): their ids are free for reuse
@@ -1069,6 +1114,19 @@ fn server_to_client(
                         opcode,
                         &(caps | SEAT_CAP_TOUCH).to_ne_bytes(),
                     ));
+                    return;
+                }
+                // configure(width, height, states): the tile's size replaces the first two words, the states stay the compositor's
+                if let Some((toplevel, (width, height), tile)) = &tiled
+                    && object == *toplevel
+                    && opcode == XDG_TOPLEVEL_CONFIGURE
+                    && body.len() >= 8
+                {
+                    let mut tiled_body = body.to_vec();
+                    tiled_body[0..4].copy_from_slice(&width.to_ne_bytes());
+                    tiled_body[4..8].copy_from_slice(&height.to_ne_bytes());
+                    tile.rewritten.fetch_add(1, Ordering::Relaxed);
+                    out.extend(self::event(object, opcode, &tiled_body));
                     return;
                 }
                 out.extend(self::event(object, opcode, body));
