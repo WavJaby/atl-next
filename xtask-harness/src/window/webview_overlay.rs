@@ -71,8 +71,6 @@ const RESIZES: [(i32, i32, u32); 2] = [(720, 400, 4242), (720, 800, 4243)];
 const RESIZE: (i32, i32, u32) = RESIZES[1];
 /// Wheel notches down: any positive count scrolls a page taller than the window; 3 = one typical wheel flick.
 const WHEEL_NOTCHES: i32 = 3;
-/// After the resize's ack: Android's relayout (one traversal) and the platform's placement (one frame); generous.
-const RESIZE_SETTLE: Duration = Duration::from_secs(2);
 
 /// The last `wvo layout window=<w>x<h>` size the fixture logged.
 fn window_size(app: &str) -> Option<(u32, u32)> {
@@ -326,7 +324,7 @@ fn resize_check(app: &str) -> Result<String, String> {
     // CSS px = physical / density, unknown here: compare aspect; integer CSS sizes round, so allow one CSS px on either axis (|iw*h - ih*w| <= max(w, h))
     let (iw, ih) = vp;
     let (w, h) = (i64::from(w), i64::from(h));
-    if (iw * h - ih * w).abs() > w.max(h) {
+    if !viewport_fits(vp, (w, h)) {
         return Err(format!(
             "page viewport {iw}x{ih} CSS px does not match the view {w}x{h}"
         ));
@@ -334,6 +332,32 @@ fn resize_check(app: &str) -> Result<String, String> {
     Ok(format!(
         "placement and page viewport follow the window: dst 0,0,{w},{h}, viewport {iw}x{ih} CSS px"
     ))
+}
+
+/// The page's viewport `(iw, ih)` (CSS px) has the view's `(w, h)` (physical px) aspect. CSS px = physical / density, unknown here: compare aspect; integer CSS sizes round, so allow one CSS px
+/// on either axis (|iw*h - ih*w| <= max(w, h)).
+fn viewport_fits((iw, ih): (i64, i64), (w, h): (i64, i64)) -> bool {
+    (iw * h - ih * w).abs() <= w.max(h)
+}
+
+/// The resize `layouts_before` preceded is answered: the fixture logged a new layout, and after that layout the page's viewport title has its aspect and the WebView's last placement is its
+/// rectangle. Input before all three can land outside the page: a click at y=380 sent while the page was still 361 px high (its 761 px viewport title came 1.1 s later) reached Android
+/// (focus moved) but not the page (no tap1), with renders at 1-2.7 s (GPU starved + load 11, 2026-11-22).
+fn resize_answered(app: &str, layouts_before: usize) -> bool {
+    if app.matches(LAYOUT).count() <= layouts_before {
+        return false;
+    }
+    let (Some((w, h)), Some(at)) = (window_size(app), app.rfind(LAYOUT)) else {
+        return false;
+    };
+    let (w, h) = (i64::from(w), i64::from(h));
+    let viewport = app[at..]
+        .lines()
+        .filter_map(|l| l.split(&format!("{TITLE}viewport")).nth(1))
+        .filter_map(|s| s.trim().split_once('x'))
+        .filter_map(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)))
+        .any(|vp| viewport_fits(vp, (w, h)));
+    viewport && last_placed(app) == Some([0, 0, w, h])
 }
 
 fn esc(proxy: &Proxy) -> Result<(), String> {
@@ -353,14 +377,18 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
     // the hidden preload loads too before any input: shown by mistake, it is the topmost widget and takes the click (its sub-gate reports a missing load)
     let _ = wait_for_line(app_log, PRELOAD_LOADED, ACK_WAIT);
     std::thread::sleep(PAINT_SETTLE);
+    // each resize waits for its answers, not a fixed time ([`resize_answered`]); one never answered is the resize sub-gate's failure, and the probe goes on after ACK_WAIT
     for (w, h, serial) in RESIZES {
+        let layouts = std::fs::read_to_string(app_log)
+            .map(|t| t.matches(LAYOUT).count())
+            .unwrap_or(0);
         proxy
             .inject_configure(w, h, serial, &[])
             .map_err(|e| e.to_string())?;
         let _ = await_event(&proxy.events, ACK_WAIT, |e| {
             *e == ProxyEvent::Acked { serial }
         });
-        std::thread::sleep(RESIZE_SETTLE);
+        let _ = widgets::wait_until(app_log, ACK_WAIT, |t| resize_answered(t, layouts));
     }
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = super::content_origin(&text)?;
@@ -491,6 +519,20 @@ mod tests {
             1,
         );
         assert!(sub(&lost, true, true, "focus-return").is_err());
+    }
+
+    /// The red run's order (2026-11-22): the 761 layout, the late 361 viewport title, the 761 placement -- not answered (the click then went outside the page); the 761 viewport title answers it.
+    /// No layout past the count before the configure: not answered, whatever else is logged.
+    #[test]
+    fn a_resize_is_answered_by_layout_viewport_and_placement() {
+        let before = "x AtlWindow: wvo layout window=720x361 web=0,0,720,361\n\
+                      y atl-platform-ui: sideband [1, 1] placed dst=0,0,720,361 clip=0,0,720,361 alpha=1\n\
+                      x AtlWindow: wvo layout window=720x761 web=0,0,720,761\nx AtlWindow: wvo title viewport720x361\n\
+                      y atl-platform-ui: sideband [1, 1] placed dst=0,0,720,761 clip=0,0,720,761 alpha=1\n";
+        assert!(!resize_answered(before, 1));
+        let after = format!("{before}x AtlWindow: wvo title viewport720x761\n");
+        assert!(resize_answered(&after, 1));
+        assert!(!resize_answered(&after, 2));
     }
 
     /// Where the Escs go, from AOSP's routing (key -> focused View; the page leaves Esc unhandled): touch tap -> all 3 at the GL view either map; mouse click -> AOSP map 3 at the page;

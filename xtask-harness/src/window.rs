@@ -45,6 +45,7 @@ mod ime;
 mod move_output;
 mod slow_display;
 mod splash;
+mod starvation;
 mod surface_view;
 mod suspended;
 mod ui_block;
@@ -379,11 +380,10 @@ fn takes_pictures(stage: Stage) -> bool {
 /// One sub-gate's result under its name (printed `window: <name>: pass|FAIL`); the name travels with the result, so no list of names can fall out of step with the checks.
 pub(crate) type Sub = (&'static str, Result<String, String>);
 
-/// A stage's sub-gates, and the ones a GPU-starved host left unjudged (slow_display.rs `starved`).
+/// A stage's sub-gates: functional ones, always judged, and timed ones, whose bound assumes a render time (starvation.rs decides whether this run's host left them unjudged).
 pub struct Checks {
     pub subs: Vec<Sub>,
-    /// Some on a starved host: why, and the sub-gates as measured (shown, judging nothing).
-    pub undecided: Option<(String, Vec<Sub>)>,
+    pub timed: Vec<starvation::Timed>,
 }
 
 /// The fixture's dir.
@@ -3061,9 +3061,8 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
     if args.verbose {
         println!("---- app log\n{app}");
     }
-    // the sub-gates, once the marker is logged (they read the frames or the touches after it)
-    // a stage that proved host starvation by a host quantity its defect cannot produce: why, and the sub-gates it left unjudged (shown, counted neither pass nor fail)
-    let mut undecided: Option<(String, Vec<Sub>)> = None;
+    // the sub-gates, once the marker is logged (they read the frames or the touches after it); timed ones go through the one starvation rule below
+    let mut timed: Vec<starvation::Timed> = Vec::new();
     let sub: Vec<Sub> = match (args.stage, v.marker_ms) {
         (Stage::Frames, Some(_)) => {
             vec![
@@ -3107,12 +3106,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         ),
         (Stage::UiBlock, Some(_)) => {
             let c = ui_block::checks(&app, display.refresh_hz, commits.as_deref());
-            undecided = c.undecided;
+            timed = c.timed;
             c.subs
         }
         (Stage::SlowDisplay, Some(_)) => {
             let c = slow_display::checks(&app, display.refresh_hz, throttle);
-            undecided = c.undecided;
+            timed = c.timed;
             c.subs
         }
         (Stage::MouseTouch, Some(_)) => widgets::mouse_touch_checks(&app, &liveness),
@@ -3294,6 +3293,21 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
     if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
         sub.push(("vsync-tier", vsync_tier_check(&app, presented)));
     }
+    // the one host-GPU-starvation rule, every stage: the window's own render after the marker, printed whether or not a timed sub-gate exists, so land logs show the host's state
+    let mut undecided = Vec::new();
+    if let Some(marked) = v.marker_ms {
+        match starvation::host_render_us(&app, marked) {
+            Some((median, max, n)) => println!(
+                "window: host gpu: window render median {} ms, max {} ms over {n} paint lines after the marker",
+                median / 1000,
+                max / 1000
+            ),
+            None => println!("window: host gpu: no paint line after the marker"),
+        }
+        let (judged, unjudged) = starvation::apply(&app, args.stage.name(), marked, timed);
+        sub.extend(judged);
+        undecided = unjudged;
+    }
     let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
     for (name, result) in &sub {
         match result {
@@ -3301,14 +3315,14 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             Err(s) => println!("window: {name}: FAIL {s}"),
         }
     }
-    if let Some((why, unjudged)) = &undecided {
-        for (name, result) in unjudged {
-            let (Ok(s) | Err(s)) = result;
-            println!("window: {name}: undecided {why}: {s}");
-        }
+    for (name, why, result) in &undecided {
+        let (Ok(s) | Err(s)) = result;
+        println!("window: {name}: undecided {why}: {s}");
     }
     // a real failure elsewhere still fails the run; undecided replaces only a pass
-    if let (Some(_), None, None, Some((why, _))) = (v.marker_ms, &v.fault, &sub_fault, &undecided) {
+    if let (Some(_), None, None, Some((_, why, _))) =
+        (v.marker_ms, &v.fault, &sub_fault, undecided.first())
+    {
         // check_gates.rs `undecided_line` reads this line; the exit code alone carries the outcome
         println!(
             "window: {}{}: {why}",

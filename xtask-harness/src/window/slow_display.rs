@@ -4,9 +4,11 @@
 //! rate while the app's UI thread is idle (the fixture's steady phase). SurfaceFlinger does not latch while the last present is pending (SurfaceFlinger.cpp commit `wouldBackpressureHwc`): the producer
 //! must be held to the display's rate and the composer must replace no frame unseen. A composer that latches every tick (`--break-no-backpressure`) lets the producer post at the output rate.
 //! Judged against the display, not the app's UI thread: holds whichever thread the window runs on.
-//! Host too slow: when the window's own measured render over the steady phase exceeds the composer's hold bound, held / replaced judge nothing and the stage is `undecided` (neither pass nor fail);
-//! never decided from the composer's counters, which broken backpressure moves the same way ([`gpu_starved`]). [`starved`] is the window gates' one starvation rule (ui-block's commits use it too).
+//! Host too slow: held / replaced assume the window renders within the composer's hold bound over the steady phase; they are declared timed ([`checks`]) and the window gates' one starvation
+//! rule (starvation.rs) leaves them unjudged, pass or fail, when the window's own measured render exceeds it -- never decided from the composer's counters, which broken backpressure moves the
+//! same way (R6-8).
 
+use super::starvation::{Fakes, Timed, render_max_us, span};
 use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, number, period_ms, result_line};
 use super::{ACK_WAIT, Checks, Liveness, Sub, await_event, line_stamp, wait_for_line};
 use crate::composer::word;
@@ -117,64 +119,9 @@ fn phase_delta(app: &str, k: &str) -> Result<u64, String> {
     Ok(number(last, k)?.saturating_sub(number(first, k)?))
 }
 
-/// The platform's per-second paint line (atl-platform-ui-linux paint_stats.rs): `render_us=mean/max`, the GSK render + swap, measured by the window itself.
-const PAINT: &str = "atl-platform-ui: paint ";
-
-/// The stamps (ms) of the first lines holding `from` and `to`; None without both.
-pub(super) fn span(app: &str, from: &str, to: &str) -> Option<(u64, u64)> {
-    let stamp = |marker: &str| {
-        app.lines()
-            .find(|l| l.contains(marker))
-            .and_then(line_stamp)
-    };
-    Some((stamp(from)?, stamp(to)?))
-}
-
-/// The longest window render (us) among the paint lines covering any part of `[start, end]` (log stamps, ms). A line covers `[stamp - ms, stamp]`: its counts are deltas since the previous line,
-/// which on a starved host comes seconds later (3 s lines measured at load 10), so a span shorter than that holds no stamped line at all and only the covering line measures it. None without one.
-pub(super) fn render_max_us(app: &str, (start, end): (u64, u64)) -> Option<u64> {
-    app.lines()
-        .filter(|l| l.contains(PAINT))
-        .filter(|l| {
-            let (Some(at), Some(ms)) = (
-                line_stamp(l),
-                word(l, "ms").and_then(|v| v.parse::<u64>().ok()),
-            ) else {
-                return false;
-            };
-            at >= start && at.saturating_sub(ms) <= end
-        })
-        .filter_map(|l| word(l, "render_us")?.split_once('/')?.1.parse().ok())
-        .max()
-}
-
-/// The steady phase's longest window render ([`render_max_us`]).
+/// The steady phase's longest window render (starvation.rs `render_max_us`).
 fn steady_render_max_us(app: &str) -> Option<u64> {
     render_max_us(app, span(app, STEADY_START, STEADY_END)?)
-}
-
-/// The window gates' one starvation rule: a window render (`render_max_us`, the GSK render + swap the window measures itself) longer than the interval `limit` (`limit_us`) a sub-gate's bound
-/// assumes leaves that bound judging the host, not the code. Some(text) naming both times: the `undecided` reason (window.rs `judge`).
-pub(super) fn starved(render_max_us: u64, limit_us: f64, limit: &str) -> Option<String> {
-    (render_max_us as f64 > limit_us).then(|| {
-        format!(
-            "host GPU starved (window render max {} ms > {limit} ms)",
-            render_max_us / 1000
-        )
-    })
-}
-
-/// Host GPU starvation: a window render in the steady phase longer than the composer's hold bound (a loaded software-GL host: 250-500 ms paints measured at load 10-13). Every hold then expires
-/// before the window takes, so the bound, not the throttled display, sets the rate and held / replaced judge nothing whatever the code does. Keyed on the window's own measured render time, never
-/// on the composer's counters: an early-expiring hold (broken backpressure) grows `latches_unpainted` too but cannot lengthen the window's render, so it stays judged (R6-8).
-/// Judged against the composer's configured bound whether backpressure is on or off: the red control (`--break-no-backpressure`) on a starved host is undecided too, never a pass.
-pub fn gpu_starved(app: &str) -> Option<String> {
-    let bound = hold_bound_ms(app).ok().filter(|b| *b > 0)?;
-    starved(
-        steady_render_max_us(app)?,
-        (bound * 1000) as f64,
-        &format!("hold bound {bound}"),
-    )
 }
 
 /// Sub-gate paint: the steady phase's longest window render, shown beside the verdict (judges nothing on its own).
@@ -227,8 +174,9 @@ fn bound_check(app: &str, refresh_hz: f32) -> Result<String, String> {
     }
 }
 
-/// The sub-gates; `refresh_hz`: the run's display; `throttle`: the proxy's counts at the end of the drive. On a GPU-starved host held and replaced judge nothing, pass or fail: the bound, not the
-/// display, set the rate, so the stage is `undecided` (window.rs `judge`: its own exit code, neither pass nor fail for `check`); bound, throttled and paint are judged as always.
+/// The sub-gates; `refresh_hz`: the run's display; `throttle`: the proxy's counts at the end of the drive. held and replaced are timed (starvation.rs): they assume each take comes within the
+/// composer's configured hold bound over the steady phase -- configured whether backpressure is on or off, so the red control (`--break-no-backpressure`) on a starved host is undecided too, never
+/// a pass. Starvation fakes either outcome (Fakes::Both): expired holds post more, a GPU-starved producer posts less. Without a bound line they are judged. bound, throttled, paint: functional.
 pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Checks {
     let rate: Vec<Sub> = vec![
         ("held", held_check(app, refresh_hz)),
@@ -237,16 +185,25 @@ pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Checks {
     let mut subs = vec![
         ("bound", bound_check(app, refresh_hz)),
         ("throttled", throttled_check(throttle)),
+        ("paint", paint_check(app)),
     ];
-    let undecided = match gpu_starved(app) {
-        Some(why) => Some((why, rate)),
-        None => {
+    let timed = match hold_bound_ms(app) {
+        Ok(bound) if bound > 0 => rate
+            .into_iter()
+            .map(|sub| Timed {
+                sub,
+                limit_us: (bound * 1000) as f64,
+                limit: format!("hold bound {bound} ms"),
+                span: span(app, STEADY_START, STEADY_END),
+                fakes: Fakes::Both,
+            })
+            .collect(),
+        _ => {
             subs.extend(rate);
-            None
+            Vec::new()
         }
     };
-    subs.push(("paint", paint_check(app)));
-    Checks { subs, undecided }
+    Checks { subs, timed }
 }
 
 /// The probe: once the window acks its configure, the proxy slows its frame callbacks; then the fixture's result line. The throttle's counts reach the checks through the live half (window.rs `live`).
@@ -264,6 +221,7 @@ pub fn drive(proxy: Proxy, app_log: &Path, refresh_hz: f32) -> Result<Liveness, 
 
 #[cfg(test)]
 mod tests {
+    use super::super::starvation::apply;
     use super::*;
 
     fn result(ms: u64, posts: u64) -> String {
@@ -288,9 +246,10 @@ mod tests {
         assert!(throttled_check((0, 60)).is_err());
     }
 
-    /// Starvation keys on the window's measured render, not on the composer's counters: unpainted latches with fast paints (an early-expiring hold, R6-8: broken backpressure cannot lengthen the
-    /// window's render) stay judged and red; a render over the 100 ms bound inside the phase leaves held / replaced unjudged (undecided, pass or fail), backpressure off (the red control) included;
-    /// 100 ms exactly or a long render outside the phase decide as usual. The phase is 1.000..5.000 s; the outside line at 6.500 s covers 5.500..6.500 s ([`render_max_us`]).
+    /// held / replaced are timed against the configured hold bound over the steady phase, Fakes::Both; starvation.rs `apply` decides. Unpainted latches with fast paints (an early-expiring hold,
+    /// R6-8: broken backpressure cannot lengthen the window's render) stay judged and red; renders over the 100 ms bound in the phase and through the run leave both unjudged, pass or fail,
+    /// backpressure off (the red control) included; 100 ms exactly, slow renders only outside the phase, or one slow phase render on an otherwise fast run decide as usual. The phase is
+    /// 1.000..5.000 s; the outside line at 6.500 s covers 5.500..6.500 s.
     #[test]
     fn starvation_is_the_window_render_not_the_counters() {
         let counters = |t: &str, unpainted: u64, dropped: u64| {
@@ -314,60 +273,43 @@ mod tests {
         };
         let on = "0.5 INFO atl-composer: ui: backpressure=true bound_ms=100\n";
         let off = "0.5 INFO atl-composer: ui: backpressure=false bound_ms=100\n";
-        let judged = |l: &str| {
+        let judge = |l: &str| {
             let c = checks(l, 60.0, (1, 1));
-            assert!(c.undecided.is_none(), "{l}");
-            c.subs
+            apply(l, "slow-display", 0, c.timed)
+        };
+        let replaced = |l: &str| {
+            let (judged, undecided) = judge(l);
+            assert!(undecided.is_empty(), "{l}");
+            judged
                 .into_iter()
                 .find(|(n, _)| *n == "replaced")
                 .expect("judged")
                 .1
         };
         let unjudged = |l: &str| {
-            let c = checks(l, 60.0, (1, 1));
-            assert!(
-                c.subs
-                    .iter()
-                    .all(|(n, _)| !["held", "replaced"].contains(n))
-            );
-            c.undecided.expect("starved").0
+            let (judged, undecided) = judge(l);
+            assert!(judged.is_empty(), "{l}");
+            let names: Vec<&str> = undecided.iter().map(|u| u.0).collect();
+            assert_eq!(names, ["held", "replaced"]);
+            undecided[0].1.clone()
         };
         // latches_unpainted +40 with 20 ms paints: judged, red
-        assert!(judged(&log(on, 20_000, 0, 135)).is_err());
+        assert!(replaced(&log(on, 20_000, 20_000, 135)).is_err());
         assert_eq!(
-            unjudged(&log(on, 100_001, 0, 135)),
-            "host GPU starved (window render max 100 ms > hold bound 100 ms)"
+            unjudged(&log(on, 100_001, 100_001, 135)),
+            "host GPU starved (window render median 100 ms, max 100 ms in the phase > hold bound 100 ms)"
         );
         // a pass on a starved host judges nothing either
-        unjudged(&log(on, 300_000, 0, 0));
-        assert!(judged(&log(on, 100_000, 0, 135)).is_err());
-        assert!(judged(&log(on, 0, 300_000, 135)).is_err());
+        unjudged(&log(on, 300_000, 300_000, 0));
+        assert!(replaced(&log(on, 100_000, 100_000, 135)).is_err());
+        assert!(replaced(&log(on, 0, 300_000, 135)).is_err());
+        // one slow render in the phase, the run's median fast (lower median of 300 / 0 ms = 0): a host hiccup, judged
+        assert!(replaced(&log(on, 300_000, 0, 135)).is_err());
         // the red control: red when judged, undecided (never a pass) when starved
-        assert!(judged(&log(off, 20_000, 0, 135)).is_err());
-        unjudged(&log(off, 300_000, 0, 135));
-        let c = checks(&log(on, 300_000, 0, 0), 60.0, (1, 1));
-        assert_eq!((c.subs.len(), c.undecided.map(|u| u.1.len())), (3, Some(2)));
-    }
-
-    /// A paint line covers `[stamp - ms, stamp]`: over the span 10.000..12.000 s, a line at 13.000 s with ms=3000 (10..13 s) and one at 10.500 s with ms=1000 count, their max 900 us; lines at 9.000 s
-    /// (ms=1000: 8..9 s) and 15.000 s (ms=2000: 13..15 s) do not. No covering line: None.
-    #[test]
-    fn a_paint_line_counts_where_its_span_covers() {
-        let paint = |t: &str, ms: u64, max_us: u64| {
-            format!("{t}  INFO atl-platform-ui: paint ms={ms} render_us=1/{max_us}\n")
-        };
-        let app = [
-            paint("9.000", 1000, 5000),
-            paint("10.500", 1000, 700),
-            paint("13.000", 3000, 900),
-            paint("15.000", 2000, 8000),
-        ]
-        .concat();
-        assert_eq!(render_max_us(&app, (10_000, 12_000)), Some(900));
-        assert_eq!(
-            render_max_us(&paint("9.000", 1000, 5000), (10_000, 12_000)),
-            None
-        );
+        assert!(replaced(&log(off, 20_000, 20_000, 135)).is_err());
+        unjudged(&log(off, 300_000, 300_000, 135));
+        let c = checks(&log(on, 300_000, 300_000, 0), 60.0, (1, 1));
+        assert_eq!((c.subs.len(), c.timed.len()), (3, 2));
     }
 
     /// 60 Hz K 4 = 66.7 ms < 100 passes; 30 Hz K 4 = 133.3 ms does not; backpressure off has no bound.
