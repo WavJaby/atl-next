@@ -204,6 +204,28 @@ impl Tile {
     }
 }
 
+/// A compositor's sandbox policy for globals it allows outside ([`Proxy::withhold_in_contexts`]): the `wl_registry.global` events of these interfaces never reach a security context's clients, as
+/// Hyprland's allow-list (ProtocolManager.cpp `isGlobalPrivileged`) withholds zxdg_output_manager_v1 there while labwc's offers it. Connections outside a context see every global.
+#[derive(Debug, Default)]
+pub struct Withheld {
+    interfaces: Mutex<Vec<String>>,
+    dropped: AtomicU64,
+}
+
+impl Withheld {
+    /// The global announcements dropped so far: 0 means no context client ever looked for one (the policy was not exercised).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    fn interfaces(&self) -> Vec<String> {
+        self.interfaces
+            .lock()
+            .map(|i| i.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// CLOCK_MONOTONIC now, ns.
 fn monotonic_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -214,6 +236,8 @@ const WL_DISPLAY_ID: u32 = 1;
 const WL_DISPLAY_GET_REGISTRY: u16 = 1;
 /// `wl_registry.bind(name, interface, version, new_id)`, request 0.
 const WL_REGISTRY_BIND: u16 = 0;
+/// `wl_registry.global(name: uint, interface: string, version: uint)`, event 0 (wayland.xml).
+const WL_REGISTRY_GLOBAL: u16 = 0;
 /// `xdg_wm_base`: request `pong(serial)` is opcode 3, event `ping(serial)` is opcode 0.
 const XDG_WM_BASE_PONG: u16 = 3;
 const XDG_WM_BASE_PING: u16 = 0;
@@ -636,6 +660,7 @@ pub struct Proxy {
     throttle: Arc<Throttle>,
     commits: Arc<Commits>,
     tile: Arc<Tile>,
+    withheld: Arc<Withheld>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -658,8 +683,10 @@ impl Proxy {
         let throttle: Arc<Throttle> = Arc::default();
         let commits: Arc<Commits> = Arc::default();
         let tile: Arc<Tile> = Arc::default();
+        let withheld: Arc<Withheld> = Arc::default();
         let hub = Hub {
             upstream: upstream.to_owned(),
+            in_context: false,
             events: tx,
             injections: Arc::clone(&injections),
             wakes: Arc::clone(&wakes),
@@ -670,6 +697,7 @@ impl Proxy {
                 throttle: Arc::clone(&throttle),
                 commits: Arc::clone(&commits),
                 tile: Arc::clone(&tile),
+                withheld: Arc::clone(&withheld),
             },
         };
         thread::spawn(move || {
@@ -689,7 +717,20 @@ impl Proxy {
             throttle,
             commits,
             tile,
+            withheld,
         })
+    }
+
+    /// From the next connection on, security contexts' clients are not told of `interfaces` ([`Withheld`]): call before atld starts.
+    pub fn withhold_in_contexts(&self, interfaces: &[&str]) {
+        if let Ok(mut list) = self.withheld.interfaces.lock() {
+            *list = interfaces.iter().map(|i| (*i).to_owned()).collect();
+        }
+    }
+
+    /// The policy's handle ([`Withheld::dropped`]), valid after the proxy moves.
+    pub fn withheld(&self) -> Arc<Withheld> {
+        Arc::clone(&self.withheld)
     }
 
     /// Tiles the window at `width` x `height` logical px ([`Tile`]): call before the client connects, so its first configure is the tile's.
@@ -824,12 +865,15 @@ struct Counters {
     throttle: Arc<Throttle>,
     commits: Arc<Commits>,
     tile: Arc<Tile>,
+    withheld: Arc<Withheld>,
 }
 
 /// What every connection of one proxy shares. A security context's relayed connections ([`relay_context`]) share it too, with the proxy's context listener as their upstream.
 #[derive(Clone)]
 struct Hub {
     upstream: PathBuf,
+    /// The connections are a security context's ([`relay_context`]): [`Withheld`] applies.
+    in_context: bool,
     events: Sender<(Instant, Event)>,
     injections: Shared<Vec<Injection>>,
     wakes: Shared<Vec<OwnedFd>>,
@@ -869,6 +913,13 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
         Arc::clone(&hub.injections),
         Arc::clone(&hub.window),
     );
+    // the sandbox policy as it stands when the connection opens: a context's connections only
+    let hidden = if hub.in_context {
+        hub.counters.withheld.interfaces()
+    } else {
+        Vec::new()
+    };
+    let withheld = (hidden, Arc::clone(&hub.counters.withheld));
     thread::spawn(move || {
         let _ = server_to_client(
             &server,
@@ -878,6 +929,7 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
             &events_s,
             &injections,
             &window,
+            &withheld,
         );
         let _ = client.shutdown(std::net::Shutdown::Both);
     });
@@ -967,6 +1019,7 @@ fn relay_context(hub: &Hub, fds: &mut Vec<OwnedFd>) -> Result<()> {
     fds.push(OwnedFd::from(close_r));
     let relay = Hub {
         upstream: path,
+        in_context: true,
         ..hub.clone()
     };
     let theirs = UnixListener::from(listen);
@@ -1007,6 +1060,7 @@ fn server_to_client(
     events: &Sender<(Instant, Event)>,
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
+    (hidden, withheld): &(Vec<String>, Arc<Withheld>),
 ) -> Result<()> {
     let (presented, throttle) = {
         let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
@@ -1041,7 +1095,7 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let (wm_base, seats, touch, feedbacks, callbacks, tiled) = {
+            let (registry, wm_base, seats, touch, feedbacks, callbacks, tiled) = {
                 let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
                 // the window's toplevel exists before the compositor configures it (the client's get_toplevel came first)
                 let tiled = ids
@@ -1055,6 +1109,7 @@ fn server_to_client(
                         .collect()
                 };
                 (
+                    ids.registry,
                     ids.id_of(WM_BASE),
                     of(WL_SEAT),
                     ids.touch,
@@ -1072,6 +1127,15 @@ fn server_to_client(
             // the seat claims touch, so the client asks for the proxy's wl_touch; the sync that took that id answers on it and deletes it: both are the proxy's to drop
             let mut out = Vec::with_capacity(pending.len());
             let complete = scan(&pending, |object, opcode, body| {
+                // global(name, interface, version): the interface string follows the name
+                if !hidden.is_empty()
+                    && registry == Some(object)
+                    && opcode == WL_REGISTRY_GLOBAL
+                    && wl_string(body, 4).is_some_and(|i| hidden.contains(&i))
+                {
+                    withheld.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 if feedbacks.contains(&object) && note_feedback(&presented, opcode, body) {
                     ended.push(object);
                 }

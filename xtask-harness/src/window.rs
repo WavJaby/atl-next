@@ -2466,6 +2466,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     n.control().only(0)?;
                 }
                 let p = start_proxy(&n.socket)?;
+                if matches!(args.stage, Stage::Move) {
+                    // before atld starts: its app processes' contexts see Hyprland's policy (move_output.rs)
+                    p.withhold_in_contexts(&move_output::WITHHELD);
+                }
                 if matches!(args.stage, Stage::Tiled) {
                     // before atld starts: the window's first configure is the tile's
                     p.tile(TILE.0, TILE.1);

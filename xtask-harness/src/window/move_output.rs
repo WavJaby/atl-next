@@ -24,6 +24,10 @@ pub const SCALED_OUTPUT: Output = Output {
     scale: 1.6,
     ..GATE_OUTPUT
 };
+/// What the proxy withholds from the app's security context (wayland_proxy.rs `Withheld`): Hyprland's sandbox policy, where GDK then knows each output's integer wl_output scale only
+/// (2 on [`SCALED_OUTPUT`]) and its logical size is the mode / 2. Android's density must still be the fractional one (measured on a scale-1.6 Hyprland laptop 2026-11-22: 320 reported against
+/// atld's 256 at start, and WeChat exited on that density change).
+pub const WITHHELD: [&str; 1] = ["zxdg_output_manager_v1"];
 /// The outputs, left to right; the window opens on the first (the gates' display).
 pub const OUTPUTS: [Output; 2] = [GATE_OUTPUT, SCALED_OUTPUT];
 /// wl_output transform 180 (wayland.xml), given to the second output after the move: same size, so no GDK signal and no relaunch.
@@ -61,6 +65,12 @@ pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liv
     outputs
         .set_transform(1, ROTATED_TRANSFORM)
         .map_err(|e| format!("{e:#}"))?;
+    // the policy was exercised: the app's context asked for globals and missed the withheld ones
+    if proxy.withheld().dropped() == 0 {
+        return Err(format!(
+            "the app's security context was never denied {WITHHELD:?}: the sandbox policy was not exercised"
+        ));
+    }
     Ok(Liveness {
         answered: false,
         silent: false,
