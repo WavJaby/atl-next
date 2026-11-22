@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! A package's manifest as the gates' oracle reads it, from the APK with AOSP's own `aapt2 dump xmltree --file AndroidManifest.xml` (owner D3, 2026-11-03: aapt2 is a build and test time tool). The
+//! A package's manifest as the gates' oracle reads it, from the APK with AOSP's own `aapt2 dump xmltree --file AndroidManifest.xml` (maintainer D3, 2026-11-03: aapt2 is a build and test time tool). The
 //! product never sees it: the services answer from the installer's parse (atl-services `packages`); gates use it for what to expect and whom to start. No second binary-XML decoder is written
 //! here: this reads aapt2's text.
 //! aapt2's format (tools/aapt2/Debug.cpp `Debug::DumpXml`): `N:` namespace lines, `E: <element> (line=n)`, `A: [<namespace uri>:]<name>[(0x<resource id>)]=<value>`; an element's attributes are indented two

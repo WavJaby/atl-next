@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! UI mode's window (M3 slice 6): the process's one window, a GTK window on the platform's display thread that shows the compositor's display. The compositor's clock thread publishes each scene into the [`Mailbox`] and
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
-//! thread (owner D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
+//! thread (maintainer D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the display thread only (the platform module's own thread, started when the toolkit attaches): the launcher's startup attaches the toolkit and [`open`]s the window before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local of the display thread and wires the window to the compositor. Both run their work there by `call`, so the caller holds only the Send [`OpenWindow`] token; no other thread touches GTK.
 //! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_reports.rs); the monitor is also this process's compositor display (Composer::set_display).
 

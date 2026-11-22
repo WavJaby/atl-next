@@ -41,7 +41,7 @@ pub struct Args {
     /// Act: rebase the branch onto origin/main when behind (git replay: no checkout is left mid-rebase; a conflict changes nothing, names the files and exits 3), build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up (record the task in `<workspace>/retired-tasks`, remove its worktree, branch and build dir, prune orphan build/driver dirs and old bases). Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
-    /// AOSP projects (`[aosp.projects]` paths) whose shared checkout the branch's `[aosp.sparse]` change can only reach by delete-and-clone: passed to the post-push `fetch --execute --recreate`. The preflight refuses a land that needs one not named here, before anything is pushed (deleting the checkout pulls files from under every reader of `src/`: the owner's call).
+    /// AOSP projects (`[aosp.projects]` paths) whose shared checkout the branch's `[aosp.sparse]` change can only reach by delete-and-clone: passed to the post-push `fetch --execute --recreate`. The preflight refuses a land that needs one not named here, before anything is pushed (deleting the checkout pulls files from under every reader of `src/`: the maintainer's call).
     #[arg(long, value_name = "PROJECT", num_args = 1..)]
     recreate: Vec<String>,
     /// Internal: the cleanup stage's child (`cleanup_execute`); runs only the cleanup. Needs `--execute`.

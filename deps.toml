@@ -202,7 +202,7 @@ debian = "libgtk-4-dev"
 arch = "gtk4"
 pkgconfig = "gtk4"
 min = "4.14.0"
-min_reason = "plan Q10 (re-decided 2026-11-17, owner): GTK baseline 4.14 (sifive and Ubuntu 24.04 ship 4.14.5); newer GTK API only as probed capability tiers, each gated; enforced by gtk_imports.rs against gtk-baseline.toml (check step gtk-imports; a runtime run's staging, per host)"
+min_reason = "plan Q10 (re-decided 2026-11-17, maintainer): GTK baseline 4.14 (sifive and Ubuntu 24.04 ship 4.14.5); newer GTK API only as probed capability tiers, each gated; enforced by gtk_imports.rs against gtk-baseline.toml (check step gtk-imports; a runtime run's staging, per host)"
 scope = ["build", "runtime"]
 used_by = ["crate:atl-platform-ui-linux", "crate:atl-platform-host-linux", "crate:atl-webview-linux"]
 

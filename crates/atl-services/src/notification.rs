@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `notification` service (Context.NOTIFICATION_SERVICE): INotificationManager-lite, toasts only (owner 2026-11-05, D4 option A). Mirrors NotificationManagerService's toast queue
+//! The `notification` service (Context.NOTIFICATION_SERVICE): INotificationManager-lite, toasts only (maintainer 2026-11-05, D4 option A). Mirrors NotificationManagerService's toast queue
 //! (enqueueToast:3969-4135, showNextToastLocked, cancelToastLocked:10367, finishToken:4192): one queue for all apps, the head shown; each shown toast hides after its duration
 //! (LONG_DELAY 3.5 s / SHORT_DELAY 2 s, :461-462), and its window token is removed when the app calls finishToken, else after FINISH_TOKEN_TIMEOUT (11 s, :465).
 //! The app draws the toast: text toasts take the pre-R TN path (activity.rs DISABLED_COMPAT_CHANGES), so ITransientNotification.show(windowToken) makes the app's ToastPresenter add a

@@ -4,7 +4,7 @@
 //! Jobs and their work items are kept per (uid, namespace, jobId), as JobStore keys them; schedule / enqueue / cancel / the pending-job queries follow JobSchedulerService.
 //! Running follows JobServiceContext: the activity service binds the app's JobService as the system (BIND_AUTO_CREATE), onServiceConnected sends IJobService.startJob(JobParameters) carrying this run's
 //! IJobCallback; acknowledgeStartMessage(false), jobFinished, or dequeueWork finding no work left ends the run (unbind). dequeueWork / completeWork move work items as JobStatus does.
-//! Desktop policy (owner behaviour decisions 2/3): a job runs as soon as it is scheduled. No constraint is modelled (charging, battery not low, idle, storage not low, network, minimum latency,
+//! Desktop policy (maintainer behaviour decisions 2/3): a job runs as soon as it is scheduled. No constraint is modelled (charging, battery not low, idle, storage not low, network, minimum latency,
 //! content triggers): each one a started job carries is counted `constraint ignored (runs at once): <name>`. Periodic and rescheduled jobs stay stored after their run and do not run again
 //! (interval and backoff not modelled; counted). A running job that is cancelled gets stopJob and ends at acknowledgeStopMessage; one replaced by a different JobInfo keeps running on the new job's
 //! work (AOSP stops it; counted at its end as cancelled or replaced).

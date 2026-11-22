@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Bounded capture of an app process's stdout + stderr (liblog's stderr sink among them) into its `log/<name>.log`. An app's output is not ours to trust: a warning stack logged in a loop
-//! (Doodle Jump's BillingClient) wrote 9.5 GB in 90 s and filled the disk. Mirrors systemd-journald (journald.conf(5)), the Linux convention (owner decision 3):
+//! (Doodle Jump's BillingClient) wrote 9.5 GB in 90 s and filled the disk. Mirrors systemd-journald (journald.conf(5)), the Linux convention (maintainer decision 3):
 //! - `RateLimitIntervalSec=` / `RateLimitBurst=`: at most `burst` lines per `interval` per process; the rest of the window is dropped, and when the window ends one line records it,
 //!   journald's `Suppressed N messages from <unit>`;
 //! - `SystemMaxUse=` / `SystemMaxFileSize=`: a per-process byte budget, split into a head (the start of the output: verdicts read start and resume lines) and a tail ring of segments, rotated and

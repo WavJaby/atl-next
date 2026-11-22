@@ -332,7 +332,7 @@ func systemSharedLibs(tree string) ([]string, error) {
 	return libs, nil
 }
 
-// androidDefine: the other macro clang defines for Soong's device triple (owner 2026-11-01), on device compiles only: AOSP device code keys the Android userspace API on it, which this runtime provides.
+// androidDefine: the other macro clang defines for Soong's device triple (maintainer 2026-11-01), on device compiles only: AOSP device code keys the Android userspace API on it, which this runtime provides.
 // __BIONIC__, which bionic's sys/cdefs.h defines, stays undefined: glibc is the C library, and libc++ keys ABI-shaping config on it (regex word class, ctype masks).
 // libc++ 19's __ANDROID__ sites leave its objects byte-identical on glibc given the xlocale.h shim (libcxxShim); xtask check step libcxx keeps that true across libc++ bumps.
 const androidDefine = "-D__ANDROID__"

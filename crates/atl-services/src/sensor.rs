@@ -390,7 +390,7 @@ impl SensorHub {
         let injection = match injection {
             Some(package) => {
                 if !sensors.is_empty() {
-                    // explicit request wins over a real sensor (owner 2026-11-18, behaviour decision 2): bypass mode delivers only injected events, so the real ones are not listed or polled
+                    // explicit request wins over a real sensor (maintainer 2026-11-18, behaviour decision 2): bypass mode delivers only injected events, so the real ones are not listed or polled
                     log(&format!(
                         "injection on: overrides {} real accelerometer(s) (tilt keys requested; every app of this services instance)",
                         sensors.len()
@@ -850,7 +850,7 @@ mod tests {
         assert_eq!(hub.enable(1, &ch, 1, 20_000_000), BAD_VALUE);
     }
 
-    /// The three states of the decision (owner 2026-11-18: an explicit tilt-keys request wins; not requested = exact AOSP): (no real sensor, requested) and (real sensor, requested) list only the injected sensor; (real, not requested) lists the real one, NORMAL mode.
+    /// The three states of the decision (maintainer 2026-11-18: an explicit tilt-keys request wins; not requested = exact AOSP): (no real sensor, requested) and (real sensor, requested) list only the injected sensor; (real, not requested) lists the real one, NORMAL mode.
     #[test]
     fn requested_injection_wins_over_a_real_sensor_and_off_keeps_it() {
         let names = |h: &SensorHub| -> Vec<String> {

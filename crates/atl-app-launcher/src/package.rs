@@ -21,7 +21,7 @@ const INFO_FLAGS: i64 =
 /// The user generate fills per-user fields for: the only one (UserHandle.USER_SYSTEM).
 const USER: i32 = 0;
 
-/// The device-side answers the parse asks for: PMS's in system_server, here the installer's (each one an owner decision, listed in the M3 state note).
+/// The device-side answers the parse asks for: PMS's in system_server, here the installer's (each one a maintainer decision, listed in the M3 state note).
 pub struct Device {
     /// `hasFeature` (PMS mPackageParserCallback -> hasSystemFeature(feature, 0), PackageManagerService.java:2026): the features this device declares, which atld's PackageManager must answer identically.
     pub features: Vec<String>,

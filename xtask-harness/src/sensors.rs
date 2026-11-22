@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test sensors`: the sensor service gate. The fixture APK (xtask-harness/testdata/sensors) uses SensorManager in onCreate under atld, as `test app` runs its app; atld runs in a private user + mount namespace with a fake `/sys/bus` and `/run/udev/data` the gate writes (atld_run.rs `with_fake_devices`), so the product reads its fixed IIO and udev paths.
 //! Stage `empty`: no IIO device. Pass = the lookup (getSystemService + getDefaultSensor) within [`LOOKUP_LIMIT`], 0 sensors, default accelerometer null, registerListener false, no fault. Break `unregistered`: the services skip `sensorservice`, so SensorManager waits for it (60 tries, SensorManager.cpp `waitForSensorService`) and the lookup limit fails.
-//! Stage `iio`: two fake accelerometers, the owner's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
+//! Stage `iio`: two fake accelerometers, the maintainer's laptop's display one (its upright reading, its hwdb mount matrix as the udev property `ACCEL_MOUNT_MATRIX`, a decoy sysfs `in_accel_mount_matrix` the property must beat, `ACCEL_LOCATION=display`) and a base one
 //! (`ACCEL_LOCATION=base`). Pass = only the display one listed, as android.sensor.accelerometer, >= [`MIN_EVENTS`] events, each with the values derived below, timestamps increasing on the elapsedRealtimeNanos base, and the services' poll stopped after unregisterListener.
 //! Breaks: `hwdb` (no udev entry for the display device: the decoy matrix applies), `location` (no udev entry for the base device: it is listed), `scale` (doubled scale written) -- each while the real values / count are expected; `frame` expects the canonical values (no canonical -> Android conversion). Each must fail.
 //! Stage `buffer`: the iio stage's display accelerometer with its kernel buffer on (the laptop's layout and trigger, realtime stamps, 10 Hz). A FIFO at `/dev/iio:device0` in atld's namespace stands in for the char device; a writer thread fills it with scans while `buffer/enable` reads 1, and holds them for [`HOLD_FOR`] after the app registers (the silent path: re-emits, then samples again). Pass = the iio checks, and the tier counters say buffered with no ts-fallback.
@@ -103,11 +103,11 @@ const TOLERANCE: f64 = 1e-4;
 const STOP_WAIT: Duration = Duration::from_secs(5);
 const TAIL: usize = 40;
 
-/// The display device's reading: the owner's laptop upright, measured 2026-11-06 as (-0.06, -8.71, -3.74) m/s², here in steps of [`SCALE`]. Every axis is non-zero, so each axis's sign is checked.
+/// The display device's reading: the maintainer's laptop upright, measured 2026-11-06 as (-0.06, -8.71, -3.74) m/s², here in steps of [`SCALE`]. Every axis is non-zero, so each axis's sign is checked.
 const RAW: [i64; 3] = [-6, -871, -374];
 /// One raw step, m/s²: the hundredths the measurement was read in.
 const SCALE: f64 = 0.01;
-/// The laptop's hwdb `ACCEL_MOUNT_MATRIX` (owner, 2026-11-06): z negated.
+/// The laptop's hwdb `ACCEL_MOUNT_MATRIX` (maintainer, 2026-11-06): z negated.
 const MATRIX: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]];
 /// A sysfs `in_accel_mount_matrix` the udev property must beat (an x/y swap: its values differ on every axis pair).
 const DECOY: [[f64; 3]; 3] = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];

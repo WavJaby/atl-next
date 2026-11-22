@@ -63,7 +63,7 @@ pub struct Mapping {
     len: usize,
 }
 
-// SAFETY: a mapping is plain shared memory; which thread reads or writes it is the owner's decision (the mixer's lock).
+// SAFETY: a mapping is plain shared memory; which thread reads or writes it is the maintainer's decision (the mixer's lock).
 unsafe impl Send for Mapping {}
 
 impl Mapping {

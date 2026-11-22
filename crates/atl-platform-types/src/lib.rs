@@ -133,7 +133,7 @@ mod tests {
         m.map(|m| (m.size.width, m.size.height))
     }
 
-    /// The owner's laptop: 1600x1000 logical at 1.6 is the 2560x1600 panel; 1.25 of 1229 is 1536.25 -> 1536; a negative side is 0; an unusable scale is no monitor.
+    /// The maintainer's laptop: 1600x1000 logical at 1.6 is the 2560x1600 panel; 1.25 of 1229 is 1536.25 -> 1536; a negative side is 0; an unusable scale is no monitor.
     #[test]
     fn logical_is_physical_at_scale() {
         assert_eq!(

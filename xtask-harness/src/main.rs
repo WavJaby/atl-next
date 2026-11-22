@@ -110,7 +110,7 @@ enum Command {
     ///
     /// A stalled or frozen app: `kill -QUIT $(pgrep -x <last 15 characters of the package>)` (the process names itself after its package; atld's `process <pid>` lines name the sandbox, not the app) makes ART dump every thread's Java and native stack into the app log, `<out>/run-apk/root/log/<package>.log` (`-v` prints it); the app runs on, as on Android.
     RunApk(run_apk::Args),
-    /// Runs WSL-built outputs on a Linux desktop over ssh (the owner's laptop, plan L1): `push` bundles a gate's record and `lib/`, `test` runs the prerequisite check on the target.
+    /// Runs WSL-built outputs on a Linux desktop over ssh (the maintainer's laptop, plan L1): `push` bundles a gate's record and `lib/`, `test` runs the prerequisite check on the target.
     ///
     /// Read-only or dry-run by default; `--apply` is the only mode that copies or runs anything remotely. The host is an ssh alias from WSL `~/.ssh/config` or `local:<dir>`.
     Remote {

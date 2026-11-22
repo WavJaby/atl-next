@@ -2465,7 +2465,7 @@ nope
         let env: BTreeMap<_, _> = on.env().into_iter().collect();
         assert_eq!(env["SCCACHE_DIR"], "/ws/cache/sccache");
         assert_eq!(env["SCCACHE_DIRECT"], "false");
-        // the spec's default limit (owner 2026-11-11)
+        // the spec's default limit (maintainer 2026-11-11)
         assert_eq!(env["SCCACHE_CACHE_SIZE"], "5G");
         // view hash = FNV-1a 64 offset basis for the empty view (the plain build); then this cache's token
         let uds = env["SCCACHE_SERVER_UDS"].to_string_lossy().into_owned();

@@ -20,7 +20,7 @@ const CAPTURE_FOR: Duration = Duration::from_millis(1500);
 const TOOL_LIMIT: Duration = Duration::from_secs(10);
 /// The silence pw-play gets: 0.25 s of pw-cat's raw default (s16, 2 channels, 48 kHz) = 48000 * 2 * 2 / 4 bytes.
 const SILENCE_BYTES: usize = 48_000;
-/// SINK / SOURCE `-`: on a desktop the run must not play into (the owner's laptop): no playback at all, and the capture attempt takes the default source (bytes counted, dropped).
+/// SINK / SOURCE `-`: on a desktop the run must not play into (the maintainer's laptop): no playback at all, and the capture attempt takes the default source (bytes counted, dropped).
 const DEFAULT: &str = "-";
 /// Both streams' extra props: no fallback to the default node when the target is not visible.
 const NO_FALLBACK: &str = "{ node.dont-fallback=true }";

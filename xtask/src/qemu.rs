@@ -27,7 +27,7 @@ use crate::verdict::Verdict;
 
 /// The sources.toml row of the QEMU checkout, `src/qemu`.
 pub const UPSTREAM: &str = "qemu";
-/// The arch built without `--arch`: the first bridge arch (owner decision D3, QEMU bridge plan section 3).
+/// The arch built without `--arch`: the first bridge arch (maintainer decision D3, QEMU bridge plan section 3).
 pub const DEFAULT_ARCH: &str = "arm64";
 /// API level of the guest compiler: 29 is the first with ELF TLS, the shape of a modern app's `.so` (jni_fixture.rs).
 pub const GUEST_API: u32 = 29;

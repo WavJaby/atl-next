@@ -9,7 +9,7 @@ use atl_layout::Layout;
 
 use crate::arches;
 
-/// The NDK release the fixtures are built with (owner decision D1, bridge-1 plan); `--ndk` overrides.
+/// The NDK release the fixtures are built with (maintainer decision D1, bridge-1 plan); `--ndk` overrides.
 pub const NDK_DIR: &str = "android-ndk-r30";
 
 /// The NDK's llvm prebuilt dir for this build machine.

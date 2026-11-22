@@ -20,7 +20,7 @@ pub enum UaError {
     },
 }
 
-/// The Chrome token (owner decision D4 open; plan S9 recommends including one): CDD/CTS require `Chrome/<a>.<b>.<c>.<d>` and no Chromium runs here, so no version is true.
+/// The Chrome token (maintainer decision D4 open; plan S9 recommends including one): CDD/CTS require `Chrome/<a>.<b>.<c>.<d>` and no Chromium runs here, so no version is true.
 /// 300.0.0.0 is the engine's own claim: WebKitGTK sends exactly this token to sites that need a Chrome UA (WebKit 2.54 Source/WebCore/platform/glib/UserAgentQuirks.cpp, `stringForQuirk(NeedsChromeBrowser)`); same engine, same claim.
 pub const CHROME_TOKEN: &str = "Chrome/300.0.0.0";
 

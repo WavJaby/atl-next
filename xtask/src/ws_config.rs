@@ -71,7 +71,7 @@ const RETIRED: [(&str, &str, &str); 4] = [
 ];
 
 /// Size limit of the compiler cache (sccache evicts least recently used entries past it), in sccache's `SCCACHE_CACHE_SIZE` syntax.
-/// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries); 1.7 GB was in use under the old 2 GB limit (2026-11-11), so the owner raised it to 5 GB: ~60 such generations, room for the goal closure to grow.
+/// One clean build of the libandroid_runtime closure stores ~80 MB (2026-11-01, zstd entries); 1.7 GB was in use under the old 2 GB limit (2026-11-11), so the maintainer raised it to 5 GB: ~60 such generations, room for the goal closure to grow.
 pub const DEFAULT_SCCACHE_SIZE: &str = "5G";
 
 /// `build.refresh_min_upstream_files`: native refreshes a rebased checkout's build dir (out::refresh) only when at least this many upstream-input files (out::UPSTREAM_INPUTS: patches/, sources.toml) changed between the dir's base and the newer base.
@@ -79,10 +79,10 @@ pub const DEFAULT_SCCACHE_SIZE: &str = "5G";
 /// Measured (2026-11-16): 0 upstream files changed -> keep 149-171 s vs refresh 214-232 s (README-only rebase); 0 upstream + 40 other native files (crates, bp2ninja) -> keep 157-175 s vs refresh 185 s. Refresh never won without an upstream change, so 1 = any upstream change; no rebase with one was measurable yet (no two bases differ there).
 pub const DEFAULT_REFRESH_MIN_UPSTREAM_FILES: u32 = 1;
 
-/// `pool.mem_gib` (GiB): memory reservable by admitted work. 20 = the 24 GB WSL cap (owner 2026-11-14) minus a 4 GB floor for the kernel, page cache, WSLg and editors [est, re-measure under load].
+/// `pool.mem_gib` (GiB): memory reservable by admitted work. 20 = the 24 GB WSL cap (maintainer 2026-11-14) minus a 4 GB floor for the kernel, page cache, WSLg and editors [est, re-measure under load].
 pub const DEFAULT_POOL_MEM_GIB: u32 = 20;
 
-/// `pool.starve_after_s`: a ticket waiting this long joins the top tier at its arrival (build_pool.rs `Tier`), so a stream of owner/land tickets cannot hold an agent's back forever.
+/// `pool.starve_after_s`: a ticket waiting this long joins the top tier at its arrival (build_pool.rs `Tier`), so a stream of maintainer/land tickets cannot hold an agent's back forever.
 /// It must exceed the waits FIFO alone produces under load, else every ticket is promoted when the pool is busy and priority vanishes exactly then: the longest measured wait was 2250.8 s (2026-11-18, job s3-ab2, 6 tickets ahead behind two cold natives); 7200 s = ~3.2x that.
 pub const DEFAULT_POOL_STARVE_AFTER_S: u32 = 7200;
 
@@ -91,9 +91,9 @@ fn default_cpu_slots() -> u32 {
     std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
-/// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: owner's hard stop 6.
+/// `disk.host_min_free` (GiB): the Windows drive holding the WSL vhdx. A full libandroid_runtime build from cold grows the vhdx by several GiB, and a host drive that fills mid-build fails writes inside the distro: maintainer's hard stop 6.
 pub const DEFAULT_HOST_MIN_FREE: u64 = 6;
-/// `disk.host_shrink_below` (GiB): under it, a note asks to shrink the vhdx (owner: shrink when C: < 30 GB). A note, never a refusal.
+/// `disk.host_shrink_below` (GiB): under it, a note asks to shrink the vhdx (maintainer: shrink when C: < 30 GB). A note, never a refusal.
 pub const DEFAULT_HOST_SHRINK_BELOW: u64 = 30;
 /// `disk.workspace_min_free` (GiB): the filesystem holding the workspace (src/, cache/, out/ logs; WSL `/`, filled to 0 B twice on 2026-11-15). One build can grow sccache from empty to its cap ([`DEFAULT_SCCACHE_SIZE`] 5 GiB) + 1 GiB for logs, cargo's registry and /tmp.
 pub const DEFAULT_WORKSPACE_MIN_FREE: u64 = 6;
@@ -106,7 +106,7 @@ pub const DEFAULT_POOL_METADATA_MIN_FREE: u64 = 1;
 /// Covers the dynamic vhdx's own metadata (BAT + sector bitmaps, well under 1% of a 90 GiB disk = <1 GiB) and other Windows writers to that drive while a build runs (~1 GiB) [est].
 pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
 
-/// `delta.ram_store`: the owner's boot unit mounts the zram-backed ext4 there (plan ram-delta D7); absent or not RAM-backed -> every child gets the pool tier, one logged reason per build.
+/// `delta.ram_store`: the maintainer's boot unit mounts the zram-backed ext4 there (plan ram-delta D7); absent or not RAM-backed -> every child gets the pool tier, one logged reason per build.
 pub const DEFAULT_RAM_STORE: &str = "/mnt/atl-zram";
 /// `delta.ram_margin_gib`: zram reports `mem_limit` as an I/O error in ext4, not ENOSPC, so admission stops short of it by this much (~one small build's RAM at lzo-rle, 2 GiB x 0.54).
 pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
@@ -114,7 +114,7 @@ pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.ratio_run` in thousandths: lzo-rle zram raw/RAM of one app data root, WeChat 8.0 clean install + launch on the zram store (2026-11-22): 796.6 MiB raw / 581 MiB zram RAM = 1.371. The device ratio mixes in build uppers (1.95), which would under-reserve a run (0.78 GiB / 1.95 = 0.40 reserved, 0.57 used); class run takes min(device ratio, this).
 pub const DEFAULT_RATIO_RUN_MILLI: u64 = 1370;
-/// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (owner estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
+/// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (maintainer estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
 /// run 797: store growth of one app data root = clean install + launch of the largest known app into an empty root (every app run starts so, out_run.rs `fresh_root`).
 /// WeChat 8.0 (versionCode 3182) on the zram store, ext4 used from the minimum after the previous root's removal to the run's peak (2 s samples, 2026-11-22): 796.5 and 796.6 MiB in the two windows no other writer touched; peak = end, so no install transient above the final root (du 792.8 MiB) at that resolution. 796.6 -> 797.
 /// Small cases: Temple Run root 251 MiB, fossify-math 7 MiB.
@@ -543,7 +543,7 @@ mod tests {
         format!("{:#}", parse(text, path()).expect_err("must refuse"))
     }
 
-    /// Expected defaults are the spec's (owner 2026-11-11 and 2026-11-14): pool.mem_gib 20, sccache_size 5G; cpu_slots is the host's CPU count.
+    /// Expected defaults are the spec's (maintainer 2026-11-11 and 2026-11-14): pool.mem_gib 20, sccache_size 5G; cpu_slots is the host's CPU count.
     #[test]
     fn empty_file_and_absent_file_give_the_defaults() {
         let cfg = parse("", path()).expect("empty");

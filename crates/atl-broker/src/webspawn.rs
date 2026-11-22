@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The web-process channel (owner D2, 2026-11-15): an app process asks the broker for exactly one thing, "start a WebKit web process for me", and gets a process weaker than itself.
+//! The web-process channel (maintainer D2, 2026-11-15): an app process asks the broker for exactly one thing, "start a WebKit web process for me", and gets a process weaker than itself.
 //! WebKit (host WebKitGTK in the app process) sandboxes its web process through Flatpak's route when `/.flatpak-info` exists: it runs `flatpak-spawn --sandbox ... WebKitWebProcess`, found in PATH.
 //! Our `flatpak-spawn` (crate atl-flatpak-spawn, bound at [`SHIM_AT`]) turns that line into one [`Request`] on this channel; the broker checks it ([`admit`]) and starts the web process through
 //! atl-sandbox-join in [`crate::Profile::WebProcess`]: a child pid namespace of the app's (WebKit takes the pid from SCM credentials and asserts it non-zero), built from the app's own mount view.

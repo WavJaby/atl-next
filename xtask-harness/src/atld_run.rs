@@ -525,7 +525,7 @@ impl Run {
         control_at(&self.root, command)
     }
 
-    /// Ends the run the way it ends (owner decision 2026-11-06): `stop` on the control socket, then waits for atld. SIGKILL only when atld does not answer or exit within [`STOP_WAIT`]
+    /// Ends the run the way it ends (maintainer decision 2026-11-06): `stop` on the control socket, then waits for atld. SIGKILL only when atld does not answer or exit within [`STOP_WAIT`]
     /// (its processes then stay: the caller's stop_apps ends the apps first).
     pub fn stop(&self, atld: &mut Child) -> Result<ExitStatus> {
         if let Some(s) = atld.try_wait()? {

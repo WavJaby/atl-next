@@ -96,7 +96,7 @@ const PROCESS_STATE_UNKNOWN: i32 = -1;
 /// Build.UNKNOWN: the serial apps targeting P+ get (ActivityManagerService attachApplicationLocked buildSerial).
 const BUILD_UNKNOWN: &str = "unknown";
 /// bindApplication's disabledCompatChanges (AppCompatCallbacks.install in handleBindApplication): Toast.CHANGE_TEXT_TOASTS_IN_THE_SYSTEM (Toast.java:124, 147798919). Enabled (AOSP's default for targetSdk > Q), a text toast goes to enqueueTextToast and SystemUI's ToastUI draws it.
-/// There is no SystemUI here, so every app takes AOSP's own disabled-change path (owner 2026-11-05, kept 2026-11-06): Toast.makeText builds the view (Toast.java:523, ToastPresenter.getTextToastView); Toast.show's else branch (:199-215) sends enqueueToast with the app's TN;
+/// There is no SystemUI here, so every app takes AOSP's own disabled-change path (maintainer 2026-11-05, kept 2026-11-06): Toast.makeText builds the view (Toast.java:523, ToastPresenter.getTextToastView); Toast.show's else branch (:199-215) sends enqueueToast with the app's TN;
 /// notification.rs answers TN.show(windowToken), and TN.handleShow (:758-792) adds the TYPE_TOAST window through ToastPresenter.show in the app. App-visible difference: Toast.getView() is non-null for text toasts. Delete this when a system UI renders enqueueTextToast.
 const DISABLED_COMPAT_CHANGES: [i64; 1] = [147_798_919];
 /// Intent.FLAG_RECEIVER_BOOT_UPGRADE (Intent.java:7647): refused in a broadcast from an app.
@@ -735,7 +735,7 @@ fn back_pressed(known: bool, callback: Option<&dyn IRequestFinishCallback>) -> b
 /// What an unhandled Back on a Task's launcher root does: the system default behind ActivityClientController.shouldMoveTaskToBack. One value for every app now; a per-app setting chooses it later.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RootBack {
-    /// moveTaskToBack, Android 12+ (owner 2026-11-12): the window is minimized, the app keeps running.
+    /// moveTaskToBack, Android 12+ (maintainer 2026-11-12): the window is minimized, the app keeps running.
     #[default]
     Minimize,
     /// requestFinish, as before Android 12: the root finishes, its window closes and with the last window the process ends.

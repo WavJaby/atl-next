@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The process-control protocol (owner D1, 2026-11-03): the system services start and kill app processes through the host (atld, which owns the broker) over one SEQPACKET connection, one JSON message per packet, strictly request then reply.
+//! The process-control protocol (maintainer D1, 2026-11-03): the system services start and kill app processes through the host (atld, which owns the broker) over one SEQPACKET connection, one JSON message per packet, strictly request then reply.
 //! `Start` is where ProcessList.startProcessLocked ends (Process.start's arguments reduced to what the broker's sandbox needs); `Kill` is Process.killProcess of a process it started. The server refuses to kill pids it did not start.
 //! `Notify` / `Withdraw` carry the notification service's display requests: the services have no session bus, so atld shows them on the desktop.
 //! Only the services hold the client end (the broker passes it as their stdin, [`crate::Spawn::stdin`]): an app has no way to ask for a start or a kill.

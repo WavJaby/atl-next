@@ -72,9 +72,9 @@ reason = "perfetto's heap-profiler client; libart calls it (heap.cc, javaheapsam
 
 ["libartpalette-system"]
 provider = "module:libartpalette_fake"
-reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (owner 2026-11-02)"
+reason = "the platform's palette (system/libartpalette, not fetched: ART's hooks into Android's platform -- thread priorities, atrace, ashmem, task profiles), which libartpalette dlopens (its android runtime_libs). ART's own fake palette (art/libartpalette system/palette_fake.cc, stem libartpalette-system) is what Soong's host ART compiles in; shipped as that library until our own palette exists (maintainer 2026-11-02)"
 
-# GL: AOSP's libEGL / libGLES* fronts are built from the tree and load libEGL_atl.so (+ libGLESv2_atl.so, the same file, and libGLESv1_CM_atl.so, ANGLE's) as their driver (owner O1 R-A 2026-11-04, moved into G1 2026-11-06); only their GL dispatch binding differs.
+# GL: AOSP's libEGL / libGLES* fronts are built from the tree and load libEGL_atl.so (+ libGLESv2_atl.so, the same file, and libGLESv1_CM_atl.so, ANGLE's) as their driver (maintainer O1 R-A 2026-11-04, moved into G1 2026-11-06); only their GL dispatch binding differs.
 ["libEGL"]
 defines = ["USE_SLOW_BINDING=1"]
 reason = "GL dispatch through getGlThreadSpecific() -> __get_tls() (atl-bionic's per-thread slot array) instead of per-arch asm reading the thread pointer, which on glibc is glibc's TCB (patches/aosp/frameworks/native 0007 makes the macro settable, 0008 has eglGetProcAddress return the driver entry instead of the asm extension forwarders; precondition: one GL driver per process). Rung 4 because: as-is (1) the asm reads a glibc TCB field; no environment setting (2) or supplied definition (3) reaches inline asm or a hard #define. Cost: one indirect call per GL call (G1 measurement)"
@@ -141,7 +141,7 @@ reason = "AOSP's crate binds its OpenSSL-licensed headers (libbssl_sys_raw bindg
 provider = "upstream:boringssl"
 reason = "bindgen's static-inline wrappers; AOSP compiles them against its OpenSSL-licensed headers, upstream's CMake (rust_wrapper) against the upstream we link"
 
-# Rust crates whose Android code is hidden on glibc (owner decision B, 2026-11-01): built as Android userspace, see `rust_os` above
+# Rust crates whose Android code is hidden on glibc (maintainer decision B, 2026-11-01): built as Android userspace, see `rust_os` above
 ["librustutils"]
 rust_os = "android"
 reason = "rustutils::system_properties (crabbyavif's MediaCodec path) wraps bionic's __system_property_* API, which atl-bionic provides; its android block adds the bindgen crates it needs"

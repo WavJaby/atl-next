@@ -39,7 +39,7 @@ size = 9528948
 signer_sha256 = "affdb124d3f4720c2f98dbca9eacba0514fba4306e20a2786c861c3c0d6ff292"
 source = "fdroid"
 
-# the upstream release asset of tag 1.14.0; its manifest declares versionName 1.0. Signed with the Android debug key (CN=Android Debug): the owner accepted that signature
+# the upstream release asset of tag 1.14.0; its manifest declares versionName 1.0. Signed with the Android debug key (CN=Android Debug): the maintainer accepted that signature
 [material-catalog]
 package = "io.material.catalog"
 version_name = "1.0"

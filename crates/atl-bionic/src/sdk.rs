@@ -10,7 +10,7 @@ use crate::props::VALUE_MAX;
 const DEVICE_LEVEL_PROPERTY: &[u8] = b"ro.build.version.sdk";
 
 /// bionic's linker (`linker_sdk_versions.cpp`) starts at the level it was built for, which for platform
-/// code is `__ANDROID_API_FUTURE__`; the launcher sets the app's (owner Q5).
+/// code is `__ANDROID_API_FUTURE__`; the launcher sets the app's (maintainer Q5).
 static TARGET_SDK: AtomicI32 = AtomicI32::new(__ANDROID_API_FUTURE__);
 
 /// bionic `set_application_target_sdk_version`: 0 means the platform level.

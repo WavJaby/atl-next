@@ -303,7 +303,7 @@ git = "https://android.googlesource.com/toolchain/llvm_android"
 change = "25/3568025/1"
 commit = "9596955b7369d93bd2a505eefac28ff17912770c"
 
-# Berberis (AOSP frameworks/libs/binary_translation): read-only reference for the identity engine's loader/thread design (owner O1, 2026-11-06), never built.
+# Berberis (AOSP frameworks/libs/binary_translation): read-only reference for the identity engine's loader/thread design (maintainer O1, 2026-11-06), never built.
 # A git row, not an [aosp.projects] one, so it lands in src/berberis outside the AOSP tree the converter scans.
 [berberis]
 git = "https://android.googlesource.com/platform/frameworks/libs/binary_translation"

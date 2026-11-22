@@ -5,7 +5,7 @@
 //! `ram` = `<delta.ram_store>/.run/<id>/` when the store is RAM-backed and admission (delta.rs, class `run`) fits one data root; `pool` = `out/pool/run/<id>/`, the baseline that works everywhere.
 //! The ram dirs sit in their own subtree, not in the build delta's `<store>/<id>/`: a delta refresh, tier change or lost-delta remake drops `<store>/<id>/` whole, and data roots do not depend on the base. A WSL restart empties the store: the record goes with the dir, so nothing dangles; the next make decides afresh.
 //! Its `.run` record names its tier (`tier=`) and a ram dir's workspace (`workspace=`: one store serves every workspace on the host). One line per make (`out: run ram|pool (<why>)`, counters `run-dir-ram|pool`), one per app run (run-apk: [`admit_run`], counters `run-ram|pool`); `run-full` counts a store found full (at a fresh root or after a run), whereupon the next fresh root moves the checkout's run dir to the pool (no mid-run migration).
-//! Data roots (owner 2026-11-22): every app run starts from a clean install on an empty root, `<run>/<name>` emptied and made by [`fresh_root`]; nothing is copied in or carried over from an earlier run. The last root of each name stays for inspection until the next run of that name, leave or prune.
+//! Data roots (maintainer 2026-11-22): every app run starts from a clean install on an empty root, `<run>/<name>` emptied and made by [`fresh_root`]; nothing is copied in or carried over from an earlier run. The last root of each name stays for inspection until the next run of that name, leave or prune.
 //! Locks: the build dir's (`build_pool`, `ws-<id>.lock`). Making a run dir or a fresh root holds the lock shared, as a build does; leave and prune remove the run dir under the exclusive lock they take for the build dir, so a run dir never goes while a build or run of its checkout holds the lock. The one removal under the shared lock: [`fresh_root`] dropping its own checkout's ram run dir off a full store.
 //! `out prune` lists run dirs whose checkout is gone and a ram run dir beside a pool one of the same id (made while the store was away).
 
@@ -688,7 +688,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
-    /// Owner rule (2026-11-22): every app run starts on an empty root. Two consecutive fresh roots of one name: the second is empty, so it sees nothing the first run created (a file, an app-made read-only dir); another name's root is left alone.
+    /// Maintainer rule (2026-11-22): every app run starts on an empty root. Two consecutive fresh roots of one name: the second is empty, so it sees nothing the first run created (a file, an app-made read-only dir); another name's root is left alone.
     #[test]
     fn consecutive_fresh_roots_share_nothing() {
         let ws = scratch("fresh");

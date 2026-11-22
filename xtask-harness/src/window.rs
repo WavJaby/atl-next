@@ -76,7 +76,7 @@ pub struct Args {
     /// Print the whole app log.
     #[arg(long, short)]
     verbose: bool,
-    /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the owner's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-<stage>-hold/root/log/`.
+    /// Holds the real window open instead of running the stage's gates (UI stages: gtk, widgets, resize). No proxy and no injected configure: the compositor alone resizes the window, so its border and size are the maintainer's to drag. The app stays up this many seconds after its resume; its log, `AtlWindow: size=` lines included, stays in `<out>/window-<stage>-hold/root/log/`.
     #[arg(long, value_name = "SECONDS")]
     hold: Option<u64>,
     /// The headless compositor's output, WxH (default: GATE_OUTPUT, 1920x1200). Stages gtk, portrait and app-id only: their expectations follow the display.
@@ -949,7 +949,7 @@ fn gtk_window_check(app: &str) -> Result<String, String> {
 
 /// The AOSP size of a portrait, resizeable app on a landscape display (`(width, height)`), written out from AOSP, not read from atl-services.
 /// The app's orientation mismatches the display's, so calculateInitialBounds takes its landscape-display branch (DesktopModeBoundsCalculator.java:165-185): the height is the ideal (side x 0.75f, truncated; :50-51, :314-318), the width (int)(tdaHeight / aspect + 0.5f).
-/// The aspect is the display's own, width / height: owner decision 2026-11-08 (option A), DisplayContent.java:6647-6654 ignores orientation requests, so getDesiredAspectRatio takes its branch (c).
+/// The aspect is the display's own, width / height: maintainer decision 2026-11-08 (option A), DisplayContent.java:6647-6654 ignores orientation requests, so getDesiredAspectRatio takes its branch (c).
 fn portrait_expected((width, height): (i32, i32)) -> (i32, i32) {
     let aspect = width as f32 / height as f32;
     (
@@ -1297,7 +1297,7 @@ pub(crate) fn stop_apps(atld: u32) {
     }
 }
 
-/// Ime stage: atld outlived the killed app (owner decision 2026-11-06: an app's death is an event, not the run's end) and ended on the control socket's `stop` with status 0. In atld's
+/// Ime stage: atld outlived the killed app (maintainer decision 2026-11-06: an app's death is an event, not the run's end) and ended on the control socket's `stop` with status 0. In atld's
 /// log (main.rs): the first app's `process <pid> ended`, then the relaunch's `control: start ...: ok`, then `control: stop`; `stopped` is atld's exit after the gate stopped it.
 fn run_survives_check(
     atld_log: &str,
@@ -2524,7 +2524,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Suspended
         | Stage::AuxProcess
         | Stage::MouseTouch => {
-            // a hold has no proxy: the compositor sees the window alone, so its border and size are the owner's drags
+            // a hold has no proxy: the compositor sees the window alone, so its border and size are the maintainer's drags
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
@@ -3663,7 +3663,7 @@ pub fn display_probe() -> Result<ExitCode> {
 }
 
 /// `xtask remote test window --stage <s>` (remote.rs `test`): the stage built and recorded here, pushed and checked on the target, its live half run there by the agent ([`agent`]) beside atld, its
-/// logs and `live.json` judged here by the same [`judge`] as `test window`. UI stages open the window on the target's session display (owner decision D1, 2026-11-18: on an empty workspace, remote.rs
+/// logs and `live.json` judged here by the same [`judge`] as `test window`. UI stages open the window on the target's session display (maintainer decision D1, 2026-11-18: on an empty workspace, remote.rs
 /// `workspace_script`) and are judged against that display ([`Rate::Session`]); frames runs headless on the 60 Hz grid as locally.
 pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     use crate::remote::{AGENT_LOG, AGENT_RC, Agent, Display, LIVE_JSON, REMOTE_DIR, Target};

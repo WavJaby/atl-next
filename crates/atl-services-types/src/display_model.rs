@@ -57,7 +57,7 @@ impl Default for DisplayModel {
 }
 
 impl DisplayModel {
-    /// The monitor as Android's display: its mode in physical pixels, its rate (`None`: the default's), and density `160 x scale` (owner, 2026-11-05: 1 dp = 1 desktop logical pixel; the panel's
+    /// The monitor as Android's display: its mode in physical pixels, its rate (`None`: the default's), and density `160 x scale` (maintainer, 2026-11-05: 1 dp = 1 desktop logical pixel; the panel's
     /// physical DPI is not used). The scale is physical per logical pixel (Wayland `wp_fractional_scale_v1` / GDK monitor scale). `quarter_turns` is the rotation (clockwise, Surface.ROTATION_*), taken mod 4.
     pub fn from_monitor(
         width: u32,
@@ -158,7 +158,7 @@ mod tests {
         assert_eq!(d.to_arg(), "1280x800@60,160,0");
     }
 
-    /// The owner's laptop (2560x1600, 120 Hz, scale 1.6): 1 dp = 1 logical px, so 160 x 1.6 = 256 dpi; scale 1 is mdpi (160); 1.25 is 200; a rate the monitor does not report keeps the default's.
+    /// The maintainer's laptop (2560x1600, 120 Hz, scale 1.6): 1 dp = 1 logical px, so 160 x 1.6 = 256 dpi; scale 1 is mdpi (160); 1.25 is 200; a rate the monitor does not report keeps the default's.
     #[test]
     fn monitor_values_and_density_from_scale() {
         let m = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);

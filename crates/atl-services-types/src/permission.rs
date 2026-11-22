@@ -119,7 +119,7 @@ pub struct PermissionState {
     pub flags: u32,
 }
 
-/// The first permission state of `package` after its install (PermissionManagerServiceImpl.restorePermissionState with no previous state; install-time half: owner decision 2026-11-05, interim rule A).
+/// The first permission state of `package` after its install (PermissionManagerServiceImpl.restorePermissionState with no previous state; install-time half: maintainer decision 2026-11-05, interim rule A).
 /// - Install permission: granted when NORMAL, or SIGNATURE and defined by `package` itself (same package -> same certificate); a signature permission of another signer gets no state.
 /// - Runtime (DANGEROUS) permission: targetSdk >= M -> not granted, flags 0 (the user grants it through PermissionController); legacy targetSdk < M -> granted, and a platform-defined one carries
 ///   REVIEW_REQUIRED | REVOKED_COMPAT (the review the user confirms once).

@@ -141,7 +141,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    /// A sysfs/devfs/procfs stand-in: Intel `xe` at 0000:00:02.0 (card0, renderD128), NVIDIA at 0000:2c:00.0 (card1, renderD129, minor 0), as measured on the owner's laptop (gpu-selection.md S1).
+    /// A sysfs/devfs/procfs stand-in: Intel `xe` at 0000:00:02.0 (card0, renderD128), NVIDIA at 0000:2c:00.0 (card1, renderD129, minor 0), as measured on the maintainer's laptop (gpu-selection.md S1).
     fn fixture(root: &Path, nvidia_info: Option<&str>) -> (PathBuf, PathBuf, PathBuf) {
         let sys = root.join("sys/class/drm");
         let dev = root.join("dev/dri");

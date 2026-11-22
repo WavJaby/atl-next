@@ -585,7 +585,7 @@ impl ActivityTasks {
             }),
             _ => None,
         };
-        // runtime-permissions P1 (owner 2026-11-14): no permission controller installed -> the request is answered as dismissed; deleted when PermissionController is the controller (S4)
+        // runtime-permissions P1 (maintainer 2026-11-14): no permission controller installed -> the request is answered as dismissed; deleted when PermissionController is the controller (S4)
         if let Some(request) = intent.filter(|_| {
             permission_request::answered_as_dismissed(intent, self.packages.permission_controller())
         }) {

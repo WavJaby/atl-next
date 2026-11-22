@@ -30,7 +30,7 @@ const DEV: &str = "/dev";
 const AXES: [&str; 3] = ["x", "y", "z"];
 /// Read interval when the device states no sampling frequency: 100 Hz, Android's SENSOR_DELAY_FASTEST class for a phone accelerometer, and 3 small sysfs reads per sample stay cheap at it.
 const DEFAULT_PERIOD: Duration = Duration::from_millis(10);
-/// The polled tier's advertised interval (owner decision D5). One sample is three sysfs reads, 107-121 ms each on the owner's laptop (design section 6), so 3 x 110 ms. The device's 100 ms is not met by this tier.
+/// The polled tier's advertised interval (maintainer decision D5). One sample is three sysfs reads, 107-121 ms each on the maintainer's laptop (design section 6), so 3 x 110 ms. The device's 100 ms is not met by this tier.
 const POLLED_PERIOD: Duration = Duration::from_millis(330);
 /// Storage bits assumed when `scan_elements/in_accel_x_type` is absent: 16 is the widest common accelerometer word, so the range is an over-estimate, never a clip.
 const DEFAULT_REAL_BITS: u32 = 16;
@@ -513,7 +513,7 @@ pub(crate) mod tests {
         assert!((a.max_range - 20.48).abs() < 1e-4);
     }
 
-    /// The owner's laptop (TP3607SH, HID accel_3d), measured 2026-11-06, with hwdb `ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, -1`. Raw readings at scale 0.01 and the Android values by hand:
+    /// The maintainer's laptop (TP3607SH, HID accel_3d), measured 2026-11-06, with hwdb `ACCEL_MOUNT_MATRIX=1, 0, 0; 0, 1, 0; 0, 0, -1`. Raw readings at scale 0.01 and the Android values by hand:
     /// canonical = (x, y, -z), Android = (-x, -y, -z) of the raw. Upright: y = +g, z > 0 (the lid leans back). Flat screen-up: z = +g. Left edge down = right edge up: x = +g.
     pub(crate) const LAPTOP_CASES: [([&str; 3], [f32; 3]); 3] = [
         (["-6", "-871", "-374"], [0.06, 8.71, 3.74]),

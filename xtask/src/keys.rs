@@ -3,7 +3,7 @@
 //! Dev builds: one set per workspace, `<workspace>/keys`, shared by every build dir so a build dir change never changes a signer; made once by `xtask keys --execute` as AOSP's development/tools/make_key makes a key (openssl genrsa -f4 2048, req -x509 -sha256 -days 10000, pkcs8 -topk8 -nocrypt).
 //! Never AOSP's published keys (build/make/target/product/security): our PackageManager grants `android`'s signature permissions to every APK signed like `android`, so a published platform key would hand them to any downloaded APK signed with it.
 //! Never the build dir's `test-keys/debug.keystore` either: that is the fixture apps' signer; a fixture signed like the platform would void every signature-permission gate.
-//! Release sets live wherever their holder keeps them (owner decision open): `native --keys <dir>` takes any set of this layout; nothing here stores or names one.
+//! Release sets live wherever their holder keeps them (maintainer decision open): `native --keys <dir>` takes any set of this layout; nothing here stores or names one.
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};

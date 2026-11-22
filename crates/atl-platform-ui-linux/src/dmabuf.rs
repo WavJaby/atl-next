@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! A Scene buffer as a `GdkDmabufTexture`: GSK imports the dma-buf itself (GL: an EGLImage, Vulkan: an imported memory), nothing is copied on the CPU (owner decision O3: dmabuf only, no CPU fallback).
+//! A Scene buffer as a `GdkDmabufTexture`: GSK imports the dma-buf itself (GL: an EGLImage, Vulkan: an imported memory), nothing is copied on the CPU (maintainer decision O3: dmabuf only, no CPU fallback).
 //! The layout (fourcc, modifier, plane offsets and strides) is the one gralloc's handle states (`atl_scene_buffer::DmabufView`); a format/modifier pair the display cannot import is refused here, before GDK would fall back to mmap and a CPU download.
 //! Fd lifetime: GDK borrows the plane fds until the texture's release func runs. The texture owns dups of them (closed in that func), so a Scene fd the composer closes after release cannot pull the memory away under a texture GSK still holds.
 

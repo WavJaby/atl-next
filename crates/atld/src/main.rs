@@ -2,7 +2,7 @@
 //! atld, M2 wiring: starts the system the Android way, each process through the broker, then serves the services' process control until the run ends (step 7).
 //! 1. the runtime root `--root` (made fresh): `properties` (the default property area, atl-property-service; `properties.d/` one area per app process: the defaults plus the properties only that process has, [`Host::process_properties`]), `system/` (build.prop, `framework/` = the boot jars and shared libraries),
 //!    `install/` (the installer's frames of each session, read by the services), `log/<process>.log` (each process's stdout + stderr). The data root (`--data-root`, default the user's `$XDG_DATA_HOME/atl`, kept across runs): `apps/<package>/{apk,data,data_de,external}` and `device/data/{system,dalvik-cache}` ([`host_layout`]).
-//! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (owner option I, 2026-11-13): they own the package list; atld does installd's
+//! 2. the install sessions: each `--package` (its APK files) is a session the services install at their start (maintainer option I, 2026-11-13): they own the package list; atld does installd's
 //!    file work on their request (control `Install`: stage under session names (hard links where possible) + run atl-installer in the broker's installer profile; `Commit`: rename each file by its
 //!    parsed split (`base.apk`, `split_<name>.apk`), then the dir to `/data/app/<package>`, create the data dirs).
 //! 3. atl-binderd, its admin connection on stdin; the broker holds the other end.
@@ -906,7 +906,7 @@ fn partition_file(s: &str) -> Result<(PathBuf, PathBuf), String> {
     Ok((PathBuf::from(host), rel.to_path_buf()))
 }
 
-/// installd's file work for the services' install (owner option I): the sessions' files, the installer's view, and what was staged and committed.
+/// installd's file work for the services' install (maintainer option I): the sessions' files, the installer's view, and what was staged and committed.
 struct Installd {
     /// session i's files, base first (`--package` i)
     sessions: Vec<Vec<PackageFile>>,
@@ -2048,7 +2048,7 @@ impl Host {
     }
 }
 
-/// The run's control socket, `<root>/control.sock` (owner decision 2026-11-06: the run ends on an explicit stop, not with an app): one command line per connection, one reply line.
+/// The run's control socket, `<root>/control.sock` (maintainer decision 2026-11-06: the run ends on an explicit stop, not with an app): one command line per connection, one reply line.
 /// `stop` ends the run (reply `ok`); `start <package>/<class>` starts an activity as `am start` does ([`Host::am_start`]); `capture <package> <out>` writes the package's window picture to `out` ([`Host::capture`]). Anything else: `error unknown command`.
 fn serve_run_control(host: Arc<Host>, listener: UnixListener) {
     for conn in listener.incoming() {
@@ -3154,7 +3154,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             None
         }
     };
-    // what the services started dies with the run, SIGKILLed as AOSP kills an app process; then the system processes stop the Linux way (SIGTERM, the grace, SIGKILL; owner decision 3), each
+    // what the services started dies with the run, SIGKILLed as AOSP kills an app process; then the system processes stop the Linux way (SIGTERM, the grace, SIGKILL; maintainer decision 3), each
     // writing its exit totals, and binderd last, by its admin connection, printing its own counters
     let grace = Duration::from_millis(a.stop_grace_ms);
     let left: Vec<i32> = host

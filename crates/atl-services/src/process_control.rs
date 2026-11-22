@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! ProcessControl (owner D1, 2026-11-03): how the system services start and kill app processes. The seam stands where AOSP's ProcessList meets the zygote (`Process.start`) and `Process.killProcess`;
+//! ProcessControl (maintainer D1, 2026-11-03): how the system services start and kill app processes. The seam stands where AOSP's ProcessList meets the zygote (`Process.start`) and `Process.killProcess`;
 //! the one implementation is a control socket to atld, which spawns through the broker's sandbox and kills the sandbox ([`atl_broker::control`] is the protocol). The trait is shaped by that implementation:
 //! a start names the process and returns the pid binderd will report for it (what `attachApplication` sees as the calling pid), a kill takes that pid, and so does the lookup of the pid the process has
 //! inside its own sandbox (getRunningAppProcesses answers an app's own pid in its numbering).

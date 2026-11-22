@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test cts`: the progress metric of the CTS port (owner decision 2026-11-03: our own runner drives AOSP's `am instrument`, not Tradefed). One row of cts.toml = one `android_test` module: the converter builds its APK (and the apps it names),
+//! `xtask test cts`: the progress metric of the CTS port (maintainer decision 2026-11-03: our own runner drives AOSP's `am instrument`, not Tradefed). One row of cts.toml = one `android_test` module: the converter builds its APK (and the apps it names),
 //! atld installs them next to the android.test.* shared libraries and runs `am instrument -w -r [-e class ..] [-e package ..] <package>/<runner>` as the shell user (instrument.rs: the same run the `test instrument` gate checks),
 //! the INSTRUMENTATION_* text is parsed and classified (cts_report.rs), and `<out>/cts/report.json` holds every module's state and every test's outcome. The summary on stdout is the one-screen version: per module pass/fail/error/ignored/total, then the services' most-hit
 //! unimplemented-call and refused-parcelable counters summed over the run, the list of what to implement next.
@@ -52,7 +52,7 @@ pub struct Args {
     verbose: bool,
 }
 
-/// Per-module time limit: a cold ART start costs seconds and a whole CTS module hundreds of tests, so the unit-test gate's 300 s (instrument.rs LIMIT) is too short; 30 minutes bounds one row at the owner's patience and is not a measured need (no module has finished yet).
+/// Per-module time limit: a cold ART start costs seconds and a whole CTS module hundreds of tests, so the unit-test gate's 300 s (instrument.rs LIMIT) is too short; 30 minutes bounds one row at the maintainer's patience and is not a measured need (no module has finished yet).
 const LIMIT_SECS: u64 = 1800;
 /// Counters the summary lists: one screen with the module table above.
 const TOP_COUNTERS: usize = 15;

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Machine-wide admission: a weighted pool of CPU slots and memory (GiB). Heavy work holds a [`Grant`] around one leaf (a ninja build, a cargo run) and releases it after.
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
-//! Waiters queue as tickets in `cache/build-pool/queue/`, served in (tier, arrival) order ([`Tier`]: the owner's main checkout, then land, then agents), so a large request is not starved by small ones behind it; a ticket waiting past `starve_after_s` joins the top tier at its arrival. No grant is preempted: priority decides only who is admitted next.
+//! Waiters queue as tickets in `cache/build-pool/queue/`, served in (tier, arrival) order ([`Tier`]: the maintainer's main checkout, then land, then agents), so a large request is not starved by small ones behind it; a ticket waiting past `starve_after_s` joins the top tier at its arrival. No grant is preempted: priority decides only who is admitted next.
 //! Light work takes a free CPU slot at once when the queue head could not use it (`bypass_allowed`); otherwise it queues like heavy work.
-//! Reserved slot (owner 2026-11-18, option B): one CPU slot beyond `cpu_slots` plus the `light` class's memory carved out of `mem_gib`, taken only by interactive-tier light work ([`try_reserved`]), so the owner's play launch never waits behind agents' full natives. Its grant prints `granted the reserved slot` and counts in [`RESERVED_GRANTS`].
+//! Reserved slot (maintainer 2026-11-18, option B): one CPU slot beyond `cpu_slots` plus the `light` class's memory carved out of `mem_gib`, taken only by interactive-tier light work ([`try_reserved`]), so the maintainer's play launch never waits behind agents' full natives. Its grant prints `granted the reserved slot` and counts in [`RESERVED_GRANTS`].
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
 //! Nested admission is refused: a thread holding a grant, or a process with a holder among its ancestors, would wait for slots its own holder keeps.
 //! Sizes and weights: `[pool]` in `workspace.toml` (ws_config.rs); the defaults and their derivation are on [`Class::default_weight`].
@@ -157,7 +157,7 @@ pub fn held_jobs() -> Option<u32> {
 /// Admission tier of a queue ticket: served in (tier, arrival) order. Like a scheduler's nice level, but at admission: the pool admits by slots, so priority decides who is admitted next, never what a running grant gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    /// The owner at the main checkout (a game launch, a native the owner waits on).
+    /// The maintainer at the main checkout (a game launch, a native the maintainer waits on).
     Interactive,
     /// The land worktree: its verify gates main for everyone.
     Land,
@@ -166,7 +166,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Derived from the checkout, no flag or environment: the main checkout is the owner's (agents never build there, project rule), the land worktree is land's, every other checkout an agent's. A path that is no checkout (tests, a broken git dir) is an agent's: no tier is gained by failing.
+    /// Derived from the checkout, no flag or environment: the main checkout is the maintainer's (agents never build there, project rule), the land worktree is land's, every other checkout an agent's. A path that is no checkout (tests, a broken git dir) is an agent's: no tier is gained by failing.
     pub fn of(who: &Path) -> Tier {
         match crate::out::checkout_id(who).as_deref() {
             Ok(crate::out::MAIN_ID) => Tier::Interactive,

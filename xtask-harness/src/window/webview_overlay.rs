@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Stage `webview-overlay` of `xtask test window`: an in-game survey's arrangement (Angry Birds 2, owner 2026-11-18): one activity, an animating focused GLSurfaceView, a full-window WebView added
+//! Stage `webview-overlay` of `xtask test window`: an in-game survey's arrangement (Angry Birds 2, maintainer 2026-11-18): one activity, an animating focused GLSurfaceView, a full-window WebView added
 //! over it at runtime (xtask-harness/testdata/webview-overlay, Main.java). UI mode on the nested labwc; every input goes through the Wayland proxy, so it takes the real GTK path (toplevel key
 //! controller, keyboard focus, the sideband gate), not a headless injection.
 //! Sub-gates ([`checks`]): loaded (onPageFinished), web-children (the WebView's getChildCount counts only the app's own child, which the fixture then removes by index as Battle Cats TW's consent SDK
@@ -65,7 +65,7 @@ const KEY_ESC: u32 = 1;
 const PAINT_SETTLE: Duration = Duration::from_secs(2);
 /// One Looper trip plus one web-process round trip per input; generous for a loaded host.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
-/// The resizes: logical sizes (gate output scale 1: physical too), serials past the first configures'. A shrink from the default window in both axes, then a grow in height only (the owner's
+/// The resizes: logical sizes (gate output scale 1: physical too), serials past the first configures'. A shrink from the default window in both axes, then a grow in height only (the maintainer's
 /// case: window made taller, page kept its old height). The check runs on the last one.
 const RESIZES: [(i32, i32, u32); 2] = [(720, 400, 4242), (720, 800, 4243)];
 const RESIZE: (i32, i32, u32) = RESIZES[1];
@@ -313,7 +313,7 @@ fn resize_check(app: &str) -> Result<String, String> {
     if dst != [0, 0, i64::from(w), i64::from(h)] {
         return Err(format!("last placement dst={dst:?}, window {w}x{h}"));
     }
-    // the page's own viewport, not only the rectangle: a widget placed right whose content kept its old size shows the game below the page (owner screenshot 2026-11-18)
+    // the page's own viewport, not only the rectangle: a widget placed right whose content kept its old size shows the game below the page (maintainer screenshot 2026-11-18)
     let vp = app
         .lines()
         .rev()
@@ -478,7 +478,7 @@ mod tests {
         assert!(preload_check(&tapped).is_err());
         let stale = ok.replace("dst=0,0,720,520", "dst=0,0,960,600");
         assert!(resize_check(&stale).is_err());
-        // the owner's case: placed right, page kept its old height
+        // the maintainer's case: placed right, page kept its old height
         let old_page = ok.replace("viewport360x260", "viewport360x300");
         assert!(resize_check(&old_page).is_err());
         // the Battle Cats case: the provider's carrier counted as a child, so the app's removeViewAt(0) took the page off the screen

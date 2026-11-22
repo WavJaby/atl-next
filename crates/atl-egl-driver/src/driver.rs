@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The process's one driver instance: the host display it renders on, the host entries it calls, the window surfaces it made, the per-thread error.
 //! Device: the EGL device of the DRM node gralloc allocates on, as atld names it in the process's properties (atl_gralloc::node, read through bionic's `__system_property_get` in the process's global scope); on the trial tier a node without an EGL device (the kernel's vgem on WSL) only allocates and the software device renders.
-//! Rendering stays on that device: P0a measured a LINEAR buffer from one GPU failing to render on the other in both directions (owner decision 2026-11-09: no cross-GPU).
+//! Rendering stays on that device: P0a measured a LINEAR buffer from one GPU failing to render on the other in both directions (maintainer decision 2026-11-09: no cross-GPU).
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};

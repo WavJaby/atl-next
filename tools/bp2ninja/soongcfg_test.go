@@ -195,7 +195,7 @@ cc_library {
 	}
 }
 
-// What clang defines for Soong's device triple <arch>-linux-android<level> (owner 2026-11-01: __ANDROID__, never __BIONIC__) on every device C and C++ compile, none on host;
+// What clang defines for Soong's device triple <arch>-linux-android<level> (maintainer 2026-11-01: __ANDROID__, never __BIONIC__) on every device C and C++ compile, none on host;
 // both forced headers on every device compile, a libc dependency or not; the libc++ shims only in C++.
 func TestDeviceDefinesAndForced(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `

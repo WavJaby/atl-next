@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask run-apk <ROW|PATH>`: a test APK row of test-apks.toml, or an APK file given by path (unpinned), started by atld the way an app is (its launcher activity), in UI mode: the app's window is a GTK window of this desktop with --hold, else of the gate's headless compositor (nested_wayland.rs).
 //! Staging is the window gate's runtime setup (Runtime::new, gralloc, the display) under run-apk's own key (`<out>/run-apk`, `run-apk-art`, `run-apk-fonts`): the APK copied into the run's work dir, the package file from the APK's real manifest (manifest::read).
-//! Every run starts from a clean install (owner 2026-11-22): a fresh, empty data root `<run dir>/<name>` (xtask out_run.rs `fresh_root`, `cargo xtask out show --run`; name = the row, or `apk-<file stem>`), emptied at the run's start, the APK installed into it. Nothing is carried from an earlier run.
+//! Every run starts from a clean install (maintainer 2026-11-22): a fresh, empty data root `<run dir>/<name>` (xtask out_run.rs `fresh_root`, `cargo xtask out show --run`; name = the row, or `apk-<file stem>`), emptied at the run's start, the APK installed into it. Nothing is carried from an earlier run.
 //! `--reuse-data-root DIR` is the explicit opt-in for a human relaunching on one root (and the app-data gate's launches): atld `--data-root DIR`, kept across launches, `--clear-data` = `pm clear` of the package. `--user-data` is the same on atld's default root (the user's own, `atl_platform_host::user_data_root`), for a human play session only. The line `run-apk: data root: fresh|reused <path>` names which, so no report can hide a reused root.
 //! No probe; injected input only with `--pointer` (a scripted tap sequence the app runs from its first present). The verdict is about the last activity the app resumed (`services: activity resumed <class>`, sent after onResume returns). The run waits until the services
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
@@ -1741,7 +1741,7 @@ fn judge(
 mod tests {
     use super::*;
 
-    /// `--user-data` takes no value and conflicts with every other data-root choice: a reused DIR, `--clear-data` (the owner's saves are never one flag away) and a scenario's fresh root.
+    /// `--user-data` takes no value and conflicts with every other data-root choice: a reused DIR, `--clear-data` (the maintainer's saves are never one flag away) and a scenario's fresh root.
     #[test]
     fn user_data_conflicts_with_other_data_roots() {
         use clap::Parser;
@@ -2069,7 +2069,7 @@ mod tests {
                           services: activity settled at=1794924856.299\n";
     const AB2_PRESENT: &str = "1794924857.000 D atl-composer: ui: present n=1 time_ns=1\n";
 
-    /// AB2 (session 4, s4-ab2b): the owner closed the window, the services killed the app after the removal; FAILED `atld exited inside the window` before, now ok.
+    /// AB2 (session 4, s4-ab2b): the maintainer closed the window, the services killed the app after the removal; FAILED `atld exited inside the window` before, now ok.
     #[test]
     fn a_closed_window_is_a_normal_end() {
         let services = format!(

@@ -38,7 +38,7 @@ const PAGE: usize = 4096;
 /// The first word of the unmapped page: a stack read that reached it would return this.
 const MARKER: u64 = 0xdead_beef_dead_beef;
 
-/// Check z: `attach_ex` with size 0 gets the default guest stack, 1 MiB (owner D2, bionic's default order).
+/// Check z: `attach_ex` with size 0 gets the default guest stack, 1 MiB (maintainer D2, bionic's default order).
 const DEFAULT_STACK: u64 = 1 << 20;
 /// Check z: the requested stack, 256 KiB (plan G3), page-aligned so no rounding applies.
 const SIZED_STACK: u64 = 256 << 10;

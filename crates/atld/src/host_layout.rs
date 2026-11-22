@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The data root's layout (`--data-root`, default `$XDG_DATA_HOME/atl`, kept across runs) and the one-time move of the old single device tree into it.
-//! - `apps/<package>/`: one host root per package (owner layout 2026-10-29): `apk` (code, ro at `/data/app/<package>`), `data` (`/data/user/0/<package>`, its `cache`/`code_cache` inside as on AOSP),
+//! - `apps/<package>/`: one host root per package (maintainer layout 2026-10-29): `apk` (code, ro at `/data/app/<package>`), `data` (`/data/user/0/<package>`, its `cache`/`code_cache` inside as on AOSP),
 //!   `data_de` (device-protected `/data/user_de/0/<package>`), `external/{data,obb}` (`/storage/emulated/0/Android/{data,obb}/<package>`). System packages' data lives here like any package's.
 //! - `device/data/`: what is not yet per package: `system/` (SettingsProvider's /data/system), `dalvik-cache/`, `app/vmdl<session>.tmp` install staging (same filesystem as `apps/`, so commit is a rename).
 //!   Later slices move them (system state -> `system/`, regenerable state -> the XDG cache root).
@@ -68,7 +68,7 @@ pub struct Migration {
 /// Moves each package's dirs from the old device tree to `apps/<package>/` by `rename` (one filesystem: both under `data_root`); never copies, merges or deletes.
 /// Per package: an item present in both trees refuses the whole package (nothing of it moves; the caller refuses to start it); else every item still in the old tree moves.
 /// Idempotent: a tree a crash left half-moved is finished by the next call. Install staging dirs (`vmdl<n>.tmp`) are not packages.
-/// Delete this once the owner's tree is migrated and confirmed: the old tree then holds no package dirs.
+/// Delete this once the maintainer's tree is migrated and confirmed: the old tree then holds no package dirs.
 pub fn migrate(data_root: &Path) -> Result<Migration> {
     let mut packages = std::collections::BTreeSet::new();
     for item in Item::ALL {

@@ -1273,7 +1273,7 @@ fn link_target(root: &Path, dir: &Path) -> Result<()> {
 /// Why: the dir's own outputs were built on the old base and are mostly stale after the rebase, while the new base holds main's build of everything the rebase brought; the checkout's compiles hit sccache at the canonical path, so redoing its own delta is cheap.
 /// Kept: the dir's cargo target roots (`out_prune::DIR_ROOTS`), moved into the new copy: `target/` holds this running xtask binary (re-executed by path into the namespace), and every root holds the checkout's cargo units, which key on the checkout path a base's units (built in the land worktree) never match: taking the base's cost a 72-crate rebuild (X4 gate).
 /// No mtime restore (`checkout_stamps`): the kept roots hold units built from the checkout's own content after the base's recorded mtimes, so an old mtime on a file rebased back to the base's content would make them fresh. Instead every path differing from the new base gets now (`touch_changed_since`): the base's ninja outputs are newer than an old own edit.
-/// Only when main brought a large change (owner 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
+/// Only when main brought a large change (maintainer 2026-11-16): at least `build.refresh_min_upstream_files` files under [`UPSTREAM_INPUTS`] changed from the dir's base to the newer one (derivation on ws_config.rs DEFAULT_REFRESH_MIN_UPSTREAM_FILES); below it keeping the old dir rebuilds less.
 /// Kept (line `out: keep <reason>`): a dir without `.base` (built from zero), one already on the newest base or whose base is not an ancestor of it, a small change, a dir another process holds. None: the land worktree (land owns `ws/land`) or no dir yet (the first build makes it).
 pub fn refresh(root: &Path) -> Result<Option<String>> {
     let ws = Layout::of(root)?.workspace().to_owned();
@@ -1764,7 +1764,7 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
 }
 
 /// `out prune` without a flag: build dirs whose checkout is not in `live`, bases beyond the keep rule, and each live checkout's kept gate logs past [`red_logs::KEEP_RUNS`] (red_logs::prune); lists them, `execute` removes them. Returns how many removals failed (a busy dir is skipped, not failed).
-/// Also `land`'s cleanup child, after the landed worktree is gone. The orphans and bases are under the owner's standing approval; the kept gate logs past the keep (red_logs.rs) are not on that list, yet this land cleanup (execute) removes them too.
+/// Also `land`'s cleanup child, after the landed worktree is gone. The orphans and bases are under the maintainer's standing approval; the kept gate logs past the keep (red_logs.rs) are not on that list, yet this land cleanup (execute) removes them too.
 pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<usize> {
     let rows =
         match crate::ws_config::load(ws).and_then(|cfg| crate::disk_floor::pool_rows(ws, &cfg)) {

@@ -183,7 +183,7 @@ pub(super) unsafe fn table_of(guest: usize) -> Option<TableId> {
     FUNCTIONS.iter().position(|a| a.get() == Some(&f))
 }
 
-/// Why a guest object call is refused (dispatch.rs `refuse`, the named abort of owner decision D-4).
+/// Why a guest object call is refused (dispatch.rs `refuse`, the named abort of maintainer decision D-4).
 pub(super) enum Refused {
     /// x0 is no registered proxy object.
     NotProxy { id: usize, guest: usize },

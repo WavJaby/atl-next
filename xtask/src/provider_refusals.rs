@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn resume_timers_is_not_class_c() {
-        // the owner's crash (Temple Run, Pangle ad): WebView.resumeTimers must answer, never refuse
+        // the maintainer's crash (Temple Run, Pangle ad): WebView.resumeTimers must answer, never refuse
         assert!(!CLASS_C.iter().any(|(a, _)| a.ends_with("Timers")
             || a.ends_with("onPause")
             || a.ends_with("onResume")));

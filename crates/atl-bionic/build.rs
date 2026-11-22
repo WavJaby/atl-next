@@ -62,7 +62,7 @@ const APIS: &[Api] = &[
     // bionic's sys/cdefs.h brings it into every unit; ours has no include, so it can be forced
     buildscript::API_LEVEL,
     // libdl's platform-only API, declared by its callers: the target SDK setter (ART; the launcher calls
-    // it, owner Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
+    // it, maintainer Q5), the exported-namespace lookup (libvulkan, libgraphicsenv, libstagefright,
     // libvndksupport), namespace creation / linking (libgraphicsenv), the linker warnings (libandroid_runtime
     // android_app_Activity.cpp) and the default search paths (libopenjdk System.c, java.library.path)
     Api {

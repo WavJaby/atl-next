@@ -8,7 +8,7 @@ rust-version.workspace = true
 license = "MIT AND Apache-2.0"
 publish.workspace = true
 
-# The M2 system services in Rust (owner 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager.
+# The M2 system services in Rust (maintainer 2026-11-03): ActivityManager (+ the ActivityTaskManager launch path and IActivityClientController), PackageManager.
 # They implement the converter's AIDL stubs (atl-aidl) against libbinder_rs and the parcelable codecs (libatl_parcelables), so only `xtask native` builds them (feature `converter`);
 # plain workspace builds take the policy modules (permission, packages) and their tests, counting into cargo's atl-diag (dependency `atl-diag-plain`, lib.rs).
 # The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.

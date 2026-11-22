@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The toolkit session: GTK started on the module's own display thread (`atl-display`), which runs GLib's default main loop for the process's life.
 //!
-//! Thread model (owner 2026-11-20, display-thread plan D2): the display thread owns GLib's default context, GTK and GDK's Wayland connection, and waits on no app thread (rule B1); app threads reach it only through [`GtkInvoker`] (`invoke`, `call`). Android's UI thread runs its own Looper apart from it.
+//! Thread model (maintainer 2026-11-20, display-thread plan D2): the display thread owns GLib's default context, GTK and GDK's Wayland connection, and waits on no app thread (rule B1); app threads reach it only through [`GtkInvoker`] (`invoke`, `call`). Android's UI thread runs its own Looper apart from it.
 //! A UI thread that stops polling (an app blocking in `onCreate`) answers no `xdg_wm_base.ping`, so the compositor shows its native "not responding" dialog: GDK's ping is held until the app's main Looper ran a liveness token ([`ping`], display-thread plan D3).
 
 use std::sync::{Arc, Condvar, Mutex, mpsc};

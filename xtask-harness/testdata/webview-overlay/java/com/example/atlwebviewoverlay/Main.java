@@ -22,7 +22,7 @@ import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
 /**
- * The WebView-over-a-game gate: `xtask test window --stage webview-overlay` (xtask-harness/src/window/webview_overlay.rs). The arrangement of an in-game survey (Angry Birds 2, owner 2026-11-18):
+ * The WebView-over-a-game gate: `xtask test window --stage webview-overlay` (xtask-harness/src/window/webview_overlay.rs). The arrangement of an in-game survey (Angry Birds 2, maintainer 2026-11-18):
  * one activity whose content is an animating, focused GLSurfaceView; after its first frame a full-window WebView is added over it at runtime.
  * Page: one full-page button over 3 window heights of content (the survey is taller than the window); each click sets the title `tap<n>` and navigates to a fragment (a history entry), so the
  * WebView can go back; the first scroll sets the title `scrolled`; each viewport resize sets `viewport<innerWidth>x<innerHeight>` (CSS px, device-width viewport). Each key the page gets is reported through the bridge ({@link Keys}): `wvo page key <n><key>`.
@@ -137,7 +137,7 @@ public class Main extends Activity {
         WebView w = new WebView(this);
         w.getSettings().setJavaScriptEnabled(true);
         w.addJavascriptInterface(new Keys(), "atl");
-        // a consent SDK's loading indicator (Battle Cats TW, owner 2026-11-17): a child the app adds to the WebView (an AbsoluteLayout), removed by index when the page has loaded
+        // a consent SDK's loading indicator (Battle Cats TW, maintainer 2026-11-17): a child the app adds to the WebView (an AbsoluteLayout), removed by index when the page has loaded
         w.addView(new View(this), new FrameLayout.LayoutParams(1, 1));
         w.setWebViewClient(new WebViewClient() {
             private boolean spinnerGone;

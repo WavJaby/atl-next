@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# The process's own view of servicemanager (owner decision 2026-11-06, audio M0 option A/1): names this process serves are answered in-process, the rest forwarded.
+# The process's own view of servicemanager (maintainer decision 2026-11-06, audio M0 option A/1): names this process serves are answered in-process, the rest forwarded.
 # C++ is cxx glue (src/bridge.rs) plus wrap/view.{h,cpp}: adapters that convert types and forward to libbinder's API, no logic (project CLAUDE.md, C++ exception). Compiled with the converter's libbinder_ndk argv (graph.json `cxx`).
 [package]
 name = "atl-service-view"

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The process's own view of servicemanager (owner decision 2026-11-06): libbinder's default service manager becomes an in-process `android.os.IServiceManager` that answers the names this process
+//! The process's own view of servicemanager (maintainer decision 2026-11-06): libbinder's default service manager becomes an in-process `android.os.IServiceManager` that answers the names this process
 //! serves itself ([`serve`]) and forwards every other call to the real servicemanager (the binder context object, through binderd). One mechanism for every service an app process must find by a fixed
 //! name it cannot register: its SurfaceFlinger (atl-composer), the Codec2 store, the media resource manager, the media extractor service (atl-media-extractors) and the media player service (made at first lookup, [`serve_lazy`]). Other processes never see these names: servicemanager stays one namespace of system services.
 //! Native lookups only (`defaultServiceManager()`: libbinder, libbinder_ndk, libbinder_rs); Java's ServiceManager reads the context object itself and sees the real one.

@@ -121,7 +121,7 @@ fn lint_judges(steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
-/// A run's network: `flag` (`--network`) over the script's header; the lint makes the header present, offline (the regression form, owner 2026-11-20) otherwise.
+/// A run's network: `flag` (`--network`) over the script's header; the lint makes the header present, offline (the regression form, maintainer 2026-11-20) otherwise.
 pub fn network(flag: Option<Network>, script: &Script) -> Network {
     flag.or(script.network).unwrap_or(Network::Offline)
 }

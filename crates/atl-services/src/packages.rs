@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! One installed package as the services hold it (owner option I): the installer's PackageInfo (PackageInfoCommonUtils.generate over AOSP's own parse) with PMS's per-install fields set on it once
+//! One installed package as the services hold it (maintainer option I): the installer's PackageInfo (PackageInfoCommonUtils.generate over AOSP's own parse) with PMS's per-install fields set on it once
 //! ([`InstallFields::apply`]), the intent filters and `<uses-library>` lists PackageInfo does not carry (installer frames), and the install's uid, instruction set, grants and GL driver.
 //! Every IPackageManager answer is a clone of a stored info, filtered by the caller's flags ([`answer`]): nothing is re-derived from the manifest.
 

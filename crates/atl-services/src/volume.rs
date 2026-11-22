@@ -2,7 +2,7 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/audio/AudioService.java, frameworks/base/media/java/android/media/AudioSystem.java
 //! The app-visible stream volumes AudioService keeps (VolumeStreamState): per stream an index in AOSP's tenths (index * 10), its min / max, a mute flag; streams that share an alias (the
 //! non-voice STREAM_VOLUME_ALIAS_DEFAULT table: SYSTEM, NOTIFICATION, ... follow RING) move together, rescaled (rescaleIndex) to each stream's range.
-//! One state per app uid ([`AppVolumes`]), not one per device: deviation from AOSP's device-wide volume, forced by the owner decision that an app's volume is the host's per-application volume
+//! One state per app uid ([`AppVolumes`]), not one per device: deviation from AOSP's device-wide volume, forced by the maintainer decision that an app's volume is the host's per-application volume
 //! (behaviour decision 3) -- app A's setStreamVolume does not change what app B reads.
 //! STREAM_MUSIC's alias group is an absolute-volume device (AudioManager.DEVICE_VOLUME_BEHAVIOR_ABSOLUTE) once the app process registers its controller (atl-audioflinger, the app's own host
 //! stream): an app-side change is dispatched to it, a host-side change comes back with FLAG_ABSOLUTE_VOLUME and is not dispatched again. Every other alias group stays the app's own gain:

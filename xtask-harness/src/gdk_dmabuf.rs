@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The dmabuf present verdict from GTK's own debug output (`GDK_DEBUG=dmabuf`; message texts of GTK 4.18 and 4.24 in `gdk/gdkdmabuf*.c`, `gdkgl*.c`, `gsk/gpu/gskvulkanimage.c`,
 //! `gskgpurenderer.c`): every buffer is imported by the renderer (GskGLRenderer: an EGLImage; GskVulkanRenderer: a Vulkan image on the dma-buf's memory), none is downloaded on the CPU
-//! (owner decision O3: no CPU fallback). GDK advertises the formats its mmap downloader handles alongside the GPU ones (`mmap advertises dmabuf format`), so a format check before the import
+//! (maintainer decision O3: no CPU fallback). GDK advertises the formats its mmap downloader handles alongside the GPU ones (`mmap advertises dmabuf format`), so a format check before the import
 //! cannot tell the paths apart; this log can.
 
 /// What the gated client runs with.

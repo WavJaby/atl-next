@@ -71,7 +71,7 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 # APK reading for the install's native-library extraction (atl-services-types native_libs, temporary until the installer process runs AOSP's NativeLibraryHelper); inflate via flate2 + zlib-rs only (feature `deflate` would add the zopfli compressor)
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-# D-Bus client (MIT, pure Rust, no libdbus): atl-platform-host-linux's session-bus calls (notifications plan OD1, owner 2026-11-18: zbus directly). `default-rt` = zbus's own runtime (zruntime), driven by `zbus::block_on` from atld's sync threads: no tokio.
+# D-Bus client (MIT, pure Rust, no libdbus): atl-platform-host-linux's session-bus calls (notifications plan OD1, maintainer 2026-11-18: zbus directly). `default-rt` = zbus's own runtime (zruntime), driven by `zbus::block_on` from atld's sync threads: no tokio.
 # No `proxy` / `service` macros here (the product calls methods by name); xtask-harness adds `service` for its fake desktop server. deny.toml bans it outside those two.
 zbus = { version = "6.3.0", default-features = false, features = ["default-rt"] }
 # no `attributes` (the #[instrument] macro): it is the only user of syn 2, the rest of the graph is on syn 3

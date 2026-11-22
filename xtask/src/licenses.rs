@@ -17,7 +17,7 @@ pub const AOSP: &str = "aosp";
 /// The GPL-3.0-or-later QEMU bridge; its allow list = licences combinable with GPL-3.
 const BRIDGE: &str = "qemu-bridge";
 /// The exceptions under which GPL-2.0-only code may enter a process: each lets code of any licence use it.
-/// Classpath: linking with independent modules (libcore ojluni, libjdwp; owner 2026-10-29). Linux-syscall-note: programs using the kernel through system calls, i.e. the kernel uapi headers (owner 2026-10-31).
+/// Classpath: linking with independent modules (libcore ojluni, libjdwp; maintainer 2026-10-29). Linux-syscall-note: programs using the kernel through system calls, i.e. the kernel uapi headers (maintainer 2026-10-31).
 const GPL2_LINKING_EXCEPTIONS: &[&str] = &["Classpath-exception-2.0", "Linux-syscall-note"];
 /// The exceptions under which GPL-3 code may enter the runtime: each frees the works using it from copyleft (libgcc_s, Bison parsers).
 const GPL3_FREEING_EXCEPTIONS: &[&str] = &["GCC-exception-3.1", "Bison-exception-2.2"];
@@ -163,7 +163,7 @@ pub enum Unlabelled {
 /// Prefix of the AOSP `license_kind` modules (build/soong/licenses/Android.bp) that name an SPDX id.
 const SPDX_KIND: &str = "SPDX-license-identifier-";
 
-/// An AOSP package's default from its licence kinds (`aosp::package_kinds`): exactly one kind, naming a valid SPDX id. Owner decision 2026-10-31: several kinds do not say which file has which, so those files stay unresolved (a `paths` entry each).
+/// An AOSP package's default from its licence kinds (`aosp::package_kinds`): exactly one kind, naming a valid SPDX id. Maintainer decision 2026-10-31: several kinds do not say which file has which, so those files stay unresolved (a `paths` entry each).
 pub fn aosp_default(package: &Path, kinds: &BTreeSet<String>) -> Unlabelled {
     let p = package.display();
     let mut each = kinds.iter();

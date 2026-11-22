@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The api traits over the platform module's vtable (hand-written shims, owner O1): each method turns its arguments into `abi` views or callbacks, calls the module, and maps the status back to the trait's error. Each proxy owns one module handle and ends it on drop.
+//! The api traits over the platform module's vtable (hand-written shims, maintainer O1): each method turns its arguments into `abi` views or callbacks, calls the module, and maps the status back to the trait's error. Each proxy owns one module handle and ends it on drop.
 //! Thread rules are the module objects': windows, text inputs and audio objects hold raw handles, so they are neither Send nor Sync, as the GTK and PipeWire types they stand for; the session, the invoker and the frame requester are Send + Sync like theirs.
 
 use std::cell::RefCell;

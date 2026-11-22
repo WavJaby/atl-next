@@ -33,7 +33,7 @@ pub type Sample = (u32, f64, f64);
 
 /// The moves of one compressed GTK motion event, oldest first: GDK coalesces motion per frame clock and keeps the dropped samples in `gdk_event_get_history`, which excludes the event's own position.
 /// Each sample becomes its own MOVE, as an evdev device's are: AOSP's InputConsumer (consumeBatch) then folds them into one ACTION_MOVE with history samples per frame, so the app's VelocityTracker sees every sample.
-/// Times strictly increase, after `last` (the time of the pointer event published before): an evdev stream never repeats a time, while GDK on WSLg stamps every history sample of a frame with the frame's ms time (owner drag: ~15 one-pixel samples per 15 ms, all one time).
+/// Times strictly increase, after `last` (the time of the pointer event published before): an evdev stream never repeats a time, while GDK on WSLg stamps every history sample of a frame with the frame's ms time (maintainer drag: ~15 one-pixel samples per 15 ms, all one time).
 /// AOSP keeps such duplicates as zero-dt history (InputConsumer canAddSample/resampleTouchState only skip them), so app-side per-sample velocity divides by 0; samples sharing a time collapse to the last position, and a history sample timed at or before `last` (or after `current`) is dropped.
 /// The event's own position is always published, even at `last`'s time: dropping it loses the move itself (a press and a drag in one ms -> the app saw DOWN, UP and no MOVE). Button events already share times with motion, so this adds no new zero-dt kind.
 pub fn motion_samples(
@@ -58,13 +58,13 @@ pub fn motion_samples(
 const MAX_DELIVERY_MS: i64 = 1000;
 
 /// The toolkit time of an event that carries none: `GDK_CURRENT_TIME` (0), which GDK gives events whose Wayland message has no time (wl_pointer.enter/leave, keyboard focus) and events it synthesizes.
-/// Read as a real time it means "happened at toolkit 0" -> bound = now, a jump of the whole compositor base -> relearn, and the next timed event shrinks back (owner WSLg run: the INFO line fired 67 times, one base rising with guest uptime ~+41.3e6 ms, i.e. t = 0).
+/// Read as a real time it means "happened at toolkit 0" -> bound = now, a jump of the whole compositor base -> relearn, and the next timed event shrinks back (maintainer WSLg run: the INFO line fired 67 times, one base rising with guest uptime ~+41.3e6 ms, i.e. t = 0).
 pub const UNTIMED: u32 = 0;
 
 const NANOS_PER_MS: i64 = 1_000_000;
 
 /// Toolkit event time -> CLOCK_MONOTONIC ns, the base and unit AOSP stamps MotionEvent/KeyEvent with (evdev timestamps, SystemClock.uptimeNanos); InputConsumer resampling and app-side deltas compare against it.
-/// Wayland event times are the compositor's own ms clock with an unspecified base: WSLg's Weston ran 3,603,968 s (~41.7 days) ahead of the guest's monotonic clock (owner run tr-play-m4), a nested compositor on the same kernel matches it.
+/// Wayland event times are the compositor's own ms clock with an unspecified base: WSLg's Weston ran 3,603,968 s (~41.7 days) ahead of the guest's monotonic clock (maintainer run tr-play-m4), a nested compositor on the same kernel matches it.
 /// The offset (monotonic - toolkit) is learned per seat from receipt times: every event arrives after it happened, so the tightest bound is the smallest `now - t` seen; it only shrinks, which keeps the compositor's spacing between samples.
 /// Output never lies after `now` and never goes backwards; a jump of the toolkit clock (bound exceeded by [`MAX_DELIVERY_MS`]) relearns. An [`UNTIMED`] event teaches nothing and is stamped at receipt.
 /// Output is i64 ns: AOSP's unit, no wrap (u32 ms wrapped after 49.7 days of uptime).
@@ -343,7 +343,7 @@ mod tests {
         );
     }
 
-    /// Owner's WSLg drag (tr-play-m1 log, DOWN at 7600 ms (x, y) (141, 458)): frames at 7613/7631/7643 ms each published 3-5 one-pixel moves sharing the frame's time.
+    /// Maintainer's WSLg drag (tr-play-m1 log, DOWN at 7600 ms (x, y) (141, 458)): frames at 7613/7631/7643 ms each published 3-5 one-pixel moves sharing the frame's time.
     /// Each frame collapses to its last position -> one move per distinct time, increasing; a frame at the previous event's time (DOWN 7600) still publishes its own position, its stale history dropped.
     #[test]
     fn shared_times_collapse_to_last_position() {
@@ -391,7 +391,7 @@ mod tests {
         );
     }
 
-    /// Owner run tr-play-m4: Weston stamped a touch at 3643489863 ms while the guest's CLOCK_MONOTONIC read ~39522 s (app log 39442.483 s at wall 1794644772.739, the event logged 79.557 s later) -> toolkit time 3,603,968 s (~41.7 days) ahead of monotonic.
+    /// Maintainer run tr-play-m4: Weston stamped a touch at 3643489863 ms while the guest's CLOCK_MONOTONIC read ~39522 s (app log 39442.483 s at wall 1794644772.739, the event logged 79.557 s later) -> toolkit time 3,603,968 s (~41.7 days) ahead of monotonic.
     /// A drag's samples 15 ms apart keep their spacing on the monotonic clock and end at or before receipt; a later event received sooner tightens the offset; a toolkit-clock jump relearns; nothing goes backwards.
     #[test]
     fn toolkit_time_maps_onto_monotonic() {
@@ -431,12 +431,12 @@ mod tests {
         assert_eq!(ClockMap::default().map(5, 1234), 1234);
     }
 
-    /// The owner's WSLg run interleaved Weston-timed events (base ~-3603967703 ms) with untimed ones (GDK_CURRENT_TIME 0, logged as base +now, ~+41.3e6 ms rising).
+    /// The maintainer's WSLg run interleaved Weston-timed events (base ~-3603967703 ms) with untimed ones (GDK_CURRENT_TIME 0, logged as base +now, ~+41.3e6 ms rising).
     /// Untimed events relearn nothing (no INFO storm), land at receipt, and the timed ones keep the Weston base and their 15 ms spacing; nothing goes backwards.
     #[test]
     fn untimed_events_do_not_relearn() {
         let ns = |ms: i64| ms * NANOS_PER_MS;
-        // receipt of the first event, guest monotonic ms (~41.3e6, the untimed base of the owner run); the Weston base -3603967703 ms
+        // receipt of the first event, guest monotonic ms (~41.3e6, the untimed base of the maintainer run); the Weston base -3603967703 ms
         let now: i64 = 41_300_000;
         let weston = |at: i64| u32::try_from(at + 3_603_967_703).expect("u32 ms");
         let mut clock = ClockMap::default();

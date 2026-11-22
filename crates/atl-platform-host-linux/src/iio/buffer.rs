@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::iio::tests::{Fake, LAPTOP_CASES, RAW, close};
 
-    /// The owner's laptop, `scan_elements` as read 2026-11-08 (`run`): x, y, z `le:s32/32>>0` at indices 0-2, the timestamp `le:s64/64>>0` at index 3.
+    /// The maintainer's laptop, `scan_elements` as read 2026-11-08 (`run`): x, y, z `le:s32/32>>0` at indices 0-2, the timestamp `le:s64/64>>0` at index 3.
     const LAPTOP_LAYOUT: [(&str, &str); 12] = [
         ("scan_elements/in_accel_x_index", "0"),
         ("scan_elements/in_accel_x_type", "le:s32/32>>0"),

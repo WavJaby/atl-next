@@ -29,7 +29,7 @@ const TRAILERS: [&str; 2] = ["Upstream-Status", "Patch-Reason"];
 /// Untracked files named in a drift message; the rest are counted.
 const STRAYS_SHOWN: usize = 3;
 /// `patches/<upstream>/LICENSE` (`upstream_licence`, written by `--export`, compared by the drift test) is a copy of the first of these at the top of the upstream at its pin.
-/// Many AOSP projects' top-level text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names; llvm-project's is `LICENSE.TXT`. An AOSP project with none of them takes the `license_text` of the Soong packages its patches touch (owner, 2026-11-01).
+/// Many AOSP projects' top-level text is `NOTICE` (`MODULE_LICENSE_*` is an empty marker naming it), so NOTICE counts, after the conventional names; llvm-project's is `LICENSE.TXT`. An AOSP project with none of them takes the `license_text` of the Soong packages its patches touch (maintainer, 2026-11-01).
 const LICENCE_FILES: [&str; 4] = ["LICENSE", "LICENSE.TXT", "COPYING", "NOTICE"];
 const LICENCE_COPY: &str = "LICENSE";
 /// The fix for patches/ ahead of a checkout: the normal state on main between merging a patch change and the next fetch.

@@ -724,7 +724,7 @@ mod tests {
         assert!(after_intercept(&keys).is_ok());
     }
 
-    /// provider-api on hand-written lines: the owner's crash shape (resumeTimers refused) fails, AOSP's answers pass, a wrong answer fails.
+    /// provider-api on hand-written lines: the maintainer's crash shape (resumeTimers refused) fails, AOSP's answers pass, a wrong answer fails.
     #[test]
     fn provider_api_by_hand() {
         let threw = "x AtlWindow: wv api threw java.lang.UnsupportedOperationException: WebViewProvider.resumeTimers\n";

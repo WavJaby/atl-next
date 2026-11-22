@@ -5,8 +5,8 @@ use atl_gralloc::format::{self, DRM_FORMAT_MOD_LINEAR};
 use atl_gralloc::usage::{CPU_MASK, GPU_RENDER_TARGET};
 
 /// The modifier set for a buffer of `usage` in `pixel_format`, from the probe's lists (`probe`: per fourcc, atld's `--modifiers` = renderable on the device ∩ imported by the presenter; a fourcc absent = linear tier). Empty = no modifier serves it (refused).
-/// - any CPU bit, or BLOB / an unknown format: `[LINEAR]` (the CPU indexes rows); empty when GPU_RENDER_TARGET is also set and the probed set lacks LINEAR, i.e. LINEAR is not renderable on the device (NVIDIA: external-only) -- owner D2 (a)
-/// - GPU-only: the probed set as is, GBM picks inside it (owner D1 (a): no "prefer LINEAR"); `[INVALID]` on the implicit tier (node::with_implicit: the driver's own layout); empty when the probe found neither
+/// - any CPU bit, or BLOB / an unknown format: `[LINEAR]` (the CPU indexes rows); empty when GPU_RENDER_TARGET is also set and the probed set lacks LINEAR, i.e. LINEAR is not renderable on the device (NVIDIA: external-only) -- maintainer D2 (a)
+/// - GPU-only: the probed set as is, GBM picks inside it (maintainer D1 (a): no "prefer LINEAR"); `[INVALID]` on the implicit tier (node::with_implicit: the driver's own layout); empty when the probe found neither
 /// - no probe list for the fourcc (WSL, headless): `[LINEAR]`, the baseline tier
 pub fn modifiers_for(usage: u64, pixel_format: i32, probe: &[(u32, Vec<u64>)]) -> Vec<u64> {
     let linear = vec![DRM_FORMAT_MOD_LINEAR];

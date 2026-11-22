@@ -2,7 +2,7 @@
 //! The compositor of one app process: the core ([`Compositor`], [`EventThread`]) behind one lock, the binders it knows, the vsync channels, the frame clock thread, and the calls into libgui that the core's callbacks become.
 //! Binder threads call in (a transaction arrived, a connection asked for vsync); the clock thread ticks in both modes (SurfaceFlinger `commit`): it applies what is due, writes the vsync events and hands the
 //! new scene on: headless to the present thread's [`SceneSink`], UI mode to the window's [`Mailbox`]. The present thread delivers the core's calls to the clients. Nothing here waits for the window's
-//! thread: it only takes scenes from the mailbox and reports releases into it (owner D1/D3, 2026-11-08). A UI-mode tick does not latch while the window has not taken the last scene, as SurfaceFlinger does
+//! thread: it only takes scenes from the mailbox and reports releases into it (maintainer D1/D3, 2026-11-08). A UI-mode tick does not latch while the window has not taken the last scene, as SurfaceFlinger does
 //! not while the last present is pending (bounded: [`BACKPRESSURE_BOUND_NS`]; never for a producer on the window's own thread: [`Latching::LatchSameThread`]); the clock still ticks and sends vsync.
 //! Calls into libgui are never made with the lock held, and the end of a layer handle only queues its destruction for the next tick: libgui may release a handle from inside its own locks.
 

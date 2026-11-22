@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test instrument`: the device-side path of the CTS runner (owner decision 2026-11-03: our own `xtask test cts` drives AOSP's `am instrument`, not Tradefed). A JUnit3 test APK
+//! `xtask test instrument`: the device-side path of the CTS runner (maintainer decision 2026-11-03: our own `xtask test cts` drives AOSP's `am instrument`, not Tradefed). A JUnit3 test APK
 //! (xtask-harness/testdata/instrument: its own instrumentation target, `android.test.InstrumentationTestRunner` from frameworks/base/test-runner) is installed by atld next to the shared libraries
 //! android.test.{runner,base,mock}; AOSP's `am` (frameworks/base/cmds/am, built by the converter) runs as the shell uid and calls ActivityManager.startInstrumentation; the services start the
 //! process through atld's process control, bind it with the instrumentation, merge and report its results to `am`'s watcher, and kill it when the run finishes.

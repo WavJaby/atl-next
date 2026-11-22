@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The cdylib's exports (launcher-ui-module plan S2, `atl_platform_ui_api::abi`): a process loads `libatl_platform_ui_linux.so` with `dlopen(RTLD_NOW | RTLD_LOCAL)` and reaches GTK and PipeWire only through [`VTABLE`], so their closure never enters its global symbol scope. Hand-written shims (owner O1): one per trait method, each turning the handle and views into the implementation's types and calling it.
+//! The cdylib's exports (launcher-ui-module plan S2, `atl_platform_ui_api::abi`): a process loads `libatl_platform_ui_linux.so` with `dlopen(RTLD_NOW | RTLD_LOCAL)` and reaches GTK and PipeWire only through [`VTABLE`], so their closure never enters its global symbol scope. Hand-written shims (maintainer O1): one per trait method, each turning the handle and views into the implementation's types and calling it.
 //! Handles are `Box`es of the implementation types, made and freed here. No state in a thread-local of this module, so the process's thread-local teardown never reaches a module object it did not drop itself.
 //! This copy of `tracing` has none of the process's subscribers: `set_log` (`abi::set_log`, shared with the web engine module) installs one that formats each record and hands it to the process's `LogSink`.
 

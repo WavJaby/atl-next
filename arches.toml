@@ -10,7 +10,7 @@
 #   uapi_records      records `asm-<kernel_arch>/asm/ptrace.h` declares that AOSP's <sys/ptrace.h> consumers read by layout: the arch's branch of libmemunreachable ThreadCapture.cpp (pt_regs on arm/x86, user_pt_regs on arm64, user_regs_struct on riscv64). atl-bionic emits them; checked against that header (xtask check tables)
 # `[<arch>.host]` present = we build and run on it (one 64-bit process per app):
 #   rust              Rust target triple of the host build; a cross host's product crates take it as rustc --target, with its isa's extensions as target features (native.rs cross_args)
-#   identity          true = the NativeBridge identity crossing exists for this ISA (its own guest bionic runs natively, thread-pointer switch; native-bridge build.rs cfg `atl_nb_identity`), and gates use this ISA as their NB guest. Absent = false: apps' native code runs only translated (QEMU guest), and gates take a foreign NB guest. riscv64 gets one at B2 (owner M63).
+#   identity          true = the NativeBridge identity crossing exists for this ISA (its own guest bionic runs natively, thread-pointer switch; native-bridge build.rs cfg `atl_nb_identity`), and gates use this ISA as their NB guest. Absent = false: apps' native code runs only translated (QEMU guest), and gates take a foreign NB guest. riscv64 gets one at B2 (maintainer M63).
 #   meson_cpu_family  meson `cpu_family` (QEMU cross files)
 #   debian            Debian architecture name; for a sysroot row, the arch of its private apt index (cache/apt/<debian>)
 #   archlinux         Arch Linux architecture; absent where Arch has no official port
@@ -18,7 +18,7 @@
 #                     prebuilt build-only tools the converter runs (aconfig, ...). xtask native reads the build machine's row (the one whose `rust` is rustc's host), so a cross host row has none.
 #                     Absent = Soong ships none there. Checked: a linux value PrebuiltOS returns, and the directory exists in the fetched tree.
 #   isa               ISA baseline of this host's own code, cross builds only (`xtask cross`, `xtask native` of a host other than the build machine): `rv64gc_` + Z extensions. The Rust target fixes the base; each extension becomes a `+ext` rustc target feature. Checked: base is rv64gc, every extension is a rustc feature of `rust`. isa_gate checks each output's `Tag_RISCV_arch` against the closure (implied extensions included, arches.rs isa_closure); isa-tiers.toml rows let one source of a module claim one more extension (run-time tier, isa_tiers.rs).
-#   glibc_floor       newest GLIBC_x.y an output of this host may need: the glibc of the oldest machine it runs on (owner decision). Cross hosts only (with isa). Checked: dotted version; isa_gate fails any output that needs a newer one.
+#   glibc_floor       newest GLIBC_x.y an output of this host may need: the glibc of the oldest machine it runs on (maintainer decision). Cross hosts only (with isa). Checked: dotted version; isa_gate fails any output that needs a newer one.
 #   clang             clang triple of the cross compiler and link driver (`--target=<it>`), cross builds only; its arch part is the arch name. Checked: clang accepts it.
 #   sysroot           deps.toml row of this host's sysroot (a `sysroot_debs` row). Every host's atl-bridgegen probes read it (atl-bridgegen buildscript::host_sysroot_args), the build machine's too; a cross build also links against it. Checked: the row exists.
 #   cc, cxx, lld      deps.toml rows of the cross compiler (C driver, C++ driver) and of the ld.lld it links with; required with isa, absent on the build machine (deps.toml `clang` / `clang-cxx`).
@@ -78,7 +78,7 @@ uapi_records = ["user_regs_struct"]
 rust = "riscv64gc-unknown-linux-gnu"
 meson_cpu_family = "riscv64"
 debian = "riscv64"
-# owner 2026-11-08: no V, no Zbs (the riscv64 test host has neither; device tree riscv,isa-extensions)
+# maintainer 2026-11-08: no V, no Zbs (the riscv64 test host has neither; device tree riscv,isa-extensions)
 isa = "rv64gc_zba_zbb"
 # outputs run on the test host (Ubuntu 24.04, glibc 2.39); the sysroot is Debian 13 (glibc 2.41), so no output may need a newer GLIBC_ version
 glibc_floor = "2.39"

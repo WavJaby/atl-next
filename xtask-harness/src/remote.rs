@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `cargo xtask remote`: runs WSL-built outputs on a Linux desktop over ssh (the owner's laptop, plan L1).
+//! `cargo xtask remote`: runs WSL-built outputs on a Linux desktop over ssh (the maintainer's laptop, plan L1).
 //!
 //! The record: a gate's last run in a build dir writes what its runtime read (atld_run.rs `record_inputs`, via [`write_record`]): host files, and host directories whose trees the bundle takes whole.
 //! `push` bundles that record, mapped to `out/`, `java/` and `src/aosp/` names, plus `lib/`: Debian's LLVM 19 runtimes (a labelled patch until our pinned runtimes ship in an install tree, plan L1 / D1).
@@ -453,11 +453,11 @@ pub const DISPLAY_PROBE_LINE: &str = "display-probe: ";
 /// The display probe's bound: one Wayland roundtrip after the binary loads.
 const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
 
-/// Moves the target's Hyprland session to an empty workspace for a run that maps a window on the session display, and back after it (owner decision D1, 2026-11-18: a remote test window only on
+/// Moves the target's Hyprland session to an empty workspace for a run that maps a window on the session display, and back after it (maintainer decision D1, 2026-11-18: a remote test window only on
 /// an empty workspace, and the workspace that was active before comes back also on failure or interruption). Probed, never named by host: `hyprctl` on PATH and exactly one running instance
 /// (`hyprctl instances`) whose Wayland socket is the run's `$WL` -- `$WL_DIR/hypr` keeps dirs of ended sessions (7 on the laptop, 2026-11-18), so a dir count is no answer. No switch possible
 /// (no hyprctl, not one instance, no active workspace, or the session did not move) -> the run is refused before anything starts: `workspace: refused (...)`, exit [`WS_REFUSED_RC`]; a window
-/// on the owner's active workspace is the one outcome D1 rules out. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). The switch: the classic
+/// on the maintainer's active workspace is the one outcome D1 rules out. Empty = the lowest id no workspace has (Hyprland keeps only workspaces with windows or focus). The switch: the classic
 /// dispatcher (`workspace N`), and where the session did not move, the Lua one Hyprland 0.57's Lua config takes (`hl.dsp.focus({ workspace = N })`; the classic form is a Lua syntax error there).
 /// Restore, two routes, both on the target: the EXIT trap (normal end, failure, HUP/INT/TERM/PIPE) and a guardian started before the switch, detached from the ssh channel, that restores once the
 /// run script is gone without the trap having run (SIGKILL, a dropped ssh the shell died of). `$WS_MARK` (`$WL_DIR/atl-ws-<pid>`) exists while the guardian lives; the trap's restore writes it
@@ -1211,7 +1211,7 @@ impl Host {
         let out = ssh(alias).arg("true").output().context("running ssh")?;
         if !out.status.success() {
             bail!(
-                "ssh alias `{alias}` does not connect ({}): add a `Host {alias}` block to WSL ~/.ssh/config (owner; the repo holds no address)",
+                "ssh alias `{alias}` does not connect ({}): add a `Host {alias}` block to WSL ~/.ssh/config (maintainer; the repo holds no address)",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }

@@ -223,7 +223,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             normal.get("global_leak_names")
         ),
     );
-    // measured, not gated (an owner decision, state note ui-module-m1): RTLD_LOCAL keeps the module's symbols out of global scope, but its own objects still look global scope up first, so a host library inside the module binds an AOSP library the process already has (libsigchain -> libunwindstack -> AOSP libz.so: host libz.so.1, libpng16, libfreetype bind its `inflate`)
+    // measured, not gated (a maintainer decision, state note ui-module-m1): RTLD_LOCAL keeps the module's symbols out of global scope, but its own objects still look global scope up first, so a host library inside the module binds an AOSP library the process already has (libsigchain -> libunwindstack -> AOSP libz.so: host libz.so.1, libpng16, libfreetype bind its `inflate`)
     let reverse = reverse_bindings(&work.join("ld-local"), &out.join("device"))?;
     println!(
         "info reverse bindings, host object -> AOSP object in global scope: {} (first: {})",

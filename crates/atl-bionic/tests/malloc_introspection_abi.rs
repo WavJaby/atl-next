@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! bionic's malloc introspection as libmemunreachable calls it (its bionic.h declarations). Expected values: bionic's allocators
 //! without heap-walk support -- disable and enable empty (HWASan's), malloc_common_dynamic.cpp `malloc_backtrace` without malloc
-//! debug (returns 0) -- and, for `malloc_iterate`, the owner's decision (2026-11-01): fail with -1 / `ENOTSUP` (Linux 95), where
+//! debug (returns 0) -- and, for `malloc_iterate`, the maintainer's decision (2026-11-01): fail with -1 / `ENOTSUP` (Linux 95), where
 //! HWASan's returns 0, so a caller cannot read "no chunk" as "no allocation". Never this crate's own output.
 
 use std::ffi::{c_int, c_void};

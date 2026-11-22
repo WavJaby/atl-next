@@ -10,7 +10,7 @@
 //! Sub-gates ([`checks`]): shown (the dialog drew), readback (the last settled readback is that picture), pong, controls (no dim / surface origin without the insets / popup below the anchor each give
 //! another picture, so each would fail the readback), touch (real wl_pointer drags on the off-origin dialog, before and after a resize with it open, reach it in its own coordinates: InputDispatcher's
 //! per-window transform, raw coordinates staying the Task's; `--break-input-frames` must fail it). The readback is the picture at the resized size.
-//! Back is the app's first (owner 2026-11-12; ActivityClientController.onBackPressed:1720-1747 decides only what the app left unhandled):
+//! Back is the app's first (maintainer 2026-11-12; ActivityClientController.onBackPressed:1720-1747 decides only what the app left unhandled):
 //! back (Main starts Sub after the first draw; Sub leaves its Back unhandled, so the services' requestFinish finishes it, Main resumes and the services remove Sub's window; `--break-back-finish` must fail it);
 //! consumed (after the resize, Main's first Back is consumed by its OnBackInvokedCallback: logged, no move to the back for it); minimize (Main's second Back is unhandled on the launcher root: the services
 //! move the Task back once, the window sends `xdg_toplevel.set_minimized`, Main is not destroyed and the app is still running at the watch's end; `--break-root-minimize` (policy close) must fail it).
