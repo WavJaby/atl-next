@@ -80,11 +80,18 @@ fn parse_go_mod(text: &str) -> Result<(String, Vec<String>)> {
     Ok((module, requires))
 }
 
+/// Go's build cache, in the checkout's build dir (beside cargo's units), as Soong's own Go test script places it under its out dir (build/soong/scripts/run-soong-tests-with-go-tools.sh `GOCACHE=${abs_out_dir}/gocache`).
+/// Not `~/.cache/go-build`: every checkout's converter package embeds its own path, so each checkout compiled ~29 MB into one shared cache on the root disk that nothing pruned but Go's 5-day trim; here a new build dir starts from its base's cache (blueprint/soong/protobuf hit) and the entries go with the dir.
+pub fn go_cache(root: &Path) -> PathBuf {
+    crate::out::cargo_target_dir(root).join("gocache")
+}
+
 /// `go <args>` in the converter's directory under `go_work`: every dependency is a pinned checkout or a stub, so no toolchain or module downloads.
 pub fn go(root: &Path, go_work: &Path, args: &[&str]) -> Result<()> {
     let status = crate::grant_jobs(&mut Command::new("go"))
         .args(args)
         .current_dir(root.join(DIR))
+        .env("GOCACHE", go_cache(root))
         .env("GOWORK", go_work)
         .env("GOTOOLCHAIN", "local")
         .env("GOPROXY", "off")
