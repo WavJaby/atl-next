@@ -32,6 +32,10 @@ const PREEDIT: &str = "かな";
 const COMMIT: &str = "仮名";
 /// The fixture's edit line.
 const TEXT_LINE: &str = "AtlWindow: text input=";
+/// The app log's input-method lines (atl-ime), which a red dump prints beside the fixture's edits ([`TEXT_LINE`]).
+const IME_LINE_MARK: &str = "atl-ime:";
+/// Most such lines a red dump prints, the newest when the log holds more. A break run stopped at the commit logged 17 (2026-11-23, `--break-ime-commit`); the cap bounds a runaway log (a line per frame), not a normal one.
+const IME_DUMP_LINES: usize = 400;
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
 /// How long the first process's composer may take, before the kill, to log what the post-draw and release sub-checks judge (a paint that released a retired shown buffer). Paints took up to
@@ -57,6 +61,8 @@ const REBOUND_LINE: &str = "sent IInputMethodManager.IInputMethodClient.onBindMe
 static SURROUNDING: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
 /// The app log's length once the first process was dead (its death told, or the wait over), before the relaunch: its lines end there. The probe thread's, for [`first_process`].
 static FIRST_END: Mutex<Option<usize>> = Mutex::new(None);
+/// The fake IME's journal of the last [`drive`] (its events, ms since the probe started), for [`red_dump`].
+static JOURNAL: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The first process's part of the app log: the relaunched process writes the same log, and the run stops it wherever its start has got to, so the composer sub-checks (post-draw, release,
 /// dmabuf) judge the process the stage drove. The whole log when the probe never got to the kill.
@@ -151,36 +157,86 @@ fn answers(app: &str) -> usize {
         .count()
 }
 
-/// Pumps until the app log holds `n` adopted answers or the wait ends. The answer is async (outbox -> the editor's UI thread -> a binder thread -> the display thread), and one that lands after the
-/// next edit is stale and dropped by design (field.rs `surrounding`; measured 120-190 ms late at load ~8, under the probe's ~200 ms between edits): the next edit, and the kill, wait for it.
-fn wait_answers(app_log: &Path, ime: &mut Ime, n: usize) {
-    let deadline = Instant::now() + IME_WAIT;
-    while Instant::now() < deadline
-        && answers(&std::fs::read_to_string(app_log).unwrap_or_default()) < n
-    {
-        let _ = ime.pump();
-        std::thread::sleep(Duration::from_millis(20));
+/// Fail-fast verdict on one edit's text: `Ok` once the fixture logged it with a composing span, else the reason, naming `step`.
+fn text_verdict(step: &str, text: &str, app: &str) -> Result<(), String> {
+    match composing_of(app, text) {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "edit `{step}` not confirmed: no `{text}` in the app log within {IME_WAIT:?}; edits: {:?}",
+            edits(app)
+        )),
     }
 }
 
-fn wait_text(app_log: &Path, ime: &mut Ime, text: &str) -> bool {
+/// Fail-fast verdict on one edit's answers: `Ok` once `want` adopted answers are logged, else the reason, naming `step`.
+fn answers_verdict(step: &str, want: usize, app: &str) -> Result<(), String> {
+    let got = answers(app);
+    if got >= want {
+        return Ok(());
+    }
+    Err(format!(
+        "edit `{step}` not confirmed: {got} of {want} editor answers in the app log within {IME_WAIT:?}"
+    ))
+}
+
+/// Pumps until `verdict` passes on the app log or [`IME_WAIT`] ends; the error is the last verdict's.
+fn confirm(
+    app_log: &Path,
+    ime: &mut Ime,
+    verdict: impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let deadline = Instant::now() + IME_WAIT;
-    while Instant::now() < deadline {
+    loop {
         let app = std::fs::read_to_string(app_log).unwrap_or_default();
-        if composing_of(&app, text).is_some() {
-            return true;
+        let last = verdict(&app);
+        if last.is_ok() || Instant::now() >= deadline {
+            return last;
         }
         let _ = ime.pump();
         std::thread::sleep(Duration::from_millis(20));
     }
-    false
+}
+
+/// An edit whose text never reaches the fixture stops the probe here: the error names `step`, so a red costs one [`IME_WAIT`], not one per later edit.
+fn confirm_text(app_log: &Path, ime: &mut Ime, step: &str, text: &str) -> Result<(), String> {
+    confirm(app_log, ime, |app| text_verdict(step, text, app))
+}
+
+/// As [`confirm_text`], for the editor answers the batch must have. The answer is async (outbox -> the editor's UI thread -> a binder thread -> the display thread), and one that lands after the
+/// next edit is stale and dropped by design (field.rs `surrounding`; measured 120-190 ms late at load ~8, under the probe's ~200 ms between edits): the next edit, and the kill, wait for it.
+fn confirm_answers(app_log: &Path, ime: &mut Ime, step: &str, want: usize) -> Result<(), String> {
+    confirm(app_log, ime, |app| answers_verdict(step, want, app))
 }
 
 /// The probe: tap the EditText, wait for the second window to close and the IME to activate, then preedit, commit, delete.
+/// Each edit is confirmed before the next; a missing confirmation returns Err naming the step (fail-fast). The fake IME's journal is kept for [`red_dump`].
 pub fn drive(
     proxy: Proxy,
     app_log: &Path,
     mut ime: Ime,
+    breaks: Breaks,
+    atld: u32,
+    services_log: &Path,
+    relaunch: (PathBuf, String),
+) -> Result<Liveness, String> {
+    ime.restart_journal();
+    let result = steps(
+        &proxy,
+        app_log,
+        &mut ime,
+        breaks,
+        atld,
+        services_log,
+        relaunch,
+    );
+    *JOURNAL.lock().unwrap_or_else(|e| e.into_inner()) = ime.journal().to_vec();
+    result
+}
+
+fn steps(
+    proxy: &Proxy,
+    app_log: &Path,
+    ime: &mut Ime,
     breaks: Breaks,
     atld: u32,
     services_log: &Path,
@@ -202,7 +258,7 @@ pub fn drive(
         (r.top + r.height / 2) as f64 + f64::from(oy),
     );
     widgets::inject(
-        &proxy,
+        proxy,
         vec![
             PointerAction::Enter { x, y },
             widgets::press(true),
@@ -230,8 +286,8 @@ pub fn drive(
         ],
     );
     ime.commit().map_err(|e| e.to_string())?;
-    wait_text(app_log, &mut ime, &after_preedit());
-    wait_answers(app_log, &mut ime, 1);
+    confirm_text(app_log, ime, "preedit", &after_preedit())?;
+    confirm_answers(app_log, ime, "preedit", 1)?;
     ime.settle().map_err(|e| e.to_string())?;
     if !breaks.commit {
         ime.send(im_op::COMMIT_STRING, &[Arg::S(COMMIT)]);
@@ -241,9 +297,9 @@ pub fn drive(
         &[Arg::S(""), Arg::I(0), Arg::I(0)],
     );
     ime.commit().map_err(|e| e.to_string())?;
-    wait_text(app_log, &mut ime, &after_commit());
-    wait_surrounding(&mut ime, &after_commit());
-    wait_answers(app_log, &mut ime, 2);
+    confirm_text(app_log, ime, "commit", &after_commit())?;
+    wait_surrounding(ime, &after_commit());
+    confirm_answers(app_log, ime, "commit", 2)?;
     ime.settle().map_err(|e| e.to_string())?;
     // one char before the cursor, in bytes (text-input v3 counts bytes): the commit's last char
     let last = u32::try_from(COMMIT.chars().last().map_or(0, char::len_utf8)).unwrap_or(0);
@@ -253,8 +309,8 @@ pub fn drive(
         &[Arg::U(before), Arg::U(after)],
     );
     ime.commit().map_err(|e| e.to_string())?;
-    wait_text(app_log, &mut ime, &after_delete());
-    wait_answers(app_log, &mut ime, EDIT_BATCHES);
+    confirm_text(app_log, ime, "delete", &after_delete())?;
+    confirm_answers(app_log, ime, "delete", EDIT_BATCHES)?;
     // the composer sub-checks judge this process's last counters: let its paints catch up first
     wait_settled(app_log);
     // mid-session, input bound: SIGKILL the app (no Java-side teardown, so only the binder death can tell the services), then give the death notification time to arrive
@@ -333,7 +389,7 @@ pub fn checks(
             "delete",
             edit(after_delete(), &|c| c == "-1,-1", "no composing span"),
         ),
-        ("death", death_check(services, app_uid)),
+        ("death", death_verdict(probe_killed(), services, app_uid)),
         ("relaunch", relaunch_check(services)),
         // the relaunch reports too; judge the process the stage drove, as the composer sub-checks do
         ("outbox", outbox_check(first_process(app))),
@@ -462,6 +518,57 @@ fn surrounding_check() -> Result<String, String> {
     }
 }
 
+/// Whether the probe reached its SIGKILL: [`FIRST_END`] is set right after it.
+fn probe_killed() -> bool {
+    FIRST_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+/// The death sub-gate. Stopped before its SIGKILL (a fail-fast edit stop), the run's teardown kills the app, and that death is not this stage's: not judged.
+fn death_verdict(killed: bool, services: &str, app_uid: u32) -> Result<String, String> {
+    if killed {
+        death_check(services, app_uid)
+    } else {
+        Err("the probe stopped before its SIGKILL: no death of its own to judge".to_owned())
+    }
+}
+
+/// On a red of the stage (window.rs red dump): the probe journal, then every input-method line of the app log, the newest [`IME_DUMP_LINES`] when there are more.
+pub fn red_dump(app: &str) {
+    let journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    println!(
+        "---- ime probe journal ({} events, ms since the probe started)",
+        journal.len()
+    );
+    for line in &journal {
+        println!("{line}");
+    }
+    let lines = ime_lines(app);
+    let shown = newest(&lines, IME_DUMP_LINES);
+    println!(
+        "---- app log: atl-ime and text input lines (last {} of {})",
+        shown.len(),
+        lines.len()
+    );
+    for line in shown {
+        println!("{line}");
+    }
+}
+
+/// The app log's input-method lines, in log order: the `atl-ime:` ones and the fixture's edits.
+fn ime_lines(app: &str) -> Vec<&str> {
+    app.lines()
+        .filter(|l| l.contains(IME_LINE_MARK) || l.contains(TEXT_LINE))
+        .collect()
+}
+
+/// The last `cap` items.
+fn newest<T>(items: &[T], cap: usize) -> &[T] {
+    &items[items.len().saturating_sub(cap)..]
+}
+
 #[cfg(test)]
 mod outbox_tests {
     use super::*;
@@ -547,6 +654,13 @@ mod tests {
         assert!(death_check(&services, 10002).is_ok());
     }
 
+    /// A death with no probe SIGKILL before it (a fail-fast stop; the teardown killed the app) is not judged as this stage's death.
+    #[test]
+    fn a_stop_before_the_kill_is_no_death() {
+        assert!(death_verdict(true, DEATH, 10002).is_ok());
+        assert!(death_verdict(false, DEATH, 10002).is_err());
+    }
+
     /// Two deaths told before the relaunch's client stay red.
     #[test]
     fn two_deaths_are_red() {
@@ -584,5 +698,44 @@ mod tests {
         assert!(!composer_settled(&line(1, 1, 0, 0)));
         assert!(composer_settled(&line(1, 1, 0, 1)));
         assert!(composer_settled(&line(1, 0, 1, 1)));
+    }
+
+    /// The fail-fast verdicts: a confirmed edit passes; a missing text or too few answers gives a message naming the step, which stops the probe there.
+    #[test]
+    fn a_missing_confirmation_names_its_step() {
+        let app = "INFO AtlWindow: text input=typed from codeかな composing=15,17\n";
+        assert_eq!(text_verdict("preedit", "typed from codeかな", app), Ok(()));
+        let missing = text_verdict("commit", "typed from code仮名", app).unwrap_err();
+        assert!(
+            missing.starts_with("edit `commit` not confirmed: no `typed from code仮名`"),
+            "{missing}"
+        );
+        assert!(
+            missing.contains("typed from codeかな composing=15,17"),
+            "{missing}"
+        );
+        let one = "INFO atl-ime: editor text confirmed n=1: 17 units at 0 selection 17..17 composing Some((15, 17))\n";
+        assert_eq!(answers_verdict("commit", 1, one), Ok(()));
+        let short = answers_verdict("commit", 2, one).unwrap_err();
+        assert!(
+            short.starts_with("edit `commit` not confirmed: 1 of 2 editor answers"),
+            "{short}"
+        );
+    }
+
+    /// The red dump keeps every input-method line in log order; a runaway log keeps only its newest `cap`.
+    #[test]
+    fn the_red_dump_keeps_the_input_method_lines() {
+        let app = "INFO other line\nINFO atl-ime: sent Commit(\"x\") thread=atl-outbox\nINFO AtlWindow: text input=abc composing=-1,-1\nINFO atl-composer: task reports: sent 1 thread=atl-outbox\n";
+        let lines = ime_lines(app);
+        assert_eq!(
+            lines,
+            [
+                "INFO atl-ime: sent Commit(\"x\") thread=atl-outbox",
+                "INFO AtlWindow: text input=abc composing=-1,-1",
+            ]
+        );
+        assert_eq!(newest(&lines, 1), &lines[1..]);
+        assert_eq!(newest(&lines, 5), &lines[..]);
     }
 }

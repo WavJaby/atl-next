@@ -3482,6 +3482,10 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         "---- services log (last {TAIL} lines)\n{}",
         tail(&services, TAIL)
     );
+    // the ime stage's red: its probe journal and every input-method line, not only the tail above (ime.rs `red_dump`)
+    if matches!(args.stage, Stage::Ime) {
+        ime::red_dump(&app);
+    }
     let verdict = crate::verdict::Verdict {
         cmd: "window",
         total: None,

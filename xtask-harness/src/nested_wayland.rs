@@ -352,6 +352,10 @@ pub(crate) struct Ime {
     pub surrounding: Option<(String, u32, u32)>,
     /// Last `content_type`: hint bits, purpose (text-input v3 enum values).
     pub content_type: Option<(u32, u32)>,
+    /// Events received and requests sent since [`Ime::restart_journal`], as [`journal_line`] formats them: the probe journal the red dump prints.
+    journal: Vec<String>,
+    /// The journal's clock: the probe's start ([`Ime::restart_journal`]).
+    origin: Instant,
 }
 
 impl Ime {
@@ -385,9 +389,26 @@ impl Ime {
             active: false,
             surrounding: None,
             content_type: None,
+            journal: Vec::new(),
+            origin: Instant::now(),
         };
         ime.pump()?;
         Ok(ime)
+    }
+
+    /// Starts the probe journal: its times count from now, and the events before are dropped.
+    pub(crate) fn restart_journal(&mut self) {
+        self.journal.clear();
+        self.origin = Instant::now();
+    }
+
+    /// The journal's lines, oldest first.
+    pub(crate) fn journal(&self) -> &[String] {
+        &self.journal
+    }
+
+    fn record(&mut self, what: &str) {
+        self.journal.push(journal_line(self.origin.elapsed(), what));
     }
 
     /// Reads the events that have arrived.
@@ -397,13 +418,26 @@ impl Ime {
                 continue;
             }
             match opcode {
-                im_op::ACTIVATE => self.active = true,
-                im_op::DEACTIVATE => self.active = false,
-                im_op::DONE => self.dones += 1,
+                im_op::ACTIVATE => {
+                    self.active = true;
+                    self.record("recv activate");
+                }
+                im_op::DEACTIVATE => {
+                    self.active = false;
+                    self.record("recv deactivate");
+                }
+                im_op::DONE => {
+                    self.dones += 1;
+                    let serial = self.dones;
+                    self.record(&format!("recv done serial={serial}"));
+                }
                 im_op::SURROUNDING_TEXT => {
                     let text = string(&body, 0)?;
                     let cursor = word_after_string(&body, 0)?;
                     let anchor = word(&body, 4 + (word(&body, 0)? as usize).div_ceil(4) * 4 + 4)?;
+                    self.record(&format!(
+                        "recv surrounding_text {text:?} cursor={cursor} anchor={anchor}"
+                    ));
                     self.surrounding = Some((text, cursor, anchor));
                 }
                 im_op::CONTENT_TYPE => {
@@ -419,6 +453,7 @@ impl Ime {
     }
 
     pub(crate) fn send(&mut self, opcode: u16, args: &[Arg<'_>]) {
+        self.record(&format!("send {} {args:?}", request_name(opcode)));
         self.c.send(self.im, opcode, args);
     }
 
@@ -440,9 +475,26 @@ impl Ime {
     /// Applies the pending requests (`commit` with the current serial).
     pub(crate) fn commit(&mut self) -> Result<()> {
         let serial = self.dones;
-        self.send(im_op::COMMIT, &[Arg::U(serial)]);
+        self.record(&format!("send commit serial={serial}"));
+        self.c.send(self.im, im_op::COMMIT, &[Arg::U(serial)]);
         self.pump()
     }
+}
+
+/// An input-method request's name, for the journal.
+fn request_name(opcode: u16) -> &'static str {
+    match opcode {
+        im_op::COMMIT_STRING => "commit_string",
+        im_op::SET_PREEDIT_STRING => "set_preedit_string",
+        im_op::DELETE_SURROUNDING_TEXT => "delete_surrounding_text",
+        im_op::COMMIT => "commit",
+        _ => "request",
+    }
+}
+
+/// A journal line: the event's time since the probe started, then `recv` or `send` and what it was.
+fn journal_line(at: Duration, what: &str) -> String {
+    format!("+{:>6} ms {what}", at.as_millis())
 }
 
 const VPOINTER_MANAGER: &str = "zwlr_virtual_pointer_manager_v1";
@@ -657,6 +709,7 @@ fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
     Ok(s)
 }
 
+#[derive(Debug)]
 pub(crate) enum Arg<'a> {
     U(u32),
     I(i32),
@@ -804,6 +857,24 @@ mod tests {
             s.rsplit_once(')')
                 .is_some_and(|(_, r)| !r.trim_start().starts_with('Z'))
         })
+    }
+
+    /// The journal's shape (ime.rs `red_dump` prints it): ms since the probe started in a 6-wide field, then the event's name.
+    #[test]
+    fn journal_lines_carry_the_time_since_the_probe_started() {
+        assert_eq!(
+            journal_line(Duration::from_millis(1234), "recv done serial=2"),
+            "+  1234 ms recv done serial=2"
+        );
+        assert_eq!(
+            journal_line(Duration::from_millis(7), "send commit serial=0"),
+            "+     7 ms send commit serial=0"
+        );
+        assert_eq!(request_name(im_op::COMMIT), "commit");
+        assert_eq!(
+            request_name(im_op::SET_PREEDIT_STRING),
+            "set_preedit_string"
+        );
     }
 
     /// A stage that fails with the guarded process running: the error return drops the guard, which ends the process.
