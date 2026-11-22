@@ -18,7 +18,11 @@ const PAINT: &str = "atl-platform-ui: paint ";
 
 /// The stamps (ms) of the first lines holding `from` and `to`; None without both.
 pub(super) fn span(app: &str, from: &str, to: &str) -> Option<(u64, u64)> {
-    let stamp = |marker: &str| app.lines().find(|l| l.contains(marker)).and_then(line_stamp);
+    let stamp = |marker: &str| {
+        app.lines()
+            .find(|l| l.contains(marker))
+            .and_then(line_stamp)
+    };
     Some((stamp(from)?, stamp(to)?))
 }
 
@@ -44,7 +48,10 @@ pub(super) fn render_max_us(app: &str, (start, end): (u64, u64)) -> Option<u64> 
 /// The host's render over the run: median and max (us) of the paint lines' longest renders stamped at or after `from` (ms), and their count. The first paints (startup: shader compiles, first
 /// texture uploads, 1.3 s median on a free GPU) come before the marker, so they do not count. None without a paint line.
 pub(super) fn host_render_us(app: &str, from: u64) -> Option<(u64, u64, usize)> {
-    let mut v: Vec<u64> = paints(app).filter(|&(at, _, _)| at >= from).map(|(_, _, max)| max).collect();
+    let mut v: Vec<u64> = paints(app)
+        .filter(|&(at, _, _)| at >= from)
+        .map(|(_, _, max)| max)
+        .collect();
     v.sort_unstable();
     // lower median: an even count takes the smaller middle value, so a starved verdict needs at least half the lines over
     let median = *v.get(v.len().checked_sub(1)? / 2)?;
@@ -97,7 +104,10 @@ pub fn apply(app: &str, stage: &str, from: u64, timed: Vec<Timed>) -> (Vec<Sub>,
         match starved(app, host, &t) {
             Some(why) => {
                 let was = if t.sub.1.is_ok() { "pass" } else { "FAIL" };
-                println!("window: starvation: {stage} {} {was} -> undecided: {why}", t.sub.0);
+                println!(
+                    "window: starvation: {stage} {} {was} -> undecided: {why}",
+                    t.sub.0
+                );
                 undecided.push((t.sub.0, why, t.sub.1));
             }
             None => judged.push(t.sub),
@@ -116,23 +126,49 @@ mod tests {
     }
 
     fn timed(ok: bool, fakes: Fakes, span: Option<(u64, u64)>) -> Timed {
-        let r = if ok { Ok("x".to_owned()) } else { Err("x".to_owned()) };
-        Timed { sub: ("s", r), limit_us: 100_000.0, limit: "bound 100 ms".to_owned(), span, fakes }
+        let r = if ok {
+            Ok("x".to_owned())
+        } else {
+            Err("x".to_owned())
+        };
+        Timed {
+            sub: ("s", r),
+            limit_us: 100_000.0,
+            limit: "bound 100 ms".to_owned(),
+            span,
+            fakes,
+        }
     }
 
     /// A paint line covers `[stamp - ms, stamp]`: over the span 10.000..12.000 s, a line at 13.000 s with ms=3000 (10..13 s) and one at 10.500 s with ms=1000 count, their max 900 us; lines at 9.000 s
     /// (ms=1000: 8..9 s) and 15.000 s (ms=2000: 13..15 s) do not. No covering line: None.
     #[test]
     fn a_paint_line_counts_where_its_span_covers() {
-        let app = [paint("9.000", 1000, 5000), paint("10.500", 1000, 700), paint("13.000", 3000, 900), paint("15.000", 2000, 8000)].concat();
+        let app = [
+            paint("9.000", 1000, 5000),
+            paint("10.500", 1000, 700),
+            paint("13.000", 3000, 900),
+            paint("15.000", 2000, 8000),
+        ]
+        .concat();
         assert_eq!(render_max_us(&app, (10_000, 12_000)), Some(900));
-        assert_eq!(render_max_us(&paint("9.000", 1000, 5000), (10_000, 12_000)), None);
+        assert_eq!(
+            render_max_us(&paint("9.000", 1000, 5000), (10_000, 12_000)),
+            None
+        );
     }
 
     /// Median and max after the marker at 2 s: the 1.000 s startup line (3 s render) does not count; 4 lines 50/150/150/400 ms -> lower median 150 ms, max 400 ms.
     #[test]
     fn host_render_skips_startup() {
-        let app = [paint("1.000", 1000, 3_000_000), paint("3.000", 1000, 50_000), paint("4.000", 1000, 150_000), paint("5.000", 1000, 150_000), paint("6.000", 1000, 400_000)].concat();
+        let app = [
+            paint("1.000", 1000, 3_000_000),
+            paint("3.000", 1000, 50_000),
+            paint("4.000", 1000, 150_000),
+            paint("5.000", 1000, 150_000),
+            paint("6.000", 1000, 400_000),
+        ]
+        .concat();
         assert_eq!(host_render_us(&app, 2_000), Some((150_000, 400_000, 4)));
         assert_eq!(host_render_us("", 0), None);
     }
@@ -141,20 +177,54 @@ mod tests {
     /// hiccup), or a slow median with fast phase renders, stay judged; 100 ms exactly is not over. Fakes::Fail keeps a pass judged even when starved; Fakes::Both does not; no span: judged.
     #[test]
     fn unjudged_only_when_the_host_and_the_phase_are_starved() {
-        let starved_app = [paint("3.000", 1000, 300_000), paint("4.000", 1000, 300_000), paint("5.000", 1000, 300_000)].concat();
-        let spike = [paint("3.000", 1000, 10_000), paint("4.000", 1000, 300_000), paint("5.000", 1000, 10_000), paint("8.000", 1000, 10_000)].concat();
-        let slow_elsewhere = [paint("2.000", 500, 10_000), paint("5.000", 3000, 90_000), paint("8.000", 1000, 300_000), paint("9.000", 1000, 300_000), paint("10.000", 1000, 300_000)].concat();
+        let starved_app = [
+            paint("3.000", 1000, 300_000),
+            paint("4.000", 1000, 300_000),
+            paint("5.000", 1000, 300_000),
+        ]
+        .concat();
+        let spike = [
+            paint("3.000", 1000, 10_000),
+            paint("4.000", 1000, 300_000),
+            paint("5.000", 1000, 10_000),
+            paint("8.000", 1000, 10_000),
+        ]
+        .concat();
+        let slow_elsewhere = [
+            paint("2.000", 500, 10_000),
+            paint("5.000", 3000, 90_000),
+            paint("8.000", 1000, 300_000),
+            paint("9.000", 1000, 300_000),
+            paint("10.000", 1000, 300_000),
+        ]
+        .concat();
         let exact = [paint("3.000", 1000, 100_000), paint("4.000", 1000, 100_000)].concat();
         let phase = Some((3_000, 5_000));
         let run = |app: &str, t| apply(app, "stage", 0, vec![t]);
         let (j, u) = run(&starved_app, timed(false, Fakes::Fail, phase));
         assert!(j.is_empty());
-        assert_eq!(u[0].1, "host GPU starved (window render median 300 ms, max 300 ms in the phase > bound 100 ms)");
+        assert_eq!(
+            u[0].1,
+            "host GPU starved (window render median 300 ms, max 300 ms in the phase > bound 100 ms)"
+        );
         for app in [&spike, &slow_elsewhere, &exact] {
-            assert_eq!(run(app, timed(false, Fakes::Fail, phase)).1.len(), 0, "{app}");
+            assert_eq!(
+                run(app, timed(false, Fakes::Fail, phase)).1.len(),
+                0,
+                "{app}"
+            );
         }
-        assert_eq!(run(&starved_app, timed(true, Fakes::Fail, phase)).1.len(), 0);
-        assert_eq!(run(&starved_app, timed(true, Fakes::Both, phase)).1.len(), 1);
-        assert_eq!(run(&starved_app, timed(false, Fakes::Both, None)).1.len(), 0);
+        assert_eq!(
+            run(&starved_app, timed(true, Fakes::Fail, phase)).1.len(),
+            0
+        );
+        assert_eq!(
+            run(&starved_app, timed(true, Fakes::Both, phase)).1.len(),
+            1
+        );
+        assert_eq!(
+            run(&starved_app, timed(false, Fakes::Both, None)).1.len(),
+            0
+        );
     }
 }
