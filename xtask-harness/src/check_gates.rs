@@ -5,13 +5,14 @@
 //! (`host lacks ...`), never by dropping the row.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use xtask::red_logs;
 
 use crate::verdict::{Outcome, UNDECIDED_WORD};
+use crate::window::{PHASES_LINE, WatchEnd};
 
 /// One gate run: `xtask test <args>`, plus `--host <build machine>` when `host` and `--out <build dir>` when `out` (each only where the gate's own arguments have it).
 pub struct Row {
@@ -118,21 +119,31 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let task = red_logs::task_dir(root)?;
     let mut failed = Vec::new();
     let mut undecided = Vec::new();
+    let mut ends = WatchTally::default();
     for row in ROWS {
         let log = logs.join(format!("{}.log", row.name()));
         let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
         let argv = row.argv(host, out_arg);
         let started = Instant::now();
-        let status = Command::new(&exe)
+        let mut child = Command::new(&exe)
             .current_dir(root)
             .arg("test")
             .args(&argv)
             .stdout(file.try_clone()?)
             .stderr(file)
-            .status()
+            .spawn()
             .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
+        let peak = peak_while(&mut child)?;
+        let status = peak.status;
         let took = started.elapsed().as_secs_f64();
         let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let phases = phases_field(&text);
+        ends.count(phases.as_ref());
+        let measured = format!(
+            "peak={}MiB{}",
+            peak.kib / 1024,
+            phases.map(|p| format!(" {}", p.field)).unwrap_or_default()
+        );
         let outcome = Outcome::of_exit(status.code());
         let line = match outcome {
             Outcome::Undecided => undecided_line(&text, row.cmd()),
@@ -146,7 +157,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
             .map(|k| format!(" (log {})", k.display()))
             .unwrap_or_default();
         eprintln!(
-            "gates: {} {} ({took:.1}s) {line}{note}",
+            "gates: {} {} ({took:.1}s {measured}) {line}{note}",
             row.name(),
             match outcome {
                 Outcome::Pass => "ok",
@@ -161,6 +172,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
             Outcome::Undecided => undecided.push(undecided_note(row, line)),
         }
     }
+    eprintln!("gates: watch ends {}", ends.line());
     if failed.is_empty() {
         return Ok(undecided);
     }
@@ -178,6 +190,124 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     // stdout leads the step's failure text (xtask harness.rs check_step), so check's first-error line is this one, not the first gate's progress line
     println!("gates: FAILED {summary}");
     bail!("{summary}")
+}
+
+/// How often a row's process tree is sampled for its memory. A gate runs for seconds (a cold start alone 12-15 s), so 5 samples a second see its plateau; a spike shorter than this is missed,
+/// which makes the printed peak a lower bound of the true one.
+const PEAK_SAMPLE: Duration = Duration::from_millis(200);
+
+/// A row's exit and the largest summed resident memory of its process tree seen while it ran.
+struct Peak {
+    status: ExitStatus,
+    kib: u64,
+}
+
+/// Waits for `child`, sampling its process tree's summed VmRSS every [`PEAK_SAMPLE`]. The tree is the child and its descendants by parent pid: a process that double-forks away from it
+/// (reparented to init) is not counted. No cgroup per row: this host's processes sit in the root cgroup (`0::/init.scope`, no delegation), so `memory.peak` of a row scope is not available.
+fn peak_while(child: &mut Child) -> Result<Peak> {
+    let root = child.id();
+    let mut kib = 0;
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for the gate")? {
+            return Ok(Peak { status, kib });
+        }
+        kib = kib.max(tree_rss_kib(root));
+        std::thread::sleep(PEAK_SAMPLE);
+    }
+}
+
+/// The summed VmRSS (KiB) of `root` and its descendants, from `/proc`; a process gone between listing and reading counts 0.
+fn tree_rss_kib(root: u32) -> u64 {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let procs: Vec<(u32, u32)> = dir
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            Some((pid, ppid_of_stat(&stat)?))
+        })
+        .collect();
+    descendants(root, &procs)
+        .into_iter()
+        .filter_map(|pid| vm_rss_kib(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?))
+        .sum()
+}
+
+/// The parent pid in a `/proc/<pid>/stat` line (proc(5): `pid (comm) state ppid ...`; comm may hold spaces and parentheses, so the fields after the last `)`).
+fn ppid_of_stat(stat: &str) -> Option<u32> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `VmRSS:` in a `/proc/<pid>/status` text, KiB (proc(5)); a kernel thread has none.
+fn vm_rss_kib(status: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `root` and every pid whose parent chain in `procs` (`(pid, ppid)`) reaches it.
+fn descendants(root: u32, procs: &[(u32, u32)]) -> Vec<u32> {
+    let mut tree = vec![root];
+    let mut i = 0;
+    while let Some(&parent) = tree.get(i) {
+        tree.extend(
+            procs
+                .iter()
+                .filter(|(_, pp)| *pp == parent)
+                .map(|(p, _)| *p),
+        );
+        i += 1;
+    }
+    tree
+}
+
+/// A window row's phases (window.rs `PHASES_LINE`): the `key=value` fields for the gates line, and the word naming what ended its watch.
+struct Phases {
+    field: String,
+    end: String,
+}
+
+/// The last phases line in a gate's log, without its head and its parenthesised note.
+fn phases_field(text: &str) -> Option<Phases> {
+    let line = text.lines().rev().find(|l| l.starts_with(PHASES_LINE))?;
+    let field = line[PHASES_LINE.len()..]
+        .split(" (")
+        .next()?
+        .trim()
+        .to_owned();
+    let end = field
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("end="))?
+        .to_owned();
+    Some(Phases { field, end })
+}
+
+/// What ended each window row's watch, over one gates step: a path whose count stays 0 is visible on `gates: watch ends`.
+#[derive(Default)]
+struct WatchTally {
+    counts: [usize; WatchEnd::ALL.len()],
+    unknown: usize,
+}
+
+impl WatchTally {
+    fn count(&mut self, phases: Option<&Phases>) {
+        let Some(p) = phases else { return };
+        match WatchEnd::ALL.iter().position(|w| w.word() == p.end) {
+            Some(i) => self.counts[i] += 1,
+            None => self.unknown += 1,
+        }
+    }
+
+    fn line(&self) -> String {
+        let mut parts: Vec<String> = WatchEnd::ALL
+            .iter()
+            .zip(self.counts)
+            .map(|(w, n)| format!("{}={n}", w.word()))
+            .collect();
+        parts.push(format!("unknown={}", self.unknown));
+        parts.join(" ")
+    }
 }
 
 /// A red or undecided gate's log is kept under the checkout's task dir (`task`, red_logs::task_dir) in its bucket, so the next check's overwrite of `check-gates/<gate>.log` cannot reach it. A pass keeps nothing. A failed copy names the log where it stands, as a note.
@@ -274,6 +404,52 @@ mod tests {
             "window-slow-display host GPU starved (render max 205 ms > 100 ms)"
         );
         assert_eq!(undecided_line("window: pass x\n", "window"), None);
+    }
+
+    /// proc(5) lines by hand: a comm with spaces and a `)` must not shift the ppid field; VmRSS is the second word of its line, in kB.
+    #[test]
+    fn proc_fields_by_hand() {
+        assert_eq!(
+            ppid_of_stat("4242 (a) b) (c) S 17 4242 4242 0 -1"),
+            Some(17)
+        );
+        assert_eq!(ppid_of_stat("1 (init) S 0 1 1"), Some(0));
+        assert_eq!(ppid_of_stat("garbage"), None);
+        let status = "Name:\tatld\nVmHWM:\t  9000 kB\nVmRSS:\t  5120 kB\nThreads:\t4\n";
+        assert_eq!(vm_rss_kib(status), Some(5120));
+        assert_eq!(vm_rss_kib("Name:\tkthreadd\n"), None);
+    }
+
+    /// The tree is the root and every pid whose parent chain reaches it; a sibling of the root and its child are not in it.
+    #[test]
+    fn descendants_follow_parent_chains() {
+        let procs = [(10, 1), (11, 10), (12, 11), (13, 10), (20, 1), (21, 20)];
+        let mut tree = descendants(10, &procs);
+        tree.sort_unstable();
+        assert_eq!(tree, [10, 11, 12, 13]);
+    }
+
+    /// The sampler responds: this test process's own tree has resident memory (a dead probe would read 0 for every row).
+    #[test]
+    fn the_sampler_sees_this_process() {
+        assert!(tree_rss_kib(std::process::id()) > 0);
+    }
+
+    /// The phases field as window.rs prints it, and the tally of what ended each watch; a word the tally does not know is counted, not dropped.
+    #[test]
+    fn phases_and_watch_tally() {
+        let text = "window: pass x\nwindow: phases start->marker=12000 watch=4100 teardown=900 end=probe (watch cap 10000 ms, probe bounds the watch)\n";
+        let p = phases_field(text).expect("phases");
+        assert_eq!(
+            p.field,
+            "start->marker=12000 watch=4100 teardown=900 end=probe"
+        );
+        let mut t = WatchTally::default();
+        t.count(Some(&p));
+        t.count(phases_field("window: phases watch=1 end=window").as_ref());
+        t.count(phases_field("window: phases watch=1 end=odd").as_ref());
+        t.count(phases_field("sandbox: ok").as_ref());
+        assert_eq!(t.line(), "probe=1 window=1 ended=0 limit=0 unknown=1");
     }
 
     #[test]
