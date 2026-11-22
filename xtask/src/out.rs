@@ -1073,12 +1073,7 @@ pub fn publish(land: &Path) -> Result<String> {
 }
 
 /// [`publish`] of ram dir `rec` of land as `dst`. Refused while the delta is mounted (an upper is stable only unmounted), or when its lower or upper is gone or the upper was laid over another base: a base is never made from a part.
-fn publish_ram(
-    ws: &Path,
-    rec: &crate::delta::Record,
-    dst: &Path,
-    stamps: &str,
-) -> Result<String> {
+fn publish_ram(ws: &Path, rec: &crate::delta::Record, dst: &Path, stamps: &str) -> Result<String> {
     let id = LAND_ID;
     let Some(_mounted) = crate::delta::try_mount_lock(ws, id)? else {
         bail!("ws/{id}'s ram delta is mounted by a running command: not published");
@@ -1138,9 +1133,7 @@ pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
     let rec = crate::delta::record(&dir)?;
     // the configured store: the new dir's tier is decided now, wherever the old upper lives
     let store = cfg.delta.ram_store.value.clone();
-    let fits = || {
-        crate::delta::fits_now(ws, id, &cfg.delta, crate::delta::Class::Native, &store)
-    };
+    let fits = || crate::delta::fits_now(ws, id, &cfg.delta, crate::delta::Class::Native, &store);
     if keep_pool
         && rec.is_none()
         && present(&dir)?
@@ -1232,11 +1225,7 @@ pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
     };
     Ok(format!(
         "ws/{id} laid over base/{base} on tier {laid}{}",
-        if kept {
-            "; gate state carried"
-        } else {
-            ""
-        }
+        if kept { "; gate state carried" } else { "" }
     ))
 }
 
@@ -1684,10 +1673,8 @@ fn set_tier(root: &Path, ws: &Path, ram: bool, execute: bool) -> Result<ExitCode
     };
     let want = if ram { "ram" } else { "pool" };
     let cfg = crate::ws_config::load(ws)?;
-    if ram {
-        if let Err(why) = crate::delta::probe(&cfg.delta.ram_store.value, &cfg.delta)? {
-            bail!("no ram tier for ws/{id}: {why}");
-        }
+    if ram && let Err(why) = crate::delta::probe(&cfg.delta.ram_store.value, &cfg.delta)? {
+        bail!("no ram tier for ws/{id}: {why}");
     }
     // the run dir follows the explicit choice too (off = exact baseline); its data is regenerable
     crate::out_run::set_tier(root, ws, &cfg.delta, ram, execute)?;
@@ -1848,7 +1835,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!("xtask-out-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("scratch");
-        let toml = format!("[delta]\nram_store = \"{}\"\n", d.join("no-ram-store").display());
+        let toml = format!(
+            "[delta]\nram_store = \"{}\"\n",
+            d.join("no-ram-store").display()
+        );
         std::fs::write(d.join("workspace.toml"), toml).expect("workspace.toml");
         d
     }
@@ -2074,8 +2064,10 @@ mod tests {
         assert_eq!(bases(&ws).expect("bases"), ["c0"]);
         let live = BTreeSet::from([MAIN_ID.to_owned()]);
         let (_, old, _) = orphans(&ws, &live).expect("orphans");
-        assert_eq!(old, [tmp.clone()]);
-        let held = build_pool::try_lock_dir(&ws, LAND_ID).expect("lock").expect("free");
+        assert_eq!(old, vec![tmp.clone()]);
+        let held = build_pool::try_lock_dir(&ws, LAND_ID)
+            .expect("lock")
+            .expect("free");
         let (_, old, _) = orphans(&ws, &live).expect("orphans");
         assert!(old.is_empty(), "a publish may be writing it: {old:?}");
         drop(held);
@@ -2086,7 +2078,8 @@ mod tests {
     #[test]
     fn land_on_ram_publishes_and_lays_again() {
         let ws = scratch("land-ram");
-        let store = Path::new("/dev/shm").join(format!("xtask-out-{}-land-ram", std::process::id()));
+        let store =
+            Path::new("/dev/shm").join(format!("xtask-out-{}-land-ram", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(&store).expect("store");
         // tiny peaks: the tier rule, not this host's free RAM, is under test
@@ -2102,14 +2095,36 @@ mod tests {
         let g = |dir: &Path, args: &[&str]| git(Some(dir), args).expect("git");
         let commit = |msg: &str| {
             g(&repo, &["add", "-A"]);
-            g(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]);
+            g(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-q",
+                    "-m",
+                    msg,
+                ],
+            );
             g(&repo, &["rev-parse", "HEAD"])
         };
         g(&repo, &["init", "-q", "-b", "main"]);
         put(&repo.join("f"));
         let a = commit("a");
         let land = ws.join("wt").join("land");
-        g(&repo, &["worktree", "add", "-q", "--detach", land.to_str().expect("utf-8"), &a]);
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                land.to_str().expect("utf-8"),
+                &a,
+            ],
+        );
         assert_eq!(checkout_id(&land).expect("id"), LAND_ID);
         let base_a = base_of(&ws, &a);
         for p in ["target/debug/own", "gone", "dir/x", "kept"] {
@@ -2118,10 +2133,18 @@ mod tests {
         let laid = relay_land(&land, &ws, false).expect("lay");
         assert!(laid.contains("tier ram"), "{laid}");
         let dir = dir_of(&ws, LAND_ID);
-        let rec = crate::delta::record(&dir).expect("record").expect("a ram dir");
+        let rec = crate::delta::record(&dir)
+            .expect("record")
+            .expect("a ram dir");
         assert_eq!(rec.base, a);
-        assert!(!rec.dir(LAND_ID).join("fresh").exists(), "land's units are its own");
-        assert_eq!(entry(&land.join(TARGET)).expect("entry"), Entry::Link(boot_of(&target_of(&dir)).expect("boot")));
+        assert!(
+            !rec.dir(LAND_ID).join("fresh").exists(),
+            "land's units are its own"
+        );
+        assert_eq!(
+            entry(&land.join(TARGET)).expect("entry"),
+            Entry::Link(boot_of(&target_of(&dir)).expect("boot"))
+        );
         // the build, through the overlay as stage mount mounts it; the merged listing taken there
         let merged = ws.join("merged.list");
         let list = "find . -mindepth 1 \\( -type d -printf '%P d %m %T@\\n' \\) -o -printf '%P %y %m %T@ %s\\n' | LC_ALL=C sort";
@@ -2129,7 +2152,16 @@ mod tests {
             "set -e; mount -t overlay overlay -o \"$1\" \"$2\"; cd \"$2\"; echo more >> target/debug/own; touch -d 2001-01-01 target/debug/own; rm gone; rm -rf dir && mkdir dir && echo y > dir/y; mkdir -p bootstrap/debug && echo s > bootstrap/debug/state; {list} > \"$3\""
         );
         let ok = Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--", "sh", "-c"])
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "--",
+                "sh",
+                "-c",
+            ])
             .arg(&build)
             .arg("sh")
             .arg(crate::delta::mount_options(&ws, LAND_ID, &rec).expect("opts"))
@@ -2143,35 +2175,71 @@ mod tests {
         let b = commit("b");
         g(&land, &["checkout", "-q", "--detach", &b]);
         let line = publish(&land).expect("publish");
-        assert!(line.contains("ram upper") && line.contains("tier ram"), "{line}");
+        assert!(
+            line.contains("ram upper") && line.contains("tier ram"),
+            "{line}"
+        );
         let base_b = base_of(&ws, &b);
-        let out = Command::new("sh").arg("-c").arg(format!("cd \"$1\" && {list}")).arg("sh").arg(&base_b).output().expect("find");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("cd \"$1\" && {list}"))
+            .arg("sh")
+            .arg(&base_b)
+            .output()
+            .expect("find");
         let strip = |text: &str, extra: &str| -> String {
             text.lines()
-                .filter(|l| !l.starts_with("bootstrap") && !l.starts_with(".base ") && !l.starts_with(extra))
+                .filter(|l| {
+                    !l.starts_with("bootstrap") && !l.starts_with(".base ") && !l.starts_with(extra)
+                })
                 .map(|l| format!("{l}\n"))
                 .collect()
         };
         let got = String::from_utf8(out.stdout).expect("utf-8");
         let want = std::fs::read_to_string(&merged).expect("merged");
-        assert!(want.contains("dir/y f") && !want.contains("gone") && want.contains("bootstrap/debug/state"), "{want}");
-        assert_eq!(strip(&got, crate::checkout_stamps::FILE), strip(&want, "-"), "base/B vs the merged view");
-        assert!(base_b.join(crate::checkout_stamps::FILE).is_file() && !base_b.join(BOOTSTRAP_DIR).exists() && !base_b.join(BASE_FILE).exists());
+        assert!(
+            want.contains("dir/y f")
+                && !want.contains("gone")
+                && want.contains("bootstrap/debug/state"),
+            "{want}"
+        );
+        assert_eq!(
+            strip(&got, crate::checkout_stamps::FILE),
+            strip(&want, "-"),
+            "base/B vs the merged view"
+        );
+        assert!(
+            base_b.join(crate::checkout_stamps::FILE).is_file()
+                && !base_b.join(BOOTSTRAP_DIR).exists()
+                && !base_b.join(BASE_FILE).exists()
+        );
         // laid again: over base/B, gate state carried, nothing else of the old upper
-        let rec = crate::delta::record(&dir).expect("record").expect("still ram");
+        let rec = crate::delta::record(&dir)
+            .expect("record")
+            .expect("still ram");
         assert_eq!(rec.base, b);
         let upper = rec.dir(LAND_ID).join("upper");
-        let mut names: Vec<_> = std::fs::read_dir(&upper).expect("upper").flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<_> = std::fs::read_dir(&upper)
+            .expect("upper")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
         assert_eq!(names, [BASE_FILE, BOOTSTRAP_DIR]);
         assert!(upper.join("bootstrap/debug/state").is_file());
         // reset after a failed verify: ram again, gate state kept
         let line = reset_land(&land).expect("recopy");
-        assert!(line.contains("tier ram") && line.contains("gate state carried"), "{line}");
+        assert!(
+            line.contains("tier ram") && line.contains("gate state carried"),
+            "{line}"
+        );
         // the store gone: the pool tier, gate state copied off the store
         std::fs::write(ws.join("workspace.toml"), toml(&ws.join("no-ram-store"))).expect("toml");
         let line = reset_land(&land).expect("recopy to pool");
-        assert!(line.contains("tier pool") && line.contains("gate state carried"), "{line}");
+        assert!(
+            line.contains("tier pool") && line.contains("gate state carried"),
+            "{line}"
+        );
         assert!(crate::delta::record(&dir).expect("record").is_none());
         assert!(dir.join("bootstrap/debug/state").is_file() && dir.join("dir/y").is_file());
         assert!(!rec.dir(LAND_ID).exists(), "the old store dir stays behind");
@@ -2182,7 +2250,10 @@ mod tests {
         let line = publish(&land).expect("publish pool");
         assert!(line.contains("stays on tier pool"), "{line}");
         assert!(base_of(&ws, &c).join("dir/y").is_file());
-        let _ = Command::new("chmod").args(["-R", "u+rwx"]).arg(&store).status();
+        let _ = Command::new("chmod")
+            .args(["-R", "u+rwx"])
+            .arg(&store)
+            .status();
         std::fs::remove_dir_all(&store).expect("cleanup store");
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }

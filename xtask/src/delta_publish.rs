@@ -70,7 +70,9 @@ fn xattr(path: &Path, name: &str) -> Result<Vec<u8>> {
 }
 
 /// The production classifier: the kernel's rules above; `skip` = top-level names left out.
-pub fn classify<'a>(skip: &'a [&'a str]) -> impl Fn(&Path, &Path, &std::fs::Metadata) -> Result<Kind> + 'a {
+pub fn classify<'a>(
+    skip: &'a [&'a str],
+) -> impl Fn(&Path, &Path, &std::fs::Metadata) -> Result<Kind> + 'a {
     move |path, rel, meta| {
         if rel.parent() == Some(Path::new("")) && rel.to_str().is_some_and(|r| skip.contains(&r)) {
             return Ok(Kind::Skip);
@@ -80,7 +82,10 @@ pub fn classify<'a>(skip: &'a [&'a str]) -> impl Fn(&Path, &Path, &std::fs::Meta
             if meta.rdev() == 0 {
                 return Ok(Kind::Whiteout);
             }
-            bail!("{}: a character device other than an overlay whiteout (0:0)", path.display());
+            bail!(
+                "{}: a character device other than an overlay whiteout (0:0)",
+                path.display()
+            );
         }
         let mut opaque = false;
         for name in xattr_names(path)? {
@@ -89,7 +94,11 @@ pub fn classify<'a>(skip: &'a [&'a str]) -> impl Fn(&Path, &Path, &std::fs::Meta
                     b"y" => opaque = true,
                     // kernel >= 6.7: the dir holds xattr whiteouts, it is not opaque
                     b"x" => {}
-                    v => bail!("{}: {name} = {:?}: unknown overlay opaque value", path.display(), String::from_utf8_lossy(v)),
+                    v => bail!(
+                        "{}: {name} = {:?}: unknown overlay opaque value",
+                        path.display(),
+                        String::from_utf8_lossy(v)
+                    ),
                 },
                 Some("whiteout") if ft.is_file() => return Ok(Kind::Whiteout),
                 Some(a @ ("redirect" | "metacopy")) => bail!(
@@ -104,7 +113,10 @@ pub fn classify<'a>(skip: &'a [&'a str]) -> impl Fn(&Path, &Path, &std::fs::Meta
         } else if ft.is_file() || ft.is_symlink() {
             Ok(Kind::Copy)
         } else {
-            bail!("{}: neither file, dir, symlink nor whiteout (fifo or socket): not publishable", path.display())
+            bail!(
+                "{}: neither file, dir, symlink nor whiteout (fifo or socket): not publishable",
+                path.display()
+            )
         }
     }
 }
@@ -200,7 +212,10 @@ pub fn publish(
     finish: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<(crate::out::Tier, Applied)> {
     let parent = dst.parent().context("publish target has no parent")?;
-    let name = dst.file_name().context("publish target has no name")?.to_string_lossy();
+    let name = dst
+        .file_name()
+        .context("publish target has no name")?
+        .to_string_lossy();
     let tmp = parent.join(format!(".{name}.pub-{}", std::process::id()));
     remove_any(&tmp)?;
     let mut leave_out = skip.to_vec();
@@ -212,7 +227,8 @@ pub fn publish(
         std::fs::File::open(&tmp)
             .and_then(|d| d.set_modified(std::time::SystemTime::now()))
             .with_context(|| format!("setting the mtime of {}", tmp.display()))?;
-        std::fs::rename(&tmp, dst).with_context(|| format!("renaming {} -> {}", tmp.display(), dst.display()))?;
+        std::fs::rename(&tmp, dst)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), dst.display()))?;
         Ok((tier, done))
     })();
     if made.is_err() {
@@ -238,7 +254,8 @@ fn apply_dir(
     for name in names {
         let r = rel.join(&name);
         let (src, to) = (upper.join(&r), dst.join(&r));
-        let meta = std::fs::symlink_metadata(&src).with_context(|| format!("reading {}", src.display()))?;
+        let meta = std::fs::symlink_metadata(&src)
+            .with_context(|| format!("reading {}", src.display()))?;
         match classify(&src, &r, &meta)? {
             Kind::Skip => {}
             Kind::Whiteout => {
@@ -246,10 +263,12 @@ fn apply_dir(
                 done.whiteouts += 1;
             }
             kind @ (Kind::Dir | Kind::OpaqueDir) => {
-                let keep = kind == Kind::Dir && std::fs::symlink_metadata(&to).is_ok_and(|m| m.is_dir());
+                let keep =
+                    kind == Kind::Dir && std::fs::symlink_metadata(&to).is_ok_and(|m| m.is_dir());
                 if !keep {
                     remove_any(&to)?;
-                    std::fs::create_dir(&to).with_context(|| format!("creating {}", to.display()))?;
+                    std::fs::create_dir(&to)
+                        .with_context(|| format!("creating {}", to.display()))?;
                 }
                 apply_dir(upper, dst, &r, classify, done, linked)?;
                 // after the children: writing them moved the dir's mtime
@@ -261,16 +280,24 @@ fn apply_dir(
                 // unlink first, never write through: the lower copy's other hard links keep the old content, as in the merged view (copy-up breaks lower links)
                 remove_any(&to)?;
                 if meta.file_type().is_symlink() {
-                    let target = std::fs::read_link(&src).with_context(|| format!("reading {}", src.display()))?;
-                    std::os::unix::fs::symlink(&target, &to).with_context(|| format!("linking {}", to.display()))?;
+                    let target = std::fs::read_link(&src)
+                        .with_context(|| format!("reading {}", src.display()))?;
+                    std::os::unix::fs::symlink(&target, &to)
+                        .with_context(|| format!("linking {}", to.display()))?;
                     done.symlinks += 1;
-                } else if let Some(first) = (meta.nlink() > 1).then(|| linked.get(&(meta.dev(), meta.ino()))).flatten() {
-                    std::fs::hard_link(first, &to)
-                        .with_context(|| format!("linking {} -> {}", to.display(), first.display()))?;
+                } else if let Some(first) = (meta.nlink() > 1)
+                    .then(|| linked.get(&(meta.dev(), meta.ino())))
+                    .flatten()
+                {
+                    std::fs::hard_link(first, &to).with_context(|| {
+                        format!("linking {} -> {}", to.display(), first.display())
+                    })?;
                     done.links += 1;
                     continue;
                 } else {
-                    std::fs::copy(&src, &to).with_context(|| format!("copying {} -> {}", src.display(), to.display()))?;
+                    std::fs::copy(&src, &to).with_context(|| {
+                        format!("copying {} -> {}", src.display(), to.display())
+                    })?;
                     if meta.nlink() > 1 {
                         linked.insert((meta.dev(), meta.ino()), to.clone());
                     }
@@ -324,7 +351,16 @@ touch -d 2003-01-01 newdir
     /// Runs `script` with `args` as uid 0 of a fresh user + mount namespace (the delta.rs stage-mount setup).
     fn in_userns(script: &str, args: &[&Path]) {
         let ok = Command::new("unshare")
-            .args(["--user", "--map-root-user", "--mount", "--propagation", "private", "--", "sh", "-c"])
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "--",
+                "sh",
+                "-c",
+            ])
             .arg(script)
             .arg("sh")
             .args(args)
@@ -374,7 +410,12 @@ touch -d 2003-01-01 newdir
             &[&lower],
         );
         let list = root.join("merged.list");
-        let opts = format!("lowerdir={},upperdir={},workdir={},userxattr", lower.display(), upper.display(), work.display());
+        let opts = format!(
+            "lowerdir={},upperdir={},workdir={},userxattr",
+            lower.display(),
+            upper.display(),
+            work.display()
+        );
         let (build, lister) = (root.join("build.sh"), root.join("list.sh"));
         std::fs::write(&build, BUILD).unwrap();
         std::fs::write(&lister, LIST).unwrap();
@@ -383,7 +424,13 @@ touch -d 2003-01-01 newdir
             &[Path::new(&opts), &mnt, &list, &build, &lister],
         );
         let merged = std::fs::read_to_string(&list).unwrap();
-        Fixture { root, store, lower, upper, merged }
+        Fixture {
+            root,
+            store,
+            lower,
+            upper,
+            merged,
+        }
     }
 
     fn listing(f: &Fixture, dir: &Path, name: &str) -> String {
@@ -397,36 +444,70 @@ touch -d 2003-01-01 newdir
     #[test]
     fn publish_equals_the_merged_view() {
         let f = fixture("gate");
-        for case in ["rep/n", "d/sub/t", "f2d/in", "d2f now-a-file", "newdir/hl", "mvd2/m"] {
+        for case in [
+            "rep/n",
+            "d/sub/t",
+            "f2d/in",
+            "d2f now-a-file",
+            "newdir/hl",
+            "mvd2/m",
+        ] {
             let path = case.split(' ').next().unwrap();
-            assert!(f.merged.contains(path), "fixture lacks {case}: {}", f.merged);
+            assert!(
+                f.merged.contains(path),
+                "fixture lacks {case}: {}",
+                f.merged
+            );
         }
-        assert!(!f.merged.contains("gone") && !f.merged.contains("d/x ") && !f.merged.contains("rep/r"));
+        assert!(
+            !f.merged.contains("gone") && !f.merged.contains("d/x ") && !f.merged.contains("rep/r")
+        );
         // the upper holds what this test exists for: whiteouts and an opaque dir
         let wh = std::fs::symlink_metadata(f.upper.join("gone")).unwrap();
         assert!(wh.file_type().is_char_device() && wh.rdev() == 0);
-        assert_eq!(xattr(&f.upper.join("rep"), "user.overlay.opaque").unwrap(), b"y");
+        assert_eq!(
+            xattr(&f.upper.join("rep"), "user.overlay.opaque").unwrap(),
+            b"y"
+        );
         let dst = f.root.join("published");
         let (_, done) = publish(&f.lower, &f.upper, &dst, &[], &|_| Ok(())).unwrap();
         // whiteouts: d/x, d/y (mv), gone, mvd (mv of a dir); opaque: rep, d/sub, f2d; links: newdir/hl
-        assert!(done.whiteouts >= 4 && done.opaque >= 3 && done.links == 1, "{done:?}");
+        assert!(
+            done.whiteouts >= 4 && done.opaque >= 3 && done.links == 1,
+            "{done:?}"
+        );
         let got = listing(&f, &dst, "published.list");
         assert_eq!(got, f.merged, "published vs merged");
         // touch -d ...06.123456789: find's %T@ prints 10 fraction digits
         assert!(got.contains(".1234567890 "), "a's mtime to the ns: {got}");
         // no overlay xattr reaches the base
         for p in [dst.join("rep"), dst.join("a"), dst.join("d")] {
-            assert!(xattr_names(&p).unwrap().iter().all(|n| overlay_attr(n).is_none()), "{}", p.display());
+            assert!(
+                xattr_names(&p)
+                    .unwrap()
+                    .iter()
+                    .all(|n| overlay_attr(n).is_none()),
+                "{}",
+                p.display()
+            );
         }
         let ro_mnt = f.root.join("ro");
         std::fs::create_dir_all(&ro_mnt).unwrap();
         let ro_list = f.root.join("ro.list");
-        let opts = format!("ro,lowerdir={}:{},userxattr", f.upper.display(), f.lower.display());
+        let opts = format!(
+            "ro,lowerdir={}:{},userxattr",
+            f.upper.display(),
+            f.lower.display()
+        );
         in_userns(
             "set -e; mount -t overlay overlay -o \"$1\" \"$2\"; sh \"$4\" \"$2\" \"$3\"",
             &[Path::new(&opts), &ro_mnt, &ro_list, &f.root.join("list.sh")],
         );
-        assert_eq!(std::fs::read_to_string(&ro_list).unwrap(), f.merged, "ro oracle vs rw merged");
+        assert_eq!(
+            std::fs::read_to_string(&ro_list).unwrap(),
+            f.merged,
+            "ro oracle vs rw merged"
+        );
     }
 
     /// Red controls: the same gate with whiteouts ignored, or opaque dirs merged like plain dirs, goes red.
@@ -440,7 +521,10 @@ touch -d 2003-01-01 newdir
         let no_opaque = |p: &Path, r: &Path, m: &std::fs::Metadata| {
             base(p, r, m).map(|k| if k == Kind::OpaqueDir { Kind::Dir } else { k })
         };
-        for (name, cl) in [("no-whiteouts", &no_whiteouts as &Classify<'_>), ("no-opaque", &no_opaque)] {
+        for (name, cl) in [
+            ("no-whiteouts", &no_whiteouts as &Classify<'_>),
+            ("no-opaque", &no_opaque),
+        ] {
             let dst = f.root.join(name);
             sh("cp -a \"$1\" \"$2\"", &[&f.lower, &dst]);
             apply(&f.upper, &dst, cl).unwrap();
@@ -452,17 +536,33 @@ touch -d 2003-01-01 newdir
     /// The upper of a mount this code does not model is refused, not guessed.
     #[test]
     fn redirect_and_metacopy_are_refused() {
-        let dir = Path::new("/dev/shm").join(format!("xtask-publish-refuse-{}", std::process::id()));
+        let dir =
+            Path::new("/dev/shm").join(format!("xtask-publish-refuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("d")).unwrap();
         std::fs::write(dir.join("f"), "x").unwrap();
-        rustix::fs::lsetxattr(dir.join("d"), "user.overlay.redirect", b"/x", rustix::fs::XattrFlags::empty()).unwrap();
-        rustix::fs::lsetxattr(dir.join("f"), "user.overlay.metacopy", b"", rustix::fs::XattrFlags::empty()).unwrap();
+        rustix::fs::lsetxattr(
+            dir.join("d"),
+            "user.overlay.redirect",
+            b"/x",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        rustix::fs::lsetxattr(
+            dir.join("f"),
+            "user.overlay.metacopy",
+            b"",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
         let c = classify(&[]);
         for n in ["d", "f"] {
             let p = dir.join(n);
             let e = c(&p, Path::new(n), &std::fs::symlink_metadata(&p).unwrap()).unwrap_err();
-            assert!(format!("{e:#}").contains("redirect_dir or metacopy"), "{e:#}");
+            assert!(
+                format!("{e:#}").contains("redirect_dir or metacopy"),
+                "{e:#}"
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
