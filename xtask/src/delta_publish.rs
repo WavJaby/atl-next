@@ -110,11 +110,12 @@ pub fn classify<'a>(
         }
         if ft.is_dir() {
             Ok(if opaque { Kind::OpaqueDir } else { Kind::Dir })
-        } else if ft.is_file() || ft.is_symlink() {
+        } else if ft.is_file() || ft.is_symlink() || ft.is_fifo() || ft.is_socket() {
+            // fifos and sockets too: gates leave them in build dirs (`app/bus/bus`, a session bus), and a pool publish (`cp -a`) copies the node
             Ok(Kind::Copy)
         } else {
             bail!(
-                "{}: neither file, dir, symlink nor whiteout (fifo or socket): not publishable",
+                "{}: a block device in an upper: not publishable",
                 path.display()
             )
         }
@@ -129,6 +130,8 @@ pub struct Applied {
     pub bytes: u64,
     pub links: u64,
     pub symlinks: u64,
+    /// Fifo and socket nodes.
+    pub nodes: u64,
     pub dirs: u64,
     pub opaque: u64,
     pub whiteouts: u64,
@@ -137,11 +140,12 @@ pub struct Applied {
 impl Applied {
     pub fn line(&self) -> String {
         format!(
-            "{} files ({:.2} GiB), {} hard links, {} symlinks, {} dirs ({} opaque), {} whiteouts",
+            "{} files ({:.2} GiB), {} hard links, {} symlinks, {} fifo/socket nodes, {} dirs ({} opaque), {} whiteouts",
             self.files,
             self.bytes as f64 / (1u64 << 30) as f64,
             self.links,
             self.symlinks,
+            self.nodes,
             self.dirs,
             self.opaque,
             self.whiteouts
@@ -285,6 +289,17 @@ fn apply_dir(
                     std::os::unix::fs::symlink(&target, &to)
                         .with_context(|| format!("linking {}", to.display()))?;
                     done.symlinks += 1;
+                } else if meta.file_type().is_fifo() || meta.file_type().is_socket() {
+                    // the node only (unprivileged: mknod needs no capability for these types)
+                    rustix::fs::mknodat(
+                        rustix::fs::CWD,
+                        &to,
+                        rustix::fs::FileType::from_raw_mode(meta.mode()),
+                        rustix::fs::Mode::from_raw_mode(meta.mode() & 0o7777),
+                        0,
+                    )
+                    .with_context(|| format!("mknod {}", to.display()))?;
+                    done.nodes += 1;
                 } else if let Some(first) = (meta.nlink() > 1)
                     .then(|| linked.get(&(meta.dev(), meta.ino())))
                     .flatten()
@@ -333,6 +348,7 @@ ln -sfn new-target s
 echo changed >> h1
 mv mvd mvd2
 mkdir -p newdir/sub && echo f > newdir/sub/f && ln newdir/sub/f newdir/hl
+mkfifo newdir/pipe
 touch -d 2003-01-01 newdir
 ";
 
@@ -491,6 +507,12 @@ touch -d 2003-01-01 newdir
                 p.display()
             );
         }
+        assert!(got.contains("newdir/pipe p "), "the fifo: {got}");
+        assert_eq!(ro_listing(&f), f.merged, "ro oracle vs rw merged");
+    }
+
+    /// The kernel's merge of the fixture's layers read-only (lowerdir=upper:lower, nothing written): the oracle gate.sh uses on real builds.
+    fn ro_listing(f: &Fixture) -> String {
         let ro_mnt = f.root.join("ro");
         std::fs::create_dir_all(&ro_mnt).unwrap();
         let ro_list = f.root.join("ro.list");
@@ -503,11 +525,20 @@ touch -d 2003-01-01 newdir
             "set -e; mount -t overlay overlay -o \"$1\" \"$2\"; sh \"$4\" \"$2\" \"$3\"",
             &[Path::new(&opts), &ro_mnt, &ro_list, &f.root.join("list.sh")],
         );
-        assert_eq!(
-            std::fs::read_to_string(&ro_list).unwrap(),
-            f.merged,
-            "ro oracle vs rw merged"
-        );
+        std::fs::read_to_string(&ro_list).unwrap()
+    }
+
+    /// A socket node left in the upper (a gate's session bus, `app/bus/bus`, stopped real publishes before this) is published as a node, as `cp -a` publishes it from a pool dir.
+    #[test]
+    fn a_socket_in_the_upper_is_published() {
+        let f = fixture("socket");
+        drop(std::os::unix::net::UnixListener::bind(f.upper.join("newdir/sock")).unwrap());
+        let want = ro_listing(&f);
+        assert!(want.contains("newdir/sock s "), "{want}");
+        let dst = f.root.join("published");
+        let (_, done) = publish(&f.lower, &f.upper, &dst, &[], &|_| Ok(())).unwrap();
+        assert_eq!(done.nodes, 2, "the fifo and the socket: {done:?}");
+        assert_eq!(listing(&f, &dst, "published.list"), want);
     }
 
     /// Red controls: the same gate with whiteouts ignored, or opaque dirs merged like plain dirs, goes red.
