@@ -4,7 +4,8 @@
 //! preedit, a commit and a delete-surrounding; the fixture logs each edit (`text input=<text> composing=<start>,<end>`, its TextWatcher).
 //! Sub-gates: activate (the IME was activated), preedit (the text holds the preedit as a composing span), commit (the commit replaced it, no composing span left), surrounding (after the commit the IME
 //! holds the editor's text with the cursor at its end, in text-input v3 bytes: GTK reads it inside the commit's `done`, from the display thread's copy of the editor's text), delete (the last char of
-//! the commit is gone: GTK turns the IME's byte count into chars against that surrounding), copy (the editor's getSurroundingText answers confirm that copy, none diverges).
+//! the commit is gone: GTK turns the IME's byte count into chars against that surrounding), copy (the editor's getSurroundingText answers confirm that copy, one per edit batch, none diverges; the
+//! probe waits for each batch's answer before its next edit). `--break-ime-copy` keeps the copy's text through the edits: the copy sub-gate must fail.
 //! `--break-ime-commit` leaves the commit_string out: the commit sub-gate must fail. `--break-ime-delete` sends the delete's byte count as after_length (after the cursor, where nothing is): the delete
 //! sub-gate must fail.
 //! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
@@ -143,6 +144,25 @@ fn composing_of<'a>(app: &'a str, text: &str) -> Option<&'a str> {
         .map(|(_, c)| c)
 }
 
+/// The editor answers the input method adopted against a predicted copy: confirmed or diverged lines (field.rs `surrounding`).
+fn answers(app: &str) -> usize {
+    app.lines()
+        .filter(|l| l.contains(COPY_CONFIRMED) || l.contains(COPY_DIVERGED))
+        .count()
+}
+
+/// Pumps until the app log holds `n` adopted answers or the wait ends. The answer is async (outbox -> the editor's UI thread -> a binder thread -> the display thread), and one that lands after the
+/// next edit is stale and dropped by design (field.rs `surrounding`; measured 120-190 ms late at load ~8, under the probe's ~200 ms between edits): the next edit, and the kill, wait for it.
+fn wait_answers(app_log: &Path, ime: &mut Ime, n: usize) {
+    let deadline = Instant::now() + IME_WAIT;
+    while Instant::now() < deadline
+        && answers(&std::fs::read_to_string(app_log).unwrap_or_default()) < n
+    {
+        let _ = ime.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_text(app_log: &Path, ime: &mut Ime, text: &str) -> bool {
     let deadline = Instant::now() + IME_WAIT;
     while Instant::now() < deadline {
@@ -211,6 +231,7 @@ pub fn drive(
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_preedit());
+    wait_answers(app_log, &mut ime, 1);
     ime.settle().map_err(|e| e.to_string())?;
     if !breaks.commit {
         ime.send(im_op::COMMIT_STRING, &[Arg::S(COMMIT)]);
@@ -222,6 +243,7 @@ pub fn drive(
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_commit());
     wait_surrounding(&mut ime, &after_commit());
+    wait_answers(app_log, &mut ime, 2);
     ime.settle().map_err(|e| e.to_string())?;
     // one char before the cursor, in bytes (text-input v3 counts bytes): the commit's last char
     let last = u32::try_from(COMMIT.chars().last().map_or(0, char::len_utf8)).unwrap_or(0);
@@ -232,6 +254,7 @@ pub fn drive(
     );
     ime.commit().map_err(|e| e.to_string())?;
     wait_text(app_log, &mut ime, &after_delete());
+    wait_answers(app_log, &mut ime, EDIT_BATCHES);
     // the composer sub-checks judge this process's last counters: let its paints catch up first
     wait_settled(app_log);
     // mid-session, input bound: SIGKILL the app (no Java-side teardown, so only the binder death can tell the services), then give the death notification time to arrive
@@ -322,18 +345,20 @@ pub fn checks(
 const COPY_CONFIRMED: &str = "atl-ime: editor text confirmed n=";
 const COPY_DIVERGED: &str = "atl-ime: editor text diverged n=";
 
+/// The probe's edit batches, each one TextInput `done` the editor reports with an updateSelection: the preedit; the commit + empty preedit; the delete + empty preedit + preedit end.
+const EDIT_BATCHES: usize = 3;
+
 /// The display thread answers GTK from its copy of the editor's text, which applies each edit before the editor does (atl-ime editor_text.rs): the editor's later answers must agree with it.
-/// Want >= 1 confirmed (the comparison ran: the preedit's and the commit's answers) and 0 diverged.
+/// Want one confirmed per edit batch ([`EDIT_BATCHES`]: the first fresh answer after a batch is compared, later ones find the copy already the editor's; the probe waits for each before its next
+/// edit) and 0 diverged.
 fn copy_check(app: &str) -> Result<String, String> {
     let count = |marker: &str| app.lines().filter(|l| l.contains(marker)).count();
     match (count(COPY_CONFIRMED), count(COPY_DIVERGED)) {
-        (0, d) => Err(format!(
-            "no `{}` line ({d} diverged)",
-            COPY_CONFIRMED.trim_end_matches(" n=")
+        (EDIT_BATCHES, 0) => Ok(format!(
+            "{EDIT_BATCHES} editor answers confirmed the copy (one per edit batch), 0 diverged"
         )),
-        (c, 0) => Ok(format!("{c} editor answers confirmed the copy, 0 diverged")),
         (c, d) => Err(format!(
-            "{d} editor answers diverged from the copy ({c} confirmed)"
+            "{c} editor answers confirmed the copy, {d} diverged (want {EDIT_BATCHES} confirmed, one per edit batch, 0 diverged)"
         )),
     }
 }
@@ -469,18 +494,20 @@ mod outbox_tests {
         assert!(outbox_check(good).is_err());
     }
 
-    /// field.rs `surrounding`'s line shapes: confirmed lines alone pass; any diverged line, or no confirmed line (the comparison never ran), fails.
+    /// field.rs `surrounding`'s line shapes: three confirmed lines (one per edit batch) alone pass; two (an answer never adopted), any diverged line, or none (the comparison never ran) fail; an answer
+    /// against a copy that was already the editor's (`editor text <shape>`) counts as neither.
     #[test]
     fn the_copy_must_be_confirmed_and_never_diverge() {
         let ok = "INFO atl-ime: editor text confirmed n=1: 17 units at 0 selection 17..17 composing Some((15, 17))\n";
         let bad = "WARN atl-ime: editor text diverged n=1: copy 17 units at 0 ... editor 15 units at 0 ...\n";
-        assert!(copy_check(ok).is_ok());
-        assert!(copy_check(&format!("{ok}{bad}")).is_err());
-        assert!(copy_check(bad).is_err());
-        assert!(
-            copy_check("INFO atl-ime: editor text 15 units at 0 selection 15..15 composing None\n")
-                .is_err()
-        );
+        let plain = "INFO atl-ime: editor text 15 units at 0 selection 15..15 composing None\n";
+        assert!(copy_check(&ok.repeat(3)).is_ok());
+        assert!(copy_check(&format!("{}{plain}", ok.repeat(3))).is_ok());
+        assert!(copy_check(&ok.repeat(2)).is_err());
+        assert!(copy_check(&format!("{}{bad}", ok.repeat(3))).is_err());
+        assert!(copy_check(&bad.repeat(3)).is_err());
+        assert!(copy_check(plain).is_err());
+        assert_eq!(answers(&format!("{}{bad}{plain}", ok.repeat(2))), 3);
     }
 
     /// The run goes on through the relaunch, whose reports also land in the app log: the gate counts the first process's part only, so a red there stays red and the relaunch's lines are not counted.

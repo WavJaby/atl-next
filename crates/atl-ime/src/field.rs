@@ -305,10 +305,13 @@ fn on_event(event: TextInputEvent) {
             },
         };
         if let Some(text) = field.text.as_mut() {
-            match &edit {
-                Edit::Compose(new) => text.replace(new, true),
-                Edit::Commit(new) => text.replace(new, false),
-                Edit::Delete(before, after) => text.delete_code_points(*before, *after),
+            // break `copy` (window ime `--break-ime-copy`): the copy keeps its text, so the editor's answer diverges from it and the ime stage's copy sub-gate must fail
+            if !cfg!(feature = "break-copy") {
+                match &edit {
+                    Edit::Compose(new) => text.replace(new, true),
+                    Edit::Commit(new) => text.replace(new, false),
+                    Edit::Delete(before, after) => text.delete_code_points(*before, *after),
+                }
             }
             field.predicted = true;
         }

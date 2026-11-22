@@ -6,11 +6,14 @@
 //! - Commits: the window keeps committing through the block at its own idle rate: strictly inside [block start + EDGE, block end - EDGE] (EDGE = one display period: a commit in flight at the start edge,
 //!   the first after the end) at least max(1, floor(span / steady_p95) - [`SLACK`]), steady_p95 = the 95th percentile commit interval of the steady phase. Probe responds: >= 2 steady commits.
 //!   Red before S5d: the toolkit ran inside the UI thread's Looper poll, so a sleeping UI thread committed nothing (S5c measured 0 inside).
+//!   Undecided when the host's GPU is starved: a window render covering the block longer than steady_p95 (slow_display.rs `starved`; 1.5-2.3 s renders against a 45-77 ms p95 measured at load 7-10)
+//!   leaves the steady rate saying nothing about the block, whatever the code does.
 //! - Posts: SurfaceFlinger's rule, one latch per present (display-thread plan D4): the producer tracks the display, not the UI thread, so the frames posted during the block are at least the window's
 //!   commits in it less [`SLACK`].
 //! - Timeouts (every run): no dequeue timed out (`-110`).
 
-use super::{ACK_WAIT, Liveness, Sub, await_event, wait_for_line};
+use super::slow_display::{render_max_us, span, starved};
+use super::{ACK_WAIT, Checks, Liveness, await_event, wait_for_line};
 use crate::composer::word;
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
@@ -20,6 +23,9 @@ use std::time::Duration;
 pub const FIXTURE: &str = "xtask-harness/testdata/ui-block";
 /// The fixture's result line (Main.java draw).
 const RESULT: &str = "AtlWindow: ub result ";
+/// The fixture's block markers (Main.java block), stamped by the log: where the block sits among the window's paint lines.
+const BLOCK_START: &str = "AtlWindow: ub block start";
+const BLOCK_END: &str = "AtlWindow: ub block end";
 /// Frames lost at the block's two edges (the post in flight when it starts, the first latch or commit after it): the design's `- 2`.
 const SLACK: u64 = 2;
 /// Warm-up (60 frames, 1 s at 60 Hz) + steady phase 4 s + block 2 s + tail 1 s, with room for a slow start.
@@ -119,16 +125,20 @@ impl Phases {
     }
 }
 
-/// The window kept committing through the block at no less than its own steady rate (module docs).
-fn commits_check(phases: &Phases) -> Result<String, String> {
-    let (lo, hi) = phases.inside();
-    let inside = phases.count((lo, hi), true);
-    let Some(p95) = phases.steady_p95() else {
-        return Err(format!(
+/// The steady p95, or the probe-silent failure.
+fn steady_p95(phases: &Phases) -> Result<f64, String> {
+    phases.steady_p95().ok_or_else(|| {
+        format!(
             "probe silent: fewer than 2 window commits in the steady phase ({} in all)",
             phases.commits_ms.len()
-        ));
-    };
+        )
+    })
+}
+
+/// The window kept committing through the block at no less than its own steady rate (module docs).
+fn commits_check(phases: &Phases, p95: f64) -> Result<String, String> {
+    let (lo, hi) = phases.inside();
+    let inside = phases.count((lo, hi), true);
     let want = (((hi - lo) / p95).floor() as u64)
         .saturating_sub(SLACK)
         .max(1);
@@ -160,13 +170,31 @@ fn posts_check(app: &str, phases: &Phases) -> Result<String, String> {
     }
 }
 
+/// Host GPU starvation in the block: a window render covering it longer than the steady p95 the commits bound assumes for every interval inside (slow_display.rs `starved`). None without both
+/// block markers or a covering paint line: judged. A window stopped by the block paints nothing in it, so its covering lines hold only the renders around it, fast on a host that is not starved.
+fn block_starved(app: &str, p95_ms: f64) -> Option<String> {
+    let render = render_max_us(app, span(app, BLOCK_START, BLOCK_END)?)?;
+    starved(render, p95_ms * 1000.0, &format!("steady p95 {p95_ms:.1}"))
+}
+
 /// The sub-gates; `refresh_hz`: the run's display (the block's edges); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock): commits and posts are then not judged.
-pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Vec<Sub> {
+/// On a GPU-starved host ([`block_starved`]) commits judges nothing (shown, the stage `undecided`); posts holds the producer to the window's commits, whatever their rate, and stays judged.
+pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Checks {
     let mut subs = vec![("timeouts", timeouts_check(app))];
+    let mut undecided = None;
     if let Some(commits_ns) = commits_ns {
         match Phases::of(app, refresh_hz, commits_ns) {
             Ok(phases) => {
-                subs.push(("commits", commits_check(&phases)));
+                match steady_p95(&phases) {
+                    Ok(p95) => {
+                        let commits = ("commits", commits_check(&phases, p95));
+                        match block_starved(app, p95) {
+                            Some(why) => undecided = Some((why, vec![commits])),
+                            None => subs.push(commits),
+                        }
+                    }
+                    Err(e) => subs.push(("commits", Err(e))),
+                }
                 subs.push(("posts", posts_check(app, &phases)));
             }
             Err(e) => {
@@ -175,7 +203,7 @@ pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Vec<Sub
             }
         }
     }
-    subs
+    Checks { subs, undecided }
 }
 
 /// The probe: the window's configure is acked, then the fixture's result line (the phases are the app's own doing).
@@ -214,24 +242,59 @@ mod tests {
         Phases::of(&edges(during), 60.0, commits).expect("phases")
     }
 
+    /// commits as `checks` judges it on a host that is not starved.
+    fn judge(phases: &Phases) -> Result<String, String> {
+        steady_p95(phases).and_then(|p95| commits_check(phases, p95))
+    }
+
     /// Steady commits every 20 ms (p95 = 20 ms). 60 Hz: EDGE = 16.666... ms, the judged span 10016.67..11983.33 ms = 1966.67 ms: floor(98.33) = 98 - SLACK 2 = 96 wanted.
     /// Commits every 20 ms in the block from 10020: 10020..11980 = 99 inside, pass; every 21 ms: 10020..11973 = 94 inside, fail. None inside (the UI thread's block stopping the window): fail.
     #[test]
     fn commits_through_the_block_at_the_steady_rate() {
         let steady = every(6_000, 10_000, 20);
         let at = |step| [steady.clone(), every(10_020, 11_984, step)].concat();
-        assert!(commits_check(&phases(0, &at(20))).is_ok());
-        assert!(commits_check(&phases(0, &at(21))).is_err());
-        assert!(commits_check(&phases(0, &steady)).is_err());
+        assert!(judge(&phases(0, &at(20))).is_ok());
+        assert!(judge(&phases(0, &at(21))).is_err());
+        assert!(judge(&phases(0, &steady)).is_err());
+    }
+
+    /// Steady p95 20 ms (commits every 20 ms), none inside the block: red when judged. The block's markers at 10.000 / 12.000 s; a paint line at 13.000 s with ms=3000 covers it: a 20.001 ms render
+    /// there is longer than the p95, so commits is shown unjudged (the stage undecided) and posts stays judged; 20.000 ms exactly, or no covering line, judges it (red).
+    #[test]
+    fn a_starved_block_leaves_commits_undecided() {
+        let steady = every(6_000, 10_000, 20);
+        let app = |render_us: Option<u64>| {
+            let paint = render_us.map_or(String::new(), |r| {
+                format!("13.000  INFO atl-platform-ui: paint ms=3000 render_us=1/{r}\n")
+            });
+            format!(
+                "10.000 I AtlWindow: ub block start\n12.000 I AtlWindow: ub block end\n{paint}{}",
+                edges(0)
+            )
+        };
+        let c = checks(&app(Some(20_001)), 60.0, Some(&steady));
+        let (why, unjudged) = c.undecided.expect("starved");
+        assert_eq!(
+            why,
+            "host GPU starved (window render max 20 ms > steady p95 20.0 ms)"
+        );
+        assert!(matches!(unjudged.as_slice(), [("commits", Err(_))]));
+        let names: Vec<&str> = c.subs.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["timeouts", "posts"]);
+        for judged in [app(Some(20_000)), app(None)] {
+            let c = checks(&judged, 60.0, Some(&steady));
+            assert!(c.undecided.is_none());
+            assert!(c.subs.iter().any(|(n, r)| *n == "commits" && r.is_err()));
+        }
     }
 
     /// Two steady commits 1000 ms apart: p95 1000 ms, floor(1966.67 / 1000) = 1 - 2 saturates to 0, so the floor of 1 holds: one inside passes, none fails. One steady commit: probe silent.
     #[test]
     fn commits_want_at_least_one_and_a_live_probe() {
         let steady = vec![7_000 * MS, 8_000 * MS];
-        assert!(commits_check(&phases(0, &[steady.clone(), vec![11_000 * MS]].concat())).is_ok());
-        assert!(commits_check(&phases(0, &steady)).is_err());
-        assert!(commits_check(&phases(0, &[7_000 * MS, 11_000 * MS])).is_err());
+        assert!(judge(&phases(0, &[steady.clone(), vec![11_000 * MS]].concat())).is_ok());
+        assert!(judge(&phases(0, &steady)).is_err());
+        assert!(judge(&phases(0, &[7_000 * MS, 11_000 * MS])).is_err());
     }
 
     /// p95 by nearest rank: 20 intervals, 19 of 10 ms and one of 100 ms: rank ceil(19.0) = 19 -> 10 ms (the one slow paint does not set the rate); with 2 slow of 20, rank 19 -> 100 ms.
@@ -257,7 +320,7 @@ mod tests {
     #[test]
     fn commits_and_posts_only_judged_locally() {
         let app = edges(98);
-        let names = |subs: Vec<Sub>| subs.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        let names = |c: Checks| c.subs.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(names(checks(&app, 60.0, None)), ["timeouts"]);
         assert_eq!(
             names(checks(&app, 60.0, Some(&[7_000 * MS]))),
@@ -266,6 +329,7 @@ mod tests {
         let bare = "9.0 I AtlWindow: ub result posts_during=98 max_gap_ms=20\n";
         assert!(
             checks(bare, 60.0, Some(&[7_000 * MS]))
+                .subs
                 .iter()
                 .skip(1)
                 .all(|(_, r)| r.is_err())

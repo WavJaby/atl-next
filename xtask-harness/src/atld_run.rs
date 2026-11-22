@@ -1256,21 +1256,18 @@ impl Runtime {
         self
     }
 
-    /// The app processes' composer breaks `rule` (a deliberate-failure run): the staged ART lib dir's app runtime (the launcher's cdylib, which holds the composer) is replaced by one built with atl-composer feature `break-<rule>` (packages.rs `build_with_breaks`).
+    /// The app runtime's deliberate break `feature` (`<crate>/break-<rule>` of a crate the launcher's cdylib links: the composer, the input method; a deliberate-failure run): the staged ART lib dir's
+    /// app runtime is replaced by one built with that feature (packages.rs `build_with_breaks`).
     /// stage_art restages that dir on every run (as [`Self::without_art_lib`]), so the break lasts one run; the shipped library is never touched.
-    pub fn with_ui_break(self, root: &Path, rule: &str) -> Result<Self> {
+    pub fn with_ui_break(self, root: &Path, feature: &str) -> Result<Self> {
         let launcher = self
             .art
             .launcher
             .file_name()
             .and_then(|n| n.to_str())
             .context("the launcher's file name")?;
-        let release = packages::build_with_breaks(
-            root,
-            &self.out,
-            launcher,
-            &[format!("atl-composer/break-{rule}")],
-        )?;
+        let release =
+            packages::build_with_breaks(root, &self.out, launcher, &[feature.to_owned()])?;
         let at = self.art.lib_path.join(crate::launcher_closure::RUNTIME);
         std::fs::remove_file(&at).with_context(|| format!("unlinking {}", at.display()))?;
         std::fs::copy(release.join(crate::launcher_closure::RUNTIME), &at)

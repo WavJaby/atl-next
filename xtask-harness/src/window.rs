@@ -125,6 +125,9 @@ pub struct Args {
     /// Stage ime only: the services give input method clients no death link, so the death sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_ime_death: bool,
+    /// Stage ime only: the input method's copy of the editor's text keeps its text through each edit (atl-ime feature `break-copy`), so the editor's answers diverge from it and the copy sub-gate must fail.
+    #[arg(long)]
+    break_ime_copy: bool,
     /// Stage ime only: the run ends by SIGKILL, not the control socket's `stop`, so the run sub-gate must fail (the gate's deliberate break).
     #[arg(long)]
     break_atld_stop: bool,
@@ -360,6 +363,13 @@ fn takes_pictures(stage: Stage) -> bool {
 
 /// One sub-gate's result under its name (printed `window: <name>: pass|FAIL`); the name travels with the result, so no list of names can fall out of step with the checks.
 pub(crate) type Sub = (&'static str, Result<String, String>);
+
+/// A stage's sub-gates, and the ones a GPU-starved host left unjudged (slow_display.rs `starved`).
+pub struct Checks {
+    pub subs: Vec<Sub>,
+    /// Some on a starved host: why, and the sub-gates as measured (shown, judging nothing).
+    pub undecided: Option<(String, Vec<Sub>)>,
+}
 
 /// The fixture's dir.
 pub(crate) const FIXTURE: &str = "xtask-harness/testdata/window";
@@ -2190,22 +2200,29 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
                 let p = start_proxy(&n.socket)?;
                 let rt = rt.with_ui("gtk").with_wayland(&p.listen);
-                let rule = [
-                    (args.break_z_order, "z-order"),
-                    (args.break_post_draw, "post-draw"),
-                    (args.break_queue, "queue"),
-                    (args.break_ignore_hold, "ignore-hold"),
-                    (args.break_no_backpressure, "no-backpressure"),
-                    (args.break_ignore_vsync_flag, "ignore-vsync-flag"),
-                    (args.break_input_frames, "input-frames"),
-                    (args.break_input_no_wake, "input-no-wake"),
-                    (args.break_outbox, "outbox"),
-                    (args.break_handle_hold, "handle-hold"),
+                let feature = [
+                    (args.break_z_order, "atl-composer/break-z-order"),
+                    (args.break_post_draw, "atl-composer/break-post-draw"),
+                    (args.break_queue, "atl-composer/break-queue"),
+                    (args.break_ignore_hold, "atl-composer/break-ignore-hold"),
+                    (
+                        args.break_no_backpressure,
+                        "atl-composer/break-no-backpressure",
+                    ),
+                    (
+                        args.break_ignore_vsync_flag,
+                        "atl-composer/break-ignore-vsync-flag",
+                    ),
+                    (args.break_input_frames, "atl-composer/break-input-frames"),
+                    (args.break_input_no_wake, "atl-composer/break-input-no-wake"),
+                    (args.break_outbox, "atl-composer/break-outbox"),
+                    (args.break_handle_hold, "atl-composer/break-handle-hold"),
+                    (args.break_ime_copy, "atl-ime/break-copy"),
                 ]
                 .into_iter()
-                .find_map(|(on, rule)| on.then_some(rule));
-                let rt = match rule {
-                    Some(rule) => rt.with_ui_break(root, rule)?,
+                .find_map(|(on, feature)| on.then_some(feature));
+                let rt = match feature {
+                    Some(feature) => rt.with_ui_break(root, feature)?,
                     None => rt,
                 };
                 proxy = Some(p);
@@ -2805,7 +2822,11 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             args.esc_back,
             args.tap_origin.focuses() != args.break_tap_origin,
         ),
-        (Stage::UiBlock, Some(_)) => ui_block::checks(&app, display.refresh_hz, commits.as_deref()),
+        (Stage::UiBlock, Some(_)) => {
+            let c = ui_block::checks(&app, display.refresh_hz, commits.as_deref());
+            undecided = c.undecided;
+            c.subs
+        }
         (Stage::SlowDisplay, Some(_)) => {
             let c = slow_display::checks(&app, display.refresh_hz, throttle);
             undecided = c.undecided;
@@ -3275,7 +3296,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     );
     let rt = if ui { rt.with_ui("gtk") } else { rt };
     let rt = match &a.ui_break {
-        Some(rule) => rt.with_ui_break(root, rule)?,
+        Some(rule) => rt.with_ui_break(root, &format!("atl-composer/break-{rule}"))?,
         None => rt,
     };
     let rt = rt.with_app_env(&[format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG)]);
