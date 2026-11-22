@@ -343,11 +343,45 @@ fn run_client(
 /// A run's own null sink, which the run's streams target by name; the session's default sink and every stream that is not the run's stay untouched, so two runs overlap freely.
 /// PipeWire clients get the target the way a launcher passes it, libpipewire's `PIPEWIRE_PROPS` (read by every `pw_stream_new`); pulse clients get a pipewire-pulse of the run's own
 /// ([`Routing::with_pulse`]) whose streams carry the same target. `node.dont-fallback`: a stream whose target is gone fails instead of falling back to the default sink.
-/// Dropping it stops that pulse server and removes the sink, on every exit path.
+/// Lifetime: the sink is a non-lingering node of a `pw-cli` holder of the run's own ([`holder_sh`] on a remote target, a child here), so PipeWire removes it when that client goes, however the run
+/// ends -- nothing to destroy, nothing left behind. Dropping it stops the pulse server, then the holder.
 pub(crate) struct Routing {
     name: String,
-    sink: Option<String>,
+    holder: Option<Child>,
     pulse: Option<PulseServer>,
+}
+
+/// The adapter properties of a run's null node: `create-node adapter <this>`. Not lingering: the node lives as long as the client that made it.
+/// state.restore-props=false: WirePlumber's state-stream neither restores nor saves this node's volume, so a run leaves no `Audio/Sink:node.name:<sink>` key in the user's state file.
+fn null_node_props(name: &str, class: &str, extra: &str) -> String {
+    format!(
+        "{{ factory.name=support.null-audio-sink node.name={name} media.class={class} \
+         audio.rate=48000 audio.channels={CHANNELS} audio.position=[ FL FR ] object.linger=false \
+         {extra}state.restore-props=false }}"
+    )
+}
+
+/// How long a remote run's holder may wait for its sink to show in the graph, in tenths of a second (the shell's poll step): [`ROUTE_LIMIT`].
+const HOLDER_POLLS: u128 = ROUTE_LIMIT.as_millis() / 100;
+
+/// Shell (POSIX sh, the remote run's script) that makes the run's own null sink `name` before atld starts: a `pw-cli` holder fed one line through a fifo (`pw-cli` ignores the EOF after
+/// it, measured on 1.4, so it ends only when killed; `timeout` bounds it at `limit_s` if the script dies before [`holder_end_sh`]), then a wait for the node to show; exit 6 if it does not.
+/// Sets `SK` (the holder's pid); holds no fd (fd 9 is the run lock). `dir`: a shell word naming the run's scratch dir. The sink goes with the holder. Same node and target as the local [`Routing`].
+pub(crate) fn holder_sh(name: &str, dir: &str, limit_s: u64) -> String {
+    let props = null_node_props(name, "Audio/Sink", "");
+    let rt = "XDG_RUNTIME_DIR=\"/run/user/$(id -u)\"";
+    format!(
+        "rm -f {dir}/sink.fifo; mkfifo {dir}/sink.fifo || exit 6\n\
+         {rt} timeout -k 2 {limit_s} pw-cli < {dir}/sink.fifo > {dir}/sink.log 2>&1 &\nSK=$!\n\
+         printf '%s\\n' 'create-node adapter {props}' > {dir}/sink.fifo\n\
+         i=0\nuntil {rt} pw-cli ls Node 2>/dev/null | grep -qF 'node.name = \"{name}\"'; do\n  i=$((i + 1))\n  [ \"$i\" -le {HOLDER_POLLS} ] || {{ echo \"remote run: the run's null sink {name} does not show in the graph\" >&2; kill \"$SK\"; exit 6; }}\n  sleep 0.1\ndone\n\
+         echo \"remote run: audio into the run's own null sink {name}\" >&2\n"
+    )
+}
+
+/// Shell that ends [`holder_sh`]'s holder: its node, the run's sink, goes with it.
+pub(crate) fn holder_end_sh() -> &'static str {
+    "kill \"$SK\" 2>/dev/null || true\nwait \"$SK\" 2>/dev/null || true\n"
 }
 
 impl Routing {
@@ -361,31 +395,37 @@ impl Routing {
     }
 
     fn null_node(name: &str, class: &str, extra: &str) -> Result<Self> {
-        let mut routing = Routing {
+        use std::io::Write;
+        let mut holder = Command::new("pw-cli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("starting the pw-cli holder of the run's null sink")?;
+        let line = format!(
+            "create-node adapter {}\n",
+            null_node_props(name, class, extra)
+        );
+        let sent = holder
+            .stdin
+            .as_mut()
+            .context("the holder's stdin")?
+            .write_all(line.as_bytes());
+        // from here on Drop ends the holder, on every path
+        let routing = Routing {
             name: name.to_owned(),
-            sink: None,
+            holder: Some(holder),
             pulse: None,
         };
-        // state.restore-props=false: WirePlumber's state-stream neither restores nor saves this node's volume, so a run leaves no `Audio/Sink:node.name:<sink>` key in the user's state file
-        let props = format!(
-            "{{ factory.name=support.null-audio-sink node.name={name} media.class={class} \
-             audio.rate=48000 audio.channels={CHANNELS} audio.position=[ FL FR ] object.linger=true \
-             {extra}state.restore-props=false }}"
-        );
-        let created = pw_command(&["create-node", "adapter", &props])?;
-        ensure!(created.status.success(), "pw-cli create-node failed");
+        sent.context("sending create-node to the holder")?;
         let deadline = Instant::now() + ROUTE_LIMIT;
-        let id = loop {
-            if let Some(id) = node_id(name)? {
-                break id;
-            }
+        while node_id(name)?.is_none() {
             ensure!(
                 Instant::now() < deadline,
                 "the null sink {name} does not show in the graph"
             );
             thread::sleep(Duration::from_millis(20));
-        };
-        routing.sink = Some(id);
+        }
         Ok(routing)
     }
 
@@ -416,7 +456,7 @@ impl Routing {
 }
 
 /// `{ target.object=<sink> node.dont-fallback=true }` in PipeWire's SPA-JSON.
-fn stream_props(sink: &str) -> String {
+pub(crate) fn stream_props(sink: &str) -> String {
     format!("{{ target.object=\"{sink}\" node.dont-fallback=true }}")
 }
 
@@ -424,10 +464,11 @@ impl Drop for Routing {
     fn drop(&mut self) {
         // the pulse server first: its streams end before their sink goes
         drop(self.pulse.take());
-        if let Some(id) = &self.sink
-            && !pw_command(&["destroy", id]).is_ok_and(|o| o.status.success())
+        // the holder's node goes with its client
+        if let Some(mut holder) = self.holder.take()
+            && !(holder.kill().is_ok() && holder.wait().is_ok())
         {
-            report_cleanup(&format!("destroying null sink {} (object {id})", self.name));
+            report_cleanup(&format!("ending the holder of null sink {}", self.name));
         }
     }
 }
@@ -716,17 +757,147 @@ pub(crate) fn identity_check(
     if wrong { Err(detail) } else { Ok(detail) }
 }
 
+/// Where a run's app streams played, read from `pw-dump` samples taken during the run: the `audio-route:` check. App stream = an `Stream/Output/Audio` node of a client made through
+/// one of atld's security contexts (`pipewire.sec.engine=atl`), or whose `application.id` is the app's (`<package>` or the window's `atl.<package>`).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct StreamRoutes {
+    pub(crate) samples: usize,
+    /// Samples with an app stream linked into the run's own sink.
+    pub(crate) into_run_sink: usize,
+    /// Every other node an app stream was linked into, `node.name (media.class)`.
+    pub(crate) elsewhere: std::collections::BTreeSet<String>,
+}
+
+/// [`StreamRoutes`] over `dumps` (each one `pw-dump`'s JSON array); `run_sink`: the run's own sink's node name, None for an audible run (every link then counts as elsewhere).
+pub(crate) fn stream_routes(
+    dumps: &[String],
+    package: &str,
+    run_sink: Option<&str>,
+) -> Result<StreamRoutes> {
+    use serde_json::Value;
+    let mut routes = StreamRoutes::default();
+    let window_id = format!("atl.{package}");
+    for (n, text) in dumps.iter().enumerate() {
+        let objects: Vec<Value> =
+            serde_json::from_str(text).with_context(|| format!("pw-dump sample {n}"))?;
+        let props = |o: &Value| o["info"]["props"].clone();
+        let of_type = |ty: &'static str| objects.iter().filter(move |o| o["type"] == ty);
+        let atl_clients: Vec<u64> = of_type("PipeWire:Interface:Client")
+            .filter(|o| props(o)["pipewire.sec.engine"] == "atl")
+            .filter_map(|o| o["id"].as_u64())
+            .collect();
+        let nodes: std::collections::HashMap<u64, Value> = of_type("PipeWire:Interface:Node")
+            .filter_map(|o| Some((o["id"].as_u64()?, props(o))))
+            .collect();
+        let is_app_stream = |p: &Value| {
+            p["media.class"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("Stream/Output/Audio"))
+                && (p["client.id"]
+                    .as_u64()
+                    .is_some_and(|c| atl_clients.contains(&c))
+                    || p["application.id"]
+                        .as_str()
+                        .is_some_and(|a| a == package || a == window_id))
+        };
+        let mut into_run_sink = false;
+        for link in of_type("PipeWire:Interface:Link") {
+            let info = &link["info"];
+            let (Some(out), Some(input)) = (
+                info["output-node-id"].as_u64(),
+                info["input-node-id"].as_u64(),
+            ) else {
+                continue;
+            };
+            if !nodes.get(&out).is_some_and(is_app_stream) {
+                continue;
+            }
+            let target = nodes.get(&input).cloned().unwrap_or(Value::Null);
+            let name = target["node.name"].as_str().unwrap_or("?");
+            if Some(name) == run_sink {
+                into_run_sink = true;
+            } else {
+                routes.elsewhere.insert(format!(
+                    "{name} ({})",
+                    target["media.class"].as_str().unwrap_or("?")
+                ));
+            }
+        }
+        routes.samples += 1;
+        routes.into_run_sink += usize::from(into_run_sink);
+    }
+    Ok(routes)
+}
+
+/// Time between two `pw-dump` samples of a run's graph (local [`RouteSampler`], remote.rs's script): a stream that lives at least this long is seen.
+pub(crate) const ROUTE_SAMPLE: Duration = Duration::from_secs(2);
+
+/// `pw-dump` of this host's graph every [`ROUTE_SAMPLE`] on a thread of its own, from [`RouteSampler::start`] to [`RouteSampler::finish`]: a local run's samples for [`stream_routes`].
+pub(crate) struct RouteSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: thread::JoinHandle<Vec<String>>,
+}
+
+impl RouteSampler {
+    pub(crate) fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut dumps = Vec::new();
+            while !flag.load(Ordering::Relaxed) {
+                if let Ok(out) = Command::new("pw-dump").stderr(Stdio::null()).output()
+                    && out.status.success()
+                {
+                    dumps.push(String::from_utf8_lossy(&out.stdout).into_owned());
+                }
+                // in short steps: finish returns within one of them
+                let next = Instant::now() + ROUTE_SAMPLE;
+                while !flag.load(Ordering::Relaxed) && Instant::now() < next {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            dumps
+        });
+        RouteSampler { stop, thread }
+    }
+
+    /// Stops sampling; the samples taken (none if the thread failed).
+    pub(crate) fn finish(self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap_or_default()
+    }
+}
+
+/// The `audio-route:` verdict: red when an app stream was linked anywhere but the run's own sink, or when no sample was taken (the route was not checked); an app that played nothing is
+/// green but says so, since then nothing was measured.
+pub(crate) fn route_verdict(r: &StreamRoutes, run_sink: Option<&str>) -> Result<String, String> {
+    let sink = run_sink.unwrap_or("none (audible run)");
+    if r.samples == 0 {
+        return Err(format!(
+            "audio-route: no pw-dump sample: the route was not checked (run sink {sink})"
+        ));
+    }
+    let head = format!(
+        "audio-route: {} samples, app streams into the run's sink {sink} in {}",
+        r.samples, r.into_run_sink
+    );
+    if !r.elsewhere.is_empty() {
+        let names: Vec<&str> = r.elsewhere.iter().map(String::as_str).collect();
+        return Err(format!("{head}; linked elsewhere: {}", names.join(", ")));
+    }
+    if r.into_run_sink == 0 {
+        return Ok(format!(
+            "{head}; no app stream was seen (nothing played, nothing measured)"
+        ));
+    }
+    Ok(format!("{head}; elsewhere none"))
+}
+
 /// Reports a failed cleanup step on stderr; the run's verdict is already decided by then.
 fn report_cleanup(text: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "audio-pcm: cleanup failed: {text}");
-}
-
-fn pw_command(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("pw-cli")
-        .args(args)
-        .output()
-        .with_context(|| format!("running pw-cli {}", args.first().copied().unwrap_or("")))
 }
 
 /// The object id of the node named `name` in `pw-cli ls Node`: the last `id` line above its `node.name`.
@@ -857,6 +1028,78 @@ pub(crate) fn out_of_range(x: &[f32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pw-dump sample: an atld-context client 7 with stream 30, another client 8 with stream 31, the run's sink 10, a device sink 11; `links` = (output node, input node).
+    fn dump(links: &[(u64, u64)]) -> String {
+        let mut objects = vec![
+            r#"{ "id": 7, "type": "PipeWire:Interface:Client", "info": { "props": { "pipewire.sec.engine": "atl" } } }"#.to_owned(),
+            r#"{ "id": 8, "type": "PipeWire:Interface:Client", "info": { "props": { "application.name": "player" } } }"#.to_owned(),
+            r#"{ "id": 30, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 7 } } }"#.to_owned(),
+            r#"{ "id": 31, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 8 } } }"#.to_owned(),
+            r#"{ "id": 32, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 8, "application.id": "atl.com.x" } } }"#.to_owned(),
+            r#"{ "id": 10, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Audio/Sink", "node.name": "atl-run" } } }"#.to_owned(),
+            r#"{ "id": 11, "type": "PipeWire:Interface:Node", "info": { "props": { "media.class": "Audio/Sink", "node.name": "alsa_output.speakers" } } }"#.to_owned(),
+        ];
+        for (i, (o, n)) in links.iter().enumerate() {
+            objects.push(format!(r#"{{ "id": {}, "type": "PipeWire:Interface:Link", "info": {{ "output-node-id": {o}, "input-node-id": {n} }} }}"#, 100 + i));
+        }
+        format!("[{}]", objects.join(","))
+    }
+
+    #[test]
+    fn route_into_the_run_sink_is_green() {
+        // the other client's stream into the speakers is not the run's: the user's own audio
+        let r = stream_routes(
+            &[dump(&[(30, 10), (31, 11)]), dump(&[])],
+            "com.x",
+            Some("atl-run"),
+        )
+        .unwrap();
+        assert_eq!((r.samples, r.into_run_sink, r.elsewhere.len()), (2, 1, 0));
+        assert!(route_verdict(&r, Some("atl-run")).is_ok());
+    }
+
+    #[test]
+    fn route_into_a_device_sink_is_red() {
+        // by context client, then by the window's application.id on a client of no context
+        for stream in [30, 32] {
+            let r = stream_routes(&[dump(&[(stream, 11)])], "com.x", Some("atl-run")).unwrap();
+            assert_eq!(
+                r.elsewhere.iter().next().map(String::as_str),
+                Some("alsa_output.speakers (Audio/Sink)")
+            );
+            assert!(route_verdict(&r, Some("atl-run")).is_err());
+        }
+        // audible: no run sink, every link is elsewhere
+        let r = stream_routes(&[dump(&[(30, 10)])], "com.x", None).unwrap();
+        assert!(route_verdict(&r, None).is_err());
+    }
+
+    #[test]
+    fn no_sample_is_red_and_no_stream_says_so() {
+        assert!(route_verdict(&StreamRoutes::default(), Some("atl-run")).is_err());
+        let r = stream_routes(&[dump(&[])], "com.x", Some("atl-run")).unwrap();
+        assert!(
+            route_verdict(&r, Some("atl-run"))
+                .unwrap()
+                .contains("nothing measured")
+        );
+    }
+
+    #[test]
+    fn holder_script_makes_and_ends_a_non_lingering_sink() {
+        let sh = holder_sh("atl-run-apk-1", "\"$D\"", 90);
+        assert!(
+            sh.contains("timeout -k 2 90 pw-cli < \"$D\"/sink.fifo"),
+            "{sh}"
+        );
+        assert!(
+            sh.contains("node.name=atl-run-apk-1 media.class=Audio/Sink")
+                && sh.contains("object.linger=false"),
+            "{sh}"
+        );
+        assert!(holder_end_sh().contains("kill \"$SK\""));
+    }
 
     /// A sine of `freq` Hz, `amp` peak, `frames` frames at `rate`: the generator the gate's expectations are checked against.
     fn tone(rate: f64, freq: f64, amp: f64, frames: usize) -> Vec<f32> {

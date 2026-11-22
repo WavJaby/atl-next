@@ -7,6 +7,8 @@
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
 //! Sound: with --hold (the user's launch) the session's routing, as a desktop launch; headless, every stream plays into a null sink of the run's own (audio_pcm.rs Routing), never the session's sink.
+//! `remote run-apk` is muted the same way unless `--audible`: the target makes the run's own null sink (audio_pcm.rs `holder_sh`). Both driven paths judge the route (`audio-route:`, audio_pcm.rs
+//! `stream_routes` over `pw-dump` samples taken during the run): red when an app stream was linked into any node but the run's sink.
 //! `--drive <script>`: once that wait is over, the script runs against the window (drive.rs for its grammar); a failed step fails the run, and the verdict covers the run up to the script's end.
 //! `--scenario`: the row's tracked script (scenarios.rs) the same way, on a fresh data root of its own, with a `scenario:` verdict; `--controls` adds a run under each declared break that must fail at a checkpoint.
 //! `remote run-apk` ([`remote`]): the same run on a target's desktop. The bundle goes there and is checked, atld runs there for `--hold`, and the logs come back when the run ends; the verdict is read from them, against the target's end record.
@@ -20,7 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::atld_run::{
     MS_PER_S, Package, PackageFile, Run, Runtime, last_resumed, parse_stamp, run_display, settled,
 };
-use crate::audio_pcm::Routing;
+use crate::audio_pcm::{RouteSampler, Routing, route_verdict, stream_routes};
 use crate::manifest::Manifest;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
@@ -178,6 +180,14 @@ pub struct RemoteArgs {
     /// Deliberate break (`remote push`'s values): the bundle without the named file, which the check then names.
     #[arg(long = "break", value_enum)]
     brk: Option<remote::Break>,
+    /// The run's sound plays into the target's desktop session (its default sink), for a human listening; the `audio-route:` check then goes red by design. Default: muted, every stream
+    /// into a null sink the target makes for the run and removes with it. Never for an unattended run.
+    #[arg(long)]
+    audible: bool,
+    /// Apps start with `--break-mix`: their mixer plays digital silence while the streams run. With `--audible` and a fixture APK, the red control of `audio-route:` that is safe for the target's
+    /// speakers. Test only.
+    #[arg(long)]
+    break_mix: bool,
     /// Records the target's Hyprland session while the app holds: one record a second in `observe.jsonl` (its `atl.*` windows), and a verdict line. A target without exactly one Hyprland session is skipped, the reason logged.
     #[arg(long)]
     observe: bool,
@@ -599,6 +609,8 @@ pub(crate) fn run_on(
     let script_ms = args.pointer.as_deref().map_or(0, script_wait_ms);
     let started = Instant::now();
     let mut atld = timing::phase("run: atld start", || rt.start_atld(&run))?;
+    // the route of a muted run is checked, not assumed
+    let sampler = audio.as_ref().map(|_| RouteSampler::start());
     let booted = Instant::now();
     let mut resumed_at = None;
     let mut presented_at = None;
@@ -686,6 +698,12 @@ pub(crate) fn run_on(
             Ok(())
         })?;
     }
+    let route = sampler.map(|s| {
+        let sink = audio.as_ref().map(Routing::name);
+        stream_routes(&s.finish(), &m.name, sink)
+            .map_err(|e| format!("audio-route: {e:#}"))
+            .and_then(|r| route_verdict(&r, sink))
+    });
     let app = read(&app_log);
     let services = read(&services_log);
     if args.verbose {
@@ -702,6 +720,10 @@ pub(crate) fn run_on(
         .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
         .and_then(|ok| {
             render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
+        })
+        .and_then(|ok| match route {
+            Some(r) => r.map(|line| format!("{ok}; {line}")),
+            None => Ok(ok),
         });
     // the drive's failure first: it says what the script could not do, the verdict only what the app did
     let outcome = match (&driven, steps.is_some()) {
@@ -834,6 +856,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     for name in END_FILES {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
+    let _ = std::fs::remove_dir_all(run.scratch.join(remote::PW_SAMPLES));
     // the window needs a display: the session's, else labwc nested in its X11 session (remote.rs Display)
     let (display, why) = remote::probe_display(&a.host)?;
     ensure!(
@@ -841,7 +864,31 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         "remote run-apk: the target has no display for the window: {why}"
     );
     println!("remote run-apk: display: {why}");
-    let rt = rt.with_site(target.run_site(&pushed, limit, logs.join("transcript.log"), display)?);
+    // muted unless a human asked to hear it: the target's own null sink for the run, named by this run
+    let audio = remote::RunAudio {
+        sink: (!a.audible).then(|| format!("atl-run-apk-{}", std::process::id())),
+    };
+    let rt = match &audio.sink {
+        Some(sink) => rt.with_remote_audio_sink(sink),
+        None => rt,
+    };
+    let rt = if a.break_mix {
+        rt.with_broken_mix()
+    } else {
+        rt
+    };
+    println!(
+        "remote run-apk: audio {}",
+        audio.sink.as_deref().map_or_else(
+            || "audible: the target session's routing (--audible)".to_owned(),
+            |s| format!("muted: the run's own null sink {s}")
+        )
+    );
+    let rt = rt.with_site(
+        target
+            .run_site(&pushed, limit, logs.join("transcript.log"), display)?
+            .with_audio(audio.clone()),
+    );
     // before the transfer: the run's root is cleared on the target then, so a present line the watch reads is this run's
     let mut watch = if observe_on {
         let plan = observe::Plan {
@@ -895,6 +942,14 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     let outcome = outcome.and_then(|ok| {
         display_node_check(&read(&run.scratch.join("atld.log"))).map(|gpu| format!("{ok}; {gpu}"))
     });
+    // printed on its own too: an earlier failure must not hide where the sound went
+    let route = remote_route(
+        &run.scratch.join(remote::PW_SAMPLES),
+        &m.name,
+        audio.sink.as_deref(),
+    );
+    println!("remote run-apk: {}", route.as_ref().unwrap_or_else(|e| e));
+    let outcome = outcome.and_then(|ok| route.map(|r| format!("{ok}; {r}")));
     copy_logs(&run, &logs)?;
     println!(
         "remote run-apk: transcript {}",
@@ -907,6 +962,29 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         &logs.join("atld.log"),
         &logs,
     ))
+}
+
+/// `audio-route:` over the remote run's `pw-dump` samples (`<n>.json` in `dir`, in sample order).
+fn remote_route(dir: &Path, package: &str, sink: Option<&str>) -> Result<String, String> {
+    let mut files: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.filter_map(|e| {
+                let p = e.ok()?.path();
+                Some((p.file_stem()?.to_str()?.parse().ok()?, p))
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    // a sample cut short by the run's end is no JSON: skipped, the others judge
+    let dumps: Vec<String> = files
+        .iter()
+        .filter_map(|(_, p)| std::fs::read_to_string(p).ok())
+        .filter(|t| serde_json::from_str::<serde_json::Value>(t).is_ok())
+        .collect();
+    stream_routes(&dumps, package, sink)
+        .map_err(|e| format!("audio-route: {e:#}"))
+        .and_then(|r| route_verdict(&r, sink))
 }
 
 /// Index into `supported` of the ABI AOSP's `NativeLibraryHelper.findSupportedAbi` picks: the lowest index any `lib/<abi>/<file>.so` entry matches. The harness's own reading of the zip, needed before the

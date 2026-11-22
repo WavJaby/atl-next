@@ -1366,6 +1366,13 @@ impl Runtime {
         self
     }
 
+    /// A remote run's muted routing (remote.rs `RunAudio`): every PipeWire stream targets `sink`, the null sink the target makes for the run (audio_pcm.rs `holder_sh`). No pulse server
+    /// of the run's own runs there, so the web process gets none ([`Runtime::without_pulse_server`]): its sound fails instead of reaching the session's sink.
+    pub fn with_remote_audio_sink(mut self, sink: &str) -> Self {
+        self.stream_target = Some(crate::audio_pcm::stream_props(sink));
+        self.without_pulse_server()
+    }
+
     /// atld starts with `PULSE_SERVER` naming a socket that does not exist: the desktop has no pulse server, so `share-sound` grants the web process nothing (the window gate's webview sound break).
     pub fn without_pulse_server(self) -> Self {
         self.with_pulse_server("unix:/nonexistent/atl-test/pulse/native".into())

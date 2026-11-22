@@ -385,7 +385,19 @@ pub struct RemoteRun {
     agent: Option<Box<Agent>>,
     /// SHA-256 of the manifest this gate's push staged ([`stale_sh`]).
     manifest_sha256: String,
+    /// The run's audio on the target ([`RunAudio`]); None: no sink made, no route sampled.
+    audio: Option<RunAudio>,
 }
+
+/// A remote run's audio: `sink` = the run's own null sink, made on the target before atld and gone with the run (audio_pcm.rs `holder_sh`); None = an audible run (the session's routing).
+/// Either way `pw-dump` samples the target's graph during the run into the scratch dir's [`PW_SAMPLES`], for the `audio-route:` check (audio_pcm.rs `stream_routes`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunAudio {
+    pub sink: Option<String>,
+}
+
+/// The scratch subdir holding a run's `pw-dump` samples, `<n>.json`.
+pub const PW_SAMPLES: &str = "pw";
 
 /// The window gate's live half on the target (window.rs `agent`, the harness's hidden `window-live`): started before atld, it proxies atld's window to the target's compositor, drives the stage and stops
 /// atld through its control socket; it writes `live.json` for the judge here. Host paths, relocated by [`RemoteRun::spawn`].
@@ -407,6 +419,17 @@ impl Site {
         match self {
             Site::Remote(mut r) => {
                 r.agent = Some(Box::new(agent));
+                Site::Remote(r)
+            }
+            host => host,
+        }
+    }
+
+    /// This site with the run's audio ([`RunAudio`]); a host site is returned as it is (its routing is atld_run.rs `with_audio_routing`).
+    pub fn with_audio(self, audio: RunAudio) -> Site {
+        match self {
+            Site::Remote(mut r) => {
+                r.audio = Some(audio);
                 Site::Remote(r)
             }
             host => host,
@@ -688,6 +711,7 @@ struct Plan {
     agent: Option<Agent>,
     /// SHA-256 of the [`MANIFEST`] this gate staged: the run refuses a dir whose manifest differs ([`stale_sh`]).
     manifest_sha256: String,
+    audio: Option<RunAudio>,
 }
 
 fn out_path(rel: &str) -> String {
@@ -778,6 +802,22 @@ impl Plan {
         for name in &self.session_env {
             s.push_str(&session_env_script(name));
         }
+        let pw_dir = word(&out_path(&format!("{}/{PW_SAMPLES}", self.scratch)));
+        if let Some(audio) = &self.audio {
+            s.push_str(&format!(
+                "rm -rf {pw_dir}
+mkdir -p {pw_dir}
+"
+            ));
+            if let Some(sink) = &audio.sink {
+                // the holder outlives atld's timeout by the kill grace, then goes with the script or its own timeout
+                s.push_str(&crate::audio_pcm::holder_sh(
+                    sink,
+                    &word(&out_path(&self.scratch)),
+                    self.limit + 2 * KILL_GRACE,
+                ));
+            }
+        }
         let lib_path: Vec<String> = self
             .lib_dirs
             .iter()
@@ -840,6 +880,13 @@ impl Plan {
             word(&out_path(&format!("{}/atld.log", self.scratch)))
         ));
         s.push_str("pid=$!\n");
+        // the samples end with atld; the last one may miss a stream's final second, not its route
+        if self.audio.is_some() {
+            let every = crate::audio_pcm::ROUTE_SAMPLE.as_secs();
+            s.push_str(&format!(
+                "( n=0; while kill -0 \"$pid\" 2>/dev/null; do XDG_RUNTIME_DIR=\"/run/user/$(id -u)\" pw-dump > {pw_dir}/$n.json 2>/dev/null; n=$((n + 1)); sleep {every}; done ) &\nPWS=$!\n"
+            ));
+        }
         if self.agent.is_some() {
             s.push_str(&format!(
                 "printf '%s\\n' \"$pid\" > {}\n",
@@ -855,6 +902,12 @@ impl Plan {
             ));
         }
         s.push_str("kill -KILL -- \"-$pid\" 2>/dev/null || true\n");
+        if let Some(audio) = &self.audio {
+            s.push_str("wait \"$PWS\" 2>/dev/null || true\n");
+            if audio.sink.is_some() {
+                s.push_str(crate::audio_pcm::holder_end_sh());
+            }
+        }
         // the nested compositor lives for the run only: its window leaves the target's desktop with it
         if self.display == Display::NestedX11 {
             s.push_str(
@@ -898,6 +951,9 @@ impl Plan {
         let mut extra = Vec::new();
         if self.display == Display::NestedX11 {
             extra.push(labwc_log);
+        }
+        if self.audio.is_some() {
+            extra.push(format!("{}/{PW_SAMPLES}", self.scratch));
         }
         if self.agent.is_some() {
             extra.extend([LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)));
@@ -982,6 +1038,7 @@ impl RemoteRun {
                 })
                 .transpose()?,
             manifest_sha256: self.manifest_sha256.clone(),
+            audio: self.audio.clone(),
         };
         let script = scratch.join(REMOTE_SCRIPT);
         std::fs::write(&script, plan.script(&self.base))
@@ -1395,6 +1452,7 @@ impl Target {
             log,
             display,
             agent: None,
+            audio: None,
         }))
     }
 
@@ -2564,6 +2622,7 @@ mod tests {
             display: Display::Headless,
             agent: None,
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
         };
         // a wait status: exit code 2 is `2 << 8`
         let end = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
@@ -2604,6 +2663,7 @@ mod tests {
 
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "run-apk/x".into(),
             root: "run-apk/x/root".into(),
             scratch: "run-apk/x/scratch".into(),
@@ -2719,6 +2779,7 @@ mod tests {
     fn run_script_is_the_plan_in_order() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -2776,6 +2837,7 @@ mod tests {
     fn session_run_names_the_targets_one_wayland_socket() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "run-apk/app".to_owned(),
             root: "run-apk/root".to_owned(),
             scratch: "run-apk/scratch".to_owned(),
@@ -2814,6 +2876,7 @@ mod tests {
     fn nested_run_starts_and_ends_labwc_around_atld() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
             scratch: "app/scratch".to_owned(),
@@ -3066,6 +3129,7 @@ esac
     fn agent_run_switches_workspace_and_proxies_atld() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "window".to_owned(),
             root: "window/root".to_owned(),
             scratch: "window/scratch".to_owned(),
@@ -3156,6 +3220,7 @@ esac
     fn plain_run_has_no_session_discovery() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -3680,6 +3745,7 @@ esac
 
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
             scratch: "gl/run/scratch".to_owned(),
@@ -3785,6 +3851,7 @@ esac
             display: Display::Headless,
             agent: None,
             manifest_sha256: sha256_hex(a_manifest.as_bytes()),
+            audio: None,
         };
         let script = plan.script(&dir.display().to_string());
         let err = host
