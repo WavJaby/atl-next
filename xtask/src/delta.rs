@@ -26,7 +26,7 @@ use crate::ws_config::DeltaConfig;
 pub const RECORD: &str = ".delta";
 /// Set on the re-executed xtask: `mount:<uid>:<gid>` (stage mount) or `in` (inside, mounted). Like tree::ENV, internal plumbing between xtask's own processes.
 pub const ENV: &str = "ATL_XTASK_DELTA";
-/// In `<store>/<id>/`: the dir was just made; the first mount forgets the base's units reading the land checkout (out::forget_runs_reading), then removes it.
+/// In `<store>/<id>/`: the dir was just made; the first mount forgets the base's units reading a path this checkout's builds do not see (out::forget_runs_reading), then removes it.
 const FRESH: &str = "fresh";
 /// In `<store>/<id>/`: the workspace path that made it. Ids are unique per workspace only.
 const OWNER: &str = "workspace";
@@ -601,7 +601,7 @@ fn admit(
     }
 }
 
-/// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker (not for land: its units' paths are its own, as out::make), the checkout's mtimes restored from the base when `restore` (out::make's rule). Err when there is no base (a build from zero is the pool tier's).
+/// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker (land's too: on ram its `target` link does not reach the dir, out::foreign_paths), the checkout's mtimes restored from the base when `restore` (out::make's rule). Err when there is no base (a build from zero is the pool tier's).
 pub fn make_ram(root: &Path, ws: &Path, id: &str, store: &Path, restore: bool) -> Result<Record> {
     let _pin = bases_lock(ws)?;
     let base = out::pick_base(root, ws)?.context("no base to lay a ram delta over")?;
@@ -642,9 +642,7 @@ fn lay_ram(
     std::fs::create_dir_all(sd.join("work"))?;
     std::fs::write(sd.join(OWNER), format!("{}\n", ws.display()))?;
     std::fs::write(sd.join("upper").join(out::BASE_FILE), format!("{base}\n"))?;
-    if id != out::LAND_ID {
-        std::fs::write(sd.join(FRESH), "")?;
-    }
+    std::fs::write(sd.join(FRESH), "")?;
     let parent = dir.parent().context("build dir has no parent")?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".{id}.tmp-{}", std::process::id()));
@@ -1031,7 +1029,7 @@ pub fn mount_options(ws: &Path, id: &str, rec: &Record) -> Result<String> {
     ))
 }
 
-/// Stage mount: uid 0 in a fresh user + mount namespace; mounts the overlay at the dir's real path, forgets a fresh dir's land-reading units, then runs the command as `uid`/`gid` again (stage in).
+/// Stage mount: uid 0 in a fresh user + mount namespace; mounts the overlay at the dir's real path, forgets a fresh dir's units reading foreign paths (out::foreign_paths), then runs the command as `uid`/`gid` again (stage in).
 fn mount_stage(root: &Path, uid: u32, gid: u32) -> Result<ExitCode> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = out::checkout_id(root)?;
@@ -1050,9 +1048,11 @@ fn mount_stage(root: &Path, uid: u32, gid: u32) -> Result<ExitCode> {
     );
     let fresh = rec.dir(&id).join(FRESH);
     if fresh.exists() {
-        let n = out::forget_runs_reading(&dir, &ws.join(crate::land::LAND_WT))?;
+        let n = out::forget_runs_reading(&dir, &out::foreign_paths(&ws, &id, true))?;
         std::fs::remove_file(&fresh).with_context(|| format!("removing {}", fresh.display()))?;
-        println!("out: ws/{id}: {n} test/bin unit(s) reading the land checkout forgotten");
+        println!(
+            "out: ws/{id}: {n} test/bin unit(s) reading a path this checkout's builds do not see forgotten"
+        );
     }
     let mut cmd = Command::new("unshare");
     cmd.args(["--user", "--map-user"])
