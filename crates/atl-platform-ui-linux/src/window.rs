@@ -65,6 +65,8 @@ struct Shared {
     on_close_requested: Slot<dyn FnMut()>,
     /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
+    /// The window surface's scale (GdkSurface `scale`: wp_fractional_scale_v1's preferred scale once it arrived), None before realise: the monitor report's density scale ([`reported_monitor`]).
+    surface_scale: Cell<Option<f64>>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
     pointer_at: Cell<(f64, f64)>,
     /// Time (ms) of the last pointer event published: moves must come strictly after it (`input::motion_samples`).
@@ -572,6 +574,7 @@ impl Window for GtkWindow {
             on_monitor: Slot::new(),
             on_close_requested: Slot::new(),
             monitor: RefCell::new(None),
+            surface_scale: Cell::new(None),
             on_painted: Slot::new(),
             on_presented: Slot::new(),
             presentation: RefCell::new(None),
@@ -606,11 +609,21 @@ impl Window for GtkWindow {
         let scaled = (view.downgrade(), window.downgrade());
         window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
+                entered.surface_scale.set(Some(surface.scale()));
+                let rescaled = Rc::downgrade(&entered);
                 let entered = Rc::clone(&entered);
                 surface.connect_enter_monitor(move |_, m| follow_monitor(&entered, m));
                 let scaled = scaled.clone();
                 surface.connect_scale_notify(move |s| {
                     tracing::info!("atl-platform-ui: surface scale {}", s.scale());
+                    // the density follows the surface's scale: the monitor is reported again at it
+                    if let Some(shared) = rescaled.upgrade() {
+                        shared.surface_scale.set(Some(s.scale()));
+                        let monitor = shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
+                        if let Some(m) = monitor {
+                            report_monitor(&shared, &m);
+                        }
+                    }
                     // from the next idle, not inside the notification: GTK dropped a default-size request made there (the window kept its integer-scale size)
                     let scaled = scaled.clone();
                     glib::idle_add_local_once(move || {
@@ -869,14 +882,14 @@ fn follow_monitor(shared: &Rc<Shared>, m: &gdk::Monitor) {
     report_monitor(shared, m);
 }
 
-/// Logs `m` and hands it to the window's `on_monitor` (Monitor::from_desktop: GDK's logical geometry times the fractional scale, milli-Hz; the host side converts with the same function), with the
-/// rotation of its output (outputs.rs, by connector name).
+/// Logs `m` and hands it to the window's `on_monitor` ([`reported_monitor`]), with the rotation of its output (outputs.rs, by connector name).
 fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
     let g = m.geometry();
     let connector = m.connector();
     let rotation = outputs::rotation(connector.as_deref());
+    let surface_scale = shared.surface_scale.get();
     tracing::info!(
-        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}, rotation {:?}",
+        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}, surface scale {:?}, rotation {:?}",
         connector.as_deref().unwrap_or_default(),
         g.width(),
         g.height(),
@@ -884,15 +897,40 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
         g.y(),
         m.refresh_rate(),
         m.scale(),
+        surface_scale,
         rotation
     );
-    let Some(mut monitor) =
-        Monitor::from_desktop(g.width(), g.height(), m.refresh_rate(), m.scale())
-    else {
+    let Some(mut monitor) = reported_monitor(
+        g.width(),
+        g.height(),
+        m.refresh_rate(),
+        m.scale(),
+        surface_scale,
+    ) else {
         return;
     };
     monitor.rotation = rotation;
     shared.on_monitor.call(|f| f(monitor));
+}
+
+/// The monitor a window reports, from GDK's monitor (logical size, milli-Hz, scale) and the window surface's scale. Size: logical x the monitor's scale (Monitor::from_desktop; the host side converts
+/// with the same function) = the mode, with or without xdg-output. Scale (-> density): the surface's fractional scale when it has one ([`crate::view::output_scale`]), else the monitor's.
+/// Why not the monitor's alone: without zxdg_output_manager_v1 (Hyprland withholds it from security-context clients, which every app process is) GDK knows only wl_output's integer scale, 2 on a
+/// 1.6 output, and its logical size is the mode / 2; the density then disagreed with atld's own (unsandboxed) reading of the same monitor, and the app saw a density change at start.
+fn reported_monitor(
+    logical_width: i32,
+    logical_height: i32,
+    millihz: i32,
+    monitor_scale: f64,
+    surface_scale: Option<f64>,
+) -> Option<Monitor> {
+    let mut monitor = Monitor::from_desktop(logical_width, logical_height, millihz, monitor_scale)?;
+    monitor.scale = Scale::new(crate::view::output_scale(
+        surface_scale,
+        Some(monitor_scale),
+        monitor_scale,
+    ))?;
+    Some(monitor)
 }
 
 /// One requested tick of `window`: GDK runs the frame clock's update phase, which the compositor's frame callback paces once a frame was committed. The composer's clock does not wait for it:
@@ -976,5 +1014,34 @@ impl FrameClock for GtkWindow {
 impl InputSource for GtkWindow {
     fn on_events<F: FnMut(InputEvent) + 'static>(&self, on_event: F) {
         self.shared.on_event.set(Box::new(on_event));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reported_monitor;
+
+    /// The laptop (2880 x 1800 panel at Hyprland scale 1.6), measured 2026-11-22. Inside a security context GDK said 1440 x 900 at scale 2 (no xdg-output: mode / integer scale) while the
+    /// surface's fractional scale was 1.6; atld's own connection said 1800 x 1125 at 1.6. Both must give the mode and scale 1.6 (density 160 x 1.6 = 256, not 160 x 2 = 320).
+    #[test]
+    fn no_xdg_output_reports_the_fractional_scale() {
+        let sandboxed = reported_monitor(1440, 900, 120_000, 2.0, Some(1.6)).unwrap();
+        let host = reported_monitor(1800, 1125, 120_000, 1.6, Some(1.6)).unwrap();
+        for m in [sandboxed, host] {
+            assert_eq!((m.size.width, m.size.height), (2880, 1800));
+            assert_eq!(m.scale.get(), 1.6);
+        }
+    }
+
+    /// Before the fractional scale arrives (or on an integer output) the surface's scale is an integer: the monitor's scale stands.
+    #[test]
+    fn an_integer_surface_scale_leaves_the_monitor_scale() {
+        let m = reported_monitor(1920, 1200, 60_000, 1.5, Some(2.0)).unwrap();
+        assert_eq!(m.scale.get(), 1.5);
+        let m = reported_monitor(1440, 900, 60_000, 2.0, None).unwrap();
+        assert_eq!(
+            (m.size.width, m.size.height, m.scale.get()),
+            (2880, 1800, 2.0)
+        );
     }
 }
