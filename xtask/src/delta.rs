@@ -1029,7 +1029,7 @@ pub fn mount_options(ws: &Path, id: &str, rec: &Record) -> Result<String> {
     ))
 }
 
-/// Stage mount: uid 0 in a fresh user + mount namespace; mounts the overlay at the dir's real path, forgets a fresh dir's units reading foreign paths (out::foreign_paths), then runs the command as `uid`/`gid` again (stage in).
+/// Stage mount: uid 0 in a fresh user + mount namespace; mounts the overlay at the dir's real path, forgets a fresh dir's units reading foreign paths (out::foreign_paths; counter `delta-forget` per pass), then runs the command as `uid`/`gid` again (stage in).
 fn mount_stage(root: &Path, uid: u32, gid: u32) -> Result<ExitCode> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let id = out::checkout_id(root)?;
@@ -1050,6 +1050,8 @@ fn mount_stage(root: &Path, uid: u32, gid: u32) -> Result<ExitCode> {
     if fresh.exists() {
         let n = out::forget_runs_reading(&dir, &out::foreign_paths(&ws, &id, true))?;
         std::fs::remove_file(&fresh).with_context(|| format!("removing {}", fresh.display()))?;
+        // the line may go to a captured child (land --build-dir): the counter is the record that the pass ran
+        out::count(&ws, "delta-forget");
         println!(
             "out: ws/{id}: {n} test/bin unit(s) reading a path this checkout's builds do not see forgotten"
         );
