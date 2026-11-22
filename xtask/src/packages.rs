@@ -776,7 +776,9 @@ pub fn bin(root: &Path, out: &Path, package: &str, bin: &str) -> Result<PathBuf>
         .with_context(|| format!("{package} has no executable {bin}"))
 }
 
-/// `package` built as [`build`] builds it plus cargo `features` (deliberate breaks, `<dep>/break-<name>`), into [`FAULT_TARGET_DIR`]: a gate's red run. Returns cargo's output dir (its executables and `lib<name>.so`); nothing is installed, so nothing faulted ships.
+/// `package` built as [`build`] builds it plus cargo `features` (deliberate breaks, `<crate>/break-<name>` of any crate in its graph), into [`FAULT_TARGET_DIR`]: a gate's red run. Each feature's
+/// crate is selected too (cargo takes `<crate>/<feature>` only for a selected package or its direct dependency; one invocation unifies the feature into `package`'s graph). Returns cargo's output dir
+/// (its executables and `lib<name>.so`); nothing is installed, so nothing faulted ships.
 pub fn build_with_breaks(
     root: &Path,
     out: &Path,
@@ -789,9 +791,15 @@ pub fn build_with_breaks(
     );
     let packages = workspace_packages(root)?;
     let mut sel = Selection::new(root, out, &packages)?;
-    sel.selected.retain(|p| p.name == package);
+    let crates: Vec<&str> = features
+        .iter()
+        .filter_map(|f| f.split_once('/'))
+        .map(|(c, _)| c)
+        .collect();
+    sel.selected
+        .retain(|p| p.name == package || crates.contains(&p.name.as_str()));
     ensure!(
-        !sel.selected.is_empty(),
+        sel.selected.iter().any(|p| p.name == package),
         "{package} not built: its converter modules are not in {}",
         out.display()
     );

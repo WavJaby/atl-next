@@ -6,8 +6,8 @@
 //! - Commits: the window keeps committing through the block at its own idle rate: strictly inside [block start + EDGE, block end - EDGE] (EDGE = one display period: a commit in flight at the start edge,
 //!   the first after the end) at least max(1, floor(span / steady_p95) - [`SLACK`]), steady_p95 = the 95th percentile commit interval of the steady phase. Probe responds: >= 2 steady commits.
 //!   Red before S5d: the toolkit ran inside the UI thread's Looper poll, so a sleeping UI thread committed nothing (S5c measured 0 inside).
-//!   Undecided when the host's GPU is starved: a window render covering the block longer than steady_p95 (slow_display.rs `starved`; 1.5-2.3 s renders against a 45-77 ms p95 measured at load 7-10)
-//!   leaves the steady rate saying nothing about the block, whatever the code does.
+//!   A fail is undecided when the host's GPU is starved: a window render covering the block longer than steady_p95 (slow_display.rs `starved`; 1.5-2.3 s renders against a 45-77 ms p95 measured
+//!   at load 7-10) leaves the steady rate saying nothing about the block, whatever the code does. A pass stands: starvation only removes commits.
 //! - Posts: SurfaceFlinger's rule, one latch per present (display-thread plan D4): the producer tracks the display, not the UI thread, so the frames posted during the block are at least the window's
 //!   commits in it less [`SLACK`].
 //! - Timeouts (every run): no dequeue timed out (`-110`).
@@ -178,7 +178,8 @@ fn block_starved(app: &str, p95_ms: f64) -> Option<String> {
 }
 
 /// The sub-gates; `refresh_hz`: the run's display (the block's edges); `commits_ns`: the proxy's window commit times, None on a remote run (another host's clock): commits and posts are then not judged.
-/// On a GPU-starved host ([`block_starved`]) commits judges nothing (shown, the stage `undecided`); posts holds the producer to the window's commits, whatever their rate, and stays judged.
+/// A failing commits on a GPU-starved host ([`block_starved`]) judges nothing (shown, the stage `undecided`); a pass stands (a slow host removes commits, never adds them). Posts holds the producer
+/// to the window's commits, whatever their rate, and stays judged.
 pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Checks {
     let mut subs = vec![("timeouts", timeouts_check(app))];
     let mut undecided = None;
@@ -187,10 +188,11 @@ pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Checks 
             Ok(phases) => {
                 match steady_p95(&phases) {
                     Ok(p95) => {
-                        let commits = ("commits", commits_check(&phases, p95));
-                        match block_starved(app, p95) {
-                            Some(why) => undecided = Some((why, vec![commits])),
-                            None => subs.push(commits),
+                        let commits = commits_check(&phases, p95);
+                        // starvation only lowers the count, so a pass stays a pass; a fail on a starved host is undecided
+                        match commits.is_err().then(|| block_starved(app, p95)).flatten() {
+                            Some(why) => undecided = Some((why, vec![("commits", commits)])),
+                            None => subs.push(("commits", commits)),
                         }
                     }
                     Err(e) => subs.push(("commits", Err(e))),
@@ -259,7 +261,7 @@ mod tests {
     }
 
     /// Steady p95 20 ms (commits every 20 ms), none inside the block: red when judged. The block's markers at 10.000 / 12.000 s; a paint line at 13.000 s with ms=3000 covers it: a 20.001 ms render
-    /// there is longer than the p95, so commits is shown unjudged (the stage undecided) and posts stays judged; 20.000 ms exactly, or no covering line, judges it (red).
+    /// there is longer than the p95, so the failing commits is shown unjudged (the stage undecided) and posts stays judged; 20.000 ms exactly, or no covering line, judges it (red).
     #[test]
     fn a_starved_block_leaves_commits_undecided() {
         let steady = every(6_000, 10_000, 20);
@@ -286,6 +288,11 @@ mod tests {
             assert!(c.undecided.is_none());
             assert!(c.subs.iter().any(|(n, r)| *n == "commits" && r.is_err()));
         }
+        // commits every 20 ms through the block pass (99 inside, want 96): the pass stands on the starved host
+        let through = [steady.clone(), every(10_020, 11_984, 20)].concat();
+        let c = checks(&app(Some(20_001)), 60.0, Some(&through));
+        assert!(c.undecided.is_none());
+        assert!(c.subs.iter().any(|(n, r)| *n == "commits" && r.is_ok()));
     }
 
     /// Two steady commits 1000 ms apart: p95 1000 ms, floor(1966.67 / 1000) = 1 - 2 saturates to 0, so the floor of 1 holds: one inside passes, none fails. One steady commit: probe silent.
