@@ -1450,6 +1450,41 @@ fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BT
     Ok((dirs, old, pinned))
 }
 
+/// Boot targets ([`boot_of`]) whose id no live checkout has. Nothing else frees them: once a worktree's build dir exists its `target` is moved there, so a boot dir left behind is a checkout gone before its first build or one whose link was replaced.
+fn boot_orphans(ws: &Path, live: &BTreeSet<String>) -> Result<Dirs> {
+    let boot = pool(ws).join(BOOT);
+    let rd = match std::fs::read_dir(&boot) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", boot.display())),
+    };
+    let mut out = Dirs::new();
+    for entry in rd {
+        let entry = entry?;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !live.contains(&id) {
+            out.push((id, entry.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Removes orphan boot dir `path` under build dir `id`'s exclusive lock, as the other orphan classes: `false` when a process of that id still holds it.
+fn remove_boot(ws: &Path, id: &str, path: &Path) -> Result<bool> {
+    let Some(_lock) = build_pool::try_lock_dir(ws, id)? else {
+        return Ok(false);
+    };
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("removing {}", path.display()))?;
+    Ok(true)
+}
+
 /// Sorts prune candidates most paths first and returns each one's path count. A copy's metadata scales with its paths, so this is what a prune frees first.
 fn rank_by_paths(dirs: &mut Dirs, old: &mut [PathBuf]) -> Result<BTreeMap<PathBuf, u64>> {
     let mut counts = BTreeMap::new();
@@ -1778,6 +1813,21 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             },
         }
     }
+    let boots = boot_orphans(ws, live)?;
+    for (id, path) in &boots {
+        if !execute {
+            println!("orphan boot/{id}: {} (checkout gone)", path.display());
+            continue;
+        }
+        match remove_boot(ws, id, path) {
+            Ok(true) => println!("orphan boot/{id}: removed"),
+            Ok(false) => println!("orphan boot/{id}: busy, skipped: a process holds it"),
+            Err(e) => {
+                failed += 1;
+                println!("orphan boot/{id}: FAILED: {e:#}");
+            }
+        }
+    }
     // ram store dirs with neither a live checkout nor a build dir (a crash between dropping the mount point and the store dir, a checkout removed by hand)
     let mut keep = live.clone();
     keep.extend(build_dirs(ws)?.into_iter().map(|(id, _)| id));
@@ -1817,9 +1867,10 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
         "dry run, would remove (add --execute)"
     };
     println!(
-        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
+        "out prune: {verb} {} orphan build dir(s), {} orphan run dir(s), {} orphan boot dir(s), {} orphan ram delta(s), {} old base(s) and {kept_runs} kept gate-log run(s) past the keep",
         dirs.len(),
         runs.len(),
+        boots.len(),
         strays.len(),
         old.len()
     );
@@ -2399,6 +2450,35 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(leftovers, [MAIN_ID], "old dir or temp left");
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Boot dirs: a gone checkout's is listed and removed, a live checkout's is never listed, a held orphan is skipped.
+    #[test]
+    fn boot_dirs_of_gone_checkouts_are_pruned_unless_held() {
+        let ws = scratch("boot-orphans");
+        for id in ["live", "gone", "held"] {
+            put(&pool(&ws).join(BOOT).join(id).join("debug/f"));
+        }
+        let live = BTreeSet::from([MAIN_ID.to_owned(), "live".to_owned()]);
+        let ids = |ws: &Path| -> Vec<String> {
+            boot_orphans(ws, &live)
+                .expect("boots")
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&ws), ["gone", "held"]);
+        let lock = build_pool::try_lock_dir(&ws, "held")
+            .expect("lock")
+            .expect("free");
+        for (id, path) in boot_orphans(&ws, &live).expect("boots") {
+            let removed = remove_boot(&ws, &id, &path).expect("remove");
+            assert_eq!(removed, id == "gone", "{id}");
+        }
+        assert_eq!(ids(&ws), ["held"]);
+        assert!(pool(&ws).join(BOOT).join("live/debug/f").is_file());
+        drop(lock);
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
