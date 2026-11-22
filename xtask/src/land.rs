@@ -3,8 +3,8 @@
 //! Why this order: `src/<up>` is one checkout shared by every worktree and holds origin/main's pins and patches (`fetch::Main`), so a branch's unlanded patches exist only in its task copies (`src-wt/<branch>/<up>`), which only the branch's worktree resolves (`atl-layout`).
 //! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked before the push in a checkout on the branch, and why its copies go only after main and `src/` reached the new commit.
 //! That checkout is the land worktree [`LAND_WT`] (build dir `ws/land`), never the branch's own: one fixed path whose build dir holds the last landed tree, so Build compiles only the branch's diff (cargo outputs key on the checkout path too).
-//! It checks the branch out beside the branch's own worktree (`--ignore-other-worktrees`; land changes neither), so the task copies resolve by branch name as there. Green and pushed -> `ws/land` is published as `base/<commit>`, the copy new build dirs start from.
-//! Failed before the push -> the land worktree goes back to origin/main and `ws/land` is re-copied from the newest base: no failed branch's outputs stay in the dir the next base comes from.
+//! It checks the branch out beside the branch's own worktree (`--ignore-other-worktrees`; land changes neither), so the task copies resolve by branch name as there. Green and pushed -> `ws/land` is published as `base/<commit>`, which new build dirs start from (a pool dir copied; a ram dir as lower + upper, out::publish), then laid again over it.
+//! Failed before the push -> the land worktree goes back to origin/main and `ws/land` is laid again from the newest base (out::reset_land): no failed branch's outputs stay in the dir the next base comes from.
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
 //! This process is main's xtask, so it never parses the branch's tables: a branch may change their schema. What they say comes from the branch's own xtask in its worktree (`--facts` child, `patch --edit`, `check`).
 //! Cleanup runs in a child `cargo xtask land <branch> --cleanup --execute` in main: this process's binary predates the sync, so it cannot parse the tables the sync brought in.
@@ -87,8 +87,8 @@ struct Runner<'a> {
     stale: &'a dyn Fn(&Path, &str) -> Result<Option<String>>,
     /// The land worktree's build dir published as `base/<its HEAD>` (`out::publish`); its line.
     publish: &'a dyn Fn(&Path) -> Result<String>,
-    /// The land worktree's build dir deleted and copied again from the newest base (`out::recopy`); its line.
-    recopy: &'a dyn Fn(&Path) -> Result<String>,
+    /// The land worktree's build dir dropped and laid again over the newest ancestor base (`out::reset_land`); its line.
+    reset: &'a dyn Fn(&Path) -> Result<String>,
 }
 
 /// One step of a landing, in run order.
@@ -239,7 +239,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         native: &native_execute,
         stale: &build_dir_child,
         publish: &out::publish,
-        recopy: &out::recopy,
+        reset: &out::reset_land,
     };
     let line = plan.execute(&stages, &runner);
     println!("{line}");
@@ -431,7 +431,7 @@ impl Plan {
                 out::LAND_ID
             ),
             Stage::Verify => format!(
-                "verify in {land}: `cargo xtask check` must print `check: ok` (the task copies hold the branch's patches); a failure up to the push resets {land} to {} and re-copies ws/{} from the newest base",
+                "verify in {land}: `cargo xtask check` must print `check: ok` (the task copies hold the branch's patches); a failure up to the push resets {land} to {} and lays ws/{} again from the newest base",
                 fetch::MAIN_REF,
                 out::LAND_ID
             ),
@@ -446,7 +446,7 @@ impl Plan {
                 short(&self.head)
             ),
             Stage::Publish => format!(
-                "publish: {land} detached at {}, ws/{} copied to base/{}",
+                "publish: {land} detached at {}, ws/{} published as base/{} (pool: copied; ram: lower + upper), then laid again over it",
                 short(&self.head),
                 out::LAND_ID,
                 short(&self.head)
@@ -602,13 +602,13 @@ impl Plan {
         Ok((runner.publish)(&self.land).unwrap_or_else(|e| format!("base not published: {e:#}")))
     }
 
-    /// After a failed stage: before the push the land worktree goes back to origin/main and its build dir is re-copied from the newest base (no failed branch's outputs reach a later base); after it the worktree is detached at the pushed commit, its build dir kept (built from that commit).
+    /// After a failed stage: before the push the land worktree goes back to origin/main and its build dir is laid again from the newest base (no failed branch's outputs reach a later base); after it the worktree is detached at the pushed commit, its build dir kept (built from that commit).
     /// Returns what was done; a reset that itself fails is reported, the next land's preflight refuses an unready worktree by name.
     fn after_failure(&self, stage: &Stage, runner: &Runner) -> String {
         if matches!(stage, Stage::Edit(_)) || !self.land.exists() {
             return "land worktree untouched".to_owned();
         }
-        let (at, recopy) = if stage.before_push() {
+        let (at, reset) = if stage.before_push() {
             (&self.origin, true)
         } else {
             (&self.head, false)
@@ -621,12 +621,12 @@ impl Plan {
             );
         }
         let detached = format!("{} detached at {}", self.land.display(), short(at));
-        if !recopy {
+        if !reset {
             return format!("{detached}, ws/{} kept", out::LAND_ID);
         }
-        match (runner.recopy)(&self.land) {
+        match (runner.reset)(&self.land) {
             Ok(line) => format!("{detached}; {line}"),
-            Err(e) => format!("{detached}; re-copy FAILED: {e:#}"),
+            Err(e) => format!("{detached}; laying ws/{} again FAILED: {e:#}", out::LAND_ID),
         }
     }
 
@@ -1231,7 +1231,7 @@ mod tests {
                 native: &no_native,
                 stale: &current,
                 publish: &no_publish,
-                recopy: &no_recopy,
+                reset: &no_reset,
             },
         );
         assert!(line.starts_with("land: ok"), "{line}");
@@ -1281,7 +1281,7 @@ mod tests {
                 native: &no_native,
                 stale: &current,
                 publish: &no_publish,
-                recopy: &no_recopy,
+                reset: &no_reset,
             },
         );
         assert_eq!(line, "land: ok (7 steps)");
@@ -1307,8 +1307,8 @@ mod tests {
         Ok("out: base/c from ws/land (reflink)".to_owned())
     }
 
-    fn no_recopy(d: &Path) -> Result<String> {
-        panic!("ws/land of {} re-copied after a green land", d.display())
+    fn no_reset(d: &Path) -> Result<String> {
+        panic!("ws/land of {} reset after a green land", d.display())
     }
 
     /// The worktree's build dir is current: Build runs nothing.
@@ -1316,7 +1316,7 @@ mod tests {
         Ok(None)
     }
 
-    /// A build dir built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current); `recopy` puts it back to the base state.
+    /// A build dir built before the rebase, simulated: `stale` compares its record with the tree, `native` rebuilds it, `check` refuses it by name as check.rs ConverterPackages does (build_state::ensure_current); `reset` puts it back to the base state.
     struct BuildDir {
         built: std::cell::RefCell<&'static str>,
         calls: std::cell::RefCell<Vec<String>>,
@@ -1363,12 +1363,12 @@ mod tests {
                     .push(format!("publish {}", d.display()));
                 Ok("published".to_owned())
             };
-            let recopy_fn = |d: &Path| -> Result<String> {
+            let reset_fn = |d: &Path| -> Result<String> {
                 self.calls
                     .borrow_mut()
-                    .push(format!("recopy {}", d.display()));
+                    .push(format!("reset {}", d.display()));
                 *self.built.borrow_mut() = BASE;
-                Ok("re-copied".to_owned())
+                Ok("reset".to_owned())
             };
             let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { Ok(()) };
             let cleanup_fn = |_: &Path, _: &str| -> Result<String> { Ok("cleaned".to_owned()) };
@@ -1382,7 +1382,7 @@ mod tests {
                     native: &native_fn,
                     stale: &stale_fn,
                     publish: &publish_fn,
-                    recopy: &recopy_fn,
+                    reset: &reset_fn,
                 },
             )
         }
@@ -1407,7 +1407,7 @@ mod tests {
         );
     }
 
-    /// The break: without Build, the same stale build dir fails Verify by name and nothing is pushed; the land worktree goes back to origin/main and its build dir is re-copied.
+    /// The break: without Build, the same stale build dir fails Verify by name and nothing is pushed; the land worktree goes back to origin/main and its build dir is laid again.
     #[test]
     fn without_build_the_stale_build_dir_fails_verify() {
         let env = Env::new("nobuild");
@@ -1428,7 +1428,7 @@ mod tests {
         let land = env.land.display();
         assert_eq!(
             *dir.calls.borrow(),
-            [format!("check {land}"), format!("recopy {land}")]
+            [format!("check {land}"), format!("reset {land}")]
         );
         assert_eq!(env.land_head(), (None, before));
     }
@@ -1500,8 +1500,8 @@ mod tests {
         let dir = BuildDir::before_rebase();
         assert_eq!(dir.run(&plan, &plan.stages()), "land: ok (7 steps)");
         assert!(
-            !dir.calls.borrow().iter().any(|c| c.starts_with("recopy")),
-            "a green land re-copied"
+            !dir.calls.borrow().iter().any(|c| c.starts_with("reset")),
+            "a green land reset ws/land"
         );
         assert_eq!(env.land_head(), (None, second.clone()));
         assert_eq!(env.origin_main(), second);
@@ -1829,9 +1829,9 @@ mod tests {
         let publish_fn =
             |_: &Path| -> Result<String> { panic!("a base was published after a failed check") };
         let recopied = std::cell::RefCell::new(0);
-        let recopy_fn = |_: &Path| -> Result<String> {
+        let reset_fn = |_: &Path| -> Result<String> {
             *recopied.borrow_mut() += 1;
-            Ok("re-copied".to_owned())
+            Ok("reset".to_owned())
         };
         let line = plan.execute(
             &stages,
@@ -1843,7 +1843,7 @@ mod tests {
                 native: &no_native,
                 stale: &current,
                 publish: &publish_fn,
-                recopy: &recopy_fn,
+                reset: &reset_fn,
             },
         );
         assert!(
@@ -1884,7 +1884,7 @@ mod tests {
                 native: &no_native,
                 stale: &current,
                 publish: &no_publish,
-                recopy: &no_recopy,
+                reset: &no_reset,
             },
         );
         assert_eq!(line, "land: ok (7 steps)");

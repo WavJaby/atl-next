@@ -1019,7 +1019,7 @@ fn land_id(land: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Cargo reuses a target's outputs as fresh when the checkout's sources are older than them, and the unit key does not include the checkout path: a child would pass its gate on the land's artifacts. [`recopy`] carries the land's own back.
+/// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Cargo reuses a target's outputs as fresh when the checkout's sources are older than them, and the unit key does not include the checkout path: a child would pass its gate on the land's artifacts. [`reset_land`] carries the land's own back.
 fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
     copy_tree(src, dst, None, &[BOOTSTRAP_DIR])
 }
@@ -1122,7 +1122,7 @@ fn publish_ram(
 }
 
 /// Land's reset after a failed verify: `ws/land` laid again from the newest base that is an ancestor of the land worktree's HEAD ([`relay_land`]): no failed branch's outputs stay in the dir the next base comes from. Returns the line.
-pub fn recopy(land: &Path) -> Result<String> {
+pub fn reset_land(land: &Path) -> Result<String> {
     land_id(land)?;
     let ws = Layout::of(land)?.workspace().to_owned();
     relay_land(land, &ws, false)
@@ -1175,7 +1175,13 @@ pub fn relay_land(land: &Path, ws: &Path, keep_pool: bool) -> Result<String> {
         }
         match &rec {
             Some(r) => crate::delta::drop_ram(ws, id, r)?,
-            None => remove_build_dir(&dir)?,
+            None => {
+                // gone at once: a crash mid-delete must not leave a partial dir that Enter takes for land's (a `.`-name is an orphan to `out prune`)
+                let old = dir.with_file_name(format!(".{id}.old-{pid}"));
+                std::fs::rename(&dir, &old)
+                    .with_context(|| format!("renaming {} -> {}", dir.display(), old.display()))?;
+                remove_build_dir(&old)?;
+            }
         }
     }
     // the carried gate state was built from the land's earlier content: no mtime restore under it
@@ -1381,7 +1387,7 @@ fn wants_refresh(changed: usize, min: u32) -> bool {
     changed >= min as usize
 }
 
-/// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a re-copied or deleted dir), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
+/// The checkout's build dir made ([`ensure`]) with its `target/`, before a parent runs cargo there: the checkout's `target` link may name this dir's target/ already (a dir laid again or deleted), an empty copy (no base) lacks it, and cargo, which runs before any xtask code can settle the link, fails on a dangling one.
 /// Land's Enter calls it: a missing land dir is laid with the tier rule of [`relay_land`]; a ram dir needs nothing (its `target` link names the boot dir, which exists).
 pub fn prepare(root: &Path) -> Result<PathBuf> {
     let ws = Layout::of(root)?.workspace().to_owned();
@@ -1436,12 +1442,22 @@ fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BT
             pinned.insert(rec.base);
         }
     }
-    let old = bases(ws)?
+    let mut old: Vec<PathBuf> = bases(ws)?
         .into_iter()
         .skip(KEEP_BASES)
         .filter(|c| !pinned.contains(c))
         .map(|c| base_of(ws, &c))
         .collect();
+    // temp names under base/ (`.`-prefixed: a publish's copy before its rename) exist only while a publish holds ws/land's lock: with the lock free each is a crashed publish's leftover
+    if let Some(_free) = build_pool::try_lock_dir(ws, LAND_ID)?
+        && let Ok(rd) = std::fs::read_dir(pool(ws).join("base"))
+    {
+        old.extend(
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+                .map(|e| e.path()),
+        );
+    }
     Ok((dirs, old, pinned))
 }
 
@@ -1607,7 +1623,9 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                     if name == "ram" { "counts: " } else { ", " }
                 );
             }
-            println!();
+            let published = std::fs::read_to_string(p.join("publish-ram.count"))
+                .map_or("0".to_owned(), |t| t.trim().to_owned());
+            println!(", publish-ram {published}");
             let runs = [
                 "run-dir-ram",
                 "run-dir-pool",
@@ -2046,7 +2064,25 @@ mod tests {
         std::fs::remove_dir_all(&b).expect("cleanup b");
     }
 
-    /// Land on the ram tier, end to end without a build tool: laid over base/A, a "build" through the mounted overlay (modify, delete, replace a dir, gate state), publish -> base/B equals the merged view the build saw (minus gate state and `.base`, plus the stamps), ws/land laid again over base/B with the gate state carried and an otherwise empty upper; recopy keeps ram; with the store gone recopy falls back to the pool and keeps the gate state; a pool dir that would stay pool is kept by publish.
+    /// A publish's temp under base/ is a prune candidate only while no publish can be writing it (ws/land's lock free); bases() never ranks it.
+    #[test]
+    fn base_temps_are_pruned_only_with_land_idle() {
+        let ws = scratch("base-temps");
+        let tmp = pool(&ws).join("base").join(".c1.pub-1");
+        put(&tmp.join("f"));
+        put(&base_of(&ws, "c0").join("f"));
+        assert_eq!(bases(&ws).expect("bases"), ["c0"]);
+        let live = BTreeSet::from([MAIN_ID.to_owned()]);
+        let (_, old, _) = orphans(&ws, &live).expect("orphans");
+        assert_eq!(old, [tmp.clone()]);
+        let held = build_pool::try_lock_dir(&ws, LAND_ID).expect("lock").expect("free");
+        let (_, old, _) = orphans(&ws, &live).expect("orphans");
+        assert!(old.is_empty(), "a publish may be writing it: {old:?}");
+        drop(held);
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Land on the ram tier, end to end without a build tool: laid over base/A, a "build" through the mounted overlay (modify, delete, replace a dir, gate state), publish -> base/B equals the merged view the build saw (minus gate state and `.base`, plus the stamps), ws/land laid again over base/B with the gate state carried and an otherwise empty upper; reset keeps ram; with the store gone reset falls back to the pool and keeps the gate state; a pool dir that would stay pool is kept by publish.
     #[test]
     fn land_on_ram_publishes_and_lays_again() {
         let ws = scratch("land-ram");
@@ -2130,11 +2166,11 @@ mod tests {
         assert_eq!(names, [BASE_FILE, BOOTSTRAP_DIR]);
         assert!(upper.join("bootstrap/debug/state").is_file());
         // reset after a failed verify: ram again, gate state kept
-        let line = recopy(&land).expect("recopy");
+        let line = reset_land(&land).expect("recopy");
         assert!(line.contains("tier ram") && line.contains("gate state carried"), "{line}");
         // the store gone: the pool tier, gate state copied off the store
         std::fs::write(ws.join("workspace.toml"), toml(&ws.join("no-ram-store"))).expect("toml");
-        let line = recopy(&land).expect("recopy to pool");
+        let line = reset_land(&land).expect("recopy to pool");
         assert!(line.contains("tier pool") && line.contains("gate state carried"), "{line}");
         assert!(crate::delta::record(&dir).expect("record").is_none());
         assert!(dir.join("bootstrap/debug/state").is_file() && dir.join("dir/y").is_file());
@@ -2151,9 +2187,9 @@ mod tests {
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// The land's gate state is its own: publish leaves it out of the base (other checkouts would reuse it as fresh), and recopy puts the land's back, so the next land's gate runs warm.
+    /// The land's gate state is its own: publish leaves it out of the base (other checkouts would reuse it as fresh), and reset_land puts the land's back, so the next land's gate runs warm.
     #[test]
-    fn a_land_recopy_keeps_the_gate_state() {
+    fn a_land_reset_keeps_the_gate_state() {
         let ws = scratch("recopy");
         let repo = ws.join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
@@ -2185,14 +2221,14 @@ mod tests {
             !base_of(&ws, &head).join(BOOTSTRAP_DIR).exists(),
             "the base carries the gate state"
         );
-        recopy(&land).expect("recopy");
+        reset_land(&land).expect("reset");
         assert!(
             dir.join(BOOTSTRAP_DIR).join("debug/own").is_file(),
-            "recopy dropped the land's gate state"
+            "reset dropped the land's gate state"
         );
         assert!(
             dir.join(TARGET).join("debug/own").is_file(),
-            "recopy did not copy the base"
+            "reset did not copy the base"
         );
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
