@@ -9,7 +9,6 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 
 use crate::activity::ActivityManager;
 use crate::running_processes::process_info_answer;
-use crate::uid_state::ProcessState;
 
 struct ProcessInfoService {
     activity: ActivityManager,
@@ -36,11 +35,14 @@ fn fill(
 }
 
 impl ProcessInfoService {
-    /// Each pid's process as the caller numbers it, read at one instant. Empty when `pids` is null: fill refuses that.
-    fn found(&self, pids: Option<&[i32]>) -> Vec<Option<ProcessState>> {
+    /// (state, score) per pid, each answered once (process_info_answer counts). Empty when `pids` is null: fill refuses that.
+    fn answers(&self, pids: Option<&[i32]>) -> Vec<(i32, i32)> {
         pids.map_or_else(Vec::new, |pids| {
             self.activity
                 .process_states(ThreadState::get_calling_pid(), pids)
+                .into_iter()
+                .map(process_info_answer)
+                .collect()
         })
     }
 }
@@ -52,12 +54,8 @@ impl IProcessInfoService for ProcessInfoService {
         pids: Option<&[i32]>,
         states: &mut Option<Vec<i32>>,
     ) -> binder::Result<()> {
-        let found = self.found(pids);
-        fill(
-            pids,
-            states,
-            found.iter().map(|f| process_info_answer(*f).0),
-        )
+        let answers = self.answers(pids);
+        fill(pids, states, answers.iter().map(|a| a.0))
     }
 
     /// ProcessInfoService.getProcessStatesAndOomScoresFromPids. AMS first enforces GET_PROCESS_STATE_AND_OOM_SCORE: held by the media server on Android; here the caller is media code inside the app process itself.
@@ -67,17 +65,9 @@ impl IProcessInfoService for ProcessInfoService {
         states: &mut Option<Vec<i32>>,
         scores: &mut Option<Vec<i32>>,
     ) -> binder::Result<()> {
-        let found = self.found(pids);
-        fill(
-            pids,
-            states,
-            found.iter().map(|f| process_info_answer(*f).0),
-        )?;
-        fill(
-            pids,
-            scores,
-            found.iter().map(|f| process_info_answer(*f).1),
-        )
+        let answers = self.answers(pids);
+        fill(pids, states, answers.iter().map(|a| a.0))?;
+        fill(pids, scores, answers.iter().map(|a| a.1))
     }
 }
 

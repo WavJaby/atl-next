@@ -40,10 +40,25 @@ pub const INVALID_ADJ: i32 = -10_000;
 pub const FOREGROUND_APP_ADJ: i32 = 0;
 
 /// processinfo's (state, score) for one pid: the process's ProcessStateEnum value and FOREGROUND_APP_ADJ, or NONEXISTENT and INVALID_ADJ when `found` is None.
+/// Counted: a pid with no process, and the constant score given to a non-top state (plan P1: no adj is derived yet).
 pub fn process_info_answer(found: Option<ProcessState>) -> (i32, i32) {
     match found {
-        Some(state) => (state as i32, FOREGROUND_APP_ADJ),
-        None => (PROCESS_STATE_NONEXISTENT, INVALID_ADJ),
+        Some(state) => {
+            if state != ProcessState::Top {
+                atl_diag::answered(
+                    "IProcessInfoService",
+                    "score not modelled: FOREGROUND_APP_ADJ for a non-top state",
+                );
+            }
+            (state as i32, FOREGROUND_APP_ADJ)
+        }
+        None => {
+            atl_diag::answered(
+                "IProcessInfoService",
+                "pid with no attached process: NONEXISTENT",
+            );
+            (PROCESS_STATE_NONEXISTENT, INVALID_ADJ)
+        }
     }
 }
 
