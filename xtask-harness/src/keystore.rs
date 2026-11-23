@@ -9,6 +9,7 @@
 //! - servicemanager decides service access from the compiled pinned policy (service-access plan S1): the app cannot find the KeyMint HAL (checkService / getService null, isDeclared
 //!   SecurityException) but finds `activity` and the allocator HAL, listServices names everything, and each denial is one avc line in servicemanager's log that atl-diag counts as `denied`.
 //!   Red control `--break-allow-all`: the image's service access table grants everything, so the HAL checks fail.
+//! - the KeyMint HAL's sources carry no copy of the Cuttlefish IMEI its attestation IDs used to hold (plan keystore S3, D-K1; a scan of the sources, not the executable).
 //!
 //!
 //! App stage (plan keystore S2): AesActivity launched as an app (the launcher installs AndroidKeyStoreProvider as zygote's preload did) generates an AES-256-GCM key, round-trips, reports KeyInfo
@@ -21,8 +22,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, Shell};
+use crate::tree;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -108,6 +111,8 @@ const KEY_NOT_FOUND: i32 = 7;
 const PERMISSION_DENIED: i32 = 6;
 /// android.hardware.security.keymint.SecurityLevel.SOFTWARE (SecurityLevel.aidl).
 const SOFTWARE: i32 = 0;
+/// The IMEI the HAL's `attestation_id_info` (hardware/interfaces/security/keymint/aidl/default/hal/lib.rs) attested: a device identity D-K1 forbids.
+const CUTTLEFISH_IMEI: &str = "867400022047199";
 
 /// The probe's lookups of the KeyMint HAL's name (checkService, getService, isDeclared): each asks servicemanager's canFind once, so each denial writes one avc line.
 const HAL_LOOKUPS: u64 = 3;
@@ -173,6 +178,25 @@ fn checks() -> [(&'static str, String); 13] {
             "AtlKeystore: keystore-dir absent".to_owned(),
         ),
     ]
+}
+
+/// Appends the regular files under `dir` (recursively, symlinks skipped) whose bytes contain `needle`, as paths relative to `tree`.
+fn literal_hits(tree: &Path, dir: &Path, needle: &[u8], hits: &mut Vec<String>) -> Result<()> {
+    for e in std::fs::read_dir(dir).with_context(|| dir.display().to_string())? {
+        let e = e?;
+        let p = e.path();
+        let ty = e.file_type()?;
+        if ty.is_dir() {
+            literal_hits(tree, &p, needle, hits)?;
+        } else if ty.is_file()
+            && std::fs::read(&p)?
+                .windows(needle.len())
+                .any(|w| w == needle)
+        {
+            hits.push(p.strip_prefix(tree).unwrap_or(&p).display().to_string());
+        }
+    }
+    Ok(())
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -255,6 +279,30 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             failed.push(what.to_owned());
         }
     }
+    // the KeyMint HAL's sources, as the build compiles them (task copies included), carry no copy of the Cuttlefish IMEI its attestation IDs used to hold (no device identity, D-K1).
+    // Not a scan of the built executable: LLVM folds the 15-byte literal into movabs immediates (the first 8 bytes are in the image, the whole string is not).
+    let tree = tree::shared_tree(&Layout::of(root)?);
+    let mut hits = Vec::new();
+    for dir in [
+        "hardware/interfaces/security/keymint/aidl/default",
+        "system/keymint",
+    ] {
+        literal_hits(
+            &tree,
+            &tree.join(dir),
+            CUTTLEFISH_IMEI.as_bytes(),
+            &mut hits,
+        )?;
+    }
+    if hits.is_empty() {
+        println!("keystore: pass the KeyMint HAL sources carry no IMEI literal");
+    } else {
+        println!(
+            "keystore: FAIL the KeyMint HAL sources carry the Cuttlefish IMEI: {}",
+            hits.join(", ")
+        );
+        failed.push("the KeyMint HAL sources carry the Cuttlefish IMEI".to_owned());
+    }
     // libselinux's avc line per denial (avc.c avc_audit), through servicemanager's SELINUX_CB_LOG into its kernel log (atld kernel_log_to_log); atl-diag counts them as `denied`
     let sm_log = read(&run.log("servicemanager"));
     let denials = atl_diag::summary::totals(&atl_diag::summary::events(&sm_log))
@@ -287,7 +335,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         lines.push(format!("keystore2: {l}"));
     }
     lines.extend(avc_lines);
-    let mut count = checks().len() + 1;
+    // the probe's checks, servicemanager's avc line and the HAL source check
+    let mut count = checks().len() + 2;
     // the app stage: AesActivity in an app process (the launcher's zygote-child start installs the provider), two atld runs on one data root
     for n in [1, 2] {
         if n == 2 && args.break_wipe {
