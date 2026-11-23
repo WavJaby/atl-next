@@ -98,11 +98,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let runs = [
         (
             "no INTERNET",
-            probe_once(&broker, &probe, &work, &home_file, &created, port, &ui, false),
+            probe_once(
+                &broker, &probe, &work, &home_file, &created, port, &ui, false,
+            ),
         ),
         (
             "INTERNET",
-            probe_once(&broker, &probe, &work, &home_file, &created, port, &ui, true),
+            probe_once(
+                &broker, &probe, &work, &home_file, &created, port, &ui, true,
+            ),
         ),
     ];
     drop(ui);
