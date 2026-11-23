@@ -44,6 +44,8 @@ public final class Probe {
     private static final int TAG_ATTESTATION_CHALLENGE = (9 << 28) | 708;
     /** keymint Tag.ATTESTATION_ID_BRAND = TagType.BYTES | 710 (Tag.aidl:691) */
     private static final int TAG_ATTESTATION_ID_BRAND = (9 << 28) | 710;
+    /** keymint Tag.ATTESTATION_ID_IMEI = TagType.BYTES | 714 (Tag.aidl:743) */
+    private static final int TAG_ATTESTATION_ID_IMEI = (9 << 28) | 714;
     /** DER of the attestation extension's OID 1.3.6.1.4.1.11129.2.1.17 */
     private static final byte[] ATTESTATION_OID = {0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, (byte) 0xd6, 0x79, 0x02, 0x01, 0x11};
     /** CN of AOSP's software attestation intermediate and root (hardware/interfaces/security/keymint/aidl/default/ta/attest.rs): a chain carrying it is the software chain */
@@ -126,10 +128,11 @@ public final class Probe {
     }
 
     /**
-     * A challenged key asking for ATTESTATION_ID_BRAND, which keystore2 does not permission-gate (utils.rs is_device_id_attestation_tag): the TA holds no provisioned value and refuses
-     * CANNOT_ATTEST_IDS (system/keymint/ta/src/cert.rs check_attestation_id!, reached through AuthorizationList::new). The IMEI tags keystore2 does gate are not probed here: keystore2 answers them before the HAL.
+     * A challenged key asking for one attestation ID the app may not attest, with a value that is no device's. ATTESTATION_ID_BRAND: keystore2 does not gate it (utils.rs is_device_id_attestation_tag); the TA
+     * holds no provisioned value and refuses CANNOT_ATTEST_IDS (system/keymint/ta/src/cert.rs check_attestation_id!, through AuthorizationList::new). An IMEI tag: keystore2 answers it before the HAL,
+     * its permission check (utils.rs check_device_attestation_permissions) refuses CANNOT_ATTEST_IDS without READ_PRIVILEGED_PHONE_STATE (security_level.rs add_required_parameters). `label` names the line.
      */
-    private static void brandRefused(Object level) throws Exception {
+    private static void challengedId(Object level, int idTag, String label) throws Exception {
         Class<?> pc = Class.forName(KM + "KeyParameter");
         Object params = Array.newInstance(pc, 7);
         Array.set(params, 0, param(TAG_ALGORITHM, "algorithm", int.class, EC));
@@ -137,15 +140,15 @@ public final class Probe {
         Array.set(params, 2, param(TAG_EC_CURVE, "ecCurve", int.class, P_256));
         Array.set(params, 3, param(TAG_DIGEST, "digest", int.class, SHA_2_256));
         Array.set(params, 4, param(TAG_NO_AUTH_REQUIRED, "boolValue", boolean.class, true));
-        Array.set(params, 5, param(TAG_ATTESTATION_ID_BRAND, "blob", byte[].class, "ATL".getBytes(StandardCharsets.US_ASCII)));
+        Array.set(params, 5, param(idTag, "blob", byte[].class, "ATL".getBytes(StandardCharsets.US_ASCII)));
         Array.set(params, 6, param(TAG_ATTESTATION_CHALLENGE, "blob", byte[].class, "atl-probe-challenge".getBytes(StandardCharsets.US_ASCII)));
         Class<?> kdc = Class.forName(KS + "KeyDescriptor");
         try {
             level.getClass().getMethod("generateKey", kdc, kdc, params.getClass(), int.class, byte[].class)
-                    .invoke(level, descriptor("atl-probe-brand"), null, params, 0, new byte[0]);
-            line("attest-ids brand-challenge generated");
+                    .invoke(level, descriptor("atl-probe-" + label), null, params, 0, new byte[0]);
+            line("attest-ids " + label + " generated");
         } catch (Throwable t) {
-            line("attest-ids brand-challenge " + outcome(t));
+            line("attest-ids " + label + " " + outcome(t));
         }
     }
 
@@ -277,7 +280,8 @@ public final class Probe {
                 if (level != null) {
                     generated(ks, level);
                     attested(ks, level);
-                    brandRefused(level);
+                    challengedId(level, TAG_ATTESTATION_ID_BRAND, "brand-challenge");
+                    challengedId(level, TAG_ATTESTATION_ID_IMEI, "imei-challenge");
                 }
             }
         } catch (Throwable t) {

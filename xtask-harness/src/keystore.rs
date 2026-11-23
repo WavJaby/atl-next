@@ -11,6 +11,7 @@
 //!   Red control `--break-allow-all`: the image's service access table grants everything, so the HAL checks fail.
 //! - the KeyMint HAL's sources carry no copy of the Cuttlefish IMEI its attestation IDs used to hold (plan keystore S3, D-K1; a scan of the sources, not the executable).
 //! - a key generated with an attestation challenge gets AOSP's software attestation chain (plan keystore S3b, D-K1 (a)): keystore2 asks sec_key_att_app_id_provider for the application id, which the service answers from the installed packages' certificates (crates/atl-services/src/key_attestation.rs).
+//! - an app without READ_PRIVILEGED_PHONE_STATE asking for ATTESTATION_ID_IMEI gets CANNOT_ATTEST_IDS from keystore2's own permission check (utils.rs:143-148), which asks the `permission` service (crates/atl-services/src/permission_controller.rs; AOSP ActivityManagerService.PermissionController).
 //! - an app reads the boot state of an unlocked device with no verified boot: ro.boot.verifiedbootstate orange, ro.boot.vbmeta.device_state unlocked (manager 2026-11-23; CONSTANTS in atl-property-service).
 //!
 //!
@@ -113,8 +114,10 @@ const KEY_NOT_FOUND: i32 = 7;
 const PERMISSION_DENIED: i32 = 6;
 /// android.hardware.security.keymint.SecurityLevel.SOFTWARE (SecurityLevel.aidl).
 const SOFTWARE: i32 = 0;
-/// android.hardware.security.keymint.ErrorCode.CANNOT_ATTEST_IDS (ErrorCode.aidl:91): the TA's refusal of an attestation ID it holds no value for.
+/// android.hardware.security.keymint.ErrorCode.CANNOT_ATTEST_IDS (ErrorCode.aidl:91): keystore2's refusal of a device-identifier tag without the privileged permission (utils.rs:146) and the TA's refusal of an ID it holds no value for.
 const CANNOT_ATTEST_IDS: i32 = -66;
+/// android.permission.READ_PRIVILEGED_PHONE_STATE: the permission keystore2 checks for a device-identifier tag (utils.rs:145).
+const READ_PRIVILEGED_PHONE_STATE: &str = "android.permission.READ_PRIVILEGED_PHONE_STATE";
 /// The IMEI the HAL's `attestation_id_info` (hardware/interfaces/security/keymint/aidl/default/hal/lib.rs) attested: a device identity D-K1 forbids.
 const CUTTLEFISH_IMEI: &str = "867400022047199";
 
@@ -124,7 +127,7 @@ const HAL_LOOKUPS: u64 = 3;
 const HAL_TYPE: &str = "hal_keymint_service";
 
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 17] {
+fn checks() -> [(&'static str, String); 18] {
     [
         // servicemanager decides from the compiled pinned policy (Access over libselinux, atl-selinux's table): untrusted_app may not find hal_keymint_service (private/app_neverallows.te:254,
         // public/service.te:336: no allow), so checkService / getService answer null (ServiceManager.cpp tryGetService) and isDeclared fails EX_SECURITY (ServiceManager.cpp:716-733)
@@ -190,6 +193,11 @@ fn checks() -> [(&'static str, String); 17] {
         (
             "a challenged key asking ATTESTATION_ID_BRAND: CANNOT_ATTEST_IDS",
             format!("AtlKeystore: attest-ids brand-challenge error {CANNOT_ATTEST_IDS}"),
+        ),
+        // (c): keystore2 checks READ_PRIVILEGED_PHONE_STATE of the probe app through the `permission` service before the HAL (security_level.rs:500-504); the app holds none, so -66
+        (
+            "a challenged key asking ATTESTATION_ID_IMEI: CANNOT_ATTEST_IDS",
+            format!("AtlKeystore: attest-ids imei-challenge error {CANNOT_ATTEST_IDS}"),
         ),
         // the boot state of an unlocked device with no verified boot (manager 2026-11-23; CONSTANTS in atl-property-service): orange and unlocked, never green
         (
@@ -302,6 +310,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             failed.push(what.to_owned());
         }
     }
+    // -66 also comes from the TA for an ID it holds no value for, so the IMEI row alone cannot tell the two apart: keystore2's own refusal (utils.rs:194, the caller lacks the permission) is
+    // what shows the `permission` service answered false (utils.rs:146, :194 format, permission name utils.rs:145)
+    let permission_refusal =
+        format!("caller does not have the '{READ_PRIVILEGED_PHONE_STATE}' permission");
+    let ok = ks_log.contains(&permission_refusal);
+    println!(
+        "keystore: {} keystore2 refuses the IMEI request on its permission check: {permission_refusal}",
+        if ok { "pass" } else { "FAIL" }
+    );
+    if !ok {
+        failed.push("keystore2's permission refusal of the IMEI request".to_owned());
+    }
     // the KeyMint HAL's sources, as the build compiles them (task copies included), carry no copy of the Cuttlefish IMEI its attestation IDs used to hold (no device identity, D-K1).
     // Not a scan of the built executable: LLVM folds the 15-byte literal into movabs immediates (the first 8 bytes are in the image, the whole string is not).
     let tree = tree::shared_tree(&Layout::of(root)?);
@@ -358,8 +378,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         lines.push(format!("keystore2: {l}"));
     }
     lines.extend(avc_lines);
-    // the probe's checks, servicemanager's avc line and the HAL source check
-    let mut count = checks().len() + 2;
+    // the probe's checks, servicemanager's avc line, the HAL source check and keystore2's permission refusal
+    let mut count = checks().len() + 3;
     // the app stage: AesActivity in an app process (the launcher's zygote-child start installs the provider), two atld runs on one data root
     for n in [1, 2] {
         if n == 2 && args.break_wipe {
