@@ -12,6 +12,7 @@
 //!   (:470-472), one for an unprotected action without a flag is a SecurityException (:457-460). The unprotected PING still delivers (the runtime row).
 //! - ordered: two registered receivers (priority 10, 0) and the receiver app's manifest receiver pass a result on; resultTo gets the final code (ORDER); abortBroadcast skips the rest (ABORT);
 //!   an implicit intent is skipped for the restricted manifest receiver (counter `Background execution not allowed`).
+//! - alarm grant (the receiver app sets its own RTC_WAKEUP alarms from Recv.java): an inexact alarm's receiver starts AlarmSvc and the start is refused for the background uid (log `app is in background uid`, counter `startService: background start refused`; AlarmManagerService :2751, :2762 gives an inexact alarm no temp allowlist); an exact alarm set after that refusal grants the start (counter `temp allowlist granted`, AlarmManagerService :2765-2781), and AlarmSvc starts once.
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
@@ -83,6 +84,13 @@ const EXPORTED_DENIAL: &str = "Exported Denial";
 /// The headless grace this gate sets (atld `--empty-process-grace-ms`, a short one so the row ends inside the run): the explicit broadcast's receiver process ends this long after its
 /// receiver finished, once nothing holds it (activity.rs `end_headless`, plan "Linux conventions"); the default is AOSP's settle period (60 s).
 const EMPTY_GRACE_MS: u64 = 2000;
+/// The alarm chain's log lines (Recv.java): the refused start of the inexact alarm's receiver (ContextImpl :2049 `Not allowed to start service`, ActiveServices :1112 `app is in background uid`),
+/// AlarmSvc's start (once: the exact alarm's), and the counters the refusal (active_services.rs start_service_locked) and the grant (activity.rs grant_temp_locked) count.
+const ALARM_REFUSED: &str = "AtlBcast: control start refused: Not allowed to start service";
+const ALARM_BACKGROUND: &str = "app is in background uid ";
+const ALARM_SERVICE_STARTED: &str = "AtlBcast: alarm service started";
+const REFUSED_COUNTER: &str = "startService: background start refused";
+const GRANTED_COUNTER: &str = "temp allowlist granted (tempAllowlistUidLocked)";
 
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -140,6 +148,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the headless end follows the receiver's finish by EMPTY_GRACE_MS, which under a loaded host can be later than SETTLE after PING: wait for its line (LIMIT caps the wait)
     let end_line = format!("process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)");
     let mut end_seen = false;
+    // the alarm chain's last step (Recv.java ALARM_GRANT): the run ends only once AlarmSvc started, so the grant is inside the run
+    let mut alarm_seen = false;
     let ended = loop {
         if ping_seen.is_none() && read(&receiver_log).contains(PING_SENT) {
             ping_seen = Some(Instant::now());
@@ -147,7 +157,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if ping_seen.is_some() && !end_seen {
             end_seen = read(&run.log("services")).contains(&end_line);
         }
-        if ping_seen.is_some_and(|t| t.elapsed() > SETTLE && end_seen) || start.elapsed() > LIMIT {
+        if !alarm_seen {
+            alarm_seen = read(&receiver_log).contains(ALARM_SERVICE_STARTED);
+        }
+        if ping_seen.is_some_and(|t| t.elapsed() > SETTLE && end_seen && alarm_seen)
+            || start.elapsed() > LIMIT
+        {
             break None;
         }
         if let Some(s) = atld.try_wait()? {
@@ -237,6 +252,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "the explicit broadcast's receiver process ended once its receiver finished and the grace ran",
             services.contains(&end_line),
+        ),
+        (
+            "the inexact alarm's receiver start was refused for the background uid, and counted",
+            r.lines()
+                .any(|l| l.contains(ALARM_REFUSED) && l.contains(ALARM_BACKGROUND))
+                && counted(REFUSED_COUNTER),
+        ),
+        (
+            "the exact alarm granted the receiver's uid a temp allowlist, and AlarmSvc started once (the grant's start)",
+            count(&r, ALARM_SERVICE_STARTED) == 1 && counted(GRANTED_COUNTER),
         ),
     ];
     checks.extend(connectivity_checks(root, &mut rt, &work)?);

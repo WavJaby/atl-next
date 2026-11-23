@@ -1468,6 +1468,7 @@ impl Inner {
     fn temp_expired(&self, uid: u32) {
         let now = self.now_ms();
         let mut st = self.state();
+        atl_diag::answered(AM, "temp allowlist expired");
         if let Some(at) = st.uids.on_temp_expired(uid, now) {
             self.arm(Timer::UidSettle(uid), at);
         }

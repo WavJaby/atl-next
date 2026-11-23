@@ -61,7 +61,8 @@ const TEMP_ALLOWLIST_PERMISSIONS: [&str; 3] = [
 ];
 
 thread_local! {
-    /// Set by [`send_in_process`] for its own send: the caller is SYSTEM_UID, not this thread's calling uid.
+    /// Set by [`send_in_process`] for its own send: the caller is SYSTEM_UID, not this thread's calling uid. The only thread-local identity in this crate: every other caller is
+    /// a parameter (`caller`, [`IntentSink::send_as`]); this one enters through the binder `send`, which reads the calling uid there.
     static OWN_CALL: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -105,9 +106,16 @@ impl SendOptions {
                 "temp allowlist type not modelled: APP_FREEZING_DELAYED",
             );
         }
+        let grant = uid_state::grant_of(duration, kind, int(KEY_TEMP_REASON_CODE, 0));
+        if duration > 0 && grant.is_none() && kind != uid_state::TEMP_TYPE_APP_FREEZING_DELAYED {
+            atl_diag::answered(
+                INTERFACE,
+                "temp allowlist requested, no grant (REASON_DENIED or type)",
+            );
+        }
         SendOptions {
             temp_requested: duration > 0,
-            grant: uid_state::grant_of(duration, kind, int(KEY_TEMP_REASON_CODE, 0)),
+            grant,
             alarm: int(KEY_FLAGS, 0) & FLAG_IS_ALARM_BROADCAST != 0,
         }
     }
@@ -217,10 +225,23 @@ impl PendingIntents {
 /// The caller is SYSTEM_UID: the services' own thread runs no transaction, and ATL's process uid is the desktop user's, not necessarily SYSTEM_UID.
 pub fn send_in_process(operation: &SpIBinder, options: &Bundle) -> binder::Result<()> {
     let sender = operation.clone().into_interface::<dyn IIntentSender>()?;
-    OWN_CALL.set(true);
-    let result = sender.r#send(0, None, None, None, None, None, Some(options));
-    OWN_CALL.set(false);
-    result
+    let _own = OwnCall::enter();
+    sender.r#send(0, None, None, None, None, None, Some(options))
+}
+
+/// Holds OWN_CALL for one send. Drop restores the previous value, so an error return and an unwinding panic clear it as well.
+struct OwnCall(bool);
+
+impl OwnCall {
+    fn enter() -> Self {
+        Self(OWN_CALL.replace(true))
+    }
+}
+
+impl Drop for OwnCall {
+    fn drop(&mut self) {
+        OWN_CALL.set(self.0);
+    }
 }
 
 /// What a record sends: its kind, creator uid, user, request intent and the broadcast path.
