@@ -77,7 +77,7 @@ use serde::Deserialize;
 #[derive(Parser)]
 #[command(about, long_about = None)]
 struct Args {
-    /// Runtime root (removed and made again).
+    /// Runtime root (removed and made again). Holds atld's private copies of the sandbox helpers (`helpers/`: stub, join, shim), which run from there: its filesystem must allow exec.
     #[arg(long)]
     root: PathBuf,
     /// The persistent data root, kept across runs: `apps/<package>/{apk,data,data_de,external}` (each package's code, data, device-protected data, Android/data + obb) and `device/data/` (system state, dalvik-cache).
@@ -627,6 +627,25 @@ impl Root {
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("log").join(format!("{name}.log"))
     }
+    /// atld's private copies of the helper executables the broker binds or runs ([`pin_helper`]).
+    fn helpers(&self) -> PathBuf {
+        self.root.join("helpers")
+    }
+}
+
+/// A private copy of helper executable `exe` in `dir` (under the runtime root, which only this atld uses), for the broker to bind and run for atld's whole life.
+/// Why: a bind mount pins the dentry it was made from, and a web process's sandbox binds the stub again from its app's view (atl_broker WebSpawner::start); once the host file is replaced
+/// (a rebuild re-linking it, a package upgrade) that dentry is unlinked and the kernel refuses the bind (ENOENT), so the web process never starts. A file nobody else writes stays linked.
+fn pin_helper(dir: &Path, exe: &Path) -> Result<PathBuf> {
+    let name = exe
+        .file_name()
+        .with_context(|| format!("{}: no file name", exe.display()))?;
+    std::fs::create_dir_all(dir)?;
+    let at = dir.join(name);
+    // fs::copy keeps the mode bits (executable)
+    std::fs::copy(exe, &at)
+        .with_context(|| format!("pinning {} at {}", exe.display(), at.display()))?;
+    Ok(at)
 }
 
 /// `/system/framework/<file name of host>`: a link to `host` (the host's tree is visible in the sandbox), the sandbox path of the file.
@@ -2308,11 +2327,9 @@ fn run(a: &Args) -> Result<ExitCode> {
         session_args.extend(["--session".into(), i.to_string().into()]);
         sessions.push(source.files);
     }
-    let (broker, mut binderd) = Broker::start(
-        &a.binderd,
-        &a.sandbox_stub,
-        std::fs::File::create(r.log("binderd"))?,
-    )?;
+    let stub = pin_helper(&r.helpers(), &a.sandbox_stub)?;
+    let (broker, mut binderd) =
+        Broker::start(&a.binderd, &stub, std::fs::File::create(r.log("binderd"))?)?;
     let broker = if a.no_app_seccomp {
         broker.without_app_seccomp()
     } else {
@@ -2332,9 +2349,10 @@ fn run(a: &Args) -> Result<ExitCode> {
                     "web process sound: no pulse socket (from {from}; share-sound grants nothing)"
                 )),
             }
+            // pinned as the stub is: a replaced host file would leave a moment with no file (a failed exec or bind) or a version beside a running atld it was not built with
             broker.with_webspawn(atl_broker::WebSpawnHost {
-                join: join.clone(),
-                shim: shim.clone(),
+                join: pin_helper(&r.helpers(), join)?,
+                shim: pin_helper(&r.helpers(), shim)?,
                 pulse,
             })
         }
@@ -3376,6 +3394,30 @@ mod tests {
             host_pid,
             pidfd,
         }
+    }
+
+    /// A pinned helper outlives the replacement of its source the way cargo's uplift and a package upgrade replace it (a new file renamed over the old name): the copy keeps the bytes
+    /// and mode it was pinned with and is a different file from the new source, so nothing done to the source's name reaches what the broker binds.
+    #[test]
+    fn pinned_helper_survives_source_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("atld-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let src = dir.join("atl-sandbox-stub");
+        std::fs::write(&src, b"v1").expect("write");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let pinned = pin_helper(&dir.join("helpers"), &src).expect("pin");
+        assert_eq!(pinned, dir.join("helpers/atl-sandbox-stub"));
+        let next = dir.join("next");
+        std::fs::write(&next, b"v2").expect("write");
+        std::fs::rename(&next, &src).expect("rename over");
+        assert_eq!(std::fs::read(&pinned).expect("read"), b"v1");
+        let meta = std::fs::metadata(&pinned).expect("stat");
+        // 0o755: the mode the source had when pinned
+        assert_eq!(meta.mode() & 0o777, 0o755);
+        assert_ne!(meta.ino(), std::fs::metadata(&src).expect("stat").ino());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// R7-8: a daemon's logdw records go through the app log's rate bound. Burst 3 per 300 ms window: of 10 records sent at once the log keeps the first 3 (the rule: `burst` lines per window,

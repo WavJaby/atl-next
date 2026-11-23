@@ -1158,6 +1158,8 @@ impl WebSpawner {
         fds: [OwnedFd; 3],
     ) -> io::Result<i32> {
         let [socket, stdout, stderr] = fds;
+        // the app's log, for the line naming a web sandbox that failed (below)
+        let mut report = File::from(stderr.try_clone()?);
         let bwrap = host_program(BWRAP)?;
         // bwrap is exec'd inside the app's view, which shows the host's /usr and /etc only
         if !APP_ROOT_DIRS
@@ -1250,11 +1252,21 @@ impl WebSpawner {
             info_r,
             inherit,
         )?;
-        // atl-sandbox-join waits for bwrap, which ends with the web process (its socket closed, or the app's pid namespace gone)
+        // atl-sandbox-join waits for bwrap, which ends with the web process (its socket closed, or the app's pid namespace gone: killed, which bwrap reports as code 128 + signal).
+        // A code 1..=127 is a failure: bwrap's own (1, after its line naming why, e.g. a bind it could not make), join's, or the web process's; WebKit then reports only that it got no
+        // credentials, so this line ties the two together in the app's log.
+        let identifier = plan.identifier.clone();
         std::thread::Builder::new()
             .name(format!("webproc-{app_pid}"))
             .spawn(move || {
-                let _ = child.wait();
+                if let Ok(status) = child.wait()
+                    && let Some(code) = status.code().filter(|c| (1..128).contains(c))
+                {
+                    let _ = io::Write::write_all(
+                        &mut report,
+                        format!("atl-broker: web process {identifier} (pid {app_pid}): its sandbox exited with code {code} (bwrap's or atl-sandbox-join's line above names why)\n").as_bytes(),
+                    );
+                }
             })?;
         Ok(app_pid)
     }
