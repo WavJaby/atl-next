@@ -212,15 +212,17 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
     // every cargo product a row runs, built and staged once before any row starts (gate_build.rs), under a cargo grant released before the rows take theirs; rows then find them current
-    let prebuilt = Instant::now();
-    let products = {
-        let _grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
-        gate_build::ensure(root, out, &Group::ALL)?.files()
+    let (products, waited, took) = {
+        let grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
+        let started = Instant::now();
+        let files = gate_build::ensure(root, out, &Group::ALL)?.files();
+        (files, grant.waited, started.elapsed())
     };
     let snapshot = Snapshot::take(&products);
     eprintln!(
-        "gates: prebuild {:.1}s ({} products)",
-        prebuilt.elapsed().as_secs_f64(),
+        "gates: prebuild {:.1}s (pool wait {:.1}s, {} products)",
+        took.as_secs_f64(),
+        waited.as_secs_f64(),
         products.len()
     );
     let moved = Mutex::new(Moved::default());
