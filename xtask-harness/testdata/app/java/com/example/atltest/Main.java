@@ -725,7 +725,9 @@ public class Main extends Activity {
         Log.i("AtlTest", "processes: " + processes());
         started();
         stickyStart();
-        foregroundStarts();
+        // Posted, not inline: a service's create waits for this UI thread, and the rest of onCreate runs ~40 s on the riscv64 VM, past AOSP's 30 s start-foreground window (ActivityManagerConstants.java:318; the pin does not HW-scale it).
+        final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+        ui.post(new Runnable() { @Override public void run() { foregroundStarts(); } });
         Log.i("AtlTest", "sysanswers: " + sysAnswers());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
@@ -740,7 +742,8 @@ public class Main extends Activity {
         Log.i("AtlTest", "webview-package: " + webViewPackage());
         // the UA on a worker thread before any WebView exists, as AdMob's AdWorker asks it; then webview-page's WebView on this (UI) thread: the engine must stay the UI thread's.
         // The UI thread does not wait for the worker (the provider may hop to the UI thread for the UA, as Chromium's does).
-        final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+        // Posted after the FGS step above, so the UA worker starts after foregroundStarts() has queued its services' creates.
+        ui.post(new Runnable() { @Override public void run() {
         new Thread(new Runnable() {
             @Override public void run() {
                 final String ua = webView();
@@ -765,6 +768,7 @@ public class Main extends Activity {
                 });
             }
         }, "ua-worker").start();
+        } });
         mediaPlayerService();
         mediaExtractorWav();
         mediaRetrieverWav();
