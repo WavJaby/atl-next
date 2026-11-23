@@ -104,6 +104,23 @@ pub trait DesktopNotifications: Send + Sync {
     fn withdraw(&self, key: &str) -> std::io::Result<bool>;
 }
 
+/// The foreground service notifications (ServiceRecord.postNotification, ActiveServices.cancelForegroundNotificationLocked), made by the activity service as the app's own
+/// (no tag, the single user). A post is enqueueNotificationWithTag's record and display; a cancel is cancelNotificationWithTag's, without the caller checks.
+pub trait ForegroundNotices: Send + Sync {
+    /// Posts `notification` as `package`'s notification `id` (the caller added FLAG_FOREGROUND_SERVICE).
+    fn post(&self, uid: u32, package: &str, id: i32, notification: &Notification);
+    /// Cancels `package`'s notification `id` (no tag), if one is posted.
+    fn cancel(&self, package: &str, id: i32);
+}
+
+/// Discards the foreground notices: the activity service's tests, which run without a notification service.
+pub struct NoForegroundNotices;
+
+impl ForegroundNotices for NoForegroundNotices {
+    fn post(&self, _uid: u32, _package: &str, _id: i32, _notification: &Notification) {}
+    fn cancel(&self, _package: &str, _id: i32) {}
+}
+
 struct Inner {
     tasks: Arc<Tasks<SpIBinder>>,
     permissions: Arc<Permissions>,
@@ -481,53 +498,7 @@ impl INotificationManager for NotificationManager {
         let (uid, user) =
             self.0
                 .resolve_caller("enqueueNotificationWithTag", pkg, op_pkg, user_id)?;
-        let mut st = self.0.lock();
-        let channel_id = notification.channel_id.as_deref();
-        let Some(channel) = st.channels.get(uid, pkg, channel_id) else {
-            drop(st);
-            atl_diag::answered(
-                INTERFACE,
-                &format!(
-                    "notification: No Channel found for pkg={pkg}, channelId={}: dropped",
-                    channel_id.unwrap_or("null")
-                ),
-            );
-            return Ok(());
-        };
-        let before = st.posted.len();
-        st.posted
-            .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
-        let update = st.posted.len() != before;
-        let posted = Posted {
-            pkg: pkg.to_owned(),
-            tag: tag.map(str::to_owned),
-            id,
-            user,
-            uid,
-        };
-        let key = posted.key();
-        st.posted.push(posted);
-        drop(st);
-        atl_diag::answered(INTERFACE, "notification.posted");
-        // checkDisqualifyingFeatures (:9144): a blocked channel's post is recorded by the app's call and never shown
-        if channel.importance == notification_display::IMPORTANCE_NONE {
-            atl_diag::answered(INTERFACE, "notification.not_shown reason=blocked");
-            return Ok(());
-        }
-        let (content, left_out) = notification_display::content(notification, &channel, update);
-        for name in left_out {
-            atl_diag::answered(INTERFACE, &format!("notification.dropped_field {name}"));
-        }
-        let outcome = match self.0.desktop.notify(pkg, &key, content) {
-            Ok(NotifyOutcome::Shown) => "notification.shown",
-            Ok(NotifyOutcome::Updated) => "notification.updated",
-            Ok(NotifyOutcome::NoService) => "notification.not_shown reason=no-service",
-            Err(e) => {
-                atl_diag::answered(INTERFACE, &format!("notification.notify failed: {e}"));
-                "notification.not_shown reason=error"
-            }
-        };
-        atl_diag::answered(INTERFACE, outcome);
+        enqueue(&self.0, uid, user, pkg, tag, id, notification);
         Ok(())
     }
 
@@ -589,23 +560,137 @@ impl INotificationManager for NotificationManager {
     }
 }
 
-/// The service's binder, for `addService`; toast windows are bound into `tasks`, posted notifications shown on `desktop`.
-pub fn new_binder(
-    tasks: Arc<Tasks<SpIBinder>>,
-    permissions: Arc<Permissions>,
-    packages: Arc<Packages>,
-    desktop: Arc<dyn DesktopNotifications>,
-) -> SpIBinder {
-    BnNotificationManager::new_binder(
-        NotificationManager(Arc::new(Inner {
+/// The service's state: its binder ([`Notices::binder`], for `addService`) and the foreground notices of the activity service. Toast windows are bound into `tasks`,
+/// posted notifications shown on `desktop`.
+pub struct Notices(Arc<Inner>);
+
+impl Notices {
+    pub fn new(
+        tasks: Arc<Tasks<SpIBinder>>,
+        permissions: Arc<Permissions>,
+        packages: Arc<Packages>,
+        desktop: Arc<dyn DesktopNotifications>,
+    ) -> Self {
+        Notices(Arc::new(Inner {
             tasks,
             permissions,
             packages,
             desktop,
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
-        })),
-        BinderFeatures::default(),
-    )
-    .as_binder()
+        }))
+    }
+
+    /// The INotificationManager binder over this state.
+    pub fn binder(&self) -> SpIBinder {
+        BnNotificationManager::new_binder(
+            NotificationManager(Arc::clone(&self.0)),
+            BinderFeatures::default(),
+        )
+        .as_binder()
+    }
+}
+
+impl ForegroundNotices for Notices {
+    fn post(&self, uid: u32, package: &str, id: i32, notification: &Notification) {
+        enqueue(
+            &self.0,
+            uid,
+            permission::user_id(uid),
+            package,
+            None,
+            id,
+            notification,
+        );
+    }
+
+    fn cancel(&self, package: &str, id: i32) {
+        cancel_foreground(&self.0, package, id);
+    }
+}
+
+/// enqueueNotificationWithTag's record and display, shared by the binder and the foreground notices: the (pkg, tag, id, user) record is replaced or added, then shown
+/// on the desktop unless its channel is blocked or was never created.
+fn enqueue(
+    inner: &Inner,
+    uid: u32,
+    user: u32,
+    pkg: &str,
+    tag: Option<&str>,
+    id: i32,
+    notification: &Notification,
+) {
+    let mut st = inner.lock();
+    let channel_id = notification.channel_id.as_deref();
+    let Some(channel) = st.channels.get(uid, pkg, channel_id) else {
+        drop(st);
+        atl_diag::answered(
+            INTERFACE,
+            &format!(
+                "notification: No Channel found for pkg={pkg}, channelId={}: dropped",
+                channel_id.unwrap_or("null")
+            ),
+        );
+        return;
+    };
+    let before = st.posted.len();
+    st.posted
+        .retain(|p| !(p.pkg == pkg && p.tag.as_deref() == tag && p.id == id && p.user == user));
+    let update = st.posted.len() != before;
+    let posted = Posted {
+        pkg: pkg.to_owned(),
+        tag: tag.map(str::to_owned),
+        id,
+        user,
+        uid,
+    };
+    let key = posted.key();
+    st.posted.push(posted);
+    drop(st);
+    atl_diag::answered(INTERFACE, "notification.posted");
+    // checkDisqualifyingFeatures (:9144): a blocked channel's post is recorded by the app's call and never shown
+    if channel.importance == notification_display::IMPORTANCE_NONE {
+        atl_diag::answered(INTERFACE, "notification.not_shown reason=blocked");
+        return;
+    }
+    let (content, left_out) = notification_display::content(notification, &channel, update);
+    for name in left_out {
+        atl_diag::answered(INTERFACE, &format!("notification.dropped_field {name}"));
+    }
+    let outcome = match inner.desktop.notify(pkg, &key, content) {
+        Ok(NotifyOutcome::Shown) => "notification.shown",
+        Ok(NotifyOutcome::Updated) => "notification.updated",
+        Ok(NotifyOutcome::NoService) => "notification.not_shown reason=no-service",
+        Err(e) => {
+            atl_diag::answered(INTERFACE, &format!("notification.notify failed: {e}"));
+            "notification.not_shown reason=error"
+        }
+    };
+    atl_diag::answered(INTERFACE, outcome);
+}
+
+/// cancelNotificationWithTag for a foreground service's notification (no tag): the record goes and the desktop withdraws it. Called under the activity service's lock:
+/// the withdraw is one write to atld, and this path never takes the activity lock, so no cycle forms.
+fn cancel_foreground(inner: &Inner, package: &str, id: i32) {
+    let removed = {
+        let mut st = inner.lock();
+        let at = st
+            .posted
+            .iter()
+            .position(|p| p.pkg == package && p.tag.is_none() && p.id == id);
+        at.map(|i| st.posted.remove(i))
+    };
+    let Some(removed) = removed else {
+        atl_diag::answered(INTERFACE, "foreground notification cancel (nothing posted)");
+        return;
+    };
+    match inner.desktop.withdraw(&removed.key()) {
+        Ok(true) => {
+            atl_diag::answered(INTERFACE, "notification.withdrawn reason=foreground");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            atl_diag::answered(INTERFACE, &format!("notification.withdraw failed: {e}"));
+        }
+    }
 }

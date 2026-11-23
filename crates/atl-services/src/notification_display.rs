@@ -15,7 +15,7 @@ const IMPORTANCE_LOW: i32 = 2;
 const FLAG_ONGOING_EVENT: i32 = 0x2;
 const FLAG_ONLY_ALERT_ONCE: i32 = 0x8;
 const FLAG_NO_CLEAR: i32 = 0x20;
-const FLAG_FOREGROUND_SERVICE: i32 = 0x40;
+pub(crate) const FLAG_FOREGROUND_SERVICE: i32 = 0x40;
 /// Notification.EXTRA_* keys (Notification.java).
 const EXTRA_TITLE: &str = "android.title";
 const EXTRA_TITLE_BIG: &str = "android.title.big";

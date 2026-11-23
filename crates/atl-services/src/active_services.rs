@@ -6,13 +6,14 @@
 //! am_handler's (activity.rs on_timer, [`Inner::restart_service`]).
 //! Calls leave on one thread in the order the state lock produced them (broadcast_queue.rs's reason: no call out of the system process with the lock held; in-process connections, the job runner's,
 //! run their `connected` there too, so they may call back into the services).
-//! Implicit service Intents resolve as retrieveServiceLocked's resolveService does (resolve_implicit: the first of package::query_intent_services, STOCK_PM_FLAGS); no match answers 0, counted. Not modelled: AOSP's MATCH_DEBUG_TRIAGED_MISSING (ActiveServices.java:4877), instanceName (ignored, counted), bindings across users, the foreground rules (S7: startForegroundService is a start), the background caller's delayed start (counted).
+//! Implicit service Intents resolve as retrieveServiceLocked's resolveService does (resolve_implicit: the first of package::query_intent_services, STOCK_PM_FLAGS); no match answers 0, counted. Foreground services (S7): the rules are service_records.rs; this file sends the startForeground wait, its timeout (stop, counted), setServiceForeground / getForegroundServiceType and the notice posts. Not modelled: AOSP's MATCH_DEBUG_TRIAGED_MISSING (ActiveServices.java:4877), instanceName (ignored, counted), bindings across users, the background caller's delayed start (counted), the background FGS start gate (AS :1036-1052, counted), the FGS ANR (counted).
 
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
 
 use atl_aidl::aidl::android::app::IApplicationThread::IApplicationThread;
 use atl_aidl::aidl::android::app::IServiceConnection::IServiceConnection;
+use atl_parcelables::android::app::Notification;
 use atl_parcelables::android::content::pm::{ParceledListSlice, ServiceInfo};
 use atl_parcelables::android::content::res::CompatibilityInfo;
 use atl_parcelables::android::content::{ComponentName, Intent};
@@ -20,10 +21,14 @@ use atl_parcelables::codecs::android::app::ServiceStartArgs::ServiceStartArgs;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
-use super::{AM, Effects, Inner, LostWaiter, ProcessRecord, State, Timer, intent_key, log};
+use super::{
+    AM, Effects, Inner, LostWaiter, ProcessRecord, SERVICE_START_FOREGROUND_TIMEOUT_MS, State,
+    Timer, intent_key, log, security,
+};
 use crate::broadcast_dispatch::ProcKey;
+use crate::notification_display::FLAG_FOREGROUND_SERVICE;
 use crate::package;
-use crate::service_records::{self, Bind, Call, Host, Kinds, Start};
+use crate::service_records::{self, Bind, Call, Foreground, Host, Kinds, Start};
 use crate::uid_state::{self, StartMode};
 use atl_services_types::permission::{self, ROOT_UID, SYSTEM_UID};
 
@@ -33,6 +38,32 @@ const PROCESS_STATE_UNKNOWN: i32 = -1;
 pub(crate) const SYSTEM_CLIENT: i32 = -1;
 /// ActivityThread.SERVICE_DONE_EXECUTING_START (ActivityThread.java:337; ANON 0 :335, STOP 2 :339): the serviceDoneExecuting type of an onStartCommand result.
 const SERVICE_DONE_EXECUTING_START: i32 = 1;
+/// Build.VERSION_CODES.O: a startForegroundService below it is a plain start (AS :1120-1125 drops fgRequired).
+const SDK_O: i32 = 26;
+/// Build.VERSION_CODES.P: the FOREGROUND_SERVICE permission is enforced from here (AS :2197-2198).
+const SDK_P: i32 = 28;
+/// Build.VERSION_CODES.UPSIDE_DOWN_CAKE: the FGS type checks (NONE disabled, DATA_SYNC permission enforced) apply from here (ForegroundServiceTypePolicy :112-161, EnabledAfter TIRAMISU).
+const SDK_UPSIDE_DOWN_CAKE: i32 = 34;
+/// ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE (ServiceInfo.java:139) and _MANIFEST (:604): the requested type that means "the manifest's".
+const TYPE_NONE: i32 = 0;
+const TYPE_MANIFEST: i32 = -1;
+/// ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC (ServiceInfo.java:173).
+const TYPE_DATA_SYNC: i32 = 1;
+/// Service.STOP_FOREGROUND_REMOVE / STOP_FOREGROUND_DETACH (Service.java:336, :343): setServiceForeground's flags on a stop.
+const STOP_FOREGROUND_REMOVE: i32 = 1;
+const STOP_FOREGROUND_DETACH: i32 = 1 << 1;
+/// Manifest.permission.FOREGROUND_SERVICE, and FOREGROUND_SERVICE_DATA_SYNC (the DATA_SYNC type's permission, ForegroundServiceTypePolicy FGS_TYPE_POLICY_DATA_SYNC).
+const FOREGROUND_SERVICE_PERMISSION: &str = "android.permission.FOREGROUND_SERVICE";
+const FOREGROUND_SERVICE_DATA_SYNC_PERMISSION: &str =
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC";
+
+/// A notification to post once the state lock is released (setServiceForegroundInnerLocked's postNotification, ServiceRecord.java).
+pub(crate) struct Posting {
+    pub(crate) uid: u32,
+    pub(crate) package: String,
+    pub(crate) id: i32,
+    pub(crate) notification: atl_parcelables::android::app::Notification,
+}
 
 /// The binder handles of the rules.
 pub(crate) struct Svc;
@@ -375,7 +406,7 @@ impl Inner {
             Err(e) => {
                 let mut calls = Vec::new();
                 st.services.start_failed(process, uid, &mut calls);
-                self.service_calls.post(calls);
+                self.services_out(st, calls);
                 atl_diag::answered(AM, "service process start failed");
                 Err(e)
             }
@@ -429,7 +460,7 @@ impl Inner {
             self.services_now(),
             &mut calls,
         );
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         if let Err(e) =
             self.bring_up_locked(st, &looked.component.0, &looked.process, looked.uid, need)
         {
@@ -482,10 +513,18 @@ impl Inner {
             ));
         }
         if require_foreground {
-            atl_diag::answered(
-                AM,
-                "startForegroundService: accepted as a start (foreground rules: S7)",
-            );
+            if looked.target_sdk < SDK_O {
+                atl_diag::answered(
+                    AM,
+                    "startForegroundService: targetSdk below 26, plain start (AS :1120-1125)",
+                );
+            }
+            if st.uids.is_idle(looked.uid) {
+                atl_diag::answered(
+                    AM,
+                    "startForegroundService: background restriction not modelled (AS :1036-1052)",
+                );
+            }
         }
         let running = st
             .processes
@@ -506,6 +545,7 @@ impl Inner {
             info: looked.info,
             intent: intent.clone(),
             caller_uid,
+            foreground: require_foreground && looked.target_sdk >= SDK_O,
         };
         let need = st.services.start(
             req,
@@ -514,7 +554,7 @@ impl Inner {
             self.services_now(),
             &mut calls,
         );
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         let name = ComponentName {
             package: looked.component.0.clone(),
             class: looked.component.1.clone(),
@@ -566,7 +606,7 @@ impl Inner {
         };
         let mut calls = Vec::new();
         let stopped = st.services.stop_service(&component, &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         // a released start may leave its process empty: its headless grace starts now (activity.rs touch_all_locked)
         self.touch_all_locked(st);
         i32::from(stopped)
@@ -594,7 +634,7 @@ impl Inner {
         }
         let mut calls = Vec::new();
         let stopped = st.services.stop_self(token, start_id, &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         if stopped {
             self.touch_all_locked(st);
         } else {
@@ -637,7 +677,7 @@ impl Inner {
     ) -> bool {
         let mut calls = Vec::new();
         let found = st.services.unbind(&ConnHandle(conn), &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         // a released binding may leave its process empty: its headless grace starts now (activity.rs touch_all_locked)
         self.touch_all_locked(st);
         found
@@ -650,7 +690,7 @@ impl Inner {
         let restarts =
             st.services
                 .process_died(pid, allow_restart, self.services_now(), &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         for restart in restarts {
             atl_diag::answered(AM, "service restart scheduled (am_handler timer)");
             let at = u64::try_from(restart.at).unwrap_or(0);
@@ -669,7 +709,7 @@ impl Inner {
         let need = st
             .services
             .restart(&component, host, self.services_now(), &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(&mut st, calls);
         if let Err(e) = self.bring_up_locked(&mut st, &component.0, &process, uid, need) {
             log(format_args!(
                 "restart of {}/{} failed: {e}",
@@ -719,7 +759,7 @@ impl Inner {
         let mut calls = Vec::new();
         st.services
             .start_failed(&rec.process_name, rec.uid, &mut calls);
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         let key = ProcKey {
             name: rec.process_name.clone(),
             uid: rec.uid,
@@ -761,7 +801,7 @@ impl Inner {
                 stopped += 1;
             }
         }
-        self.service_calls.post(calls);
+        self.services_out(st, calls);
         if stopped > 0 {
             atl_diag::answered(AM, "service stopped: app idle (stopInBackgroundLocked)");
             self.touch_all_locked(st);
@@ -780,7 +820,215 @@ impl Inner {
         let mut calls = Vec::new();
         st.services
             .attach(pid, &process, uid, &thread, self.services_now(), &mut calls);
+        self.services_out(st, calls);
+    }
+
+    /// The services' outbound effects under `st`: the calls go out in order, then the foreground changes the rules made are applied (foreground_effects_locked).
+    fn services_out(&self, st: &mut State, calls: Vec<Call<Svc>>) {
         self.service_calls.post(calls);
+        self.foreground_effects_locked(st);
+    }
+
+    /// The foreground changes the rules made under the lock. The fgRequired timers are armed for SERVICE_START_FOREGROUND_TIMEOUT_MS from now (AS :7731-7737, at the delivery).
+    /// An ended foreground state drops its uid's FGS reason (uid_state; the settle sweep arms if the uid is now idle) and cancels its notification.
+    fn foreground_effects_locked(&self, st: &mut State) {
+        let fx = st.services.take_foreground();
+        let now = self.now_ms();
+        for component in fx.arms {
+            self.arm(
+                Timer::FgsStart(component),
+                now + SERVICE_START_FOREGROUND_TIMEOUT_MS,
+            );
+        }
+        for end in fx.ends {
+            if end.was_foreground {
+                atl_diag::answered(AM, "foreground service ended: uid FGS reason drops");
+                let at = st.uids.on_fgs_stopped(end.uid, now);
+                self.arm_settle(end.uid, at);
+            }
+            if let Some(id) = end.cancel_notice {
+                self.notices.cancel(&end.component.0, id);
+            }
+        }
+    }
+
+    /// The fgRequired timer of `component` (serviceForegroundTimeout, AS :7597-7628): a service still waiting for startForeground is stopped (stopServiceLocked, which clears its
+    /// start). The ANR that follows 10 s later (AS :7640) is not modelled. A timer whose wait is over is discarded (AS :7610-7613).
+    pub(crate) fn foreground_timeout(&self, component: (String, String)) {
+        let mut st = self.state();
+        if !st.services.foreground_expired(&component) {
+            return;
+        }
+        atl_diag::answered(AM, "fgs start timeout: ANR not modelled");
+        log(format_args!(
+            "service {}/{} did not call startForeground within {SERVICE_START_FOREGROUND_TIMEOUT_MS} ms: stopped",
+            component.0, component.1
+        ));
+        let mut calls = Vec::new();
+        st.services.stop_service(&component, &mut calls);
+        self.touch_all_locked(&mut st);
+        self.services_out(&mut st, calls);
+    }
+
+    /// setServiceForegroundLocked (AS :1842) under the state lock, with setServiceForegroundInnerLocked's checks (AS :2165-2260, :2578-2613). `class` and `token` name the
+    /// service (findServiceLocked: a mismatch is a silent no-op). An id makes it foreground and its uid's FGS reason starts; the notification comes back to post once the lock is
+    /// released. Id 0 is stopForeground: `flags` REMOVE cancels the notification, DETACH forgets it. `requested` is the type the service passed (MANIFEST: its manifest's).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_service_foreground_locked(
+        &self,
+        st: &mut State,
+        class: Option<&ComponentName>,
+        token: Option<&SpIBinder>,
+        id: i32,
+        notification: Option<&Notification>,
+        flags: i32,
+        requested: i32,
+    ) -> binder::Result<Option<Posting>> {
+        let (Some(class), Some(token)) = (class, token) else {
+            atl_diag::answered(AM, "setServiceForeground: no such service");
+            return Ok(None);
+        };
+        let Some(component) = st
+            .services
+            .component_of(token)
+            .filter(|c| c.0 == class.package && c.1 == class.class)
+        else {
+            atl_diag::answered(
+                AM,
+                "setServiceForeground: no such service (name or token differ)",
+            );
+            return Ok(None);
+        };
+        let Some(package) = self.packages.by_name(&component.0) else {
+            return Ok(None);
+        };
+        let (uid, target_sdk) = (package.uid, package.app().target_sdk_version);
+        if id == 0 {
+            st.services.stop_foreground(
+                token,
+                flags & STOP_FOREGROUND_REMOVE != 0,
+                flags & STOP_FOREGROUND_DETACH != 0,
+            );
+            self.foreground_effects_locked(st);
+            return Ok(None);
+        }
+        let Some(notification) = notification else {
+            atl_diag::refused(AM, "setServiceForeground: null notification");
+            return Err(super::illegal_argument("null notification"));
+        };
+        // FOREGROUND_SERVICE is enforced from targetSdk P (AS :2197-2198), against the service's app
+        if target_sdk >= SDK_P && !self.holds(uid, FOREGROUND_SERVICE_PERMISSION) {
+            atl_diag::refused(
+                AM,
+                "setServiceForeground: FOREGROUND_SERVICE permission denied",
+            );
+            return Err(security(&format!(
+                "Permission Denial: startForeground from uid {uid} requires {FOREGROUND_SERVICE_PERMISSION}"
+            )));
+        }
+        // the requested type is the manifest's, or a subset of it (AS :2204-2229; debug.skip_fgs_manifest_type_check unset)
+        let manifest = st
+            .services
+            .info_of(token)
+            .map_or(TYPE_NONE, |i| i.foreground_service_type);
+        let ty = if requested == TYPE_MANIFEST {
+            manifest
+        } else {
+            requested
+        };
+        if ty & !manifest != 0 {
+            atl_diag::refused(
+                AM,
+                "setServiceForeground: foregroundServiceType is not a subset of the manifest's",
+            );
+            return Err(super::illegal_argument(&format!(
+                "foregroundServiceType 0x{ty:08X} is not a subset of foregroundServiceType attribute 0x{manifest:08X} in service element of manifest file"
+            )));
+        }
+        let pid = st.services.host_of(token).unwrap_or(-1);
+        // the type policy (ForegroundServiceTypePolicy: NONE is disabled from targetSdk 34; AS validateForegroundServiceType :2883-2890)
+        if ty == TYPE_NONE && target_sdk >= SDK_UPSIDE_DOWN_CAKE {
+            return Err(if requested == TYPE_MANIFEST {
+                atl_diag::refused(
+                    AM,
+                    "setServiceForeground: MissingForegroundServiceTypeException",
+                );
+                super::illegal_state(&format!(
+                    "Starting FGS without a type  callerApp=pid {pid} targetSDK={target_sdk}"
+                ))
+            } else {
+                atl_diag::refused(
+                    AM,
+                    "setServiceForeground: InvalidForegroundServiceTypeException",
+                );
+                super::illegal_state(&format!(
+                    "Starting FGS with type none callerApp=pid {pid} targetSDK={target_sdk} has been prohibited"
+                ))
+            });
+        }
+        if ty & TYPE_DATA_SYNC != 0 {
+            atl_diag::answered(AM, "fgs type timeout not modelled: dataSync");
+            if target_sdk >= SDK_UPSIDE_DOWN_CAKE
+                && !self.holds(uid, FOREGROUND_SERVICE_DATA_SYNC_PERMISSION)
+            {
+                atl_diag::refused(
+                    AM,
+                    "setServiceForeground: FOREGROUND_SERVICE_DATA_SYNC permission denied",
+                );
+                return Err(security(&format!(
+                    "Permission Denial: starting FGS with type dataSync requires {FOREGROUND_SERVICE_DATA_SYNC_PERMISSION}"
+                )));
+            }
+        }
+        if ty & !TYPE_DATA_SYNC != 0 {
+            atl_diag::answered(AM, "fgs type permission not modelled: other types");
+        }
+        if st.uids.is_idle(uid) {
+            atl_diag::answered(
+                AM,
+                "setServiceForeground: background restriction not modelled (AS :2283)",
+            );
+        }
+        let Some(set) = st.services.set_foreground(token, Foreground { id, ty }) else {
+            return Ok(None);
+        };
+        if set.first {
+            st.uids.on_fgs_started(uid);
+        }
+        if let Some(old) = set.cancel {
+            self.notices.cancel(&component.0, old);
+        }
+        atl_diag::answered(AM, "setServiceForeground: foreground (notification posted)");
+        // setServiceForegroundInnerLocked :2626: the notification is the foreground one (fixNotification keeps the flag)
+        let mut notification = notification.clone();
+        notification.flags |= FLAG_FOREGROUND_SERVICE;
+        Ok(Some(Posting {
+            uid,
+            package: component.0,
+            id,
+            notification,
+        }))
+    }
+
+    /// getForegroundServiceTypeLocked (AS :1864-1876): the type of the foreground service `class` and `token` name; NONE when it is not foreground or not named.
+    pub(crate) fn foreground_service_type_locked(
+        &self,
+        st: &State,
+        class: Option<&ComponentName>,
+        token: Option<&SpIBinder>,
+    ) -> i32 {
+        let (Some(class), Some(token)) = (class, token) else {
+            return TYPE_NONE;
+        };
+        let named = st
+            .services
+            .component_of(token)
+            .is_some_and(|c| c.0 == class.package && c.1 == class.class);
+        if named {
+            st.services.foreground_type(token)
+        } else {
+            TYPE_NONE
+        }
     }
 
     /// The services' own bind (JobServiceContext's bindServiceAsUser): as the system uid, no client process.

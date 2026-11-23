@@ -31,7 +31,7 @@ use atl_parcelables::android::app::{
     ActivityManager_MemoryInfo, ActivityManager_PendingIntentInfo,
     ActivityManager_ProcessErrorStateInfo, ActivityManager_RunningAppProcessInfo,
     ActivityManager_TaskDescription, ApplicationErrorReport_ParcelableCrashInfo,
-    ContentProviderHolder,
+    ContentProviderHolder, Notification,
 };
 use atl_parcelables::android::content::pm::{ActivityInfo, ProviderInfo, ProviderInfoList};
 use atl_parcelables::android::content::res::{CompatibilityInfo, Configuration};
@@ -506,6 +506,9 @@ enum KillReason {
 /// AMS PROC_START_TIMEOUT (ActivityManagerService.java:568, 10 s x HW_TIMEOUT_MULTIPLIER = 1): a started process must attach within it, else it failed to start.
 const PROC_START_TIMEOUT_MS: u64 = 10_000;
 
+/// AMC DEFAULT_SERVICE_START_FOREGROUND_TIMEOUT_MS (ActivityManagerConstants.java:318, 30 s): a startForegroundService's service must call startForeground within it.
+const SERVICE_START_FOREGROUND_TIMEOUT_MS: u64 = 30_000;
+
 /// The activity service's delayed messages (am_handler.rs), keyed by what each concerns.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Timer {
@@ -525,6 +528,8 @@ enum Timer {
     ColdStart { key: ProcKey, token: u64 },
     /// a temp allowlist grant's expiry, by uid (uid_state `on_temp_expired`): the uid settles at the deadline that returns (`UidSettle`)
     TempExpiry(u32),
+    /// a started foreground service's startForeground deadline (SERVICE_START_FOREGROUND_TIMEOUT_MS), by component; armed when the start is delivered (AS :6199-6204)
+    FgsStart((String, String)),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -799,6 +804,8 @@ struct Inner {
     empty_grace_ms: u64,
     /// `--window-close-stops-services`: a window's close ends its processes' services without a restart (AOSP restarts STICKY ones)
     window_close_stops_services: bool,
+    /// the foreground service notifications (ServiceRecord.postNotification): posted and cancelled as the app's own (notification.rs)
+    notices: Arc<dyn crate::notification::ForegroundNotices>,
     /// bindApplication's `services` (mAppBindArgs, [`common_services`]), built at the first bind
     common_services: std::sync::OnceLock<Map>,
 }
@@ -917,6 +924,7 @@ impl ActivityManager {
         bind_services: bool,
         empty_grace_ms: u64,
         window_close_stops_services: bool,
+        notices: Arc<dyn crate::notification::ForegroundNotices>,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -964,6 +972,7 @@ impl ActivityManager {
                     origin: std::time::Instant::now(),
                     empty_grace_ms,
                     window_close_stops_services,
+                    notices,
                     common_services: std::sync::OnceLock::new(),
                 }
             }),
@@ -1157,7 +1166,7 @@ impl Inner {
     }
 
     /// ActivityTaskSupervisor.killTaskProcessesIfPossible: the processes of the Task's package and uid end, unless one of them holds an activity in another Task (then none ends).
-    /// A foreground service does not keep them (Q-B1, M29: nothing on the desktop shows or stops it yet). Killed after the state lock is released.
+    /// A foreground service does not keep them (D1 = M29: the process ends with its last window; the FGS notification's Stop action is notifications N6, not on main). Killed after the state lock is released.
     fn kill_task_processes(&self, task: TaskId) {
         self.kill_armed
             .lock()
@@ -1434,6 +1443,7 @@ impl Inner {
             Timer::Broadcast { pid, id, index } => self.broadcast_timeout(pid, id, index),
             Timer::ColdStart { key, token } => self.cold_start_timeout(&key, token),
             Timer::TempExpiry(uid) => self.temp_expired(uid),
+            Timer::FgsStart(component) => self.foreground_timeout(component),
         }
     }
 
@@ -1475,7 +1485,7 @@ impl Inner {
     }
 
     /// What holds the process (uid_state::Holdings): a visible Task, a started service or BIND_AUTO_CREATE binding (service_records.rs held_by, a waiting start included), a manifest
-    /// delivery in flight or waiting for it (the dispatcher's queue). FGS (S7) holds nothing yet.
+    /// delivery in flight or waiting for it (the dispatcher's queue). A foreground service holds its process (uid_state `ends`: a process with an FGS is never empty).
     fn holdings_locked(&self, st: &State, r: &ProcessRecord) -> uid_state::Holdings {
         let held = st.services.held_by(r.pid, &r.process_name, r.uid);
         let key = ProcKey {
@@ -1487,7 +1497,7 @@ impl Inner {
                 .attached
                 .as_ref()
                 .is_some_and(|a| self.atm.hosts_activity(&a.thread.as_binder())),
-            fgs: false,
+            fgs: !st.services.foreground_of_pid(r.pid).is_empty(),
             started_service: held.started,
             auto_create_binding: held.bound,
             receiver: st.dispatcher.holds(&key),
@@ -2484,7 +2494,7 @@ impl IActivityManager for ActivityManager {
 
     /// ActivityManagerService.startService -> ActiveServices.startServiceLocked (active_services.rs). A caller that names an app must be an attached one
     /// (SecurityException). The answer is the ComponentName ContextImpl reads: the service's own, the `!` / `?` / `!!` sentinels, or null for no such service.
-    /// `require_foreground` (startForegroundService) is accepted as a start: the foreground rules are S7's, counted there.
+    /// `require_foreground` (startForegroundService): the wait for startForeground is the service's (service_records.rs, armed at the delivery).
     fn r#startService(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
@@ -2556,6 +2566,48 @@ impl IActivityManager for ActivityManager {
         Ok(self
             .inner
             .stop_self_locked(&mut st, class_name, token, start_id))
+    }
+
+    /// ActivityManagerService.setServiceForeground -> ActiveServices.setServiceForegroundLocked (active_services.rs): the checks and the state under the lock; the notification
+    /// is posted (or an old one cancelled) after the lock is released. An unknown service is a silent no-op, as AOSP's findServiceLocked.
+    fn r#setServiceForeground(
+        &self,
+        class_name: Option<&ComponentName>,
+        token: Option<&SpIBinder>,
+        id: i32,
+        notification: Option<&Notification>,
+        flags: i32,
+        foreground_service_type: i32,
+    ) -> binder::Result<()> {
+        let inner = &self.inner;
+        let posting = {
+            let mut st = inner.state();
+            inner.set_service_foreground_locked(
+                &mut st,
+                class_name,
+                token,
+                id,
+                notification,
+                flags,
+                foreground_service_type,
+            )?
+        };
+        if let Some(p) = posting {
+            inner.notices.post(p.uid, &p.package, p.id, &p.notification);
+        }
+        Ok(())
+    }
+
+    /// ActivityManagerService.getForegroundServiceType -> ActiveServices.getForegroundServiceTypeLocked: the type of the named service while it is foreground, else NONE.
+    fn r#getForegroundServiceType(
+        &self,
+        class_name: Option<&ComponentName>,
+        token: Option<&SpIBinder>,
+    ) -> binder::Result<i32> {
+        let st = self.inner.state();
+        Ok(self
+            .inner
+            .foreground_service_type_locked(&st, class_name, token))
     }
 
     /// serviceDoneExecuting (oneway): the app finished a scheduled service call (ActiveServices.serviceDoneExecutingLocked, active_services.rs).
@@ -3615,6 +3667,7 @@ mod tests {
             true,
             uid_state::BACKGROUND_SETTLE_TIME_MS,
             true,
+            Arc::new(crate::notification::NoForegroundNotices),
         )
     }
 
@@ -3782,6 +3835,7 @@ mod tests {
             true,
             uid_state::BACKGROUND_SETTLE_TIME_MS,
             true,
+            Arc::new(crate::notification::NoForegroundNotices),
         )
     }
 

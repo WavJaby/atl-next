@@ -303,6 +303,13 @@ fn main() -> Result<()> {
     let tasks = Arc::new(atl_services::tasks::Tasks::new(display, a.locale));
     // the display listeners of the apps (IDisplayManager.registerCallback): the display service takes them, the registry tells them of a change
     let display_callbacks = Arc::new(atl_services::display::DisplayCallbacks::default());
+    // the notification service's state: the activity service posts and cancels the foreground service notifications through it (ServiceRecord.postNotification)
+    let notices = Arc::new(atl_services::notification::Notices::new(
+        Arc::clone(&tasks),
+        Arc::clone(&permissions),
+        packages.clone(),
+        desktop,
+    ));
     let activity = ActivityManager::new(
         packages.clone(),
         Arc::clone(&permissions),
@@ -315,6 +322,7 @@ fn main() -> Result<()> {
         !a.no_bind_service,
         a.empty_process_grace_ms,
         a.window_close_stops_services,
+        notices.clone(),
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()
@@ -574,16 +582,7 @@ fn main() -> Result<()> {
         )
         .context("addService permissionmgr")?;
     }
-    binder::add_service(
-        NOTIFICATION,
-        atl_services::notification::new_binder(
-            Arc::clone(&tasks),
-            Arc::clone(&permissions),
-            Arc::clone(&packages),
-            desktop,
-        ),
-    )
-    .context("addService notification")?;
+    binder::add_service(NOTIFICATION, notices.binder()).context("addService notification")?;
     binder::add_service(
         ALARM,
         atl_services::alarm::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
