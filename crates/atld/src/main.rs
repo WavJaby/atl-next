@@ -708,13 +708,18 @@ fn font_mounts() -> Result<Vec<Mount>> {
         .collect())
 }
 
-/// What atld's own display probes (atl-egl-probe, before any app) read from the desktop: the compositor socket as-is and [`font_mounts`]; no app code runs in them, so no security context. No compositor socket is an error.
-fn desktop_mounts() -> Result<Vec<Mount>> {
-    let socket = atl_platform_host::app_access::wayland_socket()
-        .context("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)")?;
-    Ok(std::iter::once(ro_at_own_path(&socket))
-        .chain(font_mounts()?)
-        .collect())
+/// What atld's own display probes (atl-egl-probe, before any app) read from the desktop: the compositor socket as-is ([`probe_socket`]) and [`font_mounts`]; no app code runs in them, so no security context.
+fn desktop_mounts(ui: bool) -> Result<Vec<Mount>> {
+    let socket = probe_socket(atl_platform_host::app_access::wayland_socket(), ui)?;
+    Ok(socket.into_iter().chain(font_mounts()?).collect())
+}
+
+/// The display probes' compositor socket. A UI run without one is an error: it cannot show a window. A headless run's renderer probe asks the display too, and `no Wayland display` is one of its answers (node::choose_allocator_tier).
+fn probe_socket(socket: Option<PathBuf>, ui: bool) -> Result<Option<Mount>> {
+    if ui && socket.is_none() {
+        bail!("--ui: no compositor socket (WAYLAND_DISPLAY / XDG_RUNTIME_DIR)");
+    }
+    Ok(socket.as_deref().map(ro_at_own_path))
 }
 
 /// The compositor a UI run's apps connect to: its socket (atl_platform_host::app_access::wayland_socket) and, where it offers `wp_security_context_manager_v1`, the per-process contexts an app connects through instead
@@ -2553,7 +2558,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 // every GPU's class: the probe asks which one the display picks, and NVIDIA's EGL opens its nodes even to decline
                 spawn.devices = gpu::all_device_classes().context("the GPUs' device nodes")?;
                 log(format_args!("gpu-probe: devices {:?}", spawn.devices));
-                spawn.mounts.extend(desktop_mounts()?);
+                spawn.mounts.extend(desktop_mounts(true)?);
                 let mut p = broker
                     .spawn(spawn)
                     .with_context(|| format!("starting {}", probe.display()))?;
@@ -2685,7 +2690,7 @@ fn run(a: &Args) -> Result<ExitCode> {
                 spawn.args.push("--render-env".into());
                 spawn.args.push(kv);
             }
-            spawn.mounts.extend(desktop_mounts()?);
+            spawn.mounts.extend(desktop_mounts(a.ui.is_some())?);
             let mut p = broker
                 .spawn(spawn)
                 .with_context(|| format!("starting {}", probe.display()))?;
@@ -3628,6 +3633,20 @@ mod tests {
         );
         assert!(dir.join("a.apk").exists() && dir.join("b.apk").exists());
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A headless run on a target without a compositor (an ssh host with no session) still starts: only a UI run needs the socket. With one, both kinds show it at its own path, read-only.
+    #[test]
+    fn only_a_ui_run_needs_the_compositor_socket() {
+        let socket = PathBuf::from("/run/user/1/wayland-0");
+        for ui in [false, true] {
+            let m = probe_socket(Some(socket.clone()), ui)
+                .expect("socket")
+                .expect("mount");
+            assert!(m.host == socket && m.at == socket && !m.writable);
+        }
+        assert!(probe_socket(None, true).is_err());
+        assert_eq!(probe_socket(None, false).expect("headless"), None);
     }
 
     #[test]
