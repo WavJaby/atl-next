@@ -50,7 +50,7 @@ pub fn process_info_answer(found: Option<ProcessState>) -> (i32, i32) {
 /// processinfo's lookup for `pid` as the caller (binderd tag `calling_tag`) numbers it: the state of the process that `pid_seen_by` maps to it. `procs` holds (tag, program pid, state) of the attached processes.
 /// None when no process is: pid 0 names none (pid_seen_by answers 0 for an invisible process).
 pub fn state_of_pid(
-    procs: impl Iterator<Item = (i32, Option<i32>, ProcessState)>,
+    mut procs: impl Iterator<Item = (i32, Option<i32>, ProcessState)>,
     calling_tag: i32,
     pid: i32,
 ) -> Option<ProcessState> {
