@@ -346,7 +346,7 @@ impl Stage {
 
 /// The stages whose run ends when their probe is done, not at the watch's end: the ime probe kills the app and relaunches it, a cold start (8-20 s under load, 2026-11-21) the 12 s watch
 /// cut short, so the stop landed anywhere in the relaunch (its bind missing, the death counted from the exit summary, the relaunched process's half-started counters judged). LIMIT still bounds it.
-/// webview-overlay: its probe waits for every answer it judges (the last Esc's back line), so the rest of its 30 s watch was idle time (rows 49-55 s, 2026-11-21).
+/// webview-overlay: its probe waits for every answer it judges (the last Esc's back line or decision line), so the rest of its 30 s watch was idle time (rows 49-55 s, 2026-11-21).
 /// aux-process: its probe waits for the dialog after a cold start of the new `:aux` process, as long as the ime relaunch.
 fn probe_ends_run(stage: Stage) -> bool {
     matches!(
@@ -359,8 +359,7 @@ fn probe_ends_run(stage: Stage) -> bool {
 /// sub-gates judge, so after it the watch only looks for a fault its last input caused, and the resume path's derivation of WINDOW_MS (a failure shows within ms) holds for that input too.
 /// The composer's counters line lags work by at most 1 s (atl-composer host.rs COUNTERS_PERIOD_NS), inside the grace. Per stage (check rows):
 /// surface-view: its last wait is the offscreen commit line, then the second settled picture; tiled: the tile rewrite and pictures come at the first draw, the probe's last wait the block's pong;
-/// ime: the relaunched window's rebind line; webview-overlay: the last Esc's back line. Not here: slow-display (warm-up / steady / block / tail phases are the assertion), ui-block (its timed
-/// commit-flow check spans the watch), and stages nobody audited for this. `--hold` keeps the fixed watch.
+/// ime: the relaunched window's rebind line; webview-overlay: the last Esc's back or decision line. Not here: slow-display (warm-up / steady / block / tail phases are the assertion), ui-block (its timed commit-flow check spans the watch), and stages nobody audited for this. `--hold` keeps the fixed watch.
 fn probe_bounds_watch(stage: Stage) -> bool {
     matches!(
         stage,
@@ -485,8 +484,7 @@ const GTK_WINDOW_MS: u64 = 10_000;
 const DIALOG_WINDOW_MS: u64 = 30_000;
 /// The widgets stage's watch after the marker: the first draw and the readback, then three injections, each waiting up to LINE_WAIT for its fixture line.
 const WIDGETS_WINDOW_MS: u64 = 12_000;
-/// The webview-overlay stage's watch after the marker: the WebView's late add and load (~5 s measured on a quiet host), paint settle 2 s, resize settle 2 s, then a click and three Escs, each up to its 5 s
-/// INPUT_WAIT (webview_overlay.rs): ~29 s at worst.
+/// The webview-overlay stage's watch after the marker: the WebView's late add and load (~5 s measured on a quiet host), paint settle 2 s, resize settle 2 s, then a click and three Escs, each up to its 5 s INPUT_WAIT (webview_overlay.rs; an AOSP-map Esc ends at its decision line): ~29 s at worst.
 const WEBVIEW_OVERLAY_WINDOW_MS: u64 = 30_000;
 /// The resize stage's watch after the marker: the first draw, then each configure (acked within PONG_WAIT) with RESIZE_SETTLE for the relayout, the presents and the readback.
 const RESIZE_WINDOW_MS: u64 = 18_000;

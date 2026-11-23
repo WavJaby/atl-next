@@ -63,8 +63,16 @@ const PLACED: &str = "atl-platform-ui: sideband ";
 const KEY_ESC: u32 = 1;
 /// After the load, WebKit's first paint (one web-process frame and one present; generous for a loaded host), as the webview stage.
 const PAINT_SETTLE: Duration = Duration::from_secs(2);
-/// One Looper trip plus one web-process round trip per input; generous for a loaded host.
+/// One input's answer: a back line (one web-process round trip), or an AOSP-map Esc's decision line ([`DECIDED`]); generous for a loaded host.
 const INPUT_WAIT: Duration = Duration::from_secs(5);
+/// The Escs one run sends: esc-page-back, esc-dismiss and esc-game each judge one.
+const ESCS: usize = 3;
+/// atl-composer's line for each unhandled key, logged before the key's fallback is published (input/mod.rs `drain_finished`): `input: unhandled key seq <n> action <a> code <c> fallback <code|none>`.
+/// The Esc's UP (ACTION_UP, KEYCODE_ESCAPE) with `fallback none` is the absence fence: AOSP's map gives Esc no fallback and the composer publishes nothing more for that key, so no Back for it can come after the line.
+/// Ordering: the decision and its publish are on one composer thread, the line before the publish, in the one log the harness reads.
+const DECIDED: &str = "input: unhandled key ";
+const ESC_UP_NONE: &str = " action 1 code 111 fallback none";
+
 /// The resizes: logical sizes (gate output scale 1: physical too), serials past the first configures'. A shrink from the default window in both axes, then a grow in height only (the maintainer's
 /// case: window made taller, page kept its old height). The check runs on the last one.
 const RESIZES: [(i32, i32, u32); 2] = [(720, 400, 4242), (720, 800, 4243)];
@@ -209,6 +217,13 @@ fn focus_return_check(app: &str) -> Result<String, String> {
     }
 }
 
+/// The Escs the composer decided with no fallback at their UP line (AOSP's map): each one's absence of Back is complete there ([`DECIDED`]).
+fn decided_none(app: &str) -> usize {
+    app.lines()
+        .filter(|l| l.contains(DECIDED) && l.contains(ESC_UP_NONE))
+        .count()
+}
+
 /// The sub-gates. `focused`: the click is expected to move Android focus to the WebView ([`tap_focus_check`]).
 pub fn checks(app: &str, esc_back: bool, focused: bool) -> Vec<Sub> {
     let has = |s: &str| app.contains(s);
@@ -220,11 +235,17 @@ pub fn checks(app: &str, esc_back: bool, focused: bool) -> Vec<Sub> {
         }
     };
     let no_back = || {
+        let none = decided_none(app);
         if [BACK_PAGE, BACK_DISMISSED, BACK_GAME]
             .iter()
             .any(|b| has(b))
         {
             Err("a back without the Esc -> Back adaptation (AOSP: Esc has no fallback)".to_owned())
+        } else if none != ESCS {
+            // a run short of its decision lines is red: the absence is judged at each line, not by a timed wait
+            Err(format!(
+                "{none} of {ESCS} Escs decided with no fallback at their UP line"
+            ))
         } else {
             Ok("no back (AOSP map)".to_owned())
         }
@@ -435,14 +456,16 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
     let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| {
         t.contains(&format!("{TITLE}scrolled"))
     });
-    // each Esc waits for one more back line of any kind, so a wrong answer does not cost the next Esc its time
+    // each Esc waits for one more back line of any kind, so a wrong answer does not cost the next Esc its time.
+    // An Esc whose UP is decided with no fallback ([`DECIDED`]) ends its wait at that line: no back can come after it, so no timed wait. An Esc with a fallback still to come waits for its back line.
     let backs = |t: &str| t.matches("AtlWindow: wvo back ").count();
-    for _ in 0..3 {
-        let before = std::fs::read_to_string(app_log)
-            .map(|t| backs(&t))
-            .unwrap_or(0);
+    for _ in 0..ESCS {
+        let text = std::fs::read_to_string(app_log).unwrap_or_default();
+        let (backs_before, none_before) = (backs(&text), decided_none(&text));
         esc(&proxy)?;
-        let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| backs(t) > before);
+        let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| {
+            backs(t) > backs_before || decided_none(t) > none_before
+        });
     }
     Ok(Liveness::default())
 }
@@ -545,5 +568,52 @@ mod tests {
         assert_eq!(esc_targets(true, true), (2, 1));
         let touch = "x AtlWindow: wvo focus gl\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo gl key 111\nx AtlWindow: wvo gl key 111\n";
         assert!(tap_focus_check(touch, false).is_ok() && tap_focus_check(touch, true).is_err());
+    }
+
+    /// AOSP's map: each Esc's UP is decided with no fallback, and the absence is judged at that line. A back before the first line is a duplicate, red at the wait.
+    /// A run short of its third line is red, not a pass by timeout, focused or not. A decision with a fallback is no line of none: its back is still to come.
+    #[test]
+    fn absence_is_judged_at_the_decision_line() {
+        let one_esc = |down: u32| {
+            format!(
+                "x AtlWindow: wvo gl key 111\nx input: unhandled key seq {down} action 0 code 111 fallback none\n\
+                 x input: unhandled key seq {} action 1 code 111 fallback none\n",
+                down + 1
+            )
+        };
+        let fenced = format!(
+            "x AtlWindow: wvo focus gl\n{}{}{}",
+            one_esc(1),
+            one_esc(3),
+            one_esc(5)
+        );
+        assert_eq!(decided_none(&fenced), ESCS);
+        let esc_game = |log: &str, focused: bool| {
+            checks(log, false, focused)
+                .into_iter()
+                .find(|(n, _)| *n == "esc-game")
+                .map(|(_, r)| r)
+                .expect("sub-gate")
+        };
+        assert!(esc_game(&fenced, false).is_ok() && esc_game(&fenced, true).is_ok());
+        // a deliberate duplicate: a back the first Esc did not earn, logged before its decision line
+        let duplicate = fenced.replacen(
+            "x input: unhandled key seq 2 ",
+            "x AtlWindow: wvo back game\nx input: unhandled key seq 2 ",
+            1,
+        );
+        assert!(esc_game(&duplicate, false).is_err());
+        let unfenced = fenced.replace(
+            "x input: unhandled key seq 6 action 1 code 111 fallback none\n",
+            "",
+        );
+        assert!(esc_game(&unfenced, false).is_err() && esc_game(&unfenced, true).is_err());
+        // a fallback still to come (BACK on the first Esc's UP): not a decision of none
+        let pending = fenced.replace(
+            "seq 2 action 1 code 111 fallback none",
+            "seq 2 action 1 code 111 fallback 4",
+        );
+        assert_eq!(decided_none(&pending), 2);
+        assert!(esc_game(&pending, false).is_err());
     }
 }
