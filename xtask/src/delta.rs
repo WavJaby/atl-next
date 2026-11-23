@@ -8,7 +8,7 @@
 //! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits (the line names the holders).
 //! A process still holding it when the command returns (a daemon a build spawned: sccache server, gradle, kotlin) may still use the overlay, so the outer command ends it ([`end_holders`]): the mount and everything using it end with the command.
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
-//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends the build to the pool; an existing ram dir is dropped first ([`fall_to_pool`]).
+//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends a new dir to the pool; an existing ram dir is kept and its build refused ([`fall_to_pool`]): admission never drops a dir.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -810,7 +810,7 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     let (reservation, stats, need_ram) = match admitted {
         Ok(a) => a,
         Err(Verdict::Admit { .. }) => bail!("delta admission returned Admit as a refusal"),
-        Err(v) => return fall_to_pool(&ws, &id, class, rec, v),
+        Err(v) => return fall_to_pool(&ws, &id, class, rec.as_ref(), v),
     };
     match rec {
         Some(r) => {
@@ -873,32 +873,31 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     Ok(Some(code))
 }
 
-/// The pool tier for a build that admission does not admit: the same remedy for every verdict (Refuse, Held, NeverFits). An existing ram dir is dropped first and the caller makes the pool dir from base; its upper is regenerable build output. A dir mounted by a command of this checkout is live state: not dropped, the build stops (`delta-refused`). One line names the verdict; `delta-dropped` counts a drop, `delta-pool` every pool build.
+/// The verdict of a build that admission does not admit (Refuse, Held, NeverFits). A new dir takes the pool: nothing to keep, one line. An existing ram dir is never dropped here: its upper holds the outputs and the `built-from` record of the checkout's last build, and a pool dir from base starts without them (check then refuses it as built from another source state). The build is refused (exit 1) and the dir stays, counted `delta-refused`; the line names the verdict and whether a running command holds the dir. Drops stay explicit: `out tier`, a lost store dir, a rebase's refresh.
 fn fall_to_pool(
     ws: &Path,
     id: &str,
     class: Class,
-    rec: Option<Record>,
+    rec: Option<&Record>,
     v: Verdict,
 ) -> Result<Option<ExitCode>> {
     let why = format!("{} build: {}", class.name(), v.reason());
-    let Some(r) = rec else {
-        println!("out: delta pool ({why})");
+    if rec.is_none() {
+        println!("out: delta pool (ws/{id}: {why}; no ram delta yet: nothing to keep)");
         out::count(ws, "delta-pool");
         return Ok(None);
+    }
+    out::count(ws, "delta-refused");
+    // the probe only: nothing is removed, so the lock goes back at once
+    let busy = try_mount_lock(ws, id)?.is_none();
+    let tail = if busy {
+        "in use by a running command of this checkout; run it again when that command ends"
+    } else {
+        "run it again when the store can take it"
     };
-    // the lock stays held across the removal: a second take here would conflict with it (flock per open file)
-    let Some(_mount) = try_mount_lock(ws, id)? else {
-        out::count(ws, "delta-refused");
-        bail!(
-            "ws/{id}: {why}; its ram delta is in use by a running command of this checkout: not dropped, the build did not start (run it again when that command ends)"
-        );
-    };
-    remove_ram(ws, id, &r)?;
-    println!("out: delta pool (ws/{id} ram delta dropped: {why})");
-    out::count(ws, "delta-dropped");
-    out::count(ws, "delta-pool");
-    Ok(None)
+    bail!(
+        "ws/{id}: {why}; its ram delta is kept (outputs and record intact): this build did not start ({tail})"
+    )
 }
 
 /// A process sharing the locked open file of a mount lock: it inherited the fd from the outer command.
@@ -1557,16 +1556,81 @@ mod tests {
         rec
     }
 
-    /// Held from admission, not a built verdict: the land-hold store of `land_hold_keeps_room_for_land` (10 GiB limit, 3 used) holds a check. An existing ram dir falls to the pool: dropped now, counted, nothing refused.
-    #[test]
-    fn held_ram_delta_falls_to_pool() {
+    /// Admission refuses an existing ram dir: its upper holds the outputs of the checkout's last build (and the `built-from` record), its `.delta` record sits in the mount point. Both must survive the refusal; nothing falls to the pool (a fall dropped them, and the next check said "built from another source state"). `want` names the verdict the case must produce.
+    fn refusal_keeps_outputs(
+        tag: &str,
+        probe: impl FnMut() -> Result<std::result::Result<Stats, String>>,
+        want: fn(&Verdict) -> bool,
+    ) {
         let pid = std::process::id();
-        let ws = std::env::temp_dir().join(format!("xtask-delta-held-{pid}"));
-        let store = std::env::temp_dir().join(format!("xtask-delta-held-store-{pid}"));
+        let ws = std::env::temp_dir().join(format!("xtask-delta-kept-{tag}-{pid}"));
+        let store = std::env::temp_dir().join(format!("xtask-delta-kept-store-{tag}-{pid}"));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(out::pool(&ws)).unwrap();
         let rec = ram_dir_fixture(&ws, &store);
+        let built = rec.dir("c").join("upper/target/app.bin");
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, "built").unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let Err(v) = admit(&ws, "c", &cfg, Class::Check, probe).unwrap() else {
+            panic!("{tag}: the check was admitted: no refusal to test");
+        };
+        assert!(want(&v), "{tag}: {v:?}");
+        let msg = format!(
+            "{:#}",
+            fall_to_pool(&ws, "c", Class::Check, Some(&rec), v)
+                .expect_err("a refused ram dir is refused, not dropped")
+        );
+        assert!(msg.contains("outputs and record intact"), "{tag}: {msg}");
+        assert_eq!(std::fs::read_to_string(&built).unwrap(), "built", "{tag}");
+        assert!(out::dir_of(&ws, "c").join(RECORD).is_file(), "{tag}");
+        assert!(rec.dir("c").join("upper").is_dir(), "{tag}");
+        assert_eq!(count_of(&ws, "delta-refused"), 1, "{tag}");
+        assert_eq!(count_of(&ws, "delta-pool"), 0, "{tag}");
+        std::fs::remove_dir_all(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Held (the land hold of `land_hold_keeps_room_for_land`: 10 GiB limit, 3 used) keeps the dir.
+    #[test]
+    fn held_ram_delta_keeps_its_outputs() {
+        refusal_keeps_outputs(
+            "held",
+            || Ok(Ok(stats(10.0, 3.0, 1950))),
+            |v| matches!(v, Verdict::Held(_)),
+        );
+    }
+
+    /// Refuse (store RAM full by its own accounting: 8 GiB limit, 7.5 used) keeps the dir.
+    #[test]
+    fn refused_ram_delta_keeps_its_outputs() {
+        refusal_keeps_outputs(
+            "refused",
+            || Ok(Ok(stats(8.0, 7.5, 1950))),
+            |v| matches!(v, Verdict::Refuse(_)),
+        );
+    }
+
+    /// NeverFits from a failed probe (store unavailable) keeps the dir too: a probe failure is no reason to remove a checkout's state.
+    #[test]
+    fn unprobed_store_keeps_its_ram_delta() {
+        refusal_keeps_outputs(
+            "unprobed",
+            || Ok(Err("store not mounted".to_owned())),
+            |v| matches!(v, Verdict::NeverFits(_)),
+        );
+    }
+
+    /// A build with no ram dir yet takes the pool when admission refuses it: nothing to keep, counted `delta-pool`, nothing refused.
+    #[test]
+    fn new_ram_delta_falls_to_pool() {
+        let pid = std::process::id();
+        let ws = std::env::temp_dir().join(format!("xtask-delta-new-{pid}"));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
@@ -1578,50 +1642,13 @@ mod tests {
         };
         assert!(matches!(v, Verdict::Held(_)), "{v:?}");
         assert!(
-            fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v)
+            fall_to_pool(&ws, "c", Class::Check, None, v)
                 .unwrap()
                 .is_none()
         );
-        assert!(!out::dir_of(&ws, "c").exists());
-        assert!(!rec.dir("c").exists());
-        assert_eq!(count_of(&ws, "delta-dropped"), 1);
         assert_eq!(count_of(&ws, "delta-pool"), 1);
         assert_eq!(count_of(&ws, "delta-refused"), 0);
         std::fs::remove_dir_all(&ws).unwrap();
-        let _ = std::fs::remove_dir_all(&store);
-    }
-
-    /// Refuse from admission: the store's RAM is full by its own accounting (8 GiB limit, 7.5 used), so a check cannot fit whatever is reserved. The ram dir falls to the pool as Held does.
-    #[test]
-    fn refused_ram_delta_falls_to_pool() {
-        let pid = std::process::id();
-        let ws = std::env::temp_dir().join(format!("xtask-delta-refused-{pid}"));
-        let store = std::env::temp_dir().join(format!("xtask-delta-refused-store-{pid}"));
-        let _ = std::fs::remove_dir_all(&ws);
-        let _ = std::fs::remove_dir_all(&store);
-        std::fs::create_dir_all(out::pool(&ws)).unwrap();
-        let rec = ram_dir_fixture(&ws, &store);
-        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
-            .unwrap()
-            .delta;
-        let Err(v) = admit(&ws, "c", &cfg, Class::Check, || {
-            Ok(Ok(stats(8.0, 7.5, 1950)))
-        })
-        .unwrap() else {
-            panic!("the check was admitted on a full store");
-        };
-        assert!(matches!(v, Verdict::Refuse(_)), "{v:?}");
-        assert!(
-            fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!out::dir_of(&ws, "c").exists());
-        assert!(!rec.dir("c").exists());
-        assert_eq!(count_of(&ws, "delta-dropped"), 1);
-        assert_eq!(count_of(&ws, "delta-refused"), 0);
-        std::fs::remove_dir_all(&ws).unwrap();
-        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// The same Held verdict while a command of this checkout still has the dir mounted (its mount lock held by a live process): the upper is live state, so nothing is dropped and the build stops, counted `delta-refused`.
@@ -1643,7 +1670,7 @@ mod tests {
         })
         .unwrap();
         let got = match verdict {
-            Err(v) => fall_to_pool(&ws, "c", Class::Check, Some(rec.clone()), v),
+            Err(v) => fall_to_pool(&ws, "c", Class::Check, Some(&rec), v),
             Ok(_) => panic!("the check was admitted: no hold, so no stop to test"),
         };
         let _ = holder.kill();
@@ -1655,7 +1682,7 @@ mod tests {
         assert!(out::dir_of(&ws, "c").exists());
         assert!(rec.dir("c").join("upper").is_dir());
         assert_eq!(count_of(&ws, "delta-refused"), 1);
-        assert_eq!(count_of(&ws, "delta-dropped"), 0);
+        assert_eq!(count_of(&ws, "delta-pool"), 0);
         std::fs::remove_dir_all(&ws).unwrap();
         let _ = std::fs::remove_dir_all(&store);
     }

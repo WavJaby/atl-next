@@ -77,7 +77,7 @@ pub enum Out {
     },
     /// Remakes this checkout's build dir on delta tier `ram` or `pool` (delta.rs), dropping the current dir (dry run unless --execute).
     ///
-    /// Build commands choose the tier when they make a dir: `ram` for a child when `delta.ram_store` is set, RAM-backed and its build class fits, else `pool`. A ram dir keeps its tier while the store admits it; one the store refuses, holds for land or never fits is dropped and remade on the pool by the next build (`delta-dropped`). `pool` is the baseline. Refused while a command of the checkout runs.
+    /// Build commands choose the tier when they make a dir: `ram` for a child when `delta.ram_store` is set, RAM-backed and its build class fits, else `pool`. A ram dir keeps its tier: a build the store refuses, holds for land or never fits is refused and the dir kept (`delta-refused`); only a new dir takes the pool on refusal. Moving a ram dir to the pool is this command's explicit drop. `pool` is the baseline. Refused while a command of the checkout runs.
     Tier {
         /// `ram` or `pool`.
         #[arg(value_parser = ["ram", "pool"])]
