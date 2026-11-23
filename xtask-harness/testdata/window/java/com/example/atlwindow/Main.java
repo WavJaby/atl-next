@@ -45,8 +45,12 @@ public class Main extends Activity {
     static final int FOREIGN_TASK = Integer.MAX_VALUE;
     /** The activity meta-data whose int value the activity requests with setRequestedOrientation (window-orientation; xtask-harness/src/window.rs stage orientation). */
     static final String REQUEST_ORIENTATION = "atl.requestOrientation";
+    /** The timeout sub-gate's delay (capture.rs `timeout`, armed by F11): the destroy waits this long, past KILL_TASK_PROCESSES_TIMEOUT (activity.rs, 1000 ms), so the services' timer ends the process first. */
+    static final long DESTROY_DELAY_MS = 5000L;
 
     private int frameCallbacks;
+    /** Set by armDestroyDelay (F11): the next onDestroy of this instance waits DESTROY_DELAY_MS. Only the timeout sub-gate presses F11, on the window it relaunched. */
+    private boolean destroyDelayed;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -105,6 +109,14 @@ public class Main extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (destroyDelayed) {
+            Log.i(TAG, "onDestroy delayed ms=" + DESTROY_DELAY_MS);
+            try {
+                Thread.sleep(DESTROY_DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         Log.i(TAG, "onDestroy reached");
     }
 
@@ -153,14 +165,24 @@ public class Main extends Activity {
         Log.i(TAG, "composer GET_COMPOSER status=" + status + " uid=" + Process.myUid());
     }
 
-    /** F12 is the capture stage's trigger for the foreign-close probe; no other stage presses it, so no other stage sends the probe. */
+    /** F12 is the capture stage's trigger for the foreign-close probe; no other stage presses it, so no other stage sends the probe. F11 arms the timeout sub-gate's delayed onDestroy (armDestroyDelay). */
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_F12) {
             removeForeignTask();
             return true;
         }
+        if (keyCode == KeyEvent.KEYCODE_F11) {
+            armDestroyDelay();
+            return true;
+        }
         return super.onKeyUp(keyCode, event);
+    }
+
+    /** The timeout sub-gate's switch (capture.rs `timeout`): the next onDestroy waits DESTROY_DELAY_MS. Logged once armed; the sub-gate waits for that line. */
+    void armDestroyDelay() {
+        destroyDelayed = true;
+        Log.i(TAG, "destroy delay armed");
     }
 
     /**

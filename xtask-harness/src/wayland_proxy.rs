@@ -10,7 +10,7 @@
 //! * `wp_presentation.feedback` (request 1) -> its `wp_presentation_feedback`'s `presented` (event 1) counted by its `kind` flags in [`Presented`]: the host's vsync marking as the compositor sends
 //!   it, independent of the client's reading of it (the window gate's vsync-tier check).
 //!
-//! Injections go to the window's connection: the first to create an `xdg_toplevel` owns them; every other connection forwards only.
+//! Injections go to the window's connection: the first to create an `xdg_toplevel` owns them until that connection ends ([`WindowRelease`]); the next connection to create one then takes them. Every other connection forwards only.
 //! [`Proxy::inject_ping`] writes a synthetic `xdg_wm_base.ping(serial)` to the client between two forwarded messages, which is what a compositor's ping is on the wire. A client whose main loop is blocked reads nothing, so no `pong` comes back; a client iterating answers at once.
 //! [`Proxy::inject_pointer`] writes `wl_pointer` events (enter, leave, motion, button, wheel and finger scrolls, each then `frame`; scrolls honour the bound `wl_seat` version) on the pointer `wl_seat.get_pointer` created, at the surface of the first `xdg_surface` (the window); the client sees them as the compositor's pointer input.
 //! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
@@ -693,7 +693,7 @@ impl Proxy {
             events: tx,
             injections: Arc::clone(&injections),
             wakes: Arc::clone(&wakes),
-            // the connection that owns the window (server_to_client): set once, never handed over
+            // the connection that owns the window (server_to_client): cleared when that connection ends ([`WindowRelease`])
             window: Arc::default(),
             counters: Counters {
                 presented: Arc::clone(&presented),
@@ -1054,6 +1054,22 @@ fn accept_context(listener: &UnixListener, close: &OwnedFd, relay: &Hub) -> Resu
     }
 }
 
+/// Clears the window's owner when the owning connection's `server_to_client` ends, so the next connection that creates an `xdg_toplevel` takes the injections. Without it, a window
+/// relaunched after the owner's close (the capture stage's timeout sub-gate) never receives its key or close: its connection forwards only.
+struct WindowRelease<'a> {
+    window: &'a Shared<Option<usize>>,
+    me: usize,
+}
+
+impl Drop for WindowRelease<'_> {
+    fn drop(&mut self) {
+        let mut owner = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        if *owner == Some(self.me) {
+            *owner = None;
+        }
+    }
+}
+
 fn server_to_client(
     server: &UnixStream,
     client: &UnixStream,
@@ -1063,6 +1079,10 @@ fn server_to_client(
     injections: &Shared<Vec<Injection>>,
     window: &Shared<Option<usize>>,
 ) -> Result<()> {
+    let _release = WindowRelease {
+        window,
+        me: Arc::as_ptr(ids) as usize,
+    };
     let (presented, throttle, hidden, withheld) = {
         let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
         (
@@ -1229,7 +1249,7 @@ fn server_to_client(
             let mut counter = [0u8; 8];
             let _ = read(wake, &mut counter);
         }
-        // only the window's connection takes injections: the first one to create an xdg_toplevel claims them for its lifetime.
+        // only the window's connection takes injections: the first one to create an xdg_toplevel claims them until it ends ([`WindowRelease`]).
         // Every connection is woken per injection, so "has bound xdg_wm_base" raced: a windowless one (another process, or one that binds wm_base and never maps) took the queue and dropped the configure / tap -- drive gate's "no configure ack" and "no frame" (tap lost -> app idle).
         let has_window = ids
             .lock()

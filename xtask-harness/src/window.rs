@@ -156,7 +156,7 @@ pub struct Args {
     #[arg(long, requires = "esc_back")]
     break_esc_back: bool,
     /// Stage capture: atld runs with `--exit-with-last-app true` and the atld-end sub-gate expects the run to end with status 0 after the close's kill, every process atld ran gone; without it,
-    /// atld `false` and the sub-gate expects atld still running after the kill. Run the stage both ways.
+    /// atld `false` and the sub-gate expects atld still running after the kill. Run the stage both ways. The timeout sub-gate (d) needs the run to go on: it runs only without this flag.
     #[arg(long)]
     exit_with_last_app: bool,
     /// Stage capture, with `--exit-with-last-app` only: atld runs with the adaptation off while the check expects the end, so the atld-end sub-gate must fail (the gate's deliberate break).
@@ -2938,6 +2938,8 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         out_dir: work.join("capture"),
         break_caller: args.break_capture_caller,
         seen: Arc::clone(&captured),
+        component: format!("{package}/{activity}"),
+        timeout_close: !args.exit_with_last_app,
     });
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
@@ -3319,7 +3321,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             )]
         }
         (Stage::Capture, Some(_)) => {
-            let mut sub = capture::checks(&captured, opening_size(display), &liveness);
+            let mut sub = capture::checks(
+                &captured,
+                opening_size(display),
+                &liveness,
+                !args.exit_with_last_app,
+            );
             sub.push((
                 "atld-end",
                 capture::atld_end_judged(&captured, &atld_log, ended, args.exit_with_last_app),
