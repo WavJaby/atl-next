@@ -652,6 +652,36 @@ impl Inner {
         }
     }
 
+    /// PROC_START_TIMEOUT_MSG (AMS handleProcessStartOrKillTimeoutLocked :4444, "failed to attach"), for the process started at `start_seq` if it is still unattached: the record
+    /// leaves, the services waiting in it come down (processStartTimedOutLocked :6969, "Forcing bringing down service"), its Task and receivers go as at a death, and the pid is
+    /// killed (killLocked "start timeout"). A process that dies before attach never attaches: this timeout is its only end (AMS has no binder death for it).
+    pub(crate) fn process_start_timed_out(&self, start_seq: i64) {
+        let mut st = self.state();
+        let Some(i) = st
+            .processes
+            .iter()
+            .position(|r| r.start_seq == start_seq && r.attached.is_none())
+        else {
+            return;
+        };
+        let rec = st.processes.remove(i);
+        log(format_args!(
+            "process {} (pid {}) failed to attach: start timeout",
+            rec.process_name, rec.pid
+        ));
+        let mut calls = Vec::new();
+        st.services
+            .start_failed(&rec.process_name, rec.uid, &mut calls);
+        self.service_calls.post(calls);
+        if let Some(task) = rec.task {
+            self.task_gone_locked(&mut st, task);
+        }
+        Self::broadcasts_died(&mut st, rec.pid);
+        self.touch_all_locked(&mut st);
+        drop(st);
+        self.kill(&[rec.pid]);
+    }
+
     /// stopInBackgroundLocked (AS :1685), from a uid's settle sweep: its started services whose start mode is not NORMAL stop (a targetSdk 26+ app, now idle, not persistent).
     pub(crate) fn stop_in_background_locked(&self, st: &mut State, uid: u32) {
         let now = self.now_ms();

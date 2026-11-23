@@ -724,6 +724,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
         started();
+        stickyStart();
         Log.i("AtlTest", "sysanswers: " + sysAnswers());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
@@ -1510,6 +1511,12 @@ public class Main extends Activity {
     /** Main.started: starts AtlStarted's chain (app.rs LOG_LINES startservice, stopservice, stopself). The service logs each row itself. */
     private void started() {
         startService(new Intent(this, AtlStarted.class).setAction(AtlStarted.ACTION_START));
+    }
+
+    /** Main.stickyStart: starts AtlSticky (START_STICKY) and AtlNotSticky (START_NOT_STICKY), each in its own process; app.rs's STICKY case ends both and reads what follows. */
+    private void stickyStart() {
+        startService(new Intent(this, AtlSticky.class).setAction("atl.test.STICKY"));
+        startService(new Intent(this, AtlNotSticky.class).setAction("atl.test.NOTSTICKY"));
     }
 
     private String jobs() {

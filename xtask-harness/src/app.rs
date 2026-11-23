@@ -811,7 +811,7 @@ struct Line {
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
 /// alarm: Main.alarms: both AlarmManager delivery kinds fire once: the RTC_WAKEUP PendingIntent broadcast reaches the registered receiver, and the ELAPSED_REALTIME OnAlarmListener's onAlarm runs (alarm.rs, pending_intent.rs).
 /// startservice, stopservice, stopself: Main.started's chain of AtlStarted (active_services.rs, service_records.rs: the start, stopService, stopSelf). START's onStartCommand (startId 1);
-/// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. Not judged here: a STICKY restart (its process ends; the gate reads only the main process's log, not `<pkg>:<process>.log`).
+/// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. The STICKY restart and the NOT_STICKY process are judged by [`StickyCase`], from their own processes' logs.
 const LOG_LINES: [Line; 32] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
@@ -2449,6 +2449,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 atld_exited,
                 no_marker: format!("no {MARKER:?} line (atld rc {rc})"),
                 local: None,
+                sticky: &StickyCase::default(),
                 desktop: None,
             })?;
             println!("remote test app: transcript {}", log.display());
@@ -2501,15 +2502,21 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the round trip and every Async row run in it too, until they are all logged
     // or RESULT_STALL passes with no new one ([`watch_on`]); the app's death ends the watch, atld outlives it
     let mut ended = ended;
+    let mut sticky = StickyCase::default();
     if passed && ended.is_none() {
         let watch = Instant::now();
         let (mut seen, mut progress) = (0, watch);
         while ended.is_none() {
+            sticky.poll(&run, &m.name);
             let (got, all) = awaited_logged(&read(&app_log));
-            if got > seen {
-                (seen, progress) = (got, Instant::now());
+            if got + sticky.steps() > seen {
+                (seen, progress) = (got + sticky.steps(), Instant::now());
             }
-            if !watch_on(watch.elapsed(), progress.elapsed(), got < all) {
+            if !watch_on(
+                watch.elapsed(),
+                progress.elapsed(),
+                got < all || !sticky.finished(sticky_wall_ms()),
+            ) {
                 break;
             }
             ended = atld_child.try_wait()?;
@@ -2546,13 +2553,228 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         atld_exited: ended.is_some(),
         no_marker,
         local: Some(outside),
+        sticky: &sticky,
         desktop: Some(fake.calls()),
     })
+}
+
+/// The STICKY case's processes (S6c): AtlSticky (START_STICKY) in `:sticky`, AtlNotSticky (START_NOT_STICKY) in `:notsticky`; each in its own process, so its log is
+/// `log/<pkg>:<process>.log`. Once both logged their first start, the gate ends both on purpose (SIGKILL to the host pid atld logged as `started <process>`).
+/// The exemption is these two ends and no other: a killed process is expected, not a fault, and not the run's end (atld's run end follows the first app process, the main one).
+const STICKY_PROC: &str = ":sticky";
+const NOT_STICKY_PROC: &str = ":notsticky";
+/// AtlSticky's first start (startId 1) and its sticky restart (startId 2, null Intent); AtlNotSticky's first start.
+const STICKY_FIRST: &str = "AtlTest: sticky: onStartCommand startId=1 action=atl.test.STICKY";
+const STICKY_RESTART: &str = "AtlTest: sticky: onStartCommand startId=2 action=null";
+const NOT_STICKY_FIRST: &str =
+    "AtlTest: notsticky: onStartCommand startId=1 action=atl.test.NOTSTICKY";
+/// ActivityManagerConstants.java:223 DEFAULT_SERVICE_RESTART_DURATION: a killed service's restart comes this long after the kill (ActiveServices.scheduleServiceRestartLocked).
+const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
+/// ActivityManagerConstants.java:226 DEFAULT_SERVICE_MIN_RESTART_TIME_BETWEEN: a restart of a service that died with another one waits this long after it.
+const SERVICE_MIN_RESTART_TIME_BETWEEN_MS: u64 = 10_000;
+/// ActivityManagerService.java:568 PROC_START_TIMEOUT: the restarted process must attach within it, else it failed to attach (activity.rs PROC_START_TIMEOUT_MS).
+const PROC_START_TIMEOUT_MS: u64 = 10_000;
+/// Above the upper bound: the death's binder notice and the spawn's own latency, which the rule's numbers do not count.
+const STICKY_SLACK_MS: u64 = 1_000;
+/// After the kill, the not-sticky process must stay down this long: the rule's restart of a second service that died with the first one, with its own delay.
+const NOT_STICKY_WINDOW_MS: u64 = SERVICE_RESTART_DURATION_MS + SERVICE_MIN_RESTART_TIME_BETWEEN_MS;
+
+/// The STICKY case's state: [`StickyCase::poll`] in the watch after the marker, [`StickyCase::verdict`] in the judge.
+#[derive(Default)]
+struct StickyCase {
+    /// the kill: wall ms when it was sent, and atld's not-sticky starts logged before it
+    killed: Option<(u64, usize)>,
+    /// the first kill that failed (no pid, or the signal), as the reason
+    kill_failed: Option<String>,
+    /// the sticky restart line's stamp, wall ms
+    restart_ms: Option<u64>,
+}
+
+impl StickyCase {
+    /// Progress steps for the watch: the kill and the restart line.
+    fn steps(&self) -> usize {
+        usize::from(self.killed.is_some()) + usize::from(self.restart_ms.is_some())
+    }
+
+    /// Whether the case has run its course at `now` (wall ms): the restart is logged and the not-sticky window has passed.
+    fn finished(&self, now: u64) -> bool {
+        match (self.killed, self.restart_ms) {
+            (Some((at, _)), Some(_)) => now >= at + NOT_STICKY_WINDOW_MS,
+            _ => false,
+        }
+    }
+
+    /// One watch step: once both first starts are logged, kills both processes; then looks for the sticky restart line.
+    fn poll(&mut self, run: &Run, package: &str) {
+        let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
+        if self.killed.is_none() {
+            if !(log(STICKY_PROC).contains(STICKY_FIRST)
+                && log(NOT_STICKY_PROC).contains(NOT_STICKY_FIRST))
+            {
+                return;
+            }
+            let atld = atl_diag::logfiles::read(&run.atld_log());
+            self.killed = Some((
+                sticky_wall_ms(),
+                started_count(&atld, package, NOT_STICKY_PROC),
+            ));
+            for proc in [STICKY_PROC, NOT_STICKY_PROC] {
+                let end = last_started_pid(&atld, package, proc)
+                    .ok_or_else(|| format!("no `started` line for {package}{proc} in atld's log"))
+                    .and_then(|pid| {
+                        kill_pid(pid).map_err(|e| format!("killing {package}{proc} pid {pid}: {e}"))
+                    });
+                if let Err(e) = end {
+                    self.kill_failed.get_or_insert(e);
+                }
+            }
+            return;
+        }
+        if self.restart_ms.is_none() {
+            self.restart_ms = log(STICKY_PROC)
+                .lines()
+                .find(|l| l.contains(STICKY_RESTART))
+                .and_then(stamp_ms);
+        }
+    }
+
+    /// The pass line, or the reason the case failed. `atld` is atld's log at judge time: a not-sticky start after the kill is the restart it must not have.
+    fn verdict(&self, atld: &str, package: &str) -> Result<String, String> {
+        let Some((at, starts_before)) = self.killed else {
+            return Err(
+                "sticky: the first starts were never logged (AtlSticky, AtlNotSticky)".to_owned(),
+            );
+        };
+        if let Some(e) = &self.kill_failed {
+            return Err(format!("sticky: {e}"));
+        }
+        let Some(restart) = self.restart_ms else {
+            return Err(format!("sticky: no {STICKY_RESTART:?} line after the kill"));
+        };
+        let gap = restart.saturating_sub(at);
+        let (lo, hi) = (
+            SERVICE_RESTART_DURATION_MS,
+            SERVICE_RESTART_DURATION_MS + PROC_START_TIMEOUT_MS + STICKY_SLACK_MS,
+        );
+        if !(lo..=hi).contains(&gap) {
+            return Err(format!(
+                "sticky: restart {gap} ms after the kill, want {lo}..={hi} ms (the restart timer, then an attach within PROC_START_TIMEOUT)"
+            ));
+        }
+        let restarted = started_count(atld, package, NOT_STICKY_PROC).saturating_sub(starts_before);
+        if restarted > 0 {
+            return Err(format!(
+                "notsticky: {restarted} start(s) after its process was ended: a NOT_STICKY service is not restarted (killServicesLocked, canStopIfKilled)"
+            ));
+        }
+        Ok(format!(
+            "sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: not restarted in {NOT_STICKY_WINDOW_MS} ms"
+        ))
+    }
+}
+
+/// The wall clock in ms, the clock of the app's logcat stamps ([`stamp_ms`]).
+fn sticky_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// A logcat line's stamp (`<secs>.<ms>`, its first field) in wall ms.
+fn stamp_ms(line: &str) -> Option<u64> {
+    let (secs, frac) = line.split_whitespace().next()?.split_once('.')?;
+    Some(secs.parse::<u64>().ok()? * 1_000 + frac.get(..3)?.parse::<u64>().ok()?)
+}
+
+/// The `started` lines atld logged for `proc` of `package`: one per start of that process.
+fn started_lines<'a>(atld: &'a str, package: &str, proc: &str) -> impl Iterator<Item = &'a str> {
+    let needle = format!("started {package}{proc} (package ");
+    atld.lines().filter(move |l| l.contains(&needle))
+}
+
+fn started_count(atld: &str, package: &str, proc: &str) -> usize {
+    started_lines(atld, package, proc).count()
+}
+
+/// The host pid of the newest start of `proc` (atld's `started ..., host pid <n>`).
+fn last_started_pid(atld: &str, package: &str, proc: &str) -> Option<i32> {
+    started_lines(atld, package, proc)
+        .last()?
+        .rsplit("host pid ")
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// SIGKILL to a process atld started, by its host pid: the STICKY case's own end of a process, not a product path.
+fn kill_pid(pid: i32) -> Result<(), String> {
+    let pid = rustix::process::Pid::from_raw(pid).ok_or_else(|| "pid 0".to_owned())?;
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod sticky_case_tests {
+    use super::*;
+
+    const ATLD_START: &str = "atld: started com.example.atltest:notsticky (package com.example.atltest): uid 10001, host pid ";
+
+    /// The case as killed at wall 10 000 with `restart` logged: the restart's gap from the kill is the verdict's number.
+    fn case(restart: u64) -> StickyCase {
+        StickyCase {
+            killed: Some((10_000, 1)),
+            kill_failed: None,
+            restart_ms: Some(restart),
+        }
+    }
+
+    #[test]
+    fn stamp_is_the_logcat_first_field_in_wall_ms() {
+        assert_eq!(
+            stamp_ms("1793747156.733 1 2 I AtlTest: sticky: x"),
+            Some(1_793_747_156_733)
+        );
+        assert_eq!(stamp_ms("no stamp here"), None);
+    }
+
+    /// Lower bound: SERVICE_RESTART_DURATION (1 000 ms) after the kill; upper: that plus PROC_START_TIMEOUT (10 000) plus 1 000 of slack = 12 000 ms.
+    #[test]
+    fn restart_gap_bounds_are_the_rule() {
+        let pass = |restart| {
+            case(restart)
+                .verdict(ATLD_START, "com.example.atltest")
+                .is_ok()
+        };
+        assert!(!pass(10_999), "999 ms: before the restart timer");
+        assert!(pass(11_000), "exactly SERVICE_RESTART_DURATION");
+        assert!(pass(22_000), "exactly 12 000 ms");
+        assert!(!pass(22_001), "past the attach budget");
+    }
+
+    /// A not-sticky start logged after the kill (atld's `started` line) fails the verdict; the starts before the kill do not count.
+    #[test]
+    fn not_sticky_restart_fails_and_its_first_start_does_not_count() {
+        let before = case(11_000);
+        let atld = format!("{ATLD_START}7\n");
+        assert!(before.verdict(&atld, "com.example.atltest").is_ok());
+        let restarted = format!("{ATLD_START}7\n{ATLD_START}9\n");
+        let why = StickyCase {
+            killed: Some((10_000, 1)),
+            ..case(11_000)
+        }
+        .verdict(&restarted, "com.example.atltest")
+        .unwrap_err();
+        assert!(why.starts_with("notsticky: 1 start(s)"), "{why}");
+    }
 }
 
 /// What [`judge`] reads besides the run's logs.
 struct AppJudge<'a> {
     run: &'a Run,
+    /// the STICKY case's state (polled by the watch; judged here)
+    sticky: &'a StickyCase,
     app_name: &'a str,
     verbose: bool,
     libs: &'a [PathBuf],
@@ -2599,6 +2821,7 @@ const REMOTE_UI_SKIPPED: [(&str, &str); 4] = [
 fn judge(j: &AppJudge) -> Result<ExitCode> {
     let AppJudge {
         run,
+        sticky,
         app_name,
         verbose,
         libs,
@@ -2661,6 +2884,13 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         whys.extend(prop_block_failures(&atld_log));
         whys.extend(device_set_failures(&app));
         whys.extend(missing_service_failures(&app));
+    }
+    // the STICKY case runs only in the local watch; a remote run has no watch and judges nothing here
+    if passed && !remote {
+        match sticky.verdict(&atld_log, app_name) {
+            Ok(pass) => println!("app: pass {pass}"),
+            Err(why) => whys.push(why),
+        }
     }
     if !remote {
         whys.extend(exit_failures(

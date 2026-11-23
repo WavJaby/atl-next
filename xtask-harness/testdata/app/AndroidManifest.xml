@@ -50,5 +50,8 @@
         <receiver android:name=".AtlOffReceiver" android:enabled="false" android:exported="false" />
         <!-- Main.started's chain (app.rs LOG_LINES startservice, stopservice, stopself): in the main process, whose log the gate reads -->
         <service android:name=".AtlStarted" android:exported="false" />
+        <!-- Main.stickyStart's services (app.rs STICKY case): each in its own process, whose log the gate reads as log/<pkg>:<process>.log -->
+        <service android:name=".AtlSticky" android:process=":sticky" android:exported="false" />
+        <service android:name=".AtlNotSticky" android:process=":notsticky" android:exported="false" />
     </application>
 </manifest>

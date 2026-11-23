@@ -1332,6 +1332,60 @@ mod tests {
         assert_eq!(s.host_of(&9), None);
     }
 
+    /// A started STICKY service (onStartCommand returned START_STICKY) dies with its process. A crash restarts it at SERVICE_RESTART_DURATION (1 s); a force-stop
+    /// (allow_restart false, forceStopPackageInternalLocked -> killServicesLocked !allowRestart, ActiveServices :7343-7345) brings it down and nothing restarts it.
+    #[test]
+    fn force_stop_does_not_restart_a_sticky_start() {
+        for allow_restart in [true, false] {
+            let mut s = Services::<T>::default();
+            let mut out = Vec::new();
+            assert_eq!(
+                s.start(start_req("S", "a"), None, || 9, 0, &mut out),
+                Host::NeedsProcess
+            );
+            s.attach(60, "p", 10_001, &"t", 200, &mut out);
+            assert_eq!(s.done_executing_start(&9, 1, START_STICKY), Ok(()));
+            out.clear();
+            let restarts = s.process_died(60, allow_restart, 5_000, &mut out);
+            if allow_restart {
+                assert_eq!(
+                    restarts,
+                    [Restart {
+                        component: component("S"),
+                        at: 6_000
+                    }]
+                );
+                assert!(s.process_of(&component("S")).is_some());
+            } else {
+                assert!(restarts.is_empty());
+                assert_eq!(s.process_of(&component("S")), None);
+            }
+        }
+    }
+
+    /// processStartTimedOutLocked (ActiveServices :6969, failed to attach, also a process that died before attach): the services waiting in that process
+    /// (uid + process name) come down; a service waiting in another process stays.
+    #[test]
+    fn start_failed_brings_down_only_the_waiting_records_of_its_process() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        assert_eq!(
+            s.start(start_req("S", "a"), None, || 9, 0, &mut out),
+            Host::NeedsProcess
+        );
+        let elsewhere = Start {
+            process: "q".into(),
+            ..start_req("T", "b")
+        };
+        assert_eq!(
+            s.start(elsewhere, None, || 10, 0, &mut out),
+            Host::NeedsProcess
+        );
+        s.start_failed("p", 10_001, &mut out);
+        assert_eq!(s.process_of(&component("S")), None);
+        assert_eq!(s.process_of(&component("T")), Some(("q".into(), 10_001)));
+    }
+
     /// scheduleServiceRestartLocked backoff: a kill 1 s after each restart multiplies the delay by SERVICE_RESTART_DURATION_FACTOR; a run past SERVICE_RESET_RUN_DURATION resets it to SERVICE_RESTART_DURATION.
     #[test]
     fn restart_delays_follow_aosp_backoff() {

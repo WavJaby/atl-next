@@ -486,6 +486,9 @@ enum KillReason {
     EmptyHeadless,
 }
 
+/// AMS PROC_START_TIMEOUT (ActivityManagerService.java:568, 10 s x HW_TIMEOUT_MULTIPLIER = 1): a started process must attach within it, else it failed to start.
+const PROC_START_TIMEOUT_MS: u64 = 10_000;
+
 /// The activity service's delayed messages (am_handler.rs), keyed by what each concerns.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Timer {
@@ -497,6 +500,8 @@ enum Timer {
     EmptyProcess(i64),
     /// a service's restart (service_records.rs `Restart.at`, ActiveServices.scheduleServiceRestartLocked's restarter): one per component, re-armed by each scheduled restart
     Restart((String, String)),
+    /// a process's start timeout (PROC_START_TIMEOUT_MS), by ProcessRecord.start_seq: a process still unattached when it fires failed to attach
+    ProcessStart(i64),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -1616,6 +1621,7 @@ impl Inner {
             Timer::UidSettle(uid) => self.settle_uid(uid),
             Timer::EmptyProcess(seq) => self.end_headless(|r| r.start_seq == seq),
             Timer::Restart(component) => self.restart_service(component),
+            Timer::ProcessStart(start_seq) => self.process_start_timed_out(start_seq),
         }
     }
 
@@ -1764,6 +1770,7 @@ impl Inner {
         });
         self.arm_settle(p.uid, settle);
         self.touch_all_locked(st);
+        self.arm(Timer::ProcessStart(start_seq), now + PROC_START_TIMEOUT_MS);
         Ok(())
     }
 
@@ -1888,7 +1895,9 @@ impl Inner {
         for mut rec in stopped {
             pids.push(rec.pid);
             Self::broadcasts_died(st, rec.pid);
-            self.services_died(st, rec.pid, true);
+            // forceStopPackageInternalLocked: killPackageProcessesLSP(allowRestart false) (AMS :4360-4361) -> cleanUpApplicationRecordLocked -> killServicesLocked(app, false):
+            // every hosted service is brought down, STICKY ones included (ActiveServices :7343-7345); none is restarted
+            self.services_died(st, rec.pid, false);
             if let Some(instr) = rec.instr.take() {
                 // the process is being killed with its package: the same CANCELED a crash reports (no further force stop: the package's processes are all gone)
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
@@ -3898,6 +3907,41 @@ mod tests {
         assert!(sticky_uids(&am, ACTION).is_empty());
         am.broadcast_as_system(&intent, true);
         assert_eq!(sticky_uids(&am, ACTION), vec![SYSTEM_UID]);
+    }
+
+    /// A process that never attaches (it died before attach, so no binder death comes) leaves at its start timeout; another process of the table stays. Its
+    /// services are brought down by the same call (service_records.rs start_failed).
+    #[test]
+    fn unattached_process_is_removed_at_its_start_timeout() {
+        let am = no_app_manager();
+        let record = |start_seq: i64, pid: i32| ProcessRecord {
+            package: "p".into(),
+            process_name: "p:x".into(),
+            uid: 10_001,
+            start_seq,
+            pid,
+            attached: None,
+            launch_activity: false,
+            task: None,
+            instr: None,
+            broadcasts_attached: false,
+            touched: 0,
+            kill_reason: None,
+            receiving: 0,
+        };
+        am.inner
+            .state()
+            .processes
+            .extend([record(1, 41), record(2, 42)]);
+        am.inner.process_start_timed_out(1);
+        let seqs: Vec<i64> = am
+            .inner
+            .state()
+            .processes
+            .iter()
+            .map(|r| r.start_seq)
+            .collect();
+        assert_eq!(seqs, [2]);
     }
 
     /// The global configuration's locale: the host's UI language tag as given, else AOSP's en-US (LocaleList needs one; ActivityThread.handleBindApplication).
