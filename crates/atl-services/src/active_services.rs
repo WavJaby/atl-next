@@ -20,7 +20,7 @@ use atl_parcelables::codecs::android::app::ServiceStartArgs::ServiceStartArgs;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
-use super::{AM, Inner, ProcessRecord, State, Timer, intent_key, log};
+use super::{AM, Effects, Inner, LostWaiter, ProcessRecord, State, Timer, intent_key, log};
 use crate::broadcast_dispatch::ProcKey;
 use crate::package;
 use crate::service_records::{self, Bind, Call, Host, Kinds, Start};
@@ -685,19 +685,27 @@ impl Inner {
             "process {} (pid {}) failed to attach: start timeout",
             rec.process_name, rec.pid
         ));
-        self.unattached_ended_locked(&mut st, &rec);
+        let lost = self.unattached_ended_locked(&mut st, &rec);
         if let Some(task) = rec.task {
             self.task_gone_locked(&mut st, task);
         }
         self.touch_all_locked(&mut st);
         drop(st);
-        self.kill(&[rec.pid]);
+        self.deliver(Effects {
+            pids: vec![rec.pid],
+            lost,
+        });
     }
 
-    /// The end of an unattached process, its record already out of the table: both sides are told from here, and only here. The services waiting for the process come down
+    /// The end of an unattached process, its record already out of the table: every side is told from here, and only here. The services waiting for the process come down
     /// (processStartTimedOutLocked :6969); the broadcast side's cold start fails and its registrations go (onApplicationTimeoutLocked -> onApplicationCleanupLocked, BroadcastQueueImpl
-    /// :709-745). Called by the start timeout and by force-stop; the caller kills the pid.
-    pub(crate) fn unattached_ended_locked(&self, st: &mut State, rec: &ProcessRecord) {
+    /// :709-745); the providers it was to publish go, their waiters returned (cleanupAppInLaunchingProvidersLocked :1893-1916, called at :4483). Called by the start timeout and by
+    /// force-stop; the caller delivers the returned waiters and kills the pid.
+    pub(crate) fn unattached_ended_locked(
+        &self,
+        st: &mut State,
+        rec: &ProcessRecord,
+    ) -> Vec<LostWaiter> {
         let mut calls = Vec::new();
         st.services
             .start_failed(&rec.process_name, rec.uid, &mut calls);
@@ -708,6 +716,14 @@ impl Inner {
         };
         self.start_failed_locked(st, &key);
         self.broadcasts_died_locked(st, rec.pid);
+        // unpublished records only: a published one of the same key belongs to a live process (start_launcher starts without the guard)
+        let lost = Self::remove_providers_of_process(st, &rec.package, &rec.process_name, |r| {
+            r.provider.is_none()
+        });
+        if !lost.is_empty() {
+            atl_diag::answered(AM, "provider waiters released: process never attached");
+        }
+        lost
     }
 
     /// stopInBackgroundLocked (AS :1685), from a uid's settle sweep: its started services whose start mode is not NORMAL stop (a targetSdk 26+ app, now idle, not persistent).

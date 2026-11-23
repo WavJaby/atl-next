@@ -417,6 +417,20 @@ impl ProviderRecord {
     }
 }
 
+/// A caller waiting on a provider that will not be published: told publish status false after the lock (Inner::deliver).
+struct LostWaiter {
+    thread: Strong<dyn IApplicationThread>,
+    holder: ContentProviderHolder,
+    authority: String,
+}
+
+/// What a state change leaves for after the state lock: the pids to kill, and the waiters to tell (Inner::deliver).
+#[derive(Default)]
+struct Effects {
+    pids: Vec<i32>,
+    lost: Vec<LostWaiter>,
+}
+
 /// The Settings app, the exception to a system provider's noReleaseNeeded (ContentProviderRecord.java:76).
 const SETTINGS_APP_PACKAGE: &str = "com.android.settings";
 
@@ -1009,11 +1023,11 @@ impl ActivityManager {
 
     /// forceStopPackageLocked for a reason outside a binder call of this service (PMS's PACKAGE_CHANGED without DONT_KILL_APP): the package's processes leave the table and are killed.
     pub fn force_stop_package(&self, package: &str) {
-        let pids = {
+        let fx = {
             let mut st = self.inner.state();
             self.inner.force_stop_package_locked(&mut st, package)
         };
-        self.inner.kill(&pids);
+        self.inner.deliver(fx);
     }
 
     /// Registry set_bounds changed `task`'s size.
@@ -1477,6 +1491,25 @@ impl Inner {
         }
     }
 
+    /// The effects of a state change, once the state lock is released: the lost providers' waiters are told (ContentProviderRecord.java:217-219), then the processes are killed
+    /// (AMS handleProcessStartOrKillTimeoutLocked: the provider cleanup comes before killLocked).
+    fn deliver(&self, fx: Effects) {
+        for w in fx.lost {
+            if let Err(e) = w.thread.r#notifyContentProviderPublishStatus(
+                Some(&w.holder),
+                Some(&w.authority),
+                0,
+                false,
+            ) {
+                log(format_args!(
+                    "notifyContentProviderPublishStatus {}: {e}",
+                    w.authority
+                ));
+            }
+        }
+        self.kill(&fx.pids);
+    }
+
     /// ProcessList.startProcessLocked (ProcessList.java:2093-2168) + Process.start: a new startSeq, the pending record, the start request. The process is a record at once (mPendingStarts + mPidsSelfLocked).
     fn start_process_locked(
         &self,
@@ -1534,8 +1567,9 @@ impl Inner {
     }
 
     /// ContentProviderHelper.getContentProviderImpl for a caller with an app thread, user 0: the provider of `authority` (PMS resolveContentProvider over the installed packages), its
-    /// record found or made (mProviderMap); published -> the full holder; else its process is started unless running (:547-614) and the caller is kept as a waiter, which gets
-    /// notifyContentProviderPublishStatus at publication (:620-648, ActivityThread.acquireProvider waits for it). None: no such provider, or its process failed to start (:604-611).
+    /// record found or made (mProviderMap); published -> the full holder; else its process starts through start_headless_locked unless its package runs one (:540-593), and the
+    /// caller is kept as a waiter: told at publication (:620-648, ActivityThread.acquireProvider waits for it), or at the end of its process without attach (unattached_ended_locked).
+    /// None: no such provider, its process failed to start (:570-575), or its process is held by another package (not modelled: AOSP installs the provider there, :540-546).
     /// Not modelled: connections and their ref counts (holder.connection null), a provider able to run in the caller's process (multiprocess / same uid: ActivityThread finds its own first).
     fn content_provider_locked(
         &self,
@@ -1599,24 +1633,42 @@ impl Inner {
         if st.providers[i].provider.is_some() {
             return Ok(Some(st.providers[i].holder()));
         }
-        let running = st
+        // A provider is published only by its own package's process (r#publishContentProviders matches the publisher's package), so a wait needs a record of
+        // (package, process). Without one, start_headless_locked starts it; a record of (process, uid) owned by another package answers Ok(false) and leaves no way to publish here: refused.
+        let own = st
             .processes
             .iter()
             .any(|r| r.package == p.name() && r.process_name == process);
-        if !running {
-            if let Err(e) = self.start_process_locked(st, p, &process, false, None) {
-                log(format_args!(
-                    "Unable to launch app {}/{} for provider {authority}: process is bad ({e})",
-                    p.name(),
-                    p.uid
-                ));
-                st.providers.remove(i);
-                return Ok(None);
+        if own {
+            atl_diag::answered(AM, "getContentProvider: waits for its running process");
+        } else {
+            match self.start_headless_locked(st, p.name(), &process, p.uid) {
+                Ok(true) => {
+                    atl_diag::answered(AM, "provider cold start (getContentProviderImpl)");
+                    log(format_args!(
+                        "provider {authority}: started process {process} of {}",
+                        p.name()
+                    ));
+                }
+                Ok(false) => {
+                    atl_diag::answered(
+                        AM,
+                        "getContentProvider: process held by another package (not modelled)",
+                    );
+                    st.providers.remove(i);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    atl_diag::answered(AM, "getContentProvider: process start failed");
+                    log(format_args!(
+                        "Unable to launch app {}/{} for provider {authority}: process is bad ({e})",
+                        p.name(),
+                        p.uid
+                    ));
+                    st.providers.remove(i);
+                    return Ok(None);
+                }
             }
-            log(format_args!(
-                "provider {authority}: started process {process} of {}",
-                p.name()
-            ));
         }
         st.providers[i].waiters.push(caller.clone());
         Ok(Some(st.providers[i].holder()))
@@ -1643,9 +1695,9 @@ impl Inner {
         }
     }
 
-    /// forceStopPackageLocked (as finishInstrumentationLocked and startInstrumentation call it): the package's processes leave the table; their pids are to be killed once the lock is
+    /// forceStopPackageLocked (as finishInstrumentationLocked and startInstrumentation call it): the package's processes leave the table; the returned Effects (their pids, the waiters of their providers) are delivered once the lock is
     /// released. A removed process's instrumentation, if any, ends as a crash would end it (handleAppDiedLocked).
-    fn force_stop_package_locked(&self, st: &mut State, package: &str) -> Vec<i32> {
+    fn force_stop_package_locked(&self, st: &mut State, package: &str) -> Effects {
         let (stopped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut st.processes)
             .into_iter()
             .partition(|r| r.package == package);
@@ -1653,12 +1705,12 @@ impl Inner {
         // cleanupDisabledPackageReceiversLocked: the package's waiting manifest deliveries are over. It runs before the kills below (AOSP runs it after them) because the drives here
         // start waiting receivers synchronously: a force-stopped package must not start a process while it is being stopped.
         self.drop_package_locked(st, package);
-        let mut pids = Vec::new();
+        let mut fx = Effects::default();
         for mut rec in stopped {
-            pids.push(rec.pid);
+            fx.pids.push(rec.pid);
             if rec.attached.is_none() {
                 // no binder death comes for an unattached process: its end is the one shared with the start timeout (unattached_ended_locked)
-                self.unattached_ended_locked(st, &rec);
+                fx.lost.extend(self.unattached_ended_locked(st, &rec));
             } else {
                 self.broadcasts_died_locked(st, rec.pid);
             }
@@ -1670,7 +1722,7 @@ impl Inner {
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
             }
         }
-        pids
+        fx
     }
 
     /// The reporting half of finishInstrumentationLocked (:14854-14915): the final results are what addInstrumentationResults gathered, over-written with `results` (:14867-14878), reported to the
@@ -1698,39 +1750,38 @@ impl Inner {
         });
     }
 
-    /// finishInstrumentationLocked: reports, then (not for no-restart) force-stops the package; the pids to kill.
+    /// finishInstrumentationLocked: reports, then (not for no-restart) force-stops the package; the effects to deliver.
     fn finish_instrumentation_locked(
         &self,
         st: &mut State,
         pid: i32,
         code: i32,
         results: Option<Bundle>,
-    ) -> Vec<i32> {
+    ) -> Effects {
         let Some(rec) = st.processes.iter_mut().find(|r| r.pid == pid) else {
-            return Vec::new();
+            return Effects::default();
         };
         let Some(instr) = rec.instr.take() else {
             log(format_args!(
                 "finishInstrumentation called on non-instrumented: pid {pid}"
             ));
-            return Vec::new();
+            return Effects::default();
         };
         let (no_restart, package) = (instr.no_restart, rec.package.clone());
         // the instrumentation no longer holds its process: its grace runs from now
         self.touch_all_locked(st);
         self.report_finished(instr, code, results);
         if no_restart {
-            return Vec::new();
+            return Effects::default();
         }
         self.force_stop_package_locked(st, &package)
     }
 
     /// AppDeathRecipient.binderDied -> appDiedLocked -> handleAppDiedLocked (:3347-3367): the record leaves the table, and an instrumentation it ran ends CANCELED with "Process crashed.".
     fn app_died(&self, pid: i32) {
-        let lost;
         // Some(finished): this death left no activity anywhere and the process had a Task (a launched app; SettingsProvider, WebView and other no-Task processes never count)
         let mut last_app = None;
-        let pids = {
+        let fx = {
             let mut st = self.state();
             let Some(i) = st
                 .processes
@@ -1756,12 +1807,15 @@ impl Inner {
                 && self.window_close_stops_services);
             self.services_died(&mut st, pid, allow_restart);
             self.touch_all_locked(&mut st);
-            lost = Self::providers_died(&mut st, &rec.package, &rec.process_name);
+            let lost =
+                Self::remove_providers_of_process(&mut st, &rec.package, &rec.process_name, |_| {
+                    true
+                });
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
             ));
-            match rec.instr.take() {
+            let mut fx = match rec.instr.take() {
                 Some(instr) => {
                     log(format_args!(
                         "Crash of app {} running instrumentation {}/{}",
@@ -1770,24 +1824,17 @@ impl Inner {
                     let no_restart = instr.no_restart;
                     self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
                     if no_restart {
-                        Vec::new()
+                        Effects::default()
                     } else {
                         self.force_stop_package_locked(&mut st, &rec.package)
                     }
                 }
-                None => Vec::new(),
-            }
+                None => Effects::default(),
+            };
+            fx.lost.extend(lost);
+            fx
         };
-        for (w, holder, auth) in lost {
-            if let Err(e) =
-                w.r#notifyContentProviderPublishStatus(Some(&holder), Some(&auth), 0, false)
-            {
-                log(format_args!(
-                    "notifyContentProviderPublishStatus {auth}: {e}"
-                ));
-            }
-        }
-        self.kill(&pids);
+        self.deliver(fx);
         if let Some(finished) = last_app {
             // read by the harness's run-apk verdict (`finished` / `live`); the host decides whether the run ends (atld --exit-with-last-app)
             log(format_args!(
@@ -1801,27 +1848,28 @@ impl Inner {
         }
     }
 
-    /// ContentProviderHelper.removeDyingProviderLocked for the providers the dead process hosted: their records go; callers still waiting get publish status false (:1546-1556), sent by the caller after the lock.
-    /// Not modelled: killing the stable clients of a published provider (AOSP kills them, :1520-1540).
-    #[allow(clippy::type_complexity)]
-    fn providers_died(
+    /// ContentProviderHelper.removeDyingProviderLocked (:1794-1806) for the providers of (package, process) that `dying` takes: their records go, and the callers still waiting
+    /// are returned to be told publish status false after the lock (ContentProviderRecord.onProviderPublishStatusLocked :190-226).
+    /// Not modelled: killing the stable clients of a published provider (AOSP kills them, :1832-1871).
+    fn remove_providers_of_process(
         st: &mut State,
         package: &str,
         process: &str,
-    ) -> Vec<(
-        Strong<dyn IApplicationThread>,
-        ContentProviderHolder,
-        String,
-    )> {
+        dying: impl Fn(&ProviderRecord) -> bool,
+    ) -> Vec<LostWaiter> {
         let mut lost = Vec::new();
         st.providers.retain_mut(|r| {
-            if r.package != package || r.process != process {
+            if r.package != package || r.process != process || !dying(r) {
                 return true;
             }
             let holder = r.holder();
-            let auth = r.info.authority.clone().unwrap_or_default();
-            for w in std::mem::take(&mut r.waiters) {
-                lost.push((w, holder.clone(), auth.clone()));
+            let authority = r.info.authority.clone().unwrap_or_default();
+            for thread in std::mem::take(&mut r.waiters) {
+                lost.push(LostWaiter {
+                    thread,
+                    holder: holder.clone(),
+                    authority: authority.clone(),
+                });
             }
             false
         });
@@ -2703,11 +2751,11 @@ impl IActivityManager for ActivityManager {
             no_restart,
         };
         // :14613-14622 forceStopPackageLocked of the target, addAppLocked -> startProcessLocked
-        let kill = inner.force_stop_package_locked(&mut st, target.name());
+        let fx = inner.force_stop_package_locked(&mut st, target.name());
         let started =
             inner.start_process_locked(&mut st, target, &default_process, false, Some(instr));
         drop(st);
-        inner.kill(&kill);
+        inner.deliver(fx);
         started.map_err(|e| illegal_state(&format!("starting {}: {e}", target.name())))?;
         Ok(true)
     }
@@ -2763,7 +2811,7 @@ impl IActivityManager for ActivityManager {
             return Err(illegal_argument("File descriptors passed in Intent"));
         }
         let inner = &self.inner;
-        let pids = {
+        let fx = {
             let mut st = inner.state();
             let Some(pid) = target.and_then(|t| Inner::record_for_thread(&st, t)) else {
                 log(format_args!("finishInstrumentation: no app for the thread"));
@@ -2771,7 +2819,7 @@ impl IActivityManager for ActivityManager {
             };
             inner.finish_instrumentation_locked(&mut st, pid, result_code, results.cloned())
         };
-        inner.kill(&pids);
+        inner.deliver(fx);
         Ok(())
     }
 
@@ -3465,9 +3513,11 @@ impl IActivityClientController for ActivityClientController {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use binder::StatusCode;
+    use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
+    use binder::{BinderFeatures, Interface, StatusCode};
 
     use super::*;
+    use crate::packages::fixture;
 
     /// A process control that starts nothing: the broadcast tests below send to no receiver.
     struct NoProcesses;
@@ -3579,6 +3629,180 @@ mod tests {
             .map(|r| r.start_seq)
             .collect();
         assert_eq!(seqs, [2]);
+    }
+
+    /// Records the process starts, in order, and the kills a test makes.
+    #[derive(Default)]
+    struct RecordingProcesses {
+        starts: Mutex<Vec<String>>,
+        kills: Mutex<Vec<i32>>,
+    }
+
+    impl ProcessControl for RecordingProcesses {
+        fn start(&self, request: &StartRequest) -> std::io::Result<i32> {
+            let mut starts = self.starts.lock().expect("starts");
+            starts.push(request.process_name.clone());
+            // any pid: the n-th start gets n
+            Ok(starts.len() as i32)
+        }
+        fn kill(&self, pid: i32) -> std::io::Result<()> {
+            self.kills.lock().expect("kills").push(pid);
+            Ok(())
+        }
+        fn program_pid(&self, pid: i32) -> std::io::Result<i32> {
+            Ok(pid)
+        }
+        fn last_app_ended(&self, _: i32, _: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An app thread waiting for a provider: each publish status it is told, in order.
+    struct PublishStatus {
+        told: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Interface for PublishStatus {}
+
+    impl IApplicationThread for PublishStatus {
+        fn r#notifyContentProviderPublishStatus(
+            &self,
+            _holder: Option<&ContentProviderHolder>,
+            _authority: Option<&str>,
+            _user_id: i32,
+            published: bool,
+        ) -> binder::Result<()> {
+            self.told.lock().expect("told").push(published);
+            Ok(())
+        }
+    }
+
+    /// A caller's app thread binder, and the list of the publish statuses it is told.
+    fn waiting_caller() -> (Strong<dyn IApplicationThread>, Arc<Mutex<Vec<bool>>>) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let thread = BnApplicationThread::new_binder(
+            PublishStatus {
+                told: Arc::clone(&told),
+            },
+            BinderFeatures::default(),
+        );
+        (thread, told)
+    }
+
+    const PROVIDER_PACKAGE: &str = "com.example.provider";
+    const PROVIDER_CLASS: &str = "com.example.provider.Data";
+    const PROVIDER_AUTHORITY: &str = "com.example.provider.data";
+    /// the uid of the provider's package and of every caller here (one app)
+    const PROVIDER_UID: u32 = 10_321;
+
+    /// One installed package with one provider, hosted by its default process.
+    fn provider_manager(control: Arc<RecordingProcesses>) -> ActivityManager {
+        let mut package = fixture::record(PROVIDER_PACKAGE);
+        package.uid = PROVIDER_UID;
+        package.info.providers = Some(vec![Some(ProviderInfo {
+            component: fixture::component(PROVIDER_PACKAGE, PROVIDER_CLASS),
+            authority: Some(PROVIDER_AUTHORITY.to_owned()),
+            ..Default::default()
+        })]);
+        let packages = Arc::new(Packages::new(vec![package], Default::default()));
+        let permissions = Arc::new(Permissions::new(&packages, &[]));
+        ActivityManager::new(
+            packages,
+            permissions,
+            control,
+            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(UiAgents::default()),
+            true,
+            RootBack::default(),
+            OrientationReshape::default(),
+            true,
+            uid_state::BACKGROUND_SETTLE_TIME_MS,
+            true,
+        )
+    }
+
+    /// getContentProviderImpl for `caller` (an app thread of PROVIDER_UID): the holder, without a provider while its process has not published it.
+    fn ask_for_provider(
+        am: &ActivityManager,
+        caller: &Strong<dyn IApplicationThread>,
+    ) -> Option<ContentProviderHolder> {
+        let mut st = am.inner.state();
+        am.inner
+            .content_provider_locked(&mut st, caller, PROVIDER_UID, PROVIDER_AUTHORITY)
+            .expect("no binder error")
+    }
+
+    /// The cold start of a provider, then its process never attaching (AMS handleProcessStartOrKillTimeoutLocked :4444-4491): every waiter is told false, the record goes,
+    /// and the next request starts the process again.
+    #[test]
+    fn provider_waiters_are_released_when_their_process_never_attaches() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let (first, first_told) = waiting_caller();
+        let (second, second_told) = waiting_caller();
+        let holder = ask_for_provider(&am, &first).expect("a holder for the first caller");
+        assert!(holder.provider.is_none(), "not published yet");
+        ask_for_provider(&am, &second).expect("a holder for the second caller");
+        assert_eq!(
+            control.starts.lock().expect("starts").len(),
+            1,
+            "the second request waits on the starting process: one start"
+        );
+        let (start_seq, pid) = {
+            let st = am.inner.state();
+            (st.processes[0].start_seq, st.processes[0].pid)
+        };
+        am.inner.process_start_timed_out(start_seq);
+        assert_eq!(*first_told.lock().expect("told"), [false]);
+        assert_eq!(*second_told.lock().expect("told"), [false]);
+        assert!(am.inner.state().providers.is_empty());
+        assert_eq!(*control.kills.lock().expect("kills"), [pid]);
+        ask_for_provider(&am, &first).expect("a holder after the release");
+        assert_eq!(
+            control.starts.lock().expect("starts").len(),
+            2,
+            "no record is left: the next request starts the process again"
+        );
+    }
+
+    /// forceStopPackageLocked of the package whose provider process never attached: the same end releases its waiters (AMS :4385-4393 for the providers, :4360 for the kill).
+    #[test]
+    fn force_stop_releases_the_waiters_of_an_unattached_provider_process() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let (caller, told) = waiting_caller();
+        ask_for_provider(&am, &caller).expect("a holder for the caller");
+        am.force_stop_package(PROVIDER_PACKAGE);
+        assert_eq!(*told.lock().expect("told"), [false]);
+        assert!(am.inner.state().providers.is_empty());
+        assert!(am.inner.state().processes.is_empty());
+    }
+
+    /// A process of (process, uid) that another package owns cannot publish this provider (publishContentProviders matches the publisher's package): the request gets
+    /// no provider, starts nothing, and waits for nothing.
+    #[test]
+    fn provider_is_refused_when_another_package_owns_its_process() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        am.inner.state().processes.push(ProcessRecord {
+            package: "com.example.other".to_owned(),
+            process_name: PROVIDER_PACKAGE.to_owned(),
+            uid: PROVIDER_UID,
+            start_seq: 1,
+            pid: 77,
+            attached: None,
+            launch_activity: false,
+            task: None,
+            instr: None,
+            attach_finished: false,
+            touched: 0,
+            kill_reason: None,
+        });
+        let (caller, told) = waiting_caller();
+        assert!(ask_for_provider(&am, &caller).is_none());
+        assert!(am.inner.state().providers.is_empty());
+        assert!(control.starts.lock().expect("starts").is_empty());
+        assert!(told.lock().expect("told").is_empty());
     }
 
     /// The global configuration's locale: the host's UI language tag as given, else AOSP's en-US (LocaleList needs one; ActivityThread.handleBindApplication).
