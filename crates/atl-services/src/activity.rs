@@ -87,7 +87,7 @@ mod active_services;
 #[path = "broadcasts_am.rs"]
 mod broadcasts_am;
 
-use broadcasts_am::Dispatch;
+use broadcasts_am::{Dispatch, SystemStep};
 
 const AM: &str = "IActivityManager";
 const ACC: &str = "IActivityClientController";
@@ -565,13 +565,21 @@ struct State {
     open_tasks: std::collections::BTreeMap<TaskId, u32>,
 }
 
-/// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`).
+/// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`). `System` is the services' own resultTo (AOSP's in-process
+/// IIntentReceiver.Stub in UserController), run from the dispatcher's result, never a binder call.
 #[derive(Clone)]
-struct ReceiverHandle(Strong<dyn IIntentReceiver>);
+enum ReceiverHandle {
+    Binder(Strong<dyn IIntentReceiver>),
+    System(SystemStep),
+}
 
 impl PartialEq for ReceiverHandle {
     fn eq(&self, o: &Self) -> bool {
-        self.0.as_binder() == o.0.as_binder()
+        match (self, o) {
+            (Self::Binder(a), Self::Binder(b)) => a.as_binder() == b.as_binder(),
+            (Self::System(a), Self::System(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -3120,7 +3128,7 @@ impl IActivityManager for ActivityManager {
             ),
             sticky,
             user_id,
-            result_to.map(|handle| ReceiverHandle(handle.clone())),
+            result_to.map(|handle| ReceiverHandle::Binder(handle.clone())),
         )
     }
 
@@ -3165,7 +3173,7 @@ impl IActivityManager for ActivityManager {
                 .inner
                 .state()
                 .broadcasts
-                .unregister(&ReceiverHandle(r.clone()));
+                .unregister(&ReceiverHandle::Binder(r.clone()));
             if !removed {
                 atl_diag::answered(AM, "unregisterReceiver: not registered");
             }
@@ -3273,7 +3281,7 @@ impl IActivityManager for ActivityManager {
             required_permission: required_permission.map(str::to_owned),
             exported,
         };
-        let handle = ReceiverHandle(receiver.clone());
+        let handle = ReceiverHandle::Binder(receiver.clone());
         if !st
             .broadcasts
             .register(handle.clone(), pid, uid, user, bf)

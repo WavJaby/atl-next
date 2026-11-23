@@ -453,6 +453,8 @@ pub struct Runtime {
     new_intent: bool,
     /// The headless empty grace, ms (atld `--empty-process-grace-ms`); None keeps atld's default (the uid settle period, 60 s).
     empty_process_grace_ms: Option<u64>,
+    /// The packages opted in to the boot broadcasts at start (atld `--autostart`, repeat; decision D2); empty = none.
+    autostart: Vec<String>,
     /// Starts owe their callers a result unless this is cleared (`--no-activity-result`, the app gate's deliberate break).
     activity_result: bool,
     /// bindService works unless this is cleared (`--no-bind-service`, the app gate's bound-service break).
@@ -999,6 +1001,7 @@ impl Runtime {
             ime_death_link: true,
             new_intent: true,
             empty_process_grace_ms: None,
+            autostart: Vec::new(),
             activity_result: true,
             bind_service: true,
             job_runner: true,
@@ -1483,6 +1486,12 @@ impl Runtime {
     /// The headless empty grace, ms (atld `--empty-process-grace-ms`): a short one lets a gate see an explicit broadcast's receiver process end (services' empty-headless rule).
     pub fn with_empty_process_grace(mut self, ms: u64) -> Self {
         self.empty_process_grace_ms = Some(ms);
+        self
+    }
+
+    /// The packages that get LOCKED_BOOT_COMPLETED and BOOT_COMPLETED at start (atld `--autostart`, decision D2); the others are opted out for the run.
+    pub fn with_autostart(mut self, packages: &[&str]) -> Self {
+        self.autostart = packages.iter().map(|p| (*p).to_owned()).collect();
         self
     }
 
@@ -2252,6 +2261,9 @@ impl Runtime {
         }
         if let Some(ms) = self.empty_process_grace_ms {
             cmd.arg("--empty-process-grace-ms").arg(ms.to_string());
+        }
+        for package in &self.autostart {
+            cmd.arg("--autostart").arg(package);
         }
         if !self.activity_result {
             cmd.arg("--no-activity-result");

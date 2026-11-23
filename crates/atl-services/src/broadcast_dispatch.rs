@@ -61,6 +61,8 @@ pub struct Facts {
     pub explicit: bool,
     pub signature_perms: bool,
     pub max_manifest_api: Option<i32>,
+    /// The system boot action (LOCKED / BOOT_COMPLETED): its receivers are gated by broadcast::boot_refusal at dispatch.
+    pub boot: Option<crate::broadcast::BootScope>,
 }
 
 /// A result: code, data and extras (BroadcastRecord.resultCode, resultData, resultExtras). `E` is the caller's extras type.

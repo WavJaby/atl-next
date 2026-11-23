@@ -19,6 +19,9 @@ use crate::installed::Installed;
 use crate::packages::{InstallFields, PackageRecord};
 use crate::process_control::ControlSocket;
 
+/// The diag interface the install's counts go under (PackageManagerService's binder name).
+const DIAG: &str = "IPackageManager";
+
 /// What the install takes besides the session ids.
 pub struct Config {
     /// The device's ABIs, preferred first: primaryCpuAbi -> instruction set.
@@ -26,15 +29,18 @@ pub struct Config {
 }
 
 /// Installs every session the host holds files for, in order (PMS's boot scan of installed packages), after the system packages `records` (the scan's): every record the services answer from. Each
-/// package's uid comes from `ids` (AppIdSettingMap). A session named like a scanned package fails the start (updated system packages come with persisted /data packages).
+/// package's uid comes from `ids` (AppIdSettingMap). A session named like a scanned package fails the start (updated system packages come with persisted /data packages). `recorded` is each package's
+/// longVersionCode as the last install recorded it (package_state); the reports say what this install did, for the start-time package broadcasts (broadcasts_am.rs package_broadcasts).
 pub fn install(
     control: &ControlSocket,
     sessions: &[u32],
     ids: &mut AppIds,
     c: &Config,
     mut records: Vec<PackageRecord>,
-) -> Result<Vec<PackageRecord>> {
+    recorded: &dyn Fn(&str) -> Option<i64>,
+) -> Result<(Vec<PackageRecord>, Vec<Reported>)> {
     ensure!(!c.abis.is_empty(), "no device ABI");
+    let mut reports = Vec::with_capacity(sessions.len());
     for &session in sessions {
         let uid = ids.acquire().context("no application id left")?;
         let frames = control
@@ -56,10 +62,61 @@ pub fn install(
         control
             .commit(session, &parsed.name, uid, names)
             .with_context(|| format!("committing {}", parsed.name))?;
+        let version = long_version(&parsed.info);
+        let change = change_of(recorded(&parsed.name), version);
+        if let Change::Downgraded { .. } = change {
+            atl_diag::answered(
+                DIAG,
+                "install: lower version than recorded: no replace broadcasts",
+            );
+        }
+        reports.push(Reported {
+            package: parsed.name.clone(),
+            uid,
+            version,
+            change,
+        });
         let code_dir = format!("{DATA_APP}/{}", parsed.name);
         records.push(parsed.record(uid, &code_dir, true, (0, 0), c));
     }
-    Ok(records)
+    Ok((records, reports))
+}
+
+/// One session's install: the package, its uid and longVersionCode, and what the install did to it against the recorded version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub package: String,
+    pub uid: u32,
+    pub version: i64,
+    pub change: Change,
+}
+
+/// What an install does to a package against its recorded version (see [`change_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Not recorded: PACKAGE_ADDED.
+    New,
+    /// A higher version than `from`: PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED, MY_PACKAGE_REPLACED to the package (BroadcastHelper.java sendPostInstallBroadcasts :600-720).
+    Updated { from: i64 },
+    /// A lower version than `from`: AOSP refuses this install (INSTALL_FAILED_VERSION_DOWNGRADE); here it installs as before, with no replace broadcast (counted).
+    Downgraded { from: i64 },
+    /// The recorded version: nothing.
+    Unchanged,
+}
+
+/// What an install of `version` does to a package recorded at `recorded` (None: never recorded). Compared as longVersionCode.
+pub fn change_of(recorded: Option<i64>, version: i64) -> Change {
+    match recorded {
+        None => Change::New,
+        Some(from) if version > from => Change::Updated { from },
+        Some(from) if version < from => Change::Downgraded { from },
+        Some(_) => Change::Unchanged,
+    }
+}
+
+/// PackageInfo.getLongVersionCode (PackageInfo.java :93-94): versionCodeMajor << 32 | versionCode (the minor word unsigned).
+pub fn long_version(info: &PackageInfo) -> i64 {
+    (i64::from(info.version_code_major) << 32) | (i64::from(info.version_code) & 0xffff_ffff)
 }
 
 /// PMS's system scan (InitAppsHelper.scanSystemDirs, before the /data packages): every package dir atl-services-types `system_packages::scan` finds under the runtime root `root` (host path), parsed
@@ -236,6 +293,34 @@ mod tests {
     use super::*;
 
     /// A parse of a dir staged as the pm shell names files (source names) whose split name differs from every file name: the renames follow the parse.
+    #[test]
+    fn change_compares_longversioncode_against_the_recorded_one() {
+        // PackageInfo.getLongVersionCode (PackageInfo.java :93-94): a higher major word beats any minor one
+        assert_eq!(change_of(None, 5), Change::New);
+        assert_eq!(change_of(Some(4), 5), Change::Updated { from: 4 });
+        assert_eq!(change_of(Some(5), 4), Change::Downgraded { from: 5 });
+        assert_eq!(change_of(Some(5), 5), Change::Unchanged);
+        assert_eq!(
+            change_of(Some(0xffff_ffff), 1 << 32),
+            Change::Updated { from: 0xffff_ffff }
+        );
+    }
+
+    #[test]
+    fn long_version_is_major_then_unsigned_minor() {
+        let info = PackageInfo {
+            version_code: -1,
+            version_code_major: 1,
+            ..PackageInfo::default()
+        };
+        assert_eq!(long_version(&info), (1_i64 << 32) | 0xffff_ffff);
+        let plain = PackageInfo {
+            version_code: 2,
+            ..PackageInfo::default()
+        };
+        assert_eq!(long_version(&plain), 2);
+    }
+
     #[test]
     fn names_come_from_the_parsed_split_names() {
         let staged = |f: &str| Some(format!("{DATA_APP}/vmdl0.tmp/{f}"));

@@ -8,12 +8,22 @@
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.BROADCAST_STICKY" />
+    <!-- the boot rows' negative control (BootRecv): it holds the permission and filters the same actions, so only the opt-in rule keeps the boot broadcasts from it -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- package visibility: an implicit broadcast reaches the receiver app's manifest receiver only when this app can see it (AppsFilter, ComputerEngine.queryIntentReceivers) -->
     <queries>
         <package android:name="com.example.atlbcastrecv" />
     </queries>
 
     <application android:label="ATL broadcast sender">
+        <!-- not opted in (no autostart setting for this package): LOCKED_BOOT_COMPLETED and BOOT_COMPLETED are skipped here (counter `boot broadcast skipped`) -->
+        <receiver android:name=".BootRecv" android:exported="false" android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <!-- no window and no hardware rendering: the gate is about broadcasts; a hardware-accelerated activity makes ActivityThread.handleLaunchActivity preload HWUI (HardwareRenderer.preload), whose EGL
              context this run's GPU setup does not provide, and its RenderThread aborts the process before the receivers run -->
         <activity android:name=".Main" android:exported="true"

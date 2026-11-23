@@ -107,6 +107,9 @@ struct Args {
     /// A window's close ends its processes' services with no restart (atld `--window-close-stops-services`); false: AOSP restarts STICKY services of a killed process.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     window_close_stops_services: bool,
+    /// A package that gets LOCKED_BOOT_COMPLETED and BOOT_COMPLETED at start (atld `--autostart`, repeat; decision D2, per-app "start at login", default off). The setting is per run: packages not listed are opted out.
+    #[arg(long = "autostart", value_name = "PACKAGE")]
+    autostart: Vec<String>,
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
@@ -265,8 +268,24 @@ fn main() -> Result<()> {
         Some(root) => install::scan(&control, root, &mut ids, &config)?,
         None => Vec::new(),
     };
-    let list: Vec<PackageRecord> =
-        install::install(&control, &a.sessions, &mut ids, &config, system)?;
+    // user 0's package state as the last run left it: the recorded install versions (install::change_of) and the boot opt-ins; entries of packages no longer installed go after the install
+    let state = match &a.system_dir {
+        Some(dir) => PackageUserStates::load(dir),
+        None => PackageUserStates::default(),
+    };
+    let recorded = |name: &str| state.version_code(name);
+    let (list, reports): (Vec<PackageRecord>, Vec<install::Reported>) =
+        install::install(&control, &a.sessions, &mut ids, &config, system, &recorded)?;
+    for r in &reports {
+        state.set_version_code(&r.package, r.version);
+        writeln!(
+            std::io::stderr(),
+            "services: install {} version {} {:?}",
+            r.package,
+            r.version,
+            r.change
+        )?;
+    }
     // the runtime's permission files (SystemConfig's <library> rows, system_config.rs) and the --shared-library rows make one registry; a name given by both is an error
     let system = match &a.partitions {
         Some(root) => SystemConfig::read(root)?,
@@ -282,19 +301,28 @@ fn main() -> Result<()> {
         Some(p) => read_json(p)?,
         None => PlatformManifest::default(),
     };
-    let mut packages =
+    let packages =
         Packages::new(list, libraries).with_platform_broadcasts(platform.protected_broadcasts);
-    // user 0's package state (component enabled settings) as the last run left it, entries of packages no longer installed dropped
+    state.set_autostart(&a.autostart);
+    state.prune(|name| packages.by_name(name).is_some());
     if let Some(dir) = &a.system_dir {
-        let state = PackageUserStates::load(dir, |name| packages.by_name(name).is_some());
+        // a failed save is logged, not a start failure (package_state.rs: the state never fails a start); the next save replaces the file
+        if let Err(e) = state.save() {
+            writeln!(
+                std::io::stderr(),
+                "services: package state not saved in {}: {e}",
+                dir.display()
+            )?;
+        }
         writeln!(
             std::io::stderr(),
-            "services: package state: {} component overrides from {}",
+            "services: package state: {} overrides from {}; boot opt-ins {}",
             state.len(),
-            dir.display()
+            dir.display(),
+            a.autostart.len()
         )?;
-        packages = packages.with_user_state(state);
     }
+    let packages = packages.with_user_state(state);
     let packages = Arc::new(packages);
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
     let permissions = Arc::new(Permissions::new(&packages, &platform.permissions));
@@ -664,6 +692,9 @@ fn main() -> Result<()> {
     .context("addService compositor registry")?;
     exit_totals_on_terminate()?;
     writeln!(std::io::stderr(), "services: ready")?;
+    // the start-time broadcasts: the install's package broadcasts, then the boot ones (UserController's order); processes are ready here, so no before-boot flag
+    activity.package_broadcasts(&reports);
+    activity.boot_completed();
     if let Some(package) = &a.launch {
         activity
             .start_launcher(package)

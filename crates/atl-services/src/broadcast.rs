@@ -655,6 +655,58 @@ pub fn manifest_target_in_range(target_sdk: i32, min: i32, max: i32) -> bool {
     (min..=max).contains(&target_sdk)
 }
 
+/// Intent actions and extras of the system broadcasts (UserController.java :712-730, :943-960; BroadcastHelper.java sendPackageBroadcast and sendPostInstallBroadcasts :567-720).
+pub const ACTION_BOOT_COMPLETED: &str = "android.intent.action.BOOT_COMPLETED";
+pub const ACTION_LOCKED_BOOT_COMPLETED: &str = "android.intent.action.LOCKED_BOOT_COMPLETED";
+pub const ACTION_PACKAGE_ADDED: &str = "android.intent.action.PACKAGE_ADDED";
+pub const ACTION_PACKAGE_REPLACED: &str = "android.intent.action.PACKAGE_REPLACED";
+pub const ACTION_MY_PACKAGE_REPLACED: &str = "android.intent.action.MY_PACKAGE_REPLACED";
+pub const EXTRA_UID: &str = "android.intent.extra.UID";
+pub const EXTRA_REPLACING: &str = "android.intent.extra.REPLACING";
+pub const EXTRA_USER_HANDLE: &str = "android.intent.extra.user_handle";
+/// Intent.FLAG_RECEIVER_OFFLOAD = 0x80000000 (Intent.java:7609) as an int. Its offload queue is not modelled: the flag only reaches the receiver's Intent.
+pub const FLAG_RECEIVER_OFFLOAD: i32 = i32::MIN;
+
+/// PowerExemptionManager.REASON_* (PowerExemptionManager.java :240, :250, :335): the labels of the temp allowlist a boot or package-replaced send grants. Only REASON_DENIED (-1) changes
+/// a grant (uid_state::grant_of); the values are the pin's, for the receiver-side log and the diag line.
+pub const REASON_BOOT_COMPLETED: i32 = 200;
+pub const REASON_LOCKED_BOOT_COMPLETED: i32 = 202;
+pub const REASON_PACKAGE_REPLACED: i32 = 311;
+
+/// ActivityManagerConstants.DEFAULT_BOOT_TIME_TEMP_ALLOWLIST_DURATION = 20 * 1000 (:241), what getBootTimeTempAllowListDuration returns for the boot and package-replaced options
+/// (UserController :3742-3754, BroadcastHelper :287-298). Granted as FOREGROUND_SERVICE_ALLOWED (type 0, PowerExemptionManager.java :94).
+pub const BOOT_TIME_TEMP_ALLOWLIST_MS: i64 = 20 * 1000;
+
+/// The boot broadcasts the services send at start. LOCKED goes first; its final result sends BOOT (broadcasts_am.rs boot_completed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootScope {
+    Locked,
+    Boot,
+}
+
+/// The boot scope of an intent action; None for any other action.
+pub fn boot_scope(action: Option<&str>) -> Option<BootScope> {
+    match action? {
+        ACTION_LOCKED_BOOT_COMPLETED => Some(BootScope::Locked),
+        ACTION_BOOT_COMPLETED => Some(BootScope::Boot),
+        _ => None,
+    }
+}
+
+/// Why a manifest receiver of a boot broadcast is skipped (Some(reason), dispatch-time policy; the reason's first ':' part is its counter). LOCKED_BOOT_COMPLETED reaches
+/// directBootAware receivers only (plan S9; AOSP's direct-boot match of the receiver query is ComputerEngine.java :5649-5651). Both reach an opted-in package only (decision D2:
+/// per-app autostart, default off); the others get them at their first process start, which is not modelled yet (plan S9 gap).
+pub fn boot_refusal(
+    scope: BootScope,
+    direct_boot_aware: bool,
+    opted_in: bool,
+) -> Option<&'static str> {
+    if scope == BootScope::Locked && !direct_boot_aware {
+        return Some("LOCKED_BOOT_COMPLETED: receiver not directBootAware");
+    }
+    (!opted_in).then_some("boot broadcast skipped: package not opted in (autostart off, D2)")
+}
+
 /// The registrations and stickies. Deliveries are the dispatcher's (broadcast_dispatch.rs), which holds what a process must receive until it attaches.
 #[derive(Debug)]
 pub struct Broadcasts<R, I> {
@@ -1461,5 +1513,78 @@ mod tests {
         assert!(manifest_target_in_range(23, 0, 23));
         assert!(!manifest_target_in_range(24, 0, 23));
         assert!(!manifest_target_in_range(25, 30, CUR_DEVELOPMENT));
+    }
+
+    #[test]
+    fn boot_actions_and_extras_are_the_aosp_strings() {
+        // Intent.java: EXTRA_USER_HANDLE "android.intent.extra.user_handle" (:6774-6775), FLAG_RECEIVER_OFFLOAD 0x80000000 (:7609)
+        assert_eq!(
+            boot_scope(Some("android.intent.action.LOCKED_BOOT_COMPLETED")),
+            Some(BootScope::Locked)
+        );
+        assert_eq!(
+            boot_scope(Some("android.intent.action.BOOT_COMPLETED")),
+            Some(BootScope::Boot)
+        );
+        assert_eq!(
+            boot_scope(Some("android.intent.action.PACKAGE_ADDED")),
+            None
+        );
+        assert_eq!(boot_scope(None), None);
+        assert_eq!(EXTRA_USER_HANDLE, "android.intent.extra.user_handle");
+        assert_eq!(FLAG_RECEIVER_OFFLOAD as u32, 0x8000_0000);
+    }
+
+    #[test]
+    fn boot_receivers_need_the_opt_in_and_locked_also_direct_boot_awareness() {
+        // D2 default: a package not opted in gets neither boot broadcast at start; LOCKED reaches directBootAware receivers only
+        const NOT_OPTED: &str = "boot broadcast skipped: package not opted in (autostart off, D2)";
+        const NOT_AWARE: &str = "LOCKED_BOOT_COMPLETED: receiver not directBootAware";
+        assert_eq!(boot_refusal(BootScope::Boot, false, true), None);
+        assert_eq!(boot_refusal(BootScope::Locked, true, true), None);
+        assert_eq!(boot_refusal(BootScope::Boot, true, false), Some(NOT_OPTED));
+        assert_eq!(
+            boot_refusal(BootScope::Locked, true, false),
+            Some(NOT_OPTED)
+        );
+        assert_eq!(
+            boot_refusal(BootScope::Locked, false, true),
+            Some(NOT_AWARE)
+        );
+        assert_eq!(
+            boot_refusal(BootScope::Locked, false, false),
+            Some(NOT_AWARE)
+        );
+    }
+
+    #[test]
+    fn boot_and_replace_grants_are_fgs_allowed_for_twenty_seconds() {
+        // UserController.getTemporaryAppAllowlistBroadcastOptions: duration getBootTimeTempAllowListDuration (20 * 1000), type FOREGROUND_SERVICE_ALLOWED (0)
+        assert_eq!(BOOT_TIME_TEMP_ALLOWLIST_MS, 20_000);
+        for reason in [
+            REASON_BOOT_COMPLETED,
+            REASON_LOCKED_BOOT_COMPLETED,
+            REASON_PACKAGE_REPLACED,
+        ] {
+            assert_eq!(
+                crate::uid_state::grant_of(
+                    BOOT_TIME_TEMP_ALLOWLIST_MS,
+                    crate::uid_state::TEMP_TYPE_FGS_ALLOWED,
+                    reason
+                ),
+                Some(crate::uid_state::TempGrant {
+                    duration_ms: 20_000,
+                    fgs: true
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn reason_codes_are_the_pinned_aosp_values() {
+        // PowerExemptionManager.java :240 (BOOT_COMPLETED 200), :250 (LOCKED_BOOT_COMPLETED 202), :335 (PACKAGE_REPLACED 311)
+        assert_eq!(REASON_BOOT_COMPLETED, 200);
+        assert_eq!(REASON_LOCKED_BOOT_COMPLETED, 202);
+        assert_eq!(REASON_PACKAGE_REPLACED, 311);
     }
 }

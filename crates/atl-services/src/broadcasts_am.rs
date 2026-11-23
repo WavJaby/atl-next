@@ -11,8 +11,10 @@ use crate::broadcast_dispatch::{
     self as bd, Action, BroadcastId, Component, Dispatcher, Facts, Finish, NewBroadcast, Outcome,
     PENDING_COLD_START_ABANDON_MS, Policy, ProcKey, Receiver, Target,
 };
+use crate::install;
 use crate::uid_state::TempGrant;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
+use atl_parcelables::codecs::android::os::Bundle::Value;
 
 /// What each receiver of a broadcast gets besides its result: the intent, the user, and whether it is a registration's initial sticky (BroadcastRecord.initialSticky).
 #[derive(Clone)]
@@ -30,6 +32,31 @@ type DispatchAction = Action<ReceiverHandle, Bundle, Payload>;
 type Recv = Receiver<ReceiverHandle>;
 /// Activity.RESULT_OK (-1): the initial result of a send (ContextImpl.sendBroadcast).
 const BROADCAST_RESULT_OK: i32 = -1;
+
+/// The services' own resultTo continuations (AOSP's in-process IIntentReceiver.Stub, UserController :712-730 and :943-960): run by [`Inner::system_step`] on the broadcast's final result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SystemStep {
+    /// LOCKED_BOOT_COMPLETED is done: BOOT_COMPLETED goes next.
+    LockedBootDone,
+    /// BOOT_COMPLETED is done (AOSP sets mBootCompleted here).
+    BootDone,
+}
+
+/// The process queue of the services' own resultTo. The services are the process, so no app thread attaches; the queue exists so the dispatcher hands the result back in process.
+fn system_proc() -> ProcKey {
+    ProcKey {
+        name: "@system".to_owned(),
+        uid: SYSTEM_UID,
+    }
+}
+
+/// android.permission.RECEIVE_BOOT_COMPLETED: the boot broadcasts' required permission (UserController :727, :964).
+const RECEIVE_BOOT_COMPLETED: &str = "android.permission.RECEIVE_BOOT_COMPLETED";
+
+/// This process's pid, the sender pid of the services' own sends.
+fn own_pid() -> i32 {
+    i32::try_from(std::process::id()).unwrap_or(i32::MAX)
+}
 
 /// One send as the binder side makes it (BroadcastController.broadcastIntentLocked after verifyBroadcastLocked): the sender's (pid, uid), its user, the permissions it required (None =
 /// null, not an empty list), its result (code, data, extras), whether it is sticky and ordered, and the process a result goes back to (resultTo).
@@ -65,6 +92,16 @@ fn dispatch_skip(
     let Some(p) = packages.by_name(&component.package) else {
         return Some(format!("Skipping delivery to {component}: package is gone"));
     };
+    if let Some(scope) = facts.boot {
+        // the boot broadcasts' gate (broadcast::boot_refusal): D2's opt-in, and LOCKED's directBootAware
+        let aware = p
+            .receiver(&component.class)
+            .is_some_and(|d| d.component.direct_boot_aware);
+        let opted_in = packages.user_state().autostart(&component.package);
+        if let Some(why) = broadcast::boot_refusal(scope, aware, opted_in) {
+            return Some(format!("{why}: {component}"));
+        }
+    }
     if facts
         .max_manifest_api
         .is_some_and(|max| !broadcast::manifest_target_in_range(p.app().target_sdk_version, 0, max))
@@ -165,8 +202,12 @@ impl Inner {
                     }
                 }
                 Action::ResultTo {
+                    handle: ReceiverHandle::System(step),
+                    ..
+                } => self.system_step(st, step),
+                Action::ResultTo {
                     pid,
-                    handle,
+                    handle: ReceiverHandle::Binder(receiver),
                     result,
                     payload,
                 } => {
@@ -175,7 +216,7 @@ impl Inner {
                         self.broadcast_queue.enqueue(
                             thread,
                             broadcast_queue::Job::Registered {
-                                receiver: handle.0,
+                                receiver,
                                 intent: payload.intent,
                                 result_code: result.code,
                                 data: result.data,
@@ -230,17 +271,24 @@ impl Inner {
     ) -> Option<broadcast_queue::Job> {
         let (result_code, data, extras) = (job.result.code, job.result.data, job.result.extras);
         match job.receiver {
-            Target::Registered(handle) => Some(broadcast_queue::Job::Registered {
-                receiver: handle.0,
-                intent: job.payload.intent,
-                result_code,
-                data,
-                extras,
-                ordered: job.ordered,
-                initial_sticky: job.payload.initial_sticky,
-                assume_delivered: job.assume_delivered,
-                user: job.payload.user,
-            }),
+            Target::Registered(ReceiverHandle::Binder(receiver)) => {
+                Some(broadcast_queue::Job::Registered {
+                    receiver,
+                    intent: job.payload.intent,
+                    result_code,
+                    data,
+                    extras,
+                    ordered: job.ordered,
+                    initial_sticky: job.payload.initial_sticky,
+                    assume_delivered: job.assume_delivered,
+                    user: job.payload.user,
+                })
+            }
+            Target::Registered(ReceiverHandle::System(_)) => {
+                // the dispatcher's targets are receivers; the in-process resultTo is never one
+                atl_diag::answered(AM, "broadcast dropped: in-process handle as a receiver");
+                None
+            }
             Target::Manifest(component) => {
                 let Some(p) = self.packages.by_name(&component.package) else {
                     atl_diag::answered(AM, "broadcast dropped: receiver package is gone");
@@ -474,6 +522,12 @@ impl Inner {
     /// The send path (BroadcastController.broadcastIntentLocked after verifyBroadcastLocked): a sticky is checked and stored (:1415-1495), then the receivers (receivers_locked) become
     /// one dispatcher broadcast. Returns BROADCAST_SUCCESS, or the sticky's refusal code.
     pub(super) fn send_broadcast(&self, spec: SendSpec<'_>) -> binder::Result<i32> {
+        let mut st = self.state();
+        self.send_broadcast_locked(&mut st, spec)
+    }
+
+    /// [`Self::send_broadcast`] under the state lock: the services' own continuations send from inside a delivery (perform), where the lock is already held.
+    fn send_broadcast_locked(&self, st: &mut State, spec: SendSpec<'_>) -> binder::Result<i32> {
         let (pid, uid) = spec.sender;
         if spec.sticky {
             let holds = self.holds(uid, permission::BROADCAST_STICKY);
@@ -507,21 +561,26 @@ impl Inner {
         {
             intent.to_mut().flags |= broadcast::FLAG_RECEIVER_INCLUDE_BACKGROUND;
         }
-        let mut st = self.state();
         if spec.sticky {
             st.broadcasts
                 .put_sticky(spec.user, key.clone(), spec.intent.clone(), uid);
         }
-        let receivers = self.receivers_locked(&st, &spec, &intent, &key);
+        let receivers = self.receivers_locked(st, &spec, &intent, &key);
         let facts = Facts {
             flags: intent.flags,
             explicit: intent.component.is_some() || intent.package.is_some(),
             signature_perms: self.permissions.is_signature_only(spec.required),
             max_manifest_api: spec.max_manifest_api,
+            boot: broadcast::boot_scope(intent.action.as_deref()),
         };
-        let result_to = spec
-            .result_to
-            .and_then(|(handle, rpid)| Self::process_key_of(&st, rpid).map(|key| (handle, key)));
+        let result_to = match spec.result_to {
+            // the services' own resultTo: its queue is the system's whatever pid the caller names (system_proc)
+            Some((ReceiverHandle::System(step), _)) => {
+                Some((ReceiverHandle::System(step), system_proc()))
+            }
+            Some((handle, rpid)) => Self::process_key_of(st, rpid).map(|key| (handle, key)),
+            None => None,
+        };
         let b = NewBroadcast {
             facts,
             receivers,
@@ -539,10 +598,64 @@ impl Inner {
                 grant: spec.grant,
             },
         };
-        let (_, actions) = self.dispatch(&mut st, |d, p| d.enqueue(b, p));
-        self.perform(&mut st, actions);
-        drop(st);
+        let (_, actions) = self.dispatch(st, |d, p| d.enqueue(b, p));
+        self.perform(st, actions);
         Ok(BROADCAST_SUCCESS)
+    }
+
+    /// The services' own resultTo continuations (SystemStep), run on the final result of an ordered broadcast the services sent. LOCKED's result sends BOOT_COMPLETED.
+    fn system_step(&self, st: &mut State, step: SystemStep) {
+        match step {
+            SystemStep::LockedBootDone => {
+                log(format_args!(
+                    "LOCKED_BOOT_COMPLETED finished: sending BOOT_COMPLETED"
+                ));
+                self.send_boot(
+                    st,
+                    broadcast::ACTION_BOOT_COMPLETED,
+                    broadcast::REASON_BOOT_COMPLETED,
+                    SystemStep::BootDone,
+                );
+            }
+            SystemStep::BootDone => log(format_args!("BOOT_COMPLETED finished")),
+        }
+    }
+
+    /// One boot broadcast as the system (UserController :712-730 and :943-960): ordered, NO_ABORT | INCLUDE_BACKGROUND | OFFLOAD, EXTRA_USER_HANDLE 0, required RECEIVE_BOOT_COMPLETED,
+    /// the boot temp allowlist (FOREGROUND_SERVICE_ALLOWED, 20 s) with `reason`. Its final result goes to `result_to` in process.
+    fn send_boot(&self, st: &mut State, action: &str, reason: i32, result_to: SystemStep) {
+        let intent = Intent {
+            action: Some(action.to_owned()),
+            flags: broadcast::FLAG_RECEIVER_NO_ABORT
+                | broadcast::FLAG_RECEIVER_INCLUDE_BACKGROUND
+                | broadcast::FLAG_RECEIVER_OFFLOAD,
+            extras: Some(Bundle::from_entries([(
+                broadcast::EXTRA_USER_HANDLE.to_owned(),
+                Value::Int(USER_SYSTEM),
+            )])),
+            ..Intent::default()
+        };
+        let required = [RECEIVE_BOOT_COMPLETED.to_owned()];
+        let spec = SendSpec {
+            intent: &intent,
+            resolved_type: None,
+            sender: (own_pid(), SYSTEM_UID),
+            user: USER_SYSTEM,
+            required: Some(&required),
+            result: (BROADCAST_RESULT_OK, None, None),
+            sticky: false,
+            ordered: true,
+            result_to: Some((ReceiverHandle::System(result_to), own_pid())),
+            max_manifest_api: None,
+            grant: uid_state::grant_of(
+                broadcast::BOOT_TIME_TEMP_ALLOWLIST_MS,
+                uid_state::TEMP_TYPE_FGS_ALLOWED,
+                reason,
+            ),
+        };
+        if let Err(e) = self.send_broadcast_locked(st, spec) {
+            log(format_args!("boot broadcast {action}: {e}"));
+        }
     }
 
     /// The registration's initial sticky (registerReceiverWithFeatureTraced:582-604): an unordered broadcast of the stored sticky to this one receiver, flagged initial.
@@ -773,11 +886,107 @@ impl ActivityManager {
                 result: (RESULT_OK, None, None),
                 sticky: false,
                 ordered: finished.is_some(),
-                result_to: finished.map(|(h, caller)| (ReceiverHandle(h.clone()), caller)),
+                result_to: finished.map(|(h, caller)| (ReceiverHandle::Binder(h.clone()), caller)),
                 max_manifest_api: None,
                 grant,
             })
             .map(|_| ())
+    }
+
+    /// The start-time package broadcasts of the install's reports (BroadcastHelper.sendPostInstallBroadcasts :600-720), before the boot ones: a new package gets PACKAGE_ADDED; an updated
+    /// one PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED to every receiver, and MY_PACKAGE_REPLACED to its own receivers alone with the REASON_PACKAGE_REPLACED temp allowlist.
+    /// Unchanged and downgraded packages send nothing (install.rs change_of).
+    pub fn package_broadcasts(&self, reports: &[install::Reported]) {
+        for r in reports {
+            match r.change {
+                install::Change::New => {
+                    self.send_package(broadcast::ACTION_PACKAGE_ADDED, r, false, None)
+                }
+                install::Change::Updated { .. } => {
+                    self.send_package(broadcast::ACTION_PACKAGE_ADDED, r, true, None);
+                    self.send_package(broadcast::ACTION_PACKAGE_REPLACED, r, true, None);
+                    self.send_package(
+                        broadcast::ACTION_MY_PACKAGE_REPLACED,
+                        r,
+                        false,
+                        Some(r.package.as_str()),
+                    );
+                }
+                install::Change::Downgraded { .. } | install::Change::Unchanged => {}
+            }
+        }
+    }
+
+    /// One package broadcast as the system (sendPackageBroadcast): data `package:<pkg>` and EXTRA_UID (EXTRA_REPLACING on an update) to every receiver, or with `target` the
+    /// package alone (setPackage, no data, no extras: MY_PACKAGE_REPLACED). Unordered, no flags, the user 0 receivers.
+    fn send_package(
+        &self,
+        action: &str,
+        r: &install::Reported,
+        replacing: bool,
+        target: Option<&str>,
+    ) {
+        let mut intent = Intent {
+            action: Some(action.to_owned()),
+            ..Intent::default()
+        };
+        let grant = match target {
+            Some(package) => {
+                intent.package = Some(package.to_owned());
+                uid_state::grant_of(
+                    broadcast::BOOT_TIME_TEMP_ALLOWLIST_MS,
+                    uid_state::TEMP_TYPE_FGS_ALLOWED,
+                    broadcast::REASON_PACKAGE_REPLACED,
+                )
+            }
+            None => {
+                intent.data = Some(format!("package:{}", r.package));
+                let mut extras = vec![(
+                    broadcast::EXTRA_UID.to_owned(),
+                    Value::Int(i32::try_from(r.uid).unwrap_or(i32::MAX)),
+                )];
+                if replacing {
+                    extras.push((broadcast::EXTRA_REPLACING.to_owned(), Value::Bool(true)));
+                }
+                intent.extras = Some(Bundle::from_entries(extras));
+                None
+            }
+        };
+        let spec = SendSpec {
+            intent: &intent,
+            resolved_type: None,
+            sender: (own_pid(), SYSTEM_UID),
+            user: USER_SYSTEM,
+            required: None,
+            result: (BROADCAST_RESULT_OK, None, None),
+            sticky: false,
+            ordered: false,
+            result_to: None,
+            max_manifest_api: None,
+            grant,
+        };
+        if let Err(e) = self.inner.send_broadcast(spec) {
+            log(format_args!(
+                "package broadcast {action} {}: {e}",
+                r.package
+            ));
+        }
+    }
+
+    /// The boot at services start (UserController's chain, :712-730 then :943-960): the system queue is attached so the in-process resultTo is delivered, then LOCKED_BOOT_COMPLETED
+    /// goes out ordered; its final result sends BOOT_COMPLETED (system_step). Both reach only the opted-in packages (D2, dispatch_skip).
+    pub fn boot_completed(&self) {
+        let mut st = self.inner.state();
+        let actions = self.inner.dispatch(&mut st, |d, p| {
+            d.process_attached(&system_proc(), own_pid(), p)
+        });
+        self.inner.perform(&mut st, actions);
+        self.inner.send_boot(
+            &mut st,
+            broadcast::ACTION_LOCKED_BOOT_COMPLETED,
+            broadcast::REASON_LOCKED_BOOT_COMPLETED,
+            SystemStep::LockedBootDone,
+        );
     }
 
     /// A broadcast the services send as the system to every user (ActivityManager.broadcastStickyIntent(intent, USER_ALL) for `sticky`, Context.sendBroadcastAsUser(intent,

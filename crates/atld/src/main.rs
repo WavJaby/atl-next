@@ -276,6 +276,10 @@ struct Args {
     /// Passed to the services.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     window_close_stops_services: bool,
+    /// Decision D2 (per-app "start at login", default off): a package named here gets LOCKED_BOOT_COMPLETED and BOOT_COMPLETED when the services start (repeat). A package not named is
+    /// opted out for this run. Passed to the services.
+    #[arg(long = "autostart", value_name = "PACKAGE")]
+    autostart: Vec<String>,
     /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
     #[arg(long, requires = "tilt_keys")]
     tilt_max_deg: Option<f32>,
@@ -3052,6 +3056,9 @@ fn run(a: &Args) -> Result<ExitCode> {
         "--window-close-stops-services".into(),
         a.window_close_stops_services.to_string().into(),
     ]);
+    for package in &a.autostart {
+        services_args.extend(["--autostart".into(), package.clone().into()]);
+    }
     if a.no_sensor_service {
         services_args.push("--no-sensor-service".into());
     }

@@ -2,7 +2,7 @@
 //! The per-user package state PMS keeps beside the install (AOSP PackageUserState): today the component enabled overrides of user 0, set by IPackageManager.setComponentEnabledSetting and read by
 //! every resolution through [`is_enabled`] (Packages::enabled).
 //! Persisted as one file the services own, `package-state.json` in the services' state dir (atld `--system-dir`), in [`state_file`]'s envelope (versioned, temp-then-rename, missing/unreadable =
-//! default). Entries of packages no longer installed are dropped at load (the package was removed: PMS forgets its settings).
+//! default). Entries of packages no longer installed are dropped by [`PackageUserStates::prune`] (the package was removed: PMS forgets its settings). Per package too: the installed longVersionCode (install.rs) and the boot opt-in (D2).
 //! The app-level setting (setApplicationEnabledSetting) is not stored: no surveyed app calls it, so the app state is always DEFAULT and the manifest's `<application android:enabled>` decides.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,13 +43,32 @@ pub fn is_enabled(package_enabled: bool, component_enabled: bool, state: i32, fl
     }
 }
 
-/// One package's overrides (PackageUserStateImpl mEnabledComponents / mDisabledComponents): a class is in at most one set.
+/// One package's record: its overrides (PackageUserStateImpl mEnabledComponents / mDisabledComponents, a class in at most one set), the installed version and the boot opt-in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Overrides {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     enabled: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     disabled: BTreeSet<String>,
+    /// The longVersionCode the install recorded (PMS's packages.xml version): the start-time install compares the session's to it (install.rs change_of).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_code: Option<i64>,
+    /// D2: the boot broadcasts reach this package at start (per-app "start at login", default off).
+    #[serde(default, skip_serializing_if = "is_off")]
+    autostart: bool,
+}
+
+fn is_off(on: &bool) -> bool {
+    !on
+}
+
+impl Overrides {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_empty()
+            && self.disabled.is_empty()
+            && self.version_code.is_none()
+            && !self.autostart
+    }
 }
 
 /// The file's shape inside [`state_file`]'s envelope.
@@ -66,25 +85,61 @@ pub struct PackageUserStates {
 }
 
 impl PackageUserStates {
-    /// The state saved in `dir`, entries of packages `installed` denies dropped. A missing file is the empty state; an unreadable one (I/O, JSON, another version) is the empty state, counted and logged
+    /// The state saved in `dir` (entries are dropped by [`Self::prune`] after the install). A missing file is the empty state; an unreadable one (I/O, JSON, another version) is the empty state, counted and logged
     /// (the next save replaces it).
-    pub fn load(dir: &Path, installed: impl Fn(&str) -> bool) -> Self {
+    pub fn load(dir: &Path) -> Self {
         let file = dir.join(FILE);
         let packages = state_file::load::<Stored>(&file, VERSION, DIAG)
             .map_or_else(BTreeMap::new, |s| s.packages);
-        let (kept, dropped): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            packages.into_iter().partition(|(p, _)| installed(p));
-        for p in dropped.keys() {
-            atl_diag::answered(DIAG, "load: entry of a package not installed dropped");
-            log(&format!(
-                "{}: {p} is not installed: its component states dropped",
-                file.display()
-            ));
-        }
         PackageUserStates {
             file: Some(file),
-            packages: Mutex::new(kept),
+            packages: Mutex::new(packages),
         }
+    }
+
+    /// Drops the records of packages `installed` denies: PMS forgets a removed package's settings. Run once the install step has the package list.
+    pub fn prune(&self, installed: impl Fn(&str) -> bool) {
+        let mut packages = self.packages();
+        let gone: Vec<String> = packages
+            .keys()
+            .filter(|p| !installed(p.as_str()))
+            .cloned()
+            .collect();
+        for p in gone {
+            packages.remove(&p);
+            atl_diag::answered(DIAG, "load: entry of a package not installed dropped");
+            log(&format!("{p} is not installed: its state dropped"));
+        }
+    }
+
+    /// The installed longVersionCode recorded for `package`; None when none was recorded.
+    pub fn version_code(&self, package: &str) -> Option<i64> {
+        self.packages().get(package).and_then(|o| o.version_code)
+    }
+
+    /// Records `package`'s installed longVersionCode (saved by [`Self::save`]).
+    pub fn set_version_code(&self, package: &str, version: i64) {
+        self.packages()
+            .entry(package.to_owned())
+            .or_default()
+            .version_code = Some(version);
+    }
+
+    /// D2: whether the boot broadcasts reach `package` at start.
+    pub fn autostart(&self, package: &str) -> bool {
+        self.packages().get(package).is_some_and(|o| o.autostart)
+    }
+
+    /// Sets the boot opt-in to exactly `packages`: the atld `--autostart` setting is per run, so every other package is opted out.
+    pub fn set_autostart(&self, packages: &[String]) {
+        let mut map = self.packages();
+        for o in map.values_mut() {
+            o.autostart = false;
+        }
+        for p in packages {
+            map.entry(p.clone()).or_default().autostart = true;
+        }
+        map.retain(|_, o| !o.is_empty());
     }
 
     fn packages(&self) -> MutexGuard<'_, BTreeMap<String, Overrides>> {
@@ -127,7 +182,7 @@ impl PackageUserStates {
             COMPONENT_ENABLED_STATE_DEFAULT => o.enabled.remove(class) | o.disabled.remove(class),
             _ => false,
         };
-        if o.enabled.is_empty() && o.disabled.is_empty() {
+        if o.is_empty() {
             packages.remove(package);
         }
         changed
@@ -224,18 +279,46 @@ mod tests {
     #[test]
     fn save_load_round_trip() {
         let dir = scratch("round-trip");
-        let s = PackageUserStates::load(&dir, |_| true);
+        let s = PackageUserStates::load(&dir);
         assert!(s.is_empty());
         s.set_component("a", "A1", COMPONENT_ENABLED_STATE_DISABLED);
         s.set_component("a", "A2", COMPONENT_ENABLED_STATE_ENABLED);
         s.set_component("gone", "G", COMPONENT_ENABLED_STATE_DISABLED);
         s.save().expect("save");
         assert!(!dir.join("package-state.json.tmp").exists());
-        let back = PackageUserStates::load(&dir, |p| p != "gone");
+        let back = PackageUserStates::load(&dir);
+        back.prune(|p| p != "gone");
         assert_eq!(back.component("a", "A1"), COMPONENT_ENABLED_STATE_DISABLED);
         assert_eq!(back.component("a", "A2"), COMPONENT_ENABLED_STATE_ENABLED);
         assert_eq!(back.component("gone", "G"), COMPONENT_ENABLED_STATE_DEFAULT);
         assert_eq!(back.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The version record and the boot opt-in survive a save; `set_autostart` opts out every other package; a record holding only them is kept by a component reset.
+    #[test]
+    fn version_and_autostart_round_trip_and_prune() {
+        let dir = scratch("version-autostart");
+        let s = PackageUserStates::load(&dir);
+        s.set_version_code("a", 1);
+        s.set_version_code("b", (2_i64 << 32) | 7);
+        s.set_autostart(&["a".to_owned()]);
+        assert!(s.set_component("a", "A", COMPONENT_ENABLED_STATE_DISABLED));
+        assert!(s.set_component("a", "A", COMPONENT_ENABLED_STATE_DEFAULT));
+        s.save().expect("save");
+        let back = PackageUserStates::load(&dir);
+        assert_eq!(back.version_code("a"), Some(1));
+        assert_eq!(back.version_code("b"), Some((2_i64 << 32) | 7));
+        assert_eq!(back.version_code("c"), None);
+        assert!(back.autostart("a"));
+        assert!(!back.autostart("b"));
+        back.set_autostart(&["b".to_owned()]);
+        assert!(!back.autostart("a"));
+        assert!(back.autostart("b"));
+        back.prune(|p| p == "a");
+        assert_eq!(back.version_code("b"), None);
+        assert!(!back.autostart("b"));
+        assert_eq!(back.version_code("a"), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -251,7 +334,7 @@ mod tests {
                 .map_or(0, |(_, _, n)| n)
         };
         let before = refusals();
-        let s = PackageUserStates::load(&dir, |_| true);
+        let s = PackageUserStates::load(&dir);
         assert!(s.is_empty());
         assert_eq!(refusals(), before + 1);
         std::fs::write(
@@ -259,13 +342,13 @@ mod tests {
             br#"{"version":99,"packages":{"a":{"disabled":["A"]}}}"#,
         )
         .expect("plant");
-        let s = PackageUserStates::load(&dir, |_| true);
+        let s = PackageUserStates::load(&dir);
         assert_eq!(s.component("a", "A"), COMPONENT_ENABLED_STATE_DEFAULT);
         assert_eq!(refusals(), before + 2);
         s.set_component("a", "A", COMPONENT_ENABLED_STATE_DISABLED);
         s.save().expect("save");
         assert_eq!(
-            PackageUserStates::load(&dir, |_| true).component("a", "A"),
+            PackageUserStates::load(&dir).component("a", "A"),
             COMPONENT_ENABLED_STATE_DISABLED
         );
         let _ = std::fs::remove_dir_all(&dir);

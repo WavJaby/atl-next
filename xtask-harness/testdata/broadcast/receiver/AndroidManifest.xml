@@ -9,6 +9,8 @@
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
     <!-- the alarm chain's exact alarm (Recv.java ALARM_GRANT): AlarmManagerService :2765-2808 needs it for an exact alarm at targetSdk >= S (AlarmManager.java :265-266) -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- the boot rows' broadcasts (BootRecv): LOCKED_BOOT_COMPLETED and BOOT_COMPLETED are delivered only to a required RECEIVE_BOOT_COMPLETED holder -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application android:label="ATL broadcast receiver">
         <!-- the sender's ordered and implicit rows (xtask-harness/testdata/broadcast/sender): an implicit intent reaches this receiver only through these filters -->
@@ -21,5 +23,15 @@
         </receiver>
         <!-- started by the alarm chain's receiver starts (Recv.java startOrLog); not exported: only this app's explicit intents reach it -->
         <service android:name=".AlarmSvc" android:exported="false" />
+        <!-- S9 boot rows: directBootAware so LOCKED_BOOT_COMPLETED reaches it; MY_PACKAGE_REPLACED is explicit to this package (the reinstall row) -->
+        <receiver android:name=".BootRecv" android:exported="false" android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <!-- started by BootRecv inside the BOOT_COMPLETED temp allowlist -->
+        <service android:name=".BootSvc" android:exported="false" />
     </application>
 </manifest>

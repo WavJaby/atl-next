@@ -14,6 +14,11 @@
 //!   an implicit intent is skipped for the restricted manifest receiver (counter `Background execution not allowed`).
 //! - alarm grant (the receiver app sets its own RTC_WAKEUP alarms from Recv.java): an inexact alarm's receiver starts AlarmSvc and the start is refused for the background uid (log `app is in background uid`, counter `startService: background start refused`; AlarmManagerService :2751, :2762 gives an inexact alarm no temp allowlist); an exact alarm set after that refusal grants the start (counter `temp allowlist granted`, AlarmManagerService :2765-2781), and AlarmSvc starts once.
 //!
+//! - boot (plan S9, decision D2): LOCKED_BOOT_COMPLETED, then BOOT_COMPLETED through its resultTo, reach the opted-in receiver app (`--autostart`) headless; BOOT's receiver starts its service inside the 20 s
+//!   temp allowlist; the sender, not opted in, gets neither (counter `boot broadcast skipped`).
+//! - reinstall (plan S9): a second atld run over the same data root installs version 2 of the receiver: the services classify it `Updated { from: 1 }` and MY_PACKAGE_REPLACED reaches it alone;
+//!   the sender, unchanged, gets none.
+//!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
 use std::path::{Path, PathBuf};
@@ -91,6 +96,28 @@ const ALARM_BACKGROUND: &str = "app is in background uid ";
 const ALARM_SERVICE_STARTED: &str = "AtlBcast: alarm service started";
 const REFUSED_COUNTER: &str = "startService: background start refused";
 const GRANTED_COUNTER: &str = "temp allowlist granted (tempAllowlistUidLocked)";
+// the S9 boot rows: BootRecv / BootSvc log lines (testdata receiver and sender), and the skip counter of the opt-in rule (broadcasts_am.rs dispatch_skip)
+const BOOT_LOCKED: &str = "AtlBcast: boot received android.intent.action.LOCKED_BOOT_COMPLETED";
+const BOOT_BOOT: &str = "AtlBcast: boot received android.intent.action.BOOT_COMPLETED";
+const BOOT_MY_REPLACED: &str = "AtlBcast: boot received android.intent.action.MY_PACKAGE_REPLACED";
+const BOOT_SERVICE_STARTED: &str = "AtlBcast: boot service started";
+const BOOT_SERVICE_REFUSED: &str = "AtlBcast: boot service refused";
+const BOOT_SKIPPED: &str = "boot broadcast skipped";
+
+/// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed).
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
 
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -116,6 +143,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("broadcast");
     let mut packages = Vec::new();
     let mut names = Vec::new();
+    let mut apk_paths: Vec<PathBuf> = Vec::new();
     for (fixture, dir) in [(SENDER, "sender"), (RECEIVER, "receiver")] {
         let apk = rt
             .apk
@@ -127,10 +155,31 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             m.name,
             m.receivers.len()
         );
+        apk_paths.push(apk.clone());
         packages.push(Package::base(apk));
         names.push(m.name);
     }
     let (sender, receiver) = (names[0].clone(), names[1].clone());
+    // the device's data root, kept across the boot run and the reinstall run (atld's install record, the package list and the opt-in); the connectivity run below stays fresh
+    let data = work.join("data");
+    let _ = std::fs::remove_dir_all(&data);
+    let kept_runtime = |autostart: &[&str]| -> Result<Runtime> {
+        Ok(Runtime::new(
+            root,
+            "broadcast",
+            &args.host,
+            args.out.as_deref(),
+            args.java_out.as_deref(),
+            "broadcast",
+            args.verbose,
+        )?
+        .with_empty_process_grace(EMPTY_GRACE_MS)
+        .with_data_root(&data)
+        .with_autostart(autostart))
+    };
+    // the boot run has no opt-in (decision D2's default): every boot receiver is skipped. The opt-in run is the reinstall run, after the restriction rows: a boot grant would
+    // make the receiver's uid active for 20 s here (AOSP-correct), so the restricted-start rows must not share its window
+    let kept = kept_runtime(&[])?;
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
@@ -140,7 +189,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         shell: None,
         log_tags: "*:i".into(),
     };
-    let mut atld = rt.start_atld(&run)?;
+    let mut atld = kept.start_atld(&run)?;
     let read = atl_diag::logfiles::read;
     let (sender_log, receiver_log) = (run.log(&sender), run.log(&receiver));
     let start = Instant::now();
@@ -185,6 +234,63 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let counted = |name: &str| counters.iter().any(|l| l.contains(name));
     let system_level = format!("{BATTERY_STICKY}{}", crate::app::battery_level());
+    // the reinstall row (plan S9): version 2 of the receiver over the same data root, the same package order (uids) and opt-in. atld installs at start, so this second run is the upgrade
+    let receiver_v2 = {
+        let v2 = work.join("receiver-v2");
+        let _ = std::fs::remove_dir_all(&v2);
+        copy_tree(&root.join(RECEIVER), &v2)?;
+        let manifest_file = v2.join("AndroidManifest.xml");
+        let text = std::fs::read_to_string(&manifest_file)?;
+        std::fs::write(
+            &manifest_file,
+            text.replace("android:versionCode=\"1\"", "android:versionCode=\"2\""),
+        )?;
+        rt.apk
+            .build(&v2, &work.join("receiver-v2-build"), &[], None, None)?
+    };
+    let run2 = Run {
+        root: work.join("root2"),
+        scratch: work.join("scratch2"),
+        launch: None,
+        packages: vec![
+            Package::base(apk_paths[0].clone()),
+            Package::base(receiver_v2),
+        ],
+        libraries: vec![],
+        shell: None,
+        log_tags: "*:i".into(),
+    };
+    let opt_in = kept_runtime(&[receiver.as_str()])?;
+    let mut atld2 = opt_in.start_atld(&run2)?;
+    let (r2_log, s2_log) = (run2.log(&receiver), run2.log(&sender));
+    let start2 = Instant::now();
+    let mut replaced_seen: Option<Instant> = None;
+    let ended2 = loop {
+        if replaced_seen.is_none() && read(&r2_log).contains(BOOT_MY_REPLACED) {
+            replaced_seen = Some(Instant::now());
+        }
+        // the sender's silence is read once SETTLE has let a late delivery land after the receiver's line
+        if replaced_seen.is_some_and(|t| t.elapsed() > SETTLE) || start2.elapsed() > LIMIT {
+            break None;
+        }
+        if let Some(s) = atld2.try_wait()? {
+            break Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    if ended2.is_none() {
+        let _ = atld2.kill();
+        atld2.wait()?;
+    }
+    println!(
+        "broadcast: reinstall run {:.1?} (atld start to the receiver's MY_PACKAGE_REPLACED, plus SETTLE)",
+        start2.elapsed()
+    );
+    let (s2, r2) = (read(&s2_log), read(&r2_log));
+    let services2 = read(&run2.log("services"));
+    for l in counter_lines(&services2) {
+        println!("broadcast: reinstall counter {l}");
+    }
     let mut checks = vec![
         (
             "runtime receiver got its package's broadcast once",
@@ -262,6 +368,53 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "the exact alarm granted the receiver's uid a temp allowlist, and AlarmSvc started once (the grant's start)",
             count(&r, ALARM_SERVICE_STARTED) == 1 && counted(GRANTED_COUNTER),
+        ),
+        (
+            "the first install recorded both packages as new (the services' install reports)",
+            services.contains("services: install com.example.atlbcast version 1 New")
+                && services.contains("services: install com.example.atlbcastrecv version 1 New"),
+        ),
+        (
+            "with no opt-in, neither package got a boot broadcast at start, and each skip is counted",
+            !r.contains(BOOT_LOCKED)
+                && !r.contains(BOOT_BOOT)
+                && !s.contains(BOOT_LOCKED)
+                && !s.contains(BOOT_BOOT)
+                && counted(BOOT_SKIPPED),
+        ),
+        (
+            "BOOT_COMPLETED reached the opted-in receiver app in the opt-in run",
+            r2.contains(BOOT_BOOT),
+        ),
+        (
+            "LOCKED_BOOT_COMPLETED reached it before BOOT_COMPLETED (the in-process resultTo chain)",
+            matches!((r2.find(BOOT_LOCKED), r2.find(BOOT_BOOT)), (Some(l), Some(b)) if l < b),
+        ),
+        (
+            "the receiver started by BOOT_COMPLETED started its service inside the temp allowlist",
+            r2.contains(BOOT_SERVICE_STARTED) && !r2.contains(BOOT_SERVICE_REFUSED),
+        ),
+        (
+            "the package not opted in got neither boot broadcast in the opt-in run, and each skip is counted",
+            !s2.contains(BOOT_LOCKED)
+                && !s2.contains(BOOT_BOOT)
+                && counter_lines(&services2)
+                    .iter()
+                    .any(|l| l.contains(BOOT_SKIPPED)),
+        ),
+        (
+            "a reinstall with a higher versionCode reached the receiver app's MY_PACKAGE_REPLACED",
+            r2.contains(BOOT_MY_REPLACED),
+        ),
+        (
+            "the reinstall classified the receiver Updated from version 1 and the same-version sender Unchanged",
+            services2.contains(
+                "services: install com.example.atlbcastrecv version 2 Updated { from: 1 }",
+            ) && services2.contains("services: install com.example.atlbcast version 1 Unchanged"),
+        ),
+        (
+            "a same-version reinstall sent the sender no MY_PACKAGE_REPLACED",
+            !s2.contains(BOOT_MY_REPLACED),
         ),
     ];
     checks.extend(connectivity_checks(root, &mut rt, &work)?);
