@@ -9,11 +9,12 @@
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
 //! Wayland (wayland_rows): on the gates' labwc, the probe connects through a per-app security context as atld gives it; no privileged interface offered, a privileged bind fails, ATL's interfaces stay. Deliberate break: mount `nested.socket` instead of the context socket; the row must then fail.
 //! PipeWire (pipewire_rows): on the desktop's PipeWire, through a per-app security context made as atld makes one (atl_platform_host::pipewire_context), at the tier its probe picks; built-in red control: the same probe through the raw socket must fail the same judgement.
-//! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate removes the two $HOME names it makes.
+//! Deliberate breaks, by hand: restore the writable host root in atl-broker `host_root` (every host dir bound rw); `home-read` must then fail. Drop `env_clear` in atl-broker `launch`; the `env:` checks must then fail. The gate writes nothing in $HOME: the one $HOME name it removes is the one a broken sandbox let the probe create.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::net::TcpListener;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -61,6 +62,8 @@ const EACCES: i32 = 13;
 const EROFS: i32 = 30;
 /// The home checks: the path is not shown (ENOENT) or Landlock refuses it (EACCES).
 const HOME_REFUSED: &[i32] = &[ENOENT, EACCES];
+/// The other-read mode bit. The home-read file has it, as the gate's old file did (umask 022): the mode bits then allow the read for any uid, so a refusal comes from the sandbox or from $HOME's own modes.
+const OTHER_READ: u32 = 0o004;
 /// The outside write: refused by the mount (EROFS), the grant (EACCES), or the mode (EPERM).
 const WRITE_REFUSED: &[i32] = &[EPERM, EACCES, EROFS];
 
@@ -87,29 +90,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .bin("atl-sandbox-probe");
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
     let pid = std::process::id();
-    let secret = home.join(format!(".atl-sandbox-probe-{pid}"));
+    let home_file = find_home_file(&home)?;
     let created = home.join(format!(".atl-sandbox-probe-new-{pid}"));
-    fs::write(
-        &secret,
-        b"the real $HOME: the app sandbox must not show this",
-    )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let ui = Ui::make(&work.join("ui"))?;
     let runs = [
         (
             "no INTERNET",
-            probe_once(&broker, &probe, &work, &secret, &created, port, &ui, false),
+            probe_once(&broker, &probe, &work, &home_file, &created, port, &ui, false),
         ),
         (
             "INTERNET",
-            probe_once(&broker, &probe, &work, &secret, &created, port, &ui, true),
+            probe_once(&broker, &probe, &work, &home_file, &created, port, &ui, true),
         ),
     ];
     drop(ui);
-    // the gate's own names in $HOME and its listener, whatever the probes did
-    let _ = fs::remove_file(&secret);
-    let _ = fs::remove_file(&created);
+    // the $HOME name a broken sandbox let the probe create (absent when refused), and the listener, whatever the probes did
+    if fs::symlink_metadata(&created).is_ok() {
+        let _ = fs::remove_file(&created);
+    }
     drop(listener);
     let mut fails = Vec::new();
     let mut lines = Vec::new();
@@ -147,6 +147,27 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The file the home-read check reads: a regular file directly in `$HOME` (a symlink is skipped: its target is not the home's), world-readable ([`OTHER_READ`]), smallest first (the probe reads it whole).
+/// Found, never made: the gate writes nothing in `$HOME` and never opens the file (the probe reports ok/err only). A home without one fails the gate: a missing file reads ENOENT in any sandbox, a vacuous pass.
+fn find_home_file(home: &Path) -> Result<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(home).with_context(|| format!("listing {}", home.display()))? {
+        let path = entry?.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() && (meta.mode() & OTHER_READ) != 0 {
+            files.push((meta.len(), path));
+        }
+    }
+    files.sort();
+    files
+        .into_iter()
+        .next()
+        .map(|(_, path)| path)
+        .context("no world-readable regular file directly in $HOME: the home-read check needs an existing one")
 }
 
 /// The UI grants' world: two listening sockets (one granted as the compositor's), a fontconfig file and a file beside it, and the DRM sysfs the probe's nodes give it.
@@ -213,7 +234,7 @@ fn probe_once(
     broker: &Broker,
     probe: &Path,
     work: &Path,
-    secret: &Path,
+    home_file: &Path,
     created: &Path,
     port: u16,
     ui: &Ui,
@@ -224,7 +245,7 @@ fn probe_once(
     let host_own = work.join("own");
     fs::create_dir_all(&host_own)?;
     let mut cmd = Command::new(probe);
-    cmd.arg(secret)
+    cmd.arg(home_file)
         .arg(created)
         .arg(OUTSIDE)
         .arg(&own)
