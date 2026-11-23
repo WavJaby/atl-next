@@ -40,6 +40,7 @@ pub mod sensor;
 pub mod shared_memory;
 pub mod state_file;
 pub mod tasks;
+pub mod uid_state;
 pub mod volume;
 pub mod window_layout;
 
