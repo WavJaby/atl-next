@@ -35,6 +35,9 @@ static void call_valist(JNIEnv *env, ...) {
 // The fake's `...A` slots compare each jvalue with tests/qemu_jni.rs V_* and answer that slot's V_RET_*.
 #define V_MID 0x7a11
 #define V_ARGS 11, 1.25, 0x100000002LL, 0.5f, (jobject)(intptr_t)0xb01, -12, 2.5, -3LL, 1.75f, 13, 3.75, 0x700000004LL, 2.25f, 14, 4.5, 5LL, 3.125f, (jobject)(intptr_t)0xb02, 5.875
+// Q6-7 part 2: the engine reads a `...` call's arguments by its method's shorty, so each `...` call names the method its arguments are: D_MID "(IDIIIIDIII)D" (CallStaticDoubleMethod, check d), F_MID "(I)F" (CallStaticFloatMethod, check f); the fake answers their shorties (tests/qemu_jni.rs method_shorty).
+#define D_MID 0x7a12
+#define F_MID 0x7a13
 
 static jdouble v_static(JNIEnv *env, jclass cls, jmethodID mid, ...) {
     va_list ap;
@@ -95,14 +98,14 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     (*env)->ReleaseStringUTFChars(env, s, chars);
     // Q6-3: a fixed fp parameter; a variadic call whose integers 8, 9, 10 spill to the stack after the eight integer registers, with fp arguments 2.25 and 7.5 in v0 and v1; an fp result; an fp result of a float
     (*env)->SetDoubleField(env, (jobject)(intptr_t)OBJ, (jfieldID)(intptr_t)FIELD, 2.5);
-    jdouble d = (*env)->CallStaticDoubleMethod(env, cls, mid, 1, 2.25, 3, 4, 5, 6, 7.5, 8, 9, 10);
+    jdouble d = (*env)->CallStaticDoubleMethod(env, cls, (jmethodID)(intptr_t)D_MID, 1, 2.25, 3, 4, 5, 6, 7.5, 8, 9, 10);
     union {
         jdouble d;
         long long i;
     } du;
     du.d = d;
     out[5] = du.i;
-    jfloat f = (*env)->CallStaticFloatMethod(env, cls, mid, 7);
+    jfloat f = (*env)->CallStaticFloatMethod(env, cls, (jmethodID)(intptr_t)F_MID, 7);
     union {
         jfloat f;
         int i;
@@ -135,6 +138,13 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     out[22] = v_virtual(env, vobj, vmid, V_ARGS);
     out[23] = v_nonvirtual(env, vobj, cls, vmid, V_ARGS);
     out[24] = (long long)(intptr_t)v_new(env, cls, vmid, V_ARGS);
+    // Q6-7 part 2 (check V): the same 19 arguments in one `...` call; out[25] the bits of its CallStaticDoubleMethod result
+    union {
+        jdouble d;
+        long long i;
+    } wu;
+    wu.d = (*env)->CallStaticDoubleMethod(env, cls, vmid, V_ARGS);
+    out[25] = wu.i;
 }
 
 // JNI_OnLoad(vm, reserved): ART calls it with no shorty, the host through a down shell (Vm kind); records both, returns JNI_VERSION_1_6 (jni.h)

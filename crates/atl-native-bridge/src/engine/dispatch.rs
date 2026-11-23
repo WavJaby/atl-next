@@ -97,7 +97,8 @@ pub unsafe extern "C" fn count_object_shell(slot: usize, target: usize, guest: u
 }
 
 /// A guest JNI call (pool id `id` < `OBJECT_STUBS`, Q6-2): x0 is the guest's JNIEnv or JavaVM, and the call runs on the host object it stands for. That object's own table slot `id` runs with x0 replaced by the host object and the other lanes forwarded; its result is the answer. The descriptor (`jni::lane_of`, from the guest object's table) gives the result class; a refused call aborts by name ([`refuse`]).
-/// Deliberate breaks: `jni_swap` exchanges x3 and x4 of CallStaticIntMethod only; `jni_guest_env` passes the guest's env through unmapped.
+/// Every `...` and `...V` call crosses as its `...A` sibling, its arguments read by the method's shorty into a `jvalue[]` (va_list.rs), so the host callee has the `A` form's prototype on every host.
+/// Deliberate breaks: `jni_swap` exchanges x3 and x4 of CallStaticIntMethod only, before the arguments are read; `jni_guest_env` passes the guest's env through unmapped.
 fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     let guest = lanes.regs[0] as usize;
     // SAFETY: x0 is the object pointer the guest called through.
@@ -106,18 +107,30 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     // SAFETY: `guest` is a guest env or vm: `lane_of` found its table, which only `guest_env` / `guest_vm` objects carry.
     let host = unsafe { objects::host_of(guest) };
     let mut lanes = *lanes;
+    // break `jni_swap`: before the arguments are read, so the call reads the exchanged lanes
+    #[cfg(atl_nb_jni_swap)]
+    if id as usize == jni::CALL_STATIC_INT_METHOD {
+        lanes.regs.swap(3, 4);
+    }
     let name = lane.name;
-    let bad32 = |b: va_list::Bad32| -> Vec<u64> {
+    let bad = |b: va_list::Bad| -> Vec<u64> {
         refuse(match b {
-            va_list::Bad32::Shorty(c) => Refused::Shorty { name, c },
-            va_list::Bad32::Past => Refused::Variadic32Window { name },
+            va_list::Bad::Shorty(c) => Refused::Shorty { name, c },
+            va_list::Bad::Past => Refused::VariadicWindow { name },
         })
     };
-    // a `...V` call (Q6-7), or a 32-bit guest's `...` call: its arguments read per the method's shorty into a jvalue array, which the `...A` sibling takes in the lane after the fixed parameters
+    // the arguments of a `...V` call (Q6-7) or a `...` call: read per the method's shorty into a jvalue array, which the `...A` sibling takes in the lane after the fixed parameters
     let mut args: Vec<u64> = Vec::new();
     let mut va_lane = None;
     let mut sig_lane = lane;
     let va_k = lane.params.iter().position(|c| *c == Class::VaList);
+    // the `...A` sibling's descriptor: the prototype the host call is placed by
+    let a_lane = |a: usize| {
+        // SAFETY: `a` is a slot of the same guest object's table as the `lane_of` above.
+        unsafe { objects::lane_of(guest, a) }
+            .unwrap_or_else(|r| refuse(r))
+            .1
+    };
     let slot = if let Some(k) = va_k {
         // lanes k - 1 and k located by the guest's rules (`int_arg`: every earlier JNI parameter is one word)
         let method = *rules.int_arg(&mut lanes, k - 1) as usize;
@@ -128,37 +141,42 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
         // SAFETY: lane k is the guest's va_list -- a pointer to it (AAPCS64), its `__ap` (AAPCS32: the one-word struct passed by value) -- and the guest made the call with the method's arguments (JNI contract).
         args = unsafe {
             if rules.word_bits == AAPCS64.word_bits {
-                va_list::jvalues(va, params).unwrap_or_else(|c| refuse(Refused::Shorty { name, c }))
+                va_list::jvalues(va, params).unwrap_or_else(bad)
             } else {
-                va_list::jvalues32(va, usize::MAX, params).unwrap_or_else(bad32)
+                va_list::jvalues32(va, usize::MAX, params).unwrap_or_else(bad)
             }
         };
         va_lane = Some(k);
-        jni::a_slot(id as usize)
-    } else if lane.variadic && rules.word_bits != AAPCS64.word_bits {
-        // AAPCS32 passes `...` in r0-r3 then the stack, one run of 4-byte words with the fixed parameters (base PCS: no fp registers for a variadic call); packed into an 8-aligned image those lanes are the list `va_start` would read, starting at the word after the k fixed parameters (all one word: env, object or class, methodID last)
+        let a = jni::a_slot(id as usize);
+        sig_lane = a_lane(a);
+        a
+    } else if lane.variadic {
+        // a `...` call, both widths: its k fixed parameters come first, the methodID last (lane k - 1)
         let k = lane.params.len();
         let method = *rules.int_arg(&mut lanes, k - 1) as usize;
         // SAFETY: as the V case: lane k - 1 is the call's jmethodID (jni.h: every `...` slot's arguments follow its methodID).
         let params = unsafe { jni::method_params(host, method) }
             .unwrap_or_else(|| refuse(Refused::NoShorty { name }));
-        let words = rules.int_lanes + rules.stack_words;
-        let image = va_list::image32(
-            lanes.regs[..rules.int_lanes]
-                .iter()
-                .chain(&lanes.stack[..rules.stack_words])
-                .copied(),
-        );
-        let base = image.as_ptr() as usize;
-        // SAFETY: `image` holds `words` 4-byte words from `base`; the reader stops before `base + 4 * words`.
-        args = unsafe { va_list::jvalues32(base + 4 * k, base + 4 * words, params) }
-            .unwrap_or_else(bad32);
+        args = if rules.word_bits == AAPCS64.word_bits {
+            // AAPCS64: the arguments are the lanes after the named registers, read as the list `va_start` would save (va_list.rs `jvalues_lanes`)
+            va_list::jvalues_lanes(&lanes, k, params).unwrap_or_else(bad)
+        } else {
+            // AAPCS32 passes `...` in r0-r3 then the stack, one run of 4-byte words with the fixed parameters (base PCS: no fp registers for a variadic call); packed into an 8-aligned image those lanes are the list `va_start` would read, starting at the word after the k fixed parameters (all one word: env, object or class, methodID last)
+            let words = rules.int_lanes + rules.stack_words;
+            let image = va_list::image32(
+                lanes.regs[..rules.int_lanes]
+                    .iter()
+                    .chain(&lanes.stack[..rules.stack_words])
+                    .copied(),
+            );
+            let base = image.as_ptr() as usize;
+            // SAFETY: `image` holds `words` 4-byte words from `base`; the reader stops before `base + 4 * words`.
+            unsafe { va_list::jvalues32(base + 4 * k, base + 4 * words, params) }
+                .unwrap_or_else(bad)
+        };
         va_lane = Some(k);
         let a = jni::variadic_a_slot(id as usize);
-        // SAFETY: as the `lane_of` above, same guest object.
-        sig_lane = unsafe { objects::lane_of(guest, a) }
-            .unwrap_or_else(|r| refuse(r))
-            .1;
+        sig_lane = a_lane(a);
         a
     } else if table == objects::ENV
         && rules.word_bits != AAPCS64.word_bits
@@ -187,21 +205,17 @@ fn call_object(rules: HostRules, id: u32, lanes: &AtlLanes) -> Answer {
     count_object(table, id as usize, target);
     #[cfg(not(all(feature = "crossing-count", not(atl_nb_qe_jni_count))))]
     let _ = table;
-    #[cfg(atl_nb_jni_swap)]
-    if id as usize == jni::CALL_STATIC_INT_METHOD {
-        lanes.regs.swap(3, 4);
-    }
     #[cfg(atl_nb_jni_guest_env)]
     let arg0 = guest as u64;
     #[cfg(not(atl_nb_jni_guest_env))]
     let arg0 = host as u64;
-    // host words replace guest lanes after the lanes are brought into the host's image (`call_host`), so a 32-bit guest's word never truncates them: the host object in lane 0, a `...V` slot's jvalue array in its va_list lane (an int lane: `place`)
+    // host words replace guest lanes after the lanes are brought into the host's image (`call_host`), so a 32-bit guest's word never truncates them: the host object in lane 0, a `...V` or `...` call's jvalue array in its va_list lane (an int lane: `place`)
     let mut host_words = vec![(0, arg0)];
     host_words.extend(va_lane.map(|k| (k, args.as_ptr() as u64)));
-    // the fixed parameters place the call; a 64-bit guest's `...` follows them unclassed, so it crosses as the guest set it (AAPCS64 and the host image share the layout); a 32-bit guest's became the A sibling's above
+    // the prototype of the slot that runs: the `A` sibling's for a `...` or `...V` call, which never has a variadic one
     let sig = Sig {
         ret: sig_lane.ret,
-        params: (!sig_lane.variadic).then_some(sig_lane.params),
+        params: Some(sig_lane.params),
     };
     call_host(rules, target, Some(name), &lanes, sig, &host_words)
 }
@@ -369,7 +383,7 @@ fn refuse_up(target: usize) -> ! {
     ))
 }
 
-/// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object, a `...` slot on a 32-bit guest. A refusal aborts, so each count reaches the abort message only.
+/// Refusals by kind, in [`refuse`]'s order: a forged id, a slot with no function, a `va_list` without a shorty source, a shorty character outside jni's, an x0 that is no proxy object, a `...` call's arguments past the lanes' stack window. A refusal aborts, so each count reaches the abort message only.
 static REFUSED: [AtomicUsize; 6] = [const { AtomicUsize::new(0) }; 6];
 
 /// The named abort of a refused guest object call: the message says which call and why, with the count of that kind.
@@ -398,11 +412,9 @@ fn refuse(r: Refused) -> ! {
                 char::from(c)
             ),
         ),
-        Refused::Variadic32Window { name } => (
+        Refused::VariadicWindow { name } => (
             5,
-            format!(
-                "JNI {name}: a 32-bit guest's `...` arguments run past the lanes' stack window"
-            ),
+            format!("JNI {name}: a `...` call's arguments run past the lanes' stack window"),
         ),
     };
     let n = REFUSED[kind].fetch_add(1, Ordering::Relaxed) + 1;

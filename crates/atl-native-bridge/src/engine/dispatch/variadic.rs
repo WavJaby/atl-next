@@ -2,7 +2,7 @@
 //! The up call on a host whose variadic convention takes the guest's lanes as they stand (x86_64 SysV, the reference; AArch64 alike): one variadic call `f(x0..x7, v0..v7, s0..s7)`.
 //! SysV: integer words x0..x7 then the eight stack words (SysV takes the sixth and later integer words from the stack, in order), fp lanes v0..v7 in xmm0..7. Both ABIs assign integer and fp arguments to registers by class in declaration order, so the guest's lanes are the callee's register image as they stand; the prototype's classes need no walk.
 //! Eight fp words always pass, so the call sets %al = 8: a variadic callee (glibc printf) saves its xmm arguments only when %al is nonzero. 8 is the ABI's upper bound on the vector registers used; a variadic call's fp count is unknown, so the exact count is not built.
-//! Not represented: fp arguments past eight, or more than 16 integers (R-1): a proxy row with such a prototype is a named trap from build time (atl_bridgegen::jni `lane_refusal`); a JNI or `bind` caller has no prototype and is not checked.
+//! Not represented: fp arguments past eight, or more than 16 integers (R-1): a proxy row with such a prototype is a named trap from build time (atl_bridgegen::jni `lane_refusal`); a `bind` caller has no prototype and is not checked.
 
 use atl_engine_api::AtlLanes;
 

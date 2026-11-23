@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Q6-2 / Q6-3 gate (QEMU bridge plan Q6-2, Q6-3), harness-less: guest JNI calls under QEMU on the real arm64 guest linker. The main executable (`xtask-harness/testdata/qemu-jni/fixture.c`, PIE on libc.so) is started; the host calls its `qj_run` with the guest env of a fake host JNIEnv (this file), and each JNI call the fixture makes crosses to the fake.
-//! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. CallStaticDoubleMethod and CallStaticFloatMethod check the lanes they were given (the stack spill, the fp arguments) and answer from them.
+//! The fake records what each call got and answers with spec values: GetVersion gives JNI_VERSION_1_6 (jni.h), CallStaticIntMethod(a, b) gives a * 10 + b, so a swapped pair shows as 32, not 23. Each `...` call reaches its `...A` slot (the route the engine places by the method's shorty): the fake checks every jvalue against fixture.c's argument list and answers its EXPECT value.
 //! Driver: run without `ATL_QJ_CASE`, it first runs each refusal case in a child process (QEMU starts once per process), then the plain case in this process. A refusal case must abort by name: SIGABRT and its message on stderr.
 //! Env (xtask qemu_jni.rs sets it; unset prints SKIP): ATL_ENGINE_SO (the engine `.so`), ATL_NB_BOOT (the engine boot executable, crates/atl-qemu-boot), ATL_NB_JNIEXE (fixture.c, PIE), ATL_NB_LINKER, ATL_NB_VDSO (the arm64 NB images; `<nb>/libnative_bridge_guest_libc` among the guest library directories).
-//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod got its lanes and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (V) CallStaticDoubleMethodV, CallLongMethodV, CallNonvirtualIntMethodV and NewObjectV with 19 mixed arguments through a guest va_list reached the `...A` slots with each jvalue right, and their results came back; (r) a reserved slot, (l) a va_list entry with no shorty source, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (n) 3,000 down shells are made and the 1st, 1,025th and last return their own answers (growable shells; break `down_cap` = the retired 1,024 pool turns it red); (R) a down call of 15 integers is refused by name in its child.
+//! Checks: (s) started; (v) GetVersion returned JNI_VERSION_1_6; (e) all 11 calls reached the fake, each with the host env it was given; (c) FindClass and GetStaticMethodID got the names and the handles they issued, CallStaticIntMethod's `...A` got (cls, mid, 2, 3), and the fixture got 23; (j) GetJavaVM, a special with its own host thunk, returned the guest vm of the fake vm; (t) NewStringUTF and GetStringUTFChars round-tripped "abc"; (d) SetDoubleField got 2.5, CallStaticDoubleMethod's `...A` got its ten jvalues and returned DOUBLE_EXPECT; (f) CallStaticFloatMethod's `...A` got 7 and returned FLOAT_EXPECT; (a) glibc atof, bound with result class Fp, returned ATOF_EXPECT in v0; (p) glibc snprintf, bound through `qemu::bind` and called from the guest with a double vararg, wrote SNPRINTF_EXPECT (the `%al` row); (V) CallStaticDoubleMethodV, CallLongMethodV, CallNonvirtualIntMethodV and NewObjectV with 19 mixed arguments through a guest va_list reached the `...A` slots with each jvalue right, and their results came back; CallStaticDoubleMethod with the same 19 arguments as `...` reached its `...A` slot with each jvalue right, and its result came back; (r) a reserved slot, (l) a va_list entry with no shorty source, (g) a forged id past the table: each refused by name. Q6-4 down calls, each through `qemu::down` with the host env or vm: (o) JNI_OnLoad returned JNI_VERSION_1_6 and got the guest vm and the reserved pointer; (m) nativeMix (14 arguments, a double result) got the guest env and class and returned MIX_EXPECT; (x) nativeScale (a float result) got the guest env and class and returned SCALE_EXPECT; (n) 3,000 down shells are made and the 1st, 1,025th and last return their own answers (growable shells; break `down_cap` = the retired 1,024 pool turns it red); (R) a down call of 15 integers is refused by name in its child.
 //! Output: `qemu-jni: (x) ok` per check, `(x) FAIL <why>` otherwise, exit 0 when all pass.
 #![expect(
     clippy::disallowed_types,
@@ -53,9 +53,6 @@ const GET_VERSION: usize = 4;
 const FIND_CLASS: usize = 6;
 const GET_STATIC_METHOD_ID: usize = 113;
 const SET_DOUBLE_FIELD: usize = 112;
-const CALL_STATIC_INT_METHOD: usize = 129;
-const CALL_STATIC_FLOAT_METHOD: usize = 135;
-const CALL_STATIC_DOUBLE_METHOD: usize = 138;
 const NEW_STRING_UTF: usize = 167;
 const GET_STRING_UTF_CHARS: usize = 169;
 const RELEASE_STRING_UTF_CHARS: usize = 170;
@@ -68,15 +65,21 @@ const FORGED_SLOT: usize = 240;
 const CALLS: usize = 11;
 /// The words of `out`: fixture.c's results at 0..7; the snprintf row (`p`) takes the pool address of its binding at 8, the buffer's address at 9, its size at 11 and returns snprintf's result at 10; the atof row (`a`) takes its binding at 12 and its argument at 13 and returns the result's bits at 14.
 /// Q6-4: the down calls' records (fixture.c `qj_seen`, copied by qj_run): JNI_OnLoad's vm at 15 and reserved at 16, nativeMix's env at 17 and class at 18, nativeScale's env at 19 and class at 20.
-/// Q6-7: the V calls' results at 21..24 (fixture.c `qj_run`).
-const OUT_WORDS: usize = 25;
+/// Q6-7: the V calls' results at 21..24, the `...` call of V_ARGS at 25 (fixture.c `qj_run`).
+const OUT_WORDS: usize = 26;
 /// Q6-7, the `...V` calls (check V): fixture.c passes V_ARGS through a va_list with method V_MID; the engine reads them by V_MID's shorty and calls these `...A` slots (jni.h order), which check each jvalue and answer their V_RET_*.
+/// The `...` calls (checks c, d, f, and V_ARGS' `...` call of check V) reach the `...A` slot of their id (jni.h: `XA` = X + 2): CallStaticIntMethod 129 -> 131, CallStaticFloatMethod 135 -> 137, CallStaticDoubleMethod 138 -> 140, which the `...V` route shares.
 const NEW_OBJECT_A: usize = 30;
 const CALL_LONG_METHOD_A: usize = 54;
 const CALL_NONVIRTUAL_INT_METHOD_A: usize = 81;
+const CALL_STATIC_INT_METHOD_A: usize = 131;
+const CALL_STATIC_FLOAT_METHOD_A: usize = 137;
 const CALL_STATIC_DOUBLE_METHOD_A: usize = 140;
 /// fixture.c `V_MID`.
 const V_MID: usize = 0x7a11;
+/// fixture.c `D_MID` (CallStaticDoubleMethod's `...` arguments) and `F_MID` (CallStaticFloatMethod's): their shorties are in `method_shorty`.
+const D_MID: usize = 0x7a12;
+const F_MID: usize = 0x7a13;
 /// One argument of fixture.c `V_ARGS`, by its JNI type.
 #[derive(Clone, Copy)]
 enum V {
@@ -108,6 +111,21 @@ const V_ARGS: [V; 19] = [
     V::L(0xb02),
     V::D(5.875),
 ];
+/// fixture.c's `...` arguments by call, in order, checked jvalue by jvalue: CallStaticIntMethod(ADD_A, ADD_B); CallStaticDoubleMethod's ten (`D_MID`); CallStaticFloatMethod's 7 (`F_MID`).
+const ADD_ARGS: [V; 2] = [V::I(ADD_A), V::I(ADD_B)];
+const D_ARGS: [V; 10] = [
+    V::I(1),
+    V::D(2.25),
+    V::I(3),
+    V::I(4),
+    V::I(5),
+    V::I(6),
+    V::D(7.5),
+    V::I(8),
+    V::I(9),
+    V::I(10),
+];
+const F_ARGS: [V; 1] = [V::I(7)];
 /// The answers of the four `...A` slots: arbitrary values of their result types, distinct from any argument.
 const V_RET_D: f64 = 0.375;
 const V_RET_J: i64 = 0x1234_5678_9abc_def0;
@@ -368,14 +386,18 @@ extern "C" fn get_static_method_id(
     METHOD
 }
 
-/// `CallStaticIntMethod(env, cls, mid, ...)`: the variadic ints follow the three fixed arguments in order.
-extern "C" fn call_static_int_method(env: usize, cls: usize, mid: usize, a: i32, b: i32) -> i32 {
+/// `CallStaticIntMethod(env, cls, mid, ADD_A, ADD_B)` through its `...A` slot: the two jvalues are the arguments in order. The answer is `a * 10 + b`.
+extern "C" fn call_static_int_method_a(
+    env: usize,
+    cls: usize,
+    mid: usize,
+    args: *const u64,
+) -> i32 {
     seen(env);
-    wrong(
-        &CALL_BAD,
-        cls != CLASS || mid != METHOD || a != ADD_A || b != ADD_B,
-    );
-    a.wrapping_mul(10).wrapping_add(b)
+    // SAFETY: the engine's jvalue array holds ADD_ARGS.len() words.
+    let ok = unsafe { args_match(&ADD_ARGS, args) };
+    wrong(&CALL_BAD, cls != CLASS || mid != METHOD || !ok);
+    ADD_EXPECT as i32
 }
 
 /// `SetDoubleField(env, obj, fid, value)`: a fixed fp parameter, in v0. The fake records its bits.
@@ -385,60 +407,18 @@ extern "C" fn set_double_field(env: usize, obj: usize, fid: usize, value: f64) {
     SET_BITS.store(value.to_bits(), Ordering::Relaxed);
 }
 
-/// `CallStaticDoubleMethod(env, cls, mid, 1, 2.25, 3, 4, 5, 6, 7.5, 8, 9, 10)` as fixture.c makes it. The integers 1, 3, 4, 5, 6 take x3..x7 (a3..a7); 8, 9, 10 come after the eight integer registers, on the stack (s0..s2); 2.25 and 7.5 are v0 and v1. The host image puts the guest's x6 and x7 at the first two stack words, so a6 and a7 are those and s0..s2 follow.
-/// The integers are `jint`: a stack slot's upper half is undefined (AAPCS64), so the callee reads the low 32 bits, as this signature does.
-/// The answer is the weighted integers 1*a3 + 2*a4 + ... + 8*s2 (= 260 for these arguments) plus (v0 + 2 * v1) / 2 (= 8.625): a position error shows as another total.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the C signature: the lanes of one call, in the order the host image lays them out"
-)]
-extern "C" fn call_static_double_method(
+/// `CallStaticFloatMethod(env, cls, F_MID, 7)` through its `...A` slot: the one jvalue is the argument. The float answer comes back in s0.
+extern "C" fn call_static_float_method_a(
     env: usize,
     cls: usize,
     mid: usize,
-    a3: i32,
-    a4: i32,
-    a5: i32,
-    a6: i32,
-    a7: i32,
-    s0: i32,
-    s1: i32,
-    s2: i32,
-    v0: f64,
-    v1: f64,
-) -> f64 {
+    args: *const u64,
+) -> f32 {
     seen(env);
-    wrong(
-        &DOUBLE_BAD,
-        cls != CLASS
-            || mid != METHOD
-            || a3 != 1
-            || a4 != 3
-            || a5 != 4
-            || a6 != 5
-            || a7 != 6
-            || s0 != 8
-            || s1 != 9
-            || s2 != 10
-            || v0.to_bits() != 2.25f64.to_bits()
-            || v1.to_bits() != 7.5f64.to_bits(),
-    );
-    let ints = i64::from(a3)
-        + 2 * i64::from(a4)
-        + 3 * i64::from(a5)
-        + 4 * i64::from(a6)
-        + 5 * i64::from(a7)
-        + 6 * i64::from(s0)
-        + 7 * i64::from(s1)
-        + 8 * i64::from(s2);
-    ints as f64 + (v0 + 2.0 * v1) / 2.0
-}
-
-/// `CallStaticFloatMethod(env, cls, mid, 7)`: one integer, in x3; the float answer comes back in s0.
-extern "C" fn call_static_float_method(env: usize, cls: usize, mid: usize, a3: i32) -> f32 {
-    seen(env);
-    wrong(&FLOAT_BAD, cls != CLASS || mid != METHOD || a3 != 7);
-    a3 as f32 * 0.5
+    // SAFETY: the engine's jvalue array holds F_ARGS.len() words.
+    let ok = unsafe { args_match(&F_ARGS, args) };
+    wrong(&FLOAT_BAD, cls != CLASS || mid != F_MID || !ok);
+    FLOAT_EXPECT
 }
 
 extern "C" fn get_java_vm(env: usize, out: *mut usize) -> i32 {
@@ -468,57 +448,79 @@ extern "C" fn release_string_utf_chars(env: usize, s: usize, chars: *const c_cha
     wrong(&STR_BAD, s != STRING || chars != STR_CHARS.as_ptr().cast());
 }
 
-/// The fake runtime's `getMethodShorty` (native_bridge.h): V_MID's shorty, result first (`D`, any type: the engine reads only the parameters), then V_ARGS's types; null for any other method.
+/// The fake runtime's `getMethodShorty` (native_bridge.h), result first (the engine reads only the parameters): METHOD's `III`, D_MID's `DIDIIIIDIII` and F_MID's `FI` (the `...` calls' arguments), V_MID's `D` then V_ARGS's types; null for any other method.
 extern "C" fn method_shorty(env: usize, mid: usize) -> *const c_char {
     static SHORTY: OnceLock<Vec<u8>> = OnceLock::new();
     wrong(&V_BAD, env != fake().env);
-    if mid != V_MID {
-        return std::ptr::null();
-    }
-    SHORTY
-        .get_or_init(|| {
-            let mut s = vec![b'D'];
-            s.extend(V_ARGS.iter().map(|a| match a {
-                V::I(_) => b'I',
-                V::J(_) => b'J',
-                V::F(_) => b'F',
-                V::D(_) => b'D',
-                V::L(_) => b'L',
-            }));
-            s.push(0);
-            s
-        })
-        .as_ptr()
-        .cast()
+    let s: &[u8] = match mid {
+        METHOD => &b"III\0"[..],
+        D_MID => &b"DIDIIIIDIII\0"[..],
+        F_MID => &b"FI\0"[..],
+        V_MID => SHORTY
+            .get_or_init(|| {
+                let mut s = vec![b'D'];
+                s.extend(V_ARGS.iter().map(|a| match a {
+                    V::I(_) => b'I',
+                    V::J(_) => b'J',
+                    V::F(_) => b'F',
+                    V::D(_) => b'D',
+                    V::L(_) => b'L',
+                }));
+                s.push(0);
+                s
+            })
+            .as_slice(),
+        _ => return std::ptr::null(),
+    };
+    s.as_ptr().cast()
 }
 
-/// One `...A` call: counts it, and counts it in V_BAD unless its env, object or class (0 = not passed), method and every jvalue are fixture.c's. A jvalue is 8 bytes, its member at offset 0 (jni.h union).
+/// One `...A` call of the V_MID list: counts it, and counts it in V_BAD unless its env, object or class (0 = not passed), method and every jvalue are fixture.c's.
 fn v_call(env: usize, obj: usize, cls: usize, mid: usize, args: *const u64) {
     V_SEEN.fetch_add(1, Ordering::Relaxed);
     let objs = (obj == 0 || obj == OBJ) && (cls == 0 || cls == CLASS);
-    let mut bad = env != fake().env || !objs || mid != V_MID;
-    for (i, want) in V_ARGS.iter().enumerate() {
-        // SAFETY: the engine's jvalue array has one word per shorty parameter, V_ARGS.len() of them.
-        let w = unsafe { *args.add(i) };
-        bad |= match *want {
-            V::I(v) => w as u32 as i32 != v,
-            V::J(v) => w as i64 != v,
-            V::F(v) => w as u32 != v.to_bits(),
-            V::D(v) => w != v.to_bits(),
-            V::L(v) => w as usize != v,
-        };
-    }
-    wrong(&V_BAD, bad);
+    // SAFETY: the engine's jvalue array has one word per shorty parameter, V_ARGS.len() of them.
+    let values = unsafe { args_match(&V_ARGS, args) };
+    wrong(
+        &V_BAD,
+        env != fake().env || !objs || mid != V_MID || !values,
+    );
 }
 
+/// Whether the jvalue array `args` holds `want` in order: one 8-byte jvalue per argument, its member at offset 0 as jni.h's union stores it (an int's low 32 bits, a long, a double's bits, a float's bits, a reference).
+///
+/// # Safety
+/// `args` is readable for `want.len()` words.
+unsafe fn args_match(want: &[V], args: *const u64) -> bool {
+    want.iter().enumerate().all(|(i, w)| {
+        // SAFETY: caller contract: word i of the array.
+        let v = unsafe { *args.add(i) };
+        match *w {
+            V::I(x) => v as u32 as i32 == x,
+            V::J(x) => v as i64 == x,
+            V::F(x) => v as u32 == x.to_bits(),
+            V::D(x) => v == x.to_bits(),
+            V::L(x) => v as usize == x,
+        }
+    })
+}
+
+/// The `...A` slot of CallStaticDoubleMethod, shared by two calls: D_MID (the `...` call of fixture.c's ten arguments, check d, answered DOUBLE_EXPECT) and V_MID (the V_ARGS calls, `v_call`, answered V_RET_D). The method names the list.
 extern "C" fn call_static_double_method_a(
     env: usize,
     cls: usize,
     mid: usize,
     args: *const u64,
 ) -> f64 {
-    v_call(env, 0, cls, mid, args);
-    V_RET_D
+    if mid != D_MID {
+        v_call(env, 0, cls, mid, args);
+        return V_RET_D;
+    }
+    seen(env);
+    // SAFETY: the engine's jvalue array has one word per shorty parameter, D_ARGS.len() of them.
+    let ok = unsafe { args_match(&D_ARGS, args) };
+    wrong(&DOUBLE_BAD, cls != CLASS || !ok);
+    DOUBLE_EXPECT
 }
 
 extern "C" fn call_long_method_a(env: usize, obj: usize, mid: usize, args: *const u64) -> i64 {
@@ -560,8 +562,8 @@ fn fake() -> &'static Fake {
                 get_static_method_id as *const () as usize,
             ),
             (
-                CALL_STATIC_INT_METHOD,
-                call_static_int_method as *const () as usize,
+                CALL_STATIC_INT_METHOD_A,
+                call_static_int_method_a as *const () as usize,
             ),
             (NEW_STRING_UTF, new_string_utf as *const () as usize),
             (
@@ -575,12 +577,8 @@ fn fake() -> &'static Fake {
             (GET_JAVA_VM, get_java_vm as *const () as usize),
             (SET_DOUBLE_FIELD, set_double_field as *const () as usize),
             (
-                CALL_STATIC_DOUBLE_METHOD,
-                call_static_double_method as *const () as usize,
-            ),
-            (
-                CALL_STATIC_FLOAT_METHOD,
-                call_static_float_method as *const () as usize,
+                CALL_STATIC_FLOAT_METHOD_A,
+                call_static_float_method_a as *const () as usize,
             ),
             (
                 CALL_STATIC_DOUBLE_METHOD_A,
@@ -826,15 +824,16 @@ fn started(r: Result<Guest, String>) -> u64 {
         V_RET_J,
         i64::from(V_RET_I),
         V_RET_OBJ as i64,
+        V_RET_D.to_bits() as i64,
     ];
     ok &= check(
         'V',
-        if v_seen == 4 && v_bad == 0 && out[21..25] == v_want {
+        if v_seen == 5 && v_bad == 0 && out[21..26] == v_want {
             Ok(())
         } else {
             Err(format!(
-                "{v_seen} A calls (expected 4), {v_bad} with a wrong env, handle or jvalue; results {:x?} (expected {v_want:x?})",
-                &out[21..25]
+                "{v_seen} A calls (expected 5), {v_bad} with a wrong env, handle or jvalue; results {:x?} (expected {v_want:x?})",
+                &out[21..26]
             ))
         },
     );

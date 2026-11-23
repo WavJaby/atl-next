@@ -24,7 +24,7 @@ mod lanes {
 pub use lanes::{Class, LANES, Lane};
 
 /// A host function's lanes as a QEMU binding crosses them (dispatch.rs `call_host`): the result class, and the parameter classes from its prototype.
-/// `params` None: no prototype (a `bind` caller, a libc row): the guest's lanes cross as they stand, which is right for integer arguments and doubles on every host, and for floats where the host keeps them unshaped (SysV).
+/// `params` None: no prototype, only for a `bind` caller (a libc row): the guest's lanes cross as they stand, right for a non-variadic callee with integer arguments. A variadic callee's double is misplaced on LP64D (read from an integer register), a float unboxed there. JNI calls always carry the prototype of their `...A` sibling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sig {
     pub ret: Class,
@@ -199,8 +199,8 @@ pub(super) enum Refused {
     NoShorty { name: &'static str },
     /// A `...V` variant whose method's shorty holds a character outside jni's `ZBSCIJFDL`.
     Shorty { name: &'static str, c: u8 },
-    /// A `...` slot called by a 32-bit guest whose variadic arguments run past the lanes (r0-r3 + the stack window): the words the method's shorty needs were not carried across.
-    Variadic32Window { name: &'static str },
+    /// A `...` call whose variadic arguments run past the lanes' stack window (the guest's r0-r3 + stack on AAPCS32, x0..x7 + stack on AAPCS64): the words the method's shorty needs were not carried across.
+    VariadicWindow { name: &'static str },
 }
 
 /// The lane descriptor of guest object call `id` made on guest object `guest`, and its table. Refused: no registered object, an id past the table, a slot with no function.

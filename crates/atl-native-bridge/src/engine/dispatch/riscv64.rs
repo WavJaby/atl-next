@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The up call on a riscv64 host (LP64D): the guest's AAPCS64 lanes are placed into the LP64D image by the prototype's classes ([`super::place`], AAPCS64 -> host rules: fp overflow into free integer registers, a float NaN-boxed in an fp register), then called from asm.
-//! A variadic call cannot be the variadic image here: RISC-V passes variadic fp arguments in integer registers, so a callee's fa0.. would be garbage (glClearColor's four floats, measured on sifive).
-//! Without a prototype (`Sig::params` None) the lanes cross as they stand: a0..a7 = x0..x7, fa0..fa7 = v0..v7, the stack words in order -- right for up to 16 integers and up to 8 doubles, not for an unboxed float.
+//! A variadic call cannot be the variadic image here: RISC-V passes variadic fp arguments in integer registers, so a callee's fa0.. would be garbage (glClearColor's four floats, measured on sifive). So a JNI `...` call never reaches a variadic callee here: it crosses as its `...A` sibling, whose prototype places every argument.
+//! Without a prototype (`Sig::params` None, `bind` callers only) the lanes cross as they stand: a0..a7 = x0..x7, fa0..fa7 = v0..v7, the stack words in order. Right for a non-variadic callee with integers; a variadic callee's fp argument is read from an integer register instead (the printf rows, out of scope).
 
 use atl_engine_api::AtlLanes;
 
