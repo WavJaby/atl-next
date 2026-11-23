@@ -39,12 +39,16 @@ public class Main extends Activity {
         super.onCreate(savedInstanceState);
         // the application's context: the receivers are the process's, not this activity's (an activity's own registrations are dropped as leaked when it finishes)
         Context app = getApplicationContext();
+        // DONE on a thread of its own: the main thread waits for it below. The PING receiver shares that looper, so DONE is delivered FIFO behind any PING (broadcast_queue.rs:4-6)
+        CountDownLatch done = new CountDownLatch(1);
+        HandlerThread doneThread = new HandlerThread("done");
+        doneThread.start();
         app.registerReceiver(new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent i) {
                 Log.i(TAG, "runtime received " + i.getAction());
             }
-        }, new IntentFilter(PING), Context.RECEIVER_NOT_EXPORTED);
+        }, new IntentFilter(PING), null, new Handler(doneThread.getLooper()), Context.RECEIVER_NOT_EXPORTED);
         sendBroadcast(new Intent(PING).setPackage(getPackageName()));
 
         sendStickyBroadcast(new Intent(STICKY).putExtra("level", 42));
@@ -57,13 +61,10 @@ public class Main extends Activity {
             }
         }, new IntentFilter(STICKY), Context.RECEIVER_EXPORTED);
 
-        // DONE on a thread of its own: the main thread waits for it below
-        CountDownLatch done = new CountDownLatch(1);
-        HandlerThread doneThread = new HandlerThread("done");
-        doneThread.start();
         app.registerReceiver(new BroadcastReceiver() {
             @Override
             public void onReceive(Context c, Intent i) {
+                Log.i(TAG, "done received");
                 done.countDown();
             }
         }, new IntentFilter(DONE), null, new Handler(doneThread.getLooper()), Context.RECEIVER_EXPORTED);

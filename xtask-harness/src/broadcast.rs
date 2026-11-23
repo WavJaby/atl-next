@@ -6,7 +6,7 @@
 //! - sticky replay: a receiver registered after the sticky gets it with isInitialStickyBroadcast() true;
 //! - cold start: the explicit broadcast starts the receiver app headless and its Recv.onReceive runs (scheduleReceiver after attach; counter `broadcast cold start`);
 //! - sticky denied: the receiver app, without BROADCAST_STICKY, gets SecurityException ("Permission Denial") from sendStickyBroadcast;
-//! - exported denial: the receiver app's implicit PING is skipped for the sender's not-exported receiver (counter `Exported Denial`, and still one `runtime received`) after [`SETTLE`];
+//! - exported denial: the receiver app's implicit PING is skipped for the sender's not-exported receiver (counter `Exported Denial`, and still one `runtime received`), judged once the sender logged DONE (the fence: the PING's looper);
 //! - protected broadcasts (BroadcastController.broadcastIntentLocked:1061-1067, the list from framework-res's manifest): the sender's BATTERY_LOW and its sticky BATTERY_CHANGED (it holds BROADCAST_STICKY)
 //!   are SecurityExceptions naming the action; registerReceiver(null, BATTERY_CHANGED) returns the battery service's sticky (the host's level, app::battery_level), not the fake level 1; a receiver for only protected actions needs no export flag at targetSdk 36
 //!   (:470-472), one for an unprotected action without a flag is a SecurityException (:457-460). The unprotected PING still delivers (the runtime row).
@@ -51,8 +51,10 @@ const SENDER: &str = "xtask-harness/testdata/broadcast/sender";
 const RECEIVER: &str = "xtask-harness/testdata/broadcast/receiver";
 /// A cold start of each app (ART without a boot image interprets framework.jar's class init), as `xtask test app`'s limit.
 const LIMIT: Duration = Duration::from_secs(180);
-/// How long the negative check waits after the receiver sent its PING: one oneway delivery between two attached processes takes milliseconds; 3 s on a loaded machine.
-const SETTLE: Duration = Duration::from_secs(3);
+/// The sender's DONE line (Main.java: the DONE receiver, on the looper the PING receiver shares): the absence checks are judged once it is logged, see [`once_before_done`]. A fixed wait would pass a duplicate a starved host delivers late.
+const DONE_RECEIVED: &str = "AtlBcast: done received";
+/// Reinstall run only: the fixed wait after the receiver's MY_PACKAGE_REPLACED, before the sender's silence is read. It stays a sleep: the sender is not launched in this run (`launch: None`), so no fence on its queue exists yet.
+const REINSTALL_SETTLE: Duration = Duration::from_secs(3);
 const TAIL: usize = 30;
 
 const RUNTIME: &str = "AtlBcast: runtime received com.example.atlbcast.PING";
@@ -130,6 +132,13 @@ fn count(text: &str, marker: &str) -> usize {
     text.lines().filter(|l| l.contains(marker)).count()
 }
 
+/// Absence judgement on the sender's log: DONE is logged and exactly one runtime PING precedes it. A PING after DONE is not judged: DONE is FIFO behind any PING queued before it on the sender's looper (broadcast_queue.rs:4-6), so nothing in flight can precede it.
+fn once_before_done(sender_log: &str) -> bool {
+    sender_log
+        .split_once(DONE_RECEIVED)
+        .is_some_and(|(before, _)| count(before, RUNTIME) == 1)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = Layout::of(root)?;
     let mut rt = Runtime::new(
@@ -196,7 +205,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (sender_log, receiver_log) = (run.log(&sender), run.log(&receiver));
     let start = Instant::now();
     let mut ping_seen: Option<Instant> = None;
-    // the headless end follows the receiver's finish by EMPTY_GRACE_MS, which under a loaded host can be later than SETTLE after PING: wait for its line (LIMIT caps the wait)
+    // the sender's DONE line: the receiver sends DONE after its PING
+    let mut done_seen = false;
+    // the headless end follows the receiver's finish by EMPTY_GRACE_MS: wait for its line (LIMIT caps the wait)
     let end_line = format!("process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)");
     let mut end_seen = false;
     // the alarm chain's last step (Recv.java ALARM_GRANT): the run ends only once AlarmSvc started, so the grant is inside the run
@@ -205,15 +216,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if ping_seen.is_none() && read(&receiver_log).contains(PING_SENT) {
             ping_seen = Some(Instant::now());
         }
+        if !done_seen {
+            done_seen = read(&sender_log).contains(DONE_RECEIVED);
+        }
         if ping_seen.is_some() && !end_seen {
             end_seen = read(&run.log("services")).contains(&end_line);
         }
         if !alarm_seen {
             alarm_seen = read(&receiver_log).contains(ALARM_SERVICE_STARTED);
         }
-        if ping_seen.is_some_and(|t| t.elapsed() > SETTLE && end_seen && alarm_seen)
-            || start.elapsed() > LIMIT
-        {
+        if (done_seen && end_seen && alarm_seen) || start.elapsed() > LIMIT {
             break None;
         }
         if let Some(s) = atld.try_wait()? {
@@ -271,8 +283,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if replaced_seen.is_none() && read(&r2_log).contains(BOOT_MY_REPLACED) {
             replaced_seen = Some(Instant::now());
         }
-        // the sender's silence is read once SETTLE has let a late delivery land after the receiver's line
-        if replaced_seen.is_some_and(|t| t.elapsed() > SETTLE) || start2.elapsed() > LIMIT {
+        // the sender's silence is read once REINSTALL_SETTLE has let a late delivery land after the receiver's line (still a fixed wait: see REINSTALL_SETTLE)
+        let settled = replaced_seen.is_some_and(|t| t.elapsed() > REINSTALL_SETTLE);
+        if settled || start2.elapsed() > LIMIT {
             break None;
         }
         if let Some(s) = atld2.try_wait()? {
@@ -285,7 +298,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         atld2.wait()?;
     }
     println!(
-        "broadcast: reinstall run {:.1?} (atld start to the receiver's MY_PACKAGE_REPLACED, plus SETTLE)",
+        "broadcast: reinstall run {:.1?} (atld start to the receiver's MY_PACKAGE_REPLACED, plus REINSTALL_SETTLE)",
         start2.elapsed()
     );
     let (s2, r2) = (read(&s2_log), read(&r2_log));
@@ -296,7 +309,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut checks = vec![
         (
             "runtime receiver got its package's broadcast once",
-            count(&s, RUNTIME) == 1,
+            once_before_done(&s),
         ),
         (
             "registerReceiver(null) returned the sticky",
@@ -316,7 +329,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
         (
             "foreign PING skipped for the not-exported receiver",
-            ping_seen.is_some() && counted(EXPORTED_DENIAL) && count(&s, RUNTIME) == 1,
+            ping_seen.is_some() && counted(EXPORTED_DENIAL) && once_before_done(&s),
         ),
         (
             "an app's protected BATTERY_LOW threw SecurityException",
@@ -537,4 +550,36 @@ fn connectivity_checks(
         );
     }
     Ok(checks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recorded sender log: the lines in the order the sender's runtime receiver logged them.
+    fn log(lines: &[&str]) -> String {
+        lines.join("\n")
+    }
+
+    #[test]
+    fn own_ping_then_done_passes() {
+        assert!(once_before_done(&log(&[RUNTIME, DONE_RECEIVED])));
+    }
+
+    #[test]
+    fn duplicate_ping_before_done_is_red_at_done() {
+        let lines = [RUNTIME, RUNTIME, DONE_RECEIVED];
+        assert!(!once_before_done(&log(&lines)));
+    }
+
+    #[test]
+    fn no_done_is_not_judged_as_absence() {
+        assert!(!once_before_done(&log(&[RUNTIME])));
+    }
+
+    #[test]
+    fn ping_after_done_is_not_judged() {
+        let lines = [RUNTIME, DONE_RECEIVED, RUNTIME];
+        assert!(once_before_done(&log(&lines)));
+    }
 }
