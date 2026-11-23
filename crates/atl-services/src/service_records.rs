@@ -886,6 +886,13 @@ impl<K: Kinds> Services<K> {
         true
     }
 
+    /// `pid` hosts a needed service (started, or bound with BIND_AUTO_CREATE): what keeps the process alive (uid_state::Holdings). S6 wires starts; until then only bindings count.
+    pub fn serves(&self, pid: i32) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.needed() && r.app.as_ref().is_some_and(|(p, _)| *p == pid))
+    }
+
     /// killServicesLocked + the client half of cleanUpApplicationRecordLocked for a dead or killed process: clients hear dead, and each hosted record is restarted (`allow_restart`) or brought down. Returns the restarts scheduled, in record order.
     pub fn process_died(
         &mut self,

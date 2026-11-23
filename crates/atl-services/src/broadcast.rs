@@ -810,6 +810,11 @@ impl<R: Clone + PartialEq, I: Clone, J> Broadcasts<R, I, J> {
     pub fn take_pending(&mut self, pid: i32) -> VecDeque<J> {
         self.pending.remove(&pid).unwrap_or_default()
     }
+
+    /// Some job waits for `pid` to attach: a receiver the process must run (uid_state::Holdings.receiver until S8's dispatcher).
+    pub fn has_pending(&self, pid: i32) -> bool {
+        self.pending.get(&pid).is_some_and(|q| !q.is_empty())
+    }
 }
 
 #[cfg(test)]

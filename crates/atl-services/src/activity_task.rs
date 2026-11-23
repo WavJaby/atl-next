@@ -1072,6 +1072,12 @@ impl ActivityTasks {
             .holds_other_task(task, |o| o.thread.as_binder() == *thread)
     }
 
+    /// A record of the process of `thread` is live in some Task, not finishing (Machine::holds_live): a window or an activity the user may see (uid_state::Holdings.task).
+    pub(crate) fn hosts_activity(&self, thread: &SpIBinder) -> bool {
+        self.machine()
+            .holds_live(|o| o.thread.as_binder() == *thread)
+    }
+
     /// The process of `thread` died: its records leave the stack (Machine::drop_owned). Some when that left no record anywhere: true when it held none that was not finishing
     /// (Machine::holds_live), the app ended itself or its Task was removed; false when it died with a live activity.
     pub(crate) fn process_died(&self, thread: &SpIBinder) -> Option<bool> {

@@ -268,6 +268,14 @@ struct Args {
     /// on `stop`, the `--run-class` command's exit or the services' exit.
     #[arg(long, action = clap::ArgAction::Set)]
     exit_with_last_app: Option<bool>,
+    /// Desktop adaptation (the services' headless end rule, plan "Linux conventions"): a process nothing holds (no window, service, receiver, provider) ends this many ms after its last
+    /// holding change, once its uid is idle. Default 60000 = AOSP's BACKGROUND_SETTLE_TIME (ActivityManagerConstants.java:253), so a cold start lives one settle period. Passed to the services.
+    #[arg(long, default_value_t = 60_000)]
+    empty_process_grace_ms: u64,
+    /// Desktop adaptation (M29): a window's close ends its processes' services with no restart. `false` = AOSP: the services of a killed process restart when STICKY (killServicesLocked allowRestart).
+    /// Passed to the services.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    window_close_stops_services: bool,
     /// With `--tilt-keys`: the angle a held key reaches, degrees (default: atl-services `TiltConfig::default`).
     #[arg(long, requires = "tilt_keys")]
     tilt_max_deg: Option<f32>,
@@ -3013,6 +3021,14 @@ fn run(a: &Args) -> Result<ExitCode> {
     services_args.push(a.root_back.clone().into());
     services_args.push("--orientation-reshape".into());
     services_args.push(a.orientation_reshape.clone().into());
+    services_args.extend([
+        "--empty-process-grace-ms".into(),
+        a.empty_process_grace_ms.to_string().into(),
+    ]);
+    services_args.extend([
+        "--window-close-stops-services".into(),
+        a.window_close_stops_services.to_string().into(),
+    ]);
     if a.no_sensor_service {
         services_args.push("--no-sensor-service".into());
     }

@@ -325,13 +325,19 @@ impl Inner {
         let mut calls = Vec::new();
         let found = st.services.unbind(&ConnHandle(conn), &mut calls);
         self.service_calls.post(calls);
+        // a released binding may leave its process empty: its headless grace starts now (activity.rs touch_all_locked)
+        self.touch_all_locked(st);
         found
     }
 
-    /// killServicesLocked + the client half of cleanUpApplicationRecordLocked for a dead or killed process.
-    pub(crate) fn services_died(&self, st: &mut State, pid: i32) {
+    /// killServicesLocked + the client half of cleanUpApplicationRecordLocked for a dead or killed process. `allow_restart` false: the process was ended with its window
+    /// (`--window-close-stops-services`); AOSP restarts STICKY services only when it is true (killServicesLocked :7202, allowRestart).
+    pub(crate) fn services_died(&self, st: &mut State, pid: i32, allow_restart: bool) {
         let mut calls = Vec::new();
-        for _ in st.services.process_died(pid, true, uptime_ms(), &mut calls) {
+        for _ in st
+            .services
+            .process_died(pid, allow_restart, uptime_ms(), &mut calls)
+        {
             atl_diag::answered(
                 AM,
                 "service process died: restart scheduled, not wired (waits for the next bind)",

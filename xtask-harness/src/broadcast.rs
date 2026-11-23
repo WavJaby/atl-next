@@ -65,6 +65,9 @@ const UNFLAGGED_DENIED: &str = "AtlBcast: unflagged register denied: com.example
 /// Counter names the services count (activity.rs): the cold start of a manifest receiver's process, and the skip of an unexported registered receiver.
 const COLD_START: &str = "broadcast cold start";
 const EXPORTED_DENIAL: &str = "Exported Denial";
+/// The headless grace this gate sets (atld `--empty-process-grace-ms`, a short one so the row ends inside the run): the explicit broadcast's receiver process ends this long after its
+/// receiver finished, once nothing holds it (activity.rs `end_headless`, plan "Linux conventions"); the default is AOSP's settle period (60 s).
+const EMPTY_GRACE_MS: u64 = 2000;
 
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -85,7 +88,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.java_out.as_deref(),
         "broadcast",
         args.verbose,
-    )?;
+    )?
+    .with_empty_process_grace(EMPTY_GRACE_MS);
     let work = rt.out.join("broadcast");
     let mut packages = Vec::new();
     let mut names = Vec::new();
@@ -190,6 +194,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "a receiver of an unprotected action without an export flag threw SecurityException",
             s.contains(UNFLAGGED_DENIED),
+        ),
+        (
+            "the explicit broadcast's receiver process ended once its receiver finished and the grace ran",
+            services.contains(&format!(
+                "process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)"
+            )),
         ),
     ];
     let mut whys = Vec::new();

@@ -74,6 +74,7 @@ use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::{AppProcess, UiAgents};
+use crate::uid_state::{self, Settle};
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
@@ -470,6 +471,30 @@ struct ProcessRecord {
     instr: Option<ActiveInstrumentation>,
     /// finishAttachApplication handed its waiting broadcasts to the sender (BroadcastQueueImpl.onApplicationAttachedLocked); until then deliveries queue
     broadcasts_attached: bool,
+    /// elapsed ms of the last holding change ([`Inner::touch_all_locked`]): the headless grace runs from here while nothing holds the process (uid_state::ends)
+    touched: u64,
+    /// why the activity service ended this process; None while it lives. Read by its death (services_died: restart or not)
+    kill_reason: Option<KillReason>,
+    /// manifest receivers handed to this process that have not finished (finishReceiver: AOSP BroadcastReceiver.PendingResult.sendFinished, TYPE_COMPONENT)
+    receiving: u32,
+}
+
+/// Why the activity service ended a process it started: a window's close (removeTask, M29), or the empty-headless end rule (uid_state::ends).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KillReason {
+    WindowClosed,
+    EmptyHeadless,
+}
+
+/// The activity service's delayed messages (am_handler.rs), keyed by what each concerns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Timer {
+    /// removeTask's kill (KILL_TASK_PROCESSES_TIMEOUT): the Task's processes end unless its destroy came first
+    KillTask(TaskId),
+    /// a uid's settle sweep (uid_state, OomAdjuster idleUids at bgTime + 60 s)
+    UidSettle(u32),
+    /// an empty headless process's grace, by ProcessRecord.start_seq
+    EmptyProcess(i64),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -493,6 +518,10 @@ struct State {
     services: active_services::Services,
     /// ProviderMap: the providers asked for, starting or published
     providers: Vec<ProviderRecord>,
+    /// the uid state (uid_state.rs): each uid's launch Tasks, idle flag and settle sweep
+    uids: uid_state::Uids,
+    /// the launch Tasks counted in `uids`, with their uid: a Task leaves once (task_gone_locked)
+    open_tasks: std::collections::BTreeMap<TaskId, u32>,
 }
 
 /// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`).
@@ -663,8 +692,14 @@ struct Inner {
     bind_services: bool,
     /// Removed Tasks whose processes wait for the top's activityDestroyed or the timeout (Task.mKillProcessesOnDestroyed)
     kill_armed: Mutex<std::collections::BTreeSet<TaskId>>,
-    /// the activity service's delayed messages (am_handler.rs): the removeTask kill timer, keyed by the Task; the message is the Task too
-    handler: AmHandler<TaskId, TaskId>,
+    /// the activity service's delayed messages (am_handler.rs): removeTask's kill, the uid settle sweep, an empty headless process's grace
+    handler: AmHandler<Timer, Timer>,
+    /// the clock of the delayed messages: uid_state's times are elapsed ms from here ([`Inner::now_ms`])
+    origin: std::time::Instant,
+    /// the empty-headless grace, ms (`--empty-process-grace-ms`): a process nothing holds ends this long after its last holding change, with its uid idle
+    empty_grace_ms: u64,
+    /// `--window-close-stops-services`: a window's close ends its processes' services without a restart (AOSP restarts STICKY ones)
+    window_close_stops_services: bool,
     /// bindApplication's `services` (mAppBindArgs, [`common_services`]), built at the first bind
     common_services: std::sync::OnceLock<Map>,
 }
@@ -781,6 +816,8 @@ impl ActivityManager {
         root_back: RootBack,
         orientation_reshape: OrientationReshape,
         bind_services: bool,
+        empty_grace_ms: u64,
+        window_close_stops_services: bool,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -818,13 +855,16 @@ impl ActivityManager {
                     kill_armed: Mutex::default(),
                     handler: {
                         let inner = inner.clone();
-                        AmHandler::spawn("ActivityHandler", move |task: TaskId| {
+                        AmHandler::spawn("ActivityHandler", move |timer: Timer| {
                             if let Some(inner) = inner.upgrade() {
-                                inner.kill_task_processes_on_timeout(task);
+                                inner.on_timer(timer);
                             }
                         })
                         .expect("starting the ActivityHandler thread")
                     },
+                    origin: std::time::Instant::now(),
+                    empty_grace_ms,
+                    window_close_stops_services,
                     common_services: std::sync::OnceLock::new(),
                 }
             }),
@@ -1224,9 +1264,10 @@ impl ActivityManager {
             .unwrap_or_else(|e| e.into_inner())
             .insert(task);
         if newly_armed {
+            let timer = Timer::KillTask(task);
             self.inner.handler.post(
-                task,
-                task,
+                timer,
+                timer,
                 std::time::Instant::now() + KILL_TASK_PROCESSES_TIMEOUT,
             );
         }
@@ -1236,13 +1277,16 @@ impl ActivityManager {
 /// ActivityTaskSupervisor.KILL_TASK_PROCESSES_TIMEOUT_MS: how long a removed Task's processes wait for its shown top's activityDestroyed (AOSP constant, not tuned).
 const KILL_TASK_PROCESSES_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// ApplicationInfo.FLAG_SYSTEM | FLAG_PERSISTENT (ApplicationInfo.java:189, :213; ActivityManagerService.PERSISTENT_MASK): the processes the empty rule never ends, and the callers' persistent check.
+const PERSISTENT_MASK: i32 = crate::packages::FLAG_SYSTEM | 1 << 3;
+
 impl Inner {
     /// activityDestroyed of `token`: false when no destroying record has it. The last record of a Task gone ends its processes: after a removeTask (the wait ends early, as
     /// killTaskProcessesOnDestroyedIfNeeded), and after the app finished its last activity itself (M29: ATL's stand-in for the low-memory killer ending a cached process).
     fn activity_destroyed(&self, token: &SpIBinder) -> bool {
         match self.atm.destroyed(token) {
             Some((task, true)) => self.kill_task_processes(task),
-            Some((_, false)) => {}
+            Some((_, false)) => self.touch_all(),
             None => return false,
         }
         true
@@ -1271,22 +1315,22 @@ impl Inner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&task);
-        self.handler.remove(&task);
+        self.handler.remove(&Timer::KillTask(task));
+        self.task_gone(task);
         let (Some(package), Some(uid)) = (self.tasks.package(task), self.tasks.owner(task)) else {
             return;
         };
         let pids: Vec<i32> = {
-            let st = self.state();
-            let procs: Vec<&ProcessRecord> = st
+            let mut st = self.state();
+            let held = st
                 .processes
                 .iter()
                 .filter(|r| r.uid == uid && r.package == package)
-                .collect();
-            let held = procs.iter().any(|r| {
-                r.attached
-                    .as_ref()
-                    .is_some_and(|a| self.atm.holds_other_task(task, &a.thread.as_binder()))
-            });
+                .any(|r| {
+                    r.attached
+                        .as_ref()
+                        .is_some_and(|a| self.atm.holds_other_task(task, &a.thread.as_binder()))
+                });
             if held {
                 log(format_args!(
                     "task {} removed: a process of {package} holds another Task, kept",
@@ -1294,7 +1338,16 @@ impl Inner {
                 ));
                 return;
             }
-            procs.iter().map(|r| r.pid).collect()
+            let mut pids = Vec::new();
+            for r in st
+                .processes
+                .iter_mut()
+                .filter(|r| r.uid == uid && r.package == package)
+            {
+                r.kill_reason = Some(KillReason::WindowClosed);
+                pids.push(r.pid);
+            }
+            pids
         };
         log(format_args!(
             "task {} removed: killing {package} pids {pids:?} at={}",
@@ -1468,6 +1521,156 @@ impl Inner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Elapsed ms on the uid state's clock (origin = Inner construction): uid_state's deadlines are in these units.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Replaces the pending message of `timer` with one due at `at_ms` (now_ms units).
+    fn arm(&self, timer: Timer, at_ms: u64) {
+        self.handler.remove(&timer);
+        self.handler.post(
+            timer,
+            timer,
+            self.origin + std::time::Duration::from_millis(at_ms),
+        );
+    }
+
+    /// Arms the uid's settle sweep at the deadline uid_state returned, when it started one.
+    fn arm_settle(&self, uid: u32, at: Option<u64>) {
+        if let Some(at) = at {
+            self.arm(Timer::UidSettle(uid), at);
+        }
+    }
+
+    /// Every process's headless grace restarts now, with its timer re-armed. Conservative: a holding's release is not traced to its process, so every process is touched (a later end, never an earlier one).
+    fn touch_all_locked(&self, st: &mut State) {
+        let now = self.now_ms();
+        for r in st.processes.iter_mut() {
+            r.touched = now;
+            self.arm(Timer::EmptyProcess(r.start_seq), now + self.empty_grace_ms);
+        }
+    }
+
+    fn touch_all(&self) {
+        let mut st = self.state();
+        self.touch_all_locked(&mut st);
+    }
+
+    /// finishReceiver of a manifest receiver: `who` is the app thread's binder (ActivityThread.ReceiverData's token), which names the process. finishReceiver is oneway, so the
+    /// calling pid is not there (binderd: sender_pid 0 for a oneway transaction). One of that process's receivers no longer holds it: its headless grace runs from here.
+    fn receiver_finished(&self, who: Option<&SpIBinder>) {
+        let mut st = self.state();
+        let process = who.and_then(|who| {
+            st.processes.iter_mut().find(|r| {
+                r.attached
+                    .as_ref()
+                    .is_some_and(|a| a.thread.as_binder() == *who)
+            })
+        });
+        if let Some(r) = process {
+            r.receiving = r.receiving.saturating_sub(1);
+        }
+        self.touch_all_locked(&mut st);
+    }
+
+    /// A launch Task left: its uid loses its active reason, once (kill_task_processes and a death can both see the same Task).
+    fn task_gone_locked(&self, st: &mut State, task: TaskId) {
+        if let Some(uid) = st.open_tasks.remove(&task) {
+            let at = st.uids.on_task_removed(uid, self.now_ms());
+            self.arm_settle(uid, at);
+        }
+    }
+
+    fn task_gone(&self, task: TaskId) {
+        let mut st = self.state();
+        self.task_gone_locked(&mut st, task);
+    }
+
+    /// The delayed-message thread's dispatch, with no lock held: each timer's own action.
+    fn on_timer(&self, timer: Timer) {
+        match timer {
+            Timer::KillTask(task) => self.kill_task_processes_on_timeout(task),
+            Timer::UidSettle(uid) => self.settle_uid(uid),
+            Timer::EmptyProcess(seq) => self.end_headless(|r| r.start_seq == seq),
+        }
+    }
+
+    /// The uid's settle sweep (idleUids :3996-4008): BecameIdle ends the uid's headless processes whose grace has run. stopInBackgroundLocked (services) joins here in S6.
+    fn settle_uid(&self, uid: u32) {
+        let now = self.now_ms();
+        let became_idle = self.state().uids.settle(uid, now) == Settle::BecameIdle;
+        if became_idle {
+            self.end_headless(|r| r.uid == uid);
+        }
+    }
+
+    /// What holds the process (uid_state::Holdings). FGS (S7) and started services (S6) hold nothing yet.
+    fn holdings_locked(&self, st: &State, r: &ProcessRecord) -> uid_state::Holdings {
+        uid_state::Holdings {
+            task: r
+                .attached
+                .as_ref()
+                .is_some_and(|a| self.atm.hosts_activity(&a.thread.as_binder())),
+            fgs: false,
+            started_service: false,
+            auto_create_binding: st.services.serves(r.pid),
+            receiver: st.broadcasts.has_pending(r.pid) || r.receiving > 0,
+            provider: st
+                .providers
+                .iter()
+                .any(|p| p.package == r.package && p.process == r.process_name),
+            instrumented: r.instr.is_some(),
+            persistent: self.persistent_app(&r.package),
+        }
+    }
+
+    /// The package's manifest FLAG_PERSISTENT: its processes are never ended by the empty rule.
+    fn persistent_app(&self, package: &str) -> bool {
+        self.packages
+            .by_name(package)
+            .is_some_and(|p| p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK)
+    }
+
+    /// The empty-headless end rule (uid_state::ends) over the processes `only` selects: nothing holds the process, its uid is idle, and its grace has run since its last touch.
+    /// Each one ended is marked EmptyHeadless, logged and counted, then killed after the state lock. A window's process is never here: its Task holds it, and its uid is active.
+    fn end_headless(&self, only: impl Fn(&ProcessRecord) -> bool) {
+        let now = self.now_ms();
+        let victims: Vec<(String, i32)> = {
+            let mut st = self.state();
+            let due: Vec<usize> = (0..st.processes.len())
+                .filter(|&i| {
+                    let r = &st.processes[i];
+                    r.kill_reason.is_none()
+                        && only(r)
+                        && uid_state::ends(
+                            &self.holdings_locked(&st, r),
+                            st.uids.is_idle(r.uid),
+                            r.touched,
+                            self.empty_grace_ms,
+                            now,
+                        )
+                })
+                .collect();
+            due.into_iter()
+                .map(|i| {
+                    let r = &mut st.processes[i];
+                    r.kill_reason = Some(KillReason::EmptyHeadless);
+                    (r.process_name.clone(), r.pid)
+                })
+                .collect()
+        };
+        for (name, _) in &victims {
+            atl_diag::answered(AM, "headless process ended: empty, uid idle, grace run");
+            log(format_args!(
+                "process {name} ended: empty headless (grace {} ms)",
+                self.empty_grace_ms
+            ));
+        }
+        let pids: Vec<i32> = victims.iter().map(|(_, pid)| *pid).collect();
+        self.kill(&pids);
+    }
+
     /// Kills processes by pid, after the state lock was released (AOSP's Process.killProcess is a local syscall; here it is a request to atld).
     fn kill(&self, pids: &[i32]) {
         for &pid in pids {
@@ -1507,6 +1710,12 @@ impl Inner {
                 let size = initial_size(&self.tasks.display(), &crate::packages::bounds_input(a));
                 self.tasks.new_task(p.uid, p.name(), size)
             });
+        let now = self.now_ms();
+        if let Some(task) = task {
+            st.open_tasks.insert(task, p.uid);
+            st.uids.on_task_added(p.uid);
+        }
+        let settle = st.uids.on_process_started(p.uid, now);
         st.processes.push(ProcessRecord {
             package: p.name().to_owned(),
             process_name: process_name.to_owned(),
@@ -1518,7 +1727,12 @@ impl Inner {
             task,
             instr,
             broadcasts_attached: false,
+            touched: now,
+            kill_reason: None,
+            receiving: 0,
         });
+        self.arm_settle(p.uid, settle);
+        self.touch_all_locked(st);
         Ok(())
     }
 
@@ -1643,7 +1857,7 @@ impl Inner {
         for mut rec in stopped {
             pids.push(rec.pid);
             Self::broadcasts_died(st, rec.pid);
-            self.services_died(st, rec.pid);
+            self.services_died(st, rec.pid, true);
             if let Some(instr) = rec.instr.take() {
                 // the process is being killed with its package: the same CANCELED a crash reports (no further force stop: the package's processes are all gone)
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
@@ -1695,6 +1909,8 @@ impl Inner {
             return Vec::new();
         };
         let (no_restart, package) = (instr.no_restart, rec.package.clone());
+        // the instrumentation no longer holds its process: its grace runs from now
+        self.touch_all_locked(st);
         self.report_finished(instr, code, results);
         if no_restart {
             return Vec::new();
@@ -1725,8 +1941,14 @@ impl Inner {
                     .process_died(&a.thread.as_binder())
                     .filter(|_| rec.task.is_some());
             }
+            if let Some(task) = rec.task {
+                self.task_gone_locked(&mut st, task);
+            }
             Self::broadcasts_died(&mut st, pid);
-            self.services_died(&mut st, pid);
+            let allow_restart = !(rec.kill_reason == Some(KillReason::WindowClosed)
+                && self.window_close_stops_services);
+            self.services_died(&mut st, pid, allow_restart);
+            self.touch_all_locked(&mut st);
             lost = Self::providers_died(&mut st, &rec.package, &rec.process_name);
             log(format_args!(
                 "process {} (pid {pid}) died",
@@ -1921,6 +2143,10 @@ impl Inner {
                 st.processes.last().map(|r| r.pid).unwrap_or_default()
             }
         };
+        // the receiver holds its process until its finishReceiver (holdings.receiver); the count is per process, and a death drops it with the record
+        if let Some(r) = st.processes.iter_mut().find(|r| r.pid == pid) {
+            r.receiving += 1;
+        }
         self.deliver_locked(st, pid, job);
     }
 
@@ -1943,8 +2169,6 @@ impl Inner {
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,
     ) -> (Option<String>, bool) {
-        /// ApplicationInfo.FLAG_SYSTEM | FLAG_PERSISTENT (ApplicationInfo.java:189, :213; ActivityManagerService.PERSISTENT_MASK)
-        const PERSISTENT_MASK: i32 = crate::packages::FLAG_SYSTEM | 1 << 3;
         let st = self.state();
         let Some(rec) = caller
             .and_then(|t| Self::record_for_thread(&st, t))
@@ -2338,6 +2562,8 @@ impl IActivityManager for ActivityManager {
         if let Some(r) = st.processes.iter_mut().find(|r| r.pid == pid) {
             r.broadcasts_attached = true;
         }
+        // the drained deliveries left the pending hold: the headless grace restarts from the hand-off
+        inner.touch_all_locked(&mut st);
         // :4921 mServices.attachApplicationLocked: the services that waited for this process start (their order against the broadcasts is no app's concern: separate senders, as in AOSP)
         inner.services_attached(&mut st, pid);
         Ok(())
@@ -3023,10 +3249,10 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.finishReceiver: a manifest receiver of a non-ordered broadcast reports done (scheduleReceiver's assumeDelivered is false). Nothing waits on it in P1 (no timeouts, no
-    /// ordered queue): counted.
+    /// ordered queue): counted. It ends the receiver's hold on its process ([`Inner::receiver_finished`]).
     fn r#finishReceiver(
         &self,
-        _who: Option<&SpIBinder>,
+        who: Option<&SpIBinder>,
         _result_code: i32,
         _result_data: Option<&str>,
         _map: Option<&Bundle>,
@@ -3034,6 +3260,7 @@ impl IActivityManager for ActivityManager {
         _flags: i32,
     ) -> binder::Result<()> {
         atl_diag::answered(AM, "finishReceiver (non-ordered: nothing waits)");
+        self.inner.receiver_finished(who);
         Ok(())
     }
 
@@ -3517,6 +3744,8 @@ mod tests {
             true,
             RootBack::default(),
             OrientationReshape::default(),
+            true,
+            uid_state::BACKGROUND_SETTLE_TIME_MS,
             true,
         )
     }

@@ -103,6 +103,12 @@ struct Args {
     /// window portrait, resizeable apps included: the desktop default) or `unresizeable` (AOSP desktop windowing: only non-resizeable activities; a resizeable one keeps its window).
     #[arg(long, value_parser = parse_orientation_reshape, default_value = "every")]
     orientation_reshape: OrientationReshape,
+    /// The headless empty grace, ms (atld `--empty-process-grace-ms`): a process nothing holds ends this long after its last holding change, once its uid is idle (uid_state settle period).
+    #[arg(long, default_value_t = atl_services::uid_state::BACKGROUND_SETTLE_TIME_MS)]
+    empty_process_grace_ms: u64,
+    /// A window's close ends its processes' services with no restart (atld `--window-close-stops-services`); false: AOSP restarts STICKY services of a killed process.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    window_close_stops_services: bool,
     /// Test only: `sensorservice` is not registered, the deliberate break of the sensors gate's empty stage (SensorManager then waits for it, SensorManager.cpp `waitForSensorService`).
     #[arg(long)]
     no_sensor_service: bool,
@@ -305,6 +311,8 @@ fn main() -> Result<()> {
         a.root_back,
         a.orientation_reshape,
         !a.no_bind_service,
+        a.empty_process_grace_ms,
+        a.window_close_stops_services,
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()

@@ -408,6 +408,8 @@ pub struct Runtime {
     ime_death_link: bool,
     /// A start may reuse a singleTop / singleTask instance unless this is cleared (`--no-new-intent`, the start-finish stage's deliberate break).
     new_intent: bool,
+    /// The headless empty grace, ms (atld `--empty-process-grace-ms`); None keeps atld's default (the uid settle period, 60 s).
+    empty_process_grace_ms: Option<u64>,
     /// Starts owe their callers a result unless this is cleared (`--no-activity-result`, the app gate's deliberate break).
     activity_result: bool,
     /// bindService works unless this is cleared (`--no-bind-service`, the app gate's bound-service break).
@@ -961,6 +963,7 @@ impl Runtime {
             break_render_path: false,
             ime_death_link: true,
             new_intent: true,
+            empty_process_grace_ms: None,
             activity_result: true,
             bind_service: true,
             job_runner: true,
@@ -1438,6 +1441,12 @@ impl Runtime {
     /// The services refuse a start that would reuse an instance (atld `--no-new-intent`): the start-finish stage's new-intent sub-gate must then fail.
     pub fn without_new_intent(mut self) -> Self {
         self.new_intent = false;
+        self
+    }
+
+    /// The headless empty grace, ms (atld `--empty-process-grace-ms`): a short one lets a gate see an explicit broadcast's receiver process end (services' empty-headless rule).
+    pub fn with_empty_process_grace(mut self, ms: u64) -> Self {
+        self.empty_process_grace_ms = Some(ms);
         self
     }
 
@@ -2180,6 +2189,9 @@ impl Runtime {
         }
         if !self.new_intent {
             cmd.arg("--no-new-intent");
+        }
+        if let Some(ms) = self.empty_process_grace_ms {
+            cmd.arg("--empty-process-grace-ms").arg(ms.to_string());
         }
         if !self.activity_result {
             cmd.arg("--no-activity-result");
