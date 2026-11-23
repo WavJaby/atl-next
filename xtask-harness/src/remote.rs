@@ -644,7 +644,7 @@ fn nested_headless_script(tag: &str, cfg: &str, log: &str) -> String {
     )
 }
 
-/// [`nested_wayland::labwc_env`] as the words of a run's labwc command (` NAME=value`): the local gate's environment, one output.
+/// [`nested_wayland::labwc_env`] as the words of a run's labwc command (` NAME=value`): one output. No renderer: wlroots picks its own (pixman, the local gates', has no dmabuf, and the app's EGL then fails on rvvm, 2026-11-23).
 fn labwc_words() -> String {
     nested_wayland::labwc_env([nested_wayland::GATE_OUTPUT].len())
         .iter()
@@ -3553,12 +3553,14 @@ esac
             !s.contains("hyprctl") && !s.contains("DISPLAY=\"$XD\""),
             "{s}"
         );
+        // wlroots picks the renderer on the target: pixman there broke the app's EGL (rvvm, 2026-11-23)
+        assert!(!s.contains("WLR_RENDERER"), "{s}");
         assert!(
             at("trap nest_end EXIT\n")
                 < at(
-                    "XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman labwc -C"
+                    "XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 labwc -C"
                 )
-                && at("WLR_RENDERER=pixman labwc -C") < at("\nWL=\"$NEST_DIR/$WL\"\n")
+                && at("WLR_LIBINPUT_NO_DEVICES=1 labwc -C") < at("\nWL=\"$NEST_DIR/$WL\"\n")
                 && at("\nWL=\"$NEST_DIR/$WL\"\n") < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                 && at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                     < at("kill -TERM \"$LW\" 2>/dev/null || true"),

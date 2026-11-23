@@ -62,13 +62,13 @@ const RC_XML_PLACED: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><d
 /// wlroots' first free name in a fresh runtime dir.
 const SOCKET: &str = "wayland-0";
 
-/// labwc's environment in a gate run, local ([`NestedCompositor::start_rc`]) and remote (remote.rs `nested_headless_script`): wlroots' headless backend with `outputs` outputs, no input devices (the seat gets its pointer from a client), pixman (measured 2026-11-06).
-pub(crate) fn labwc_env(outputs: usize) -> [(&'static str, String); 4] {
+/// labwc's environment in a gate run, local ([`NestedCompositor::start_rc`]) and remote (remote.rs `nested_headless_script`): wlroots' headless backend with `outputs` outputs, no input devices (the seat
+/// gets its pointer from a client). The renderer is not here: the local gate adds pixman (measured 2026-11-06), a remote run keeps wlroots' default.
+pub(crate) fn labwc_env(outputs: usize) -> [(&'static str, String); 3] {
     [
         ("WLR_BACKENDS", "headless".to_owned()),
         ("WLR_HEADLESS_OUTPUTS", outputs.to_string()),
         ("WLR_LIBINPUT_NO_DEVICES", "1".to_owned()),
-        ("WLR_RENDERER", "pixman".to_owned()),
     ]
 }
 
@@ -211,6 +211,8 @@ impl NestedCompositor {
             .arg(&log)
             .env("XDG_RUNTIME_DIR", &runtime)
             .envs(labwc_env(outputs.len()))
+            // pixman: measured 2026-11-06 for the gates' frames; a remote run's labwc keeps the default, pixman has no dmabuf and the app's EGL fails on it (rvvm, 2026-11-23)
+            .env("WLR_RENDERER", "pixman")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY");
