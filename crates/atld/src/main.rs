@@ -59,6 +59,7 @@ use atl_platform_host::{
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
+use atl_services_types::hw_timeouts::HwTimeouts;
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
 use atl_services_types::permission::SYSTEM_PROCESS;
@@ -2881,6 +2882,15 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
     let system_area = r.root.join("properties.d").join("system");
     std::fs::write(&system_area, atl_property_service::area(&defaults)?)?;
+    // AOSP's ro.hw_timeout_multiplier from the props (vendor build.prop comes last, its value wins): the services scale their timers by it
+    let hw = HwTimeouts::from_prop(
+        defaults
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "ro.hw_timeout_multiplier")
+            .map(|(_, v)| v.as_str()),
+    );
+    log(format_args!("hw timeouts: x{}", hw.to_arg()));
     app_env.extend(a.app_env.iter().cloned());
     log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
@@ -3023,6 +3033,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         services_args.extend(["--launch".into(), p.into()]);
     }
     services_args.extend(["--display".into(), display.to_arg().into()]);
+    services_args.extend(["--hw-timeout-multiplier".into(), hw.to_arg().into()]);
     if let Some(tag) = &locale {
         services_args.extend(["--locale".into(), tag.into()]);
     }

@@ -5,6 +5,7 @@
 pub mod app_ops;
 pub mod compositor_registry;
 pub mod display_model;
+pub mod hw_timeouts;
 pub mod input_devices;
 pub mod installer_output;
 pub mod logcat;

@@ -31,6 +31,7 @@ use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
+use atl_services_types::hw_timeouts::HwTimeouts;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::{Library, PlatformManifest};
 use atl_services_types::system_config::SystemConfig;
@@ -65,6 +66,9 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
+    /// `ro.hw_timeout_multiplier` as atld reads it (hw_timeouts.rs): scales the process-start and broadcast timers. Omitted: 1.
+    #[arg(long = "hw-timeout-multiplier", value_parser = HwTimeouts::parse_arg, default_value = "1")]
+    hw_timeouts: HwTimeouts,
     /// The desktop's UI language as a BCP-47 tag (atld: atl_platform_host::ui_locale). Omitted: none, and the global configuration takes activity.rs DEFAULT_LOCALE.
     #[arg(long)]
     locale: Option<String>,
@@ -353,6 +357,7 @@ fn main() -> Result<()> {
         a.empty_process_grace_ms,
         a.window_close_stops_services,
         notices.clone(),
+        a.hw_timeouts,
     );
     if let Some(package) = &a.launch
         && packages.by_name(package).is_none()

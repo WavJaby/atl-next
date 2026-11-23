@@ -7,13 +7,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use crate::broadcast::{FLAG_RECEIVER_FOREGROUND, FLAG_RECEIVER_NO_ABORT};
+use atl_services_types::hw_timeouts::{
+    BROADCAST_BG_TIMEOUT_BASE_MS, BROADCAST_FG_TIMEOUT_BASE_MS, HwTimeouts,
+    PENDING_COLD_START_ABANDON_BASE_MS,
+};
 
-/// BROADCAST_FG_TIMEOUT and BROADCAST_BG_TIMEOUT = 10 s and 60 s x HW_TIMEOUT_MULTIPLIER 1 (ActivityManagerService.java:584-585).
-pub const BROADCAST_FG_TIMEOUT_MS: u64 = 10_000;
-pub const BROADCAST_BG_TIMEOUT_MS: u64 = 60_000;
-/// BroadcastConstants.PENDING_COLD_START_ABANDON_TIMEOUT_MILLIS = 5 min x HW_TIMEOUT_MULTIPLIER 1 (BroadcastConstants.java:294-299).
-pub const PENDING_COLD_START_ABANDON_MS: u64 = 5 * 60 * 1000;
+use crate::broadcast::{FLAG_RECEIVER_FOREGROUND, FLAG_RECEIVER_NO_ABORT};
 
 /// Identity of an enqueued broadcast; never reused.
 pub type BroadcastId = u64;
@@ -202,6 +201,8 @@ pub struct Dispatcher<R, E, P> {
     queues: BTreeMap<ProcKey, Queue>,
     /// The process whose cold start holds the slot (BroadcastQueueImpl.mRunningColdStart). Set only while its queue is Starting.
     cold: Option<ProcKey>,
+    /// the timers' multiplier (`ro.hw_timeout_multiplier`): see [`Dispatcher::with_hw`]
+    hw: HwTimeouts,
 }
 
 // no bounds on R, E, P: a derive would require them to be Default
@@ -213,6 +214,17 @@ impl<R, E, P> Default for Dispatcher<R, E, P> {
             records: BTreeMap::new(),
             queues: BTreeMap::new(),
             cold: None,
+            hw: HwTimeouts::default(),
+        }
+    }
+}
+
+impl<R, E, P> Dispatcher<R, E, P> {
+    /// The dispatcher whose timers scale by `hw` (the BASE values x the multiplier). [`Default`] is the unscaled one (multiplier 1).
+    pub fn with_hw(hw: HwTimeouts) -> Self {
+        Dispatcher {
+            hw,
+            ..Self::default()
         }
     }
 }
@@ -570,7 +582,7 @@ impl<R: Clone, E: Clone, P: Clone> Dispatcher<R, E, P> {
                 out.push(Action::ArmColdStart {
                     key: key.clone(),
                     token,
-                    after_ms: PENDING_COLD_START_ABANDON_MS,
+                    after_ms: self.hw.scale(PENDING_COLD_START_ABANDON_BASE_MS),
                 });
                 out.push(Action::StartProcess {
                     key: key.clone(),
@@ -595,9 +607,9 @@ impl<R: Clone, E: Clone, P: Clone> Dispatcher<R, E, P> {
             return;
         };
         let after_ms = if rec.facts.flags & FLAG_RECEIVER_FOREGROUND != 0 {
-            BROADCAST_FG_TIMEOUT_MS
+            self.hw.scale(BROADCAST_FG_TIMEOUT_BASE_MS)
         } else {
-            BROADCAST_BG_TIMEOUT_MS
+            self.hw.scale(BROADCAST_BG_TIMEOUT_BASE_MS)
         };
         let job = Job {
             id,
@@ -980,7 +992,7 @@ mod tests {
         b.result_to = Some((9, key("sender")));
         let (id, a) = d.enqueue(b, &mut allow);
         assert_eq!(dest(&a), [(101, 0)]);
-        assert_eq!(timers(&a), [(101, 0, BROADCAST_BG_TIMEOUT_MS)]);
+        assert_eq!(timers(&a), [(101, 0, BROADCAST_BG_TIMEOUT_BASE_MS)]);
         let a = d.finish(101, finish(0, "a", false), &mut allow);
         assert_eq!(sent_results(&a), [(102, 1, 0, Some("a".into()))]);
         let a = d.finish(102, finish(0, "b", false), &mut allow);
@@ -1075,8 +1087,8 @@ mod tests {
         assert_eq!(
             timers(&a),
             [
-                (101, 0, BROADCAST_BG_TIMEOUT_MS),
-                (102, 1, BROADCAST_BG_TIMEOUT_MS)
+                (101, 0, BROADCAST_BG_TIMEOUT_BASE_MS),
+                (102, 1, BROADCAST_BG_TIMEOUT_BASE_MS)
             ]
         );
         let a = d.finish(101, finish(0, "", false), &mut allow);
@@ -1097,7 +1109,7 @@ mod tests {
         // the registered receiver is assumed delivered: the manifest one goes out in the same step, and only it has a timer
         assert_eq!(dest(&a), [(101, 0), (101, 1)]);
         assert!(matches!(&a[0], Action::Send { job, .. } if job.assume_delivered));
-        assert_eq!(timers(&a), [(101, 1, BROADCAST_BG_TIMEOUT_MS)]);
+        assert_eq!(timers(&a), [(101, 1, BROADCAST_BG_TIMEOUT_BASE_MS)]);
         // the manifest delivery in flight holds the process; the assumed registered one held nothing
         assert!(d.holds(&key("p1")));
     }
@@ -1151,7 +1163,7 @@ mod tests {
         assert_eq!(tokens.len(), 1);
         assert!(a.iter().any(|x| matches!(
             x,
-            Action::ArmColdStart { after_ms, .. } if *after_ms == PENDING_COLD_START_ABANDON_MS
+            Action::ArmColdStart { after_ms, .. } if *after_ms == PENDING_COLD_START_ABANDON_BASE_MS
         )));
         // p1 never attaches: its slot goes, the receiver is re-enqueued and p1 is ended for a new start; p2 does not wait for p1's retry
         let a = d.cold_start_timeout(&key("p1"), tokens[0], &mut allow);
@@ -1210,6 +1222,28 @@ mod tests {
         );
     }
 
+    /// The multiplier scales what the dispatcher arms: a foreground delivery's timer and a cold start's abandon, AOSP's literals x 2.
+    #[test]
+    fn hw_multiplier_scales_the_armed_timers() {
+        let mut d = D::with_hw(HwTimeouts::from_prop(Some("2")));
+        attach(&mut d, "p1", 101);
+        let mut b = broadcast(vec![manifest("p1", 0), manifest("p1", 0)], true);
+        b.facts.flags = FLAG_RECEIVER_FOREGROUND;
+        let (_, a) = d.enqueue(b, &mut allow);
+        // foreground: 10 s x 2 (ActivityManagerService.java:584)
+        assert_eq!(timers(&a), [(101, 0, 2 * 10 * 1000)]);
+        let mut d = D::with_hw(HwTimeouts::from_prop(Some("2")));
+        let (_, a) = d.enqueue(
+            broadcast(vec![manifest("p1", 0), manifest("p2", 0)], false),
+            &mut allow,
+        );
+        // the cold start's abandon: 5 min x 2 (BroadcastConstants.java:295)
+        assert!(a.iter().any(|x| matches!(
+            x,
+            Action::ArmColdStart { after_ms, .. } if *after_ms == 2 * 5 * 60 * 1000
+        )));
+    }
+
     #[test]
     fn timeout_ends_the_delivery_and_a_stale_timer_does_nothing() {
         let mut d = D::default();
@@ -1218,10 +1252,10 @@ mod tests {
         b.facts.flags = FLAG_RECEIVER_FOREGROUND;
         let (id, a) = d.enqueue(b, &mut allow);
         // foreground: 10 s (ActivityManagerService.java:584)
-        assert_eq!(timers(&a), [(101, 0, BROADCAST_FG_TIMEOUT_MS)]);
+        assert_eq!(timers(&a), [(101, 0, BROADCAST_FG_TIMEOUT_BASE_MS)]);
         let a = d.timeout(101, id, 0, &mut allow);
         assert_eq!(dest(&a), [(101, 1)]);
-        assert_eq!(timers(&a), [(101, 1, BROADCAST_FG_TIMEOUT_MS)]);
+        assert_eq!(timers(&a), [(101, 1, BROADCAST_FG_TIMEOUT_BASE_MS)]);
         // the timer of receiver 0 fires again after it ended
         assert!(d.timeout(101, id, 0, &mut allow).is_empty());
         assert_eq!(

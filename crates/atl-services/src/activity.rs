@@ -48,6 +48,7 @@ use atl_parcelables::parts::{
     ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo,
     ConfigurationChangeItem, LaunchActivityItem, ResumeActivityItem,
 };
+use atl_services_types::hw_timeouts::{HwTimeouts, PROC_START_TIMEOUT_BASE_MS};
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
     ThreadState,
@@ -503,9 +504,6 @@ enum KillReason {
     EmptyHeadless,
 }
 
-/// AMS PROC_START_TIMEOUT (ActivityManagerService.java:568, 10 s x HW_TIMEOUT_MULTIPLIER = 1): a started process must attach within it, else it failed to start.
-const PROC_START_TIMEOUT_MS: u64 = 10_000;
-
 /// AMC DEFAULT_SERVICE_START_FOREGROUND_TIMEOUT_MS (ActivityManagerConstants.java:318, 30 s): a startForegroundService's service must call startForeground within it.
 const SERVICE_START_FOREGROUND_TIMEOUT_MS: u64 = 30_000;
 /// AMC DEFAULT_SERVICE_START_FOREGROUND_ANR_DELAY_MS (ActivityManagerConstants.java:320, 10 s): the ANR follows a startForeground timeout this long after its stop (AS :7640).
@@ -522,11 +520,11 @@ enum Timer {
     EmptyProcess(i64),
     /// a service's restart (service_records.rs `Restart.at`, ActiveServices.scheduleServiceRestartLocked's restarter): one per component, re-armed by each scheduled restart
     Restart((String, String)),
-    /// a process's start timeout (PROC_START_TIMEOUT_MS), by ProcessRecord.start_seq: a process still unattached when it fires failed to attach; the one place an unattached process ends
+    /// a process's start timeout (PROC_START_TIMEOUT_BASE_MS x the multiplier), by ProcessRecord.start_seq: a process still unattached when it fires failed to attach; the one place an unattached process ends
     ProcessStart(i64),
     /// a broadcast delivery's timeout (BROADCAST_FG / BG_TIMEOUT): the delivery (pid, broadcast, receiver index); broadcasts_am.rs ignores a delivery that ended
     Broadcast { pid: i32, id: u64, index: usize },
-    /// a cold start's backstop (PENDING_COLD_START_ABANDON_MS): the start of process `key` named by its token; releases the broadcast queue's slot, ends no process
+    /// a cold start's backstop (hw_timeouts: PENDING_COLD_START_ABANDON_BASE_MS x the multiplier): the start of process `key` named by its token; releases the broadcast queue's slot, ends no process
     ColdStart { key: ProcKey, token: u64 },
     /// a temp allowlist grant's expiry, by uid (uid_state `on_temp_expired`): the uid settles at the deadline that returns (`UidSettle`)
     TempExpiry(u32),
@@ -790,6 +788,8 @@ struct Inner {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
     control: Arc<dyn ProcessControl>,
+    /// `ro.hw_timeout_multiplier`: scales the process-start timer here and the broadcast timers in the dispatcher (hw_timeouts.rs)
+    hw: HwTimeouts,
     state: Mutex<State>,
     reporter: Reporter,
     /// the activity lifecycle: records, launches and starts (activity_task.rs); the client controller forwards its acks here
@@ -922,7 +922,7 @@ fn under_policy(back: Back, root: RootBack) -> Back {
 impl ActivityManager {
     /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them.
     /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`]. `orientation_reshape`: see [`OrientationReshape`]. `bind_services` false is the test-only
-    /// break `--no-bind-service`: every bindService answers 0.
+    /// break `--no-bind-service`: every bindService answers 0. `hw`: the multiplier of the process-start and broadcast timers ([`HwTimeouts`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         packages: Arc<Packages>,
@@ -937,6 +937,7 @@ impl ActivityManager {
         empty_grace_ms: u64,
         window_close_stops_services: bool,
         notices: Arc<dyn crate::notification::ForegroundNotices>,
+        hw: HwTimeouts,
     ) -> Self {
         let buckets = Arc::new(ReportedBuckets::default());
         ActivityManager {
@@ -963,7 +964,11 @@ impl ActivityManager {
                     packages,
                     permissions,
                     control,
-                    state: Mutex::new(State::default()),
+                    hw,
+                    state: Mutex::new(State {
+                        dispatcher: Dispatch::with_hw(hw),
+                        ..State::default()
+                    }),
                     reporter: Reporter::new(),
                     tasks,
                     buckets,
@@ -1668,7 +1673,10 @@ impl Inner {
         });
         self.arm_settle(p.uid, settle);
         self.touch_all_locked(st);
-        self.arm(Timer::ProcessStart(start_seq), now + PROC_START_TIMEOUT_MS);
+        self.arm(
+            Timer::ProcessStart(start_seq),
+            now + self.hw.scale(PROC_START_TIMEOUT_BASE_MS),
+        );
         Ok(())
     }
 
@@ -3706,6 +3714,7 @@ mod tests {
             uid_state::BACKGROUND_SETTLE_TIME_MS,
             true,
             Arc::new(crate::notification::NoForegroundNotices),
+            HwTimeouts::default(),
         )
     }
 
@@ -3922,6 +3931,7 @@ mod tests {
             uid_state::BACKGROUND_SETTLE_TIME_MS,
             true,
             Arc::new(crate::notification::NoForegroundNotices),
+            HwTimeouts::default(),
         )
     }
 

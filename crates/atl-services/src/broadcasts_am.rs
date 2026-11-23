@@ -7,14 +7,16 @@
 use std::collections::VecDeque;
 
 use super::*;
+
 use crate::broadcast_dispatch::{
     self as bd, Action, BroadcastId, Component, Dispatcher, Facts, Finish, NewBroadcast, Outcome,
-    PENDING_COLD_START_ABANDON_MS, Policy, ProcKey, Receiver, Target,
+    Policy, ProcKey, Receiver, Target,
 };
 use crate::install;
 use crate::uid_state::TempGrant;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use atl_parcelables::codecs::android::os::Bundle::Value;
+use atl_services_types::hw_timeouts::PENDING_COLD_START_ABANDON_BASE_MS;
 
 /// What each receiver of a broadcast gets besides its result: the intent, the user, and whether it is a registration's initial sticky (BroadcastRecord.initialSticky).
 #[derive(Clone)]
@@ -250,8 +252,9 @@ impl Inner {
                     // the backstop: the slot is released and the delivery re-enqueued or failed. The process is not ended here; an unattached one ends at its start timeout
                     atl_diag::answered(AM, "cold start abandoned: slot released");
                     log(format_args!(
-                        "cold start of {} abandoned: not attached within {PENDING_COLD_START_ABANDON_MS} ms",
-                        key.name
+                        "cold start of {} abandoned: not attached within {} ms",
+                        key.name,
+                        self.hw.scale(PENDING_COLD_START_ABANDON_BASE_MS)
                     ));
                 }
                 Action::Skip { id, index, reason } => {

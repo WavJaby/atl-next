@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
+use atl_services_types::hw_timeouts::{HwTimeouts, PROC_START_TIMEOUT_BASE_MS};
 
 use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_lines, counters};
 use crate::gl_scene::{Judged, Scene};
@@ -2595,8 +2596,6 @@ const IMPORTANCE_SERVICE: i32 = 300;
 const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
 /// ActivityManagerConstants.java:226 DEFAULT_SERVICE_MIN_RESTART_TIME_BETWEEN: a restart of a service that died with another one waits this long after it.
 const SERVICE_MIN_RESTART_TIME_BETWEEN_MS: u64 = 10_000;
-/// ActivityManagerService.java:568 PROC_START_TIMEOUT: the restarted process must attach within it, else it failed to attach (activity.rs PROC_START_TIMEOUT_MS).
-const PROC_START_TIMEOUT_MS: u64 = 10_000;
 /// Above the upper bound: the death's binder notice and the spawn's own latency, which the rule's numbers do not count.
 const STICKY_SLACK_MS: u64 = 1_000;
 /// After the kill, the not-sticky process must stay down this long: the rule's restart of a second service that died with the first one, with its own delay.
@@ -2613,6 +2612,8 @@ struct StickyCase {
     restart_ms: Option<u64>,
     /// AtlSticky's logged importance (the word after STICKY_IMPORTANCE), read at the kill
     importance: Option<String>,
+    /// the run's `ro.hw_timeout_multiplier`: the restart's start budget is PROC_START_TIMEOUT_BASE_MS x it
+    hw: HwTimeouts,
 }
 
 impl StickyCase {
@@ -2681,7 +2682,9 @@ impl StickyCase {
         let gap = restart.saturating_sub(at);
         let (lo, hi) = (
             SERVICE_RESTART_DURATION_MS,
-            SERVICE_RESTART_DURATION_MS + PROC_START_TIMEOUT_MS + STICKY_SLACK_MS,
+            SERVICE_RESTART_DURATION_MS
+                + self.hw.scale(PROC_START_TIMEOUT_BASE_MS)
+                + STICKY_SLACK_MS,
         );
         if !(lo..=hi).contains(&gap) {
             return Err(format!(
@@ -2780,7 +2783,25 @@ mod sticky_case_tests {
             kill_failed: None,
             restart_ms: Some(restart),
             importance: Some("300".to_owned()),
+            hw: HwTimeouts::default(),
         }
+    }
+
+    /// The bound's upper end follows the multiplier: 1 s + PROC_START (10 s x 2) + 1 s of slack = 22 s here, from the literals.
+    #[test]
+    fn restart_bound_follows_the_multiplier() {
+        let atld = format!("{ATLD_START}7\n");
+        let hw = HwTimeouts::from_prop(Some("2"));
+        let at_bound = StickyCase {
+            hw,
+            ..case(10_000 + 22_000)
+        };
+        assert!(at_bound.verdict(&atld, "com.example.atltest").is_ok());
+        let over = StickyCase {
+            hw,
+            ..case(10_000 + 22_001)
+        };
+        assert!(over.verdict(&atld, "com.example.atltest").is_err());
     }
 
     #[test]
