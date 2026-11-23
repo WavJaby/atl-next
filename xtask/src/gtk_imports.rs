@@ -60,7 +60,7 @@ impl Baseline {
 pub fn check(root: &Path, out: &Path) -> Result<()> {
     let baseline = Baseline::load(root)?;
     for package in MODULES {
-        let (mut cmd, release) = cdylib::release_build(root, out, package)?;
+        let (mut cmd, release) = cdylib::release_build(root, out, &[package])?;
         let status = timing::phase("cdylib build", || unit_use::status(&mut cmd))?;
         ensure!(status.success(), "building {package} failed");
         baseline.check_lib(package, &release.join(lib_file(package)))?;

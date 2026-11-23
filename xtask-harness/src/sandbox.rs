@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use atl_android_paths::DATA;
 use atl_broker::app_env::APP_ENV;
 use atl_broker::{Broker, CONTROL_ENV, Mount, RESOLV_CONF, drm_sysfs, rights_of, to_log};
@@ -83,20 +83,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = out.join("sandbox");
     fs::create_dir_all(&work)?;
     let (broker, _binderd) = binder::start_binderd(root, &out, &work.join("binderd.log"))?;
-    let status = crate::unit_use::status(
-        crate::cargo_command()
-            .args([
-                "build",
-                "--release",
-                "-p",
-                "atl-sandbox-probe",
-                "--target-dir",
-            ])
-            .arg(out.join("cargo"))
-            .current_dir(root),
-    )?;
-    ensure!(status.success(), "building atl-sandbox-probe failed");
-    let probe = out.join("cargo/release/atl-sandbox-probe");
+    let probe = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?
+        .bin("atl-sandbox-probe");
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
     let pid = std::process::id();
     let secret = home.join(format!(".atl-sandbox-probe-{pid}"));

@@ -711,13 +711,9 @@ pub fn run_display() -> DisplayModel {
     }
 }
 
-/// `package`'s `bin`, built plainly (release) into `out`'s cargo target dir, for a cross host's out dir that host's (cdylib::release_build); its path.
+/// `package`'s `bin` as gate_build.rs builds it (release, `out`'s cargo target dir; a cross host's out dir: that host's).
 fn cargo_bin(root: &Path, out: &Path, package: &str) -> Result<PathBuf> {
-    let (mut cmd, release) = crate::cdylib::release_build(root, out, package)?;
-    xtask::timing::phase("cargo_bin", || {
-        crate::unit_use::exec(cmd.arg("--locked"), &format!("cargo build -p {package}"))
-    })?;
-    Ok(release.join(package))
+    Ok(crate::gate_build::ensure(root, out, &[crate::gate_build::Group::Release])?.bin(package))
 }
 
 /// The platform's API level: `ro.build.version.sdk` of the converter's build.prop.
@@ -898,12 +894,13 @@ impl Runtime {
         let services = packages::bin(root, &out, "atl-services", "atl-system-services")?;
         let am = packages::bin(root, &out, "atl-services", "atl-am")?;
         let screencap = packages::bin(root, &out, "atl-services", "atl-screencap")?;
-        let binderd = cargo_bin(root, &out, "atl-binderd")?;
-        let sandbox_stub = cargo_bin(root, &out, "atl-sandbox-stub")?;
-        let sandbox_join = cargo_bin(root, &out, "atl-sandbox-join")?;
+        let built = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?;
+        let binderd = built.bin("atl-binderd");
+        let sandbox_stub = built.bin("atl-sandbox-stub");
+        let sandbox_join = built.bin("atl-sandbox-join");
         // shown in the sandbox as flatpak-spawn (atl_broker::webspawn::SHIM_AT), the name WebKit runs
-        let flatpak_spawn = cargo_bin(root, &out, "atl-flatpak-spawn")?;
-        let atld = cargo_bin(root, &out, "atld")?;
+        let flatpak_spawn = built.bin("atl-flatpak-spawn");
+        let atld = built.bin("atld");
         let installer = packages::bin(root, &out, "atl-app-launcher", "atl-installer")?;
         let api_impl = host_art::api_impl_dex(&java_out);
         ensure!(
@@ -929,15 +926,8 @@ impl Runtime {
             let path = keychars.join(file);
             ensure!(path.is_file(), "missing input {}", path.display());
         }
-        let native_bridge = crate::cdylib::stage(
-            root,
-            &out,
-            "atl-native-bridge",
-            "native-bridge/lib",
-            atl_native_bridge::LIBRARY,
-        )?;
-        let platform_module = crate::ui_module::stage_module(root, &out)?;
-        crate::ui_module::stage_webview(root, &out)?;
+        let native_bridge = built.staged_dir(crate::gate_build::NATIVE_BRIDGE_DIR);
+        let platform_module = built.staged_dir(crate::ui_module::DIR);
         // the staged files, for this out's host: the only gate on a cross host's (riscv64) UI modules, which `xtask check` does not build
         xtask::gtk_imports::check_staged(root, &platform_module)?;
         let arches = crate::arches::load(root)?;

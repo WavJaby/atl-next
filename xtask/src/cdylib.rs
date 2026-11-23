@@ -20,7 +20,7 @@ pub fn stage_with(
     name: &str,
     features: &[&str],
 ) -> Result<PathBuf> {
-    let (mut cmd, release) = release_build(root, out, package)?;
+    let (mut cmd, release) = release_build(root, out, &[package])?;
     if !features.is_empty() {
         cmd.args(["--features", &features.join(",")]);
     }
@@ -37,13 +37,17 @@ pub fn stage_with(
     Ok(dir)
 }
 
-/// `cargo build --release -p <package>` into `<out>/cargo`, and cargo's output dir of it. A cross host's out dir (native::cross_host_of) builds for that host with cross::cargo_target, as `xtask native` builds its crates: output `<out>/cargo/<triple>/release`.
-pub fn release_build(root: &Path, out: &Path, package: &str) -> Result<(Command, PathBuf)> {
+/// `cargo build --release -p <package>...` (one invocation, so features unify over the set) into `<out>/cargo`, and cargo's output dir of it. A cross host's out dir (native::cross_host_of) builds for that host with cross::cargo_target, as `xtask native` builds its crates: output `<out>/cargo/<triple>/release`.
+pub fn release_build(root: &Path, out: &Path, packages: &[&str]) -> Result<(Command, PathBuf)> {
     let cross = crate::native::cross_host_of(root, out)?
         .map(|host| crate::cross::cargo_target(root, &host))
         .transpose()?;
     let mut cmd = crate::cargo_command();
-    cmd.args(["build", "--release", "-p", package, "--target-dir"])
+    cmd.args(["build", "--release"]);
+    for p in packages {
+        cmd.args(["-p", p]);
+    }
+    cmd.arg("--target-dir")
         .arg(out.join("cargo"))
         .current_dir(root);
     let mut release = out.join("cargo");

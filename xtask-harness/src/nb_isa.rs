@@ -56,14 +56,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "nb-isa-art",
         args.verbose,
     )?;
-    let nb_dir = crate::cdylib::stage(
-        root,
-        &out,
-        "atl-native-bridge",
-        // not below <out>/nb-isa: `compile` recreates that dir
-        "nb-isa-lib",
-        atl_native_bridge::LIBRARY,
-    )?;
+    let nb_dir = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?
+        .staged_dir(crate::gate_build::NB_ISA_DIR);
     // the launcher's NativeBridge option names the library by soname (atl-property-service default area): it must be on the library path
     let joined: OsString =
         std::env::join_paths([&host.lib_path, &nb_dir]).context("joining the library path")?;

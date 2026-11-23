@@ -30,7 +30,7 @@ const SOURCES: &str = "xtask-harness/testdata/ui-module";
 /// The fixture executable, in the converter packages' target dir (`packages::TARGET_DIR`).
 const FIXTURE: &str = "atl-platform-ui-module-fixture";
 /// The module's package and its file (atl-platform-ui-api `abi::MODULE_FILE`; the harness does not link the api crate).
-const MODULE_PACKAGE: &str = "atl-platform-ui-linux";
+pub(crate) const MODULE_PACKAGE: &str = "atl-platform-ui-linux";
 pub(crate) const MODULE_FILE: &str = "libatl_platform_ui_linux.so";
 /// NDK API level of the stand-ins: the level the plan's probe measured with (NDK r30, API 33).
 const API: u32 = 33;
@@ -98,7 +98,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         std::fs::remove_dir_all(&work)?;
     }
     std::fs::create_dir_all(&work)?;
-    let module_dir = stage_module(root, &out)?;
+    let module_dir = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?
+        .staged_dir(DIR);
     let app = build_app(root, args, &work.join("app"))?;
     let app_dir = app.parent().context("app dir")?.to_path_buf();
     let nested = NestedCompositor::start(&work)?;
@@ -349,37 +350,16 @@ fn build_app(root: &Path, args: &Args, dir: &Path) -> Result<PathBuf> {
     Ok(app)
 }
 
-/// Builds the platform module and installs it as `<out>/ui-module-lib/libatl_platform_ui_linux.so`; returns the dir, for the library path of every process that uses the atl-platform-ui facade (the launcher in a runtime run, this gate's fixture).
-pub fn stage_module(root: &Path, out: &Path) -> Result<PathBuf> {
-    crate::cdylib::stage(root, out, MODULE_PACKAGE, "ui-module-lib", MODULE_FILE)
-}
+/// `<out>/<DIR>` holds the platform module and the WebView libraries (gate_build.rs stages them): the library path of every process that uses the atl-platform-ui facade (the launcher in a runtime run, this gate's fixture).
+pub(crate) const DIR: &str = "ui-module-lib";
 
 /// The web engine module (atl-platform-ui-api `abi::WEBVIEW_MODULE_FILE`, webview plan S2.3), which the facade dlopens by name on the first WebView call.
-const WEBVIEW_MODULE_PACKAGE: &str = "atl-webview-linux";
+pub(crate) const WEBVIEW_MODULE_PACKAGE: &str = "atl-webview-linux";
 pub(crate) const WEBVIEW_MODULE_FILE: &str = "libatl_webview_linux.so";
 
 /// The WebView provider's JNI library (atl-webview, webview plan S4.1), which the provider class loads with System.loadLibrary from the app's library path (Soong's /system/lib64 role).
-const WEBVIEW_JNI_PACKAGE: &str = "atl-webview";
-const WEBVIEW_JNI_FILE: &str = "libatl_webview.so";
-
-/// Builds the WebView libraries -- the web engine module and the provider's JNI library -- into the same dir as [`stage_module`], on every app's library path. Only runtime runs stage them (the module gate's fixture never opens a WebView).
-pub fn stage_webview(root: &Path, out: &Path) -> Result<()> {
-    crate::cdylib::stage(
-        root,
-        out,
-        WEBVIEW_MODULE_PACKAGE,
-        "ui-module-lib",
-        WEBVIEW_MODULE_FILE,
-    )?;
-    crate::cdylib::stage(
-        root,
-        out,
-        WEBVIEW_JNI_PACKAGE,
-        "ui-module-lib",
-        WEBVIEW_JNI_FILE,
-    )?;
-    Ok(())
-}
+pub(crate) const WEBVIEW_JNI_PACKAGE: &str = "atl-webview";
+pub(crate) const WEBVIEW_JNI_FILE: &str = "libatl_webview.so";
 
 /// A copy of `module` in `dir` whose build identity differs: every little-endian occurrence of the fixture's reported `abi_id` (the vtable's first field, atl-platform-ui-api `abi::ABI_ID`) with each byte inverted. Stands for a module of another build without a second build.
 fn foreign_build(module: &Path, run: &Run, dir: &Path) -> Result<PathBuf> {

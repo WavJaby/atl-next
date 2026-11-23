@@ -31,6 +31,7 @@ mod drive_gate;
 mod egl_bridge;
 mod egl_driver;
 mod es1_angle;
+mod gate_build;
 mod gdk_dmabuf;
 mod gl_dispatch;
 mod gl_probe;

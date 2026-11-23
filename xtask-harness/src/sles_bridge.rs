@@ -19,7 +19,7 @@ use crate::verdict::{Failure, Verdict};
 
 const PACKAGE: &str = "atl-native-bridge";
 const TEST: &str = "sles_bridge";
-const RECORDER: &str = "sles_recorder";
+pub(crate) const RECORDER: &str = "sles_recorder";
 const TESTDATA: &str = "xtask-harness/testdata/sles-bridge";
 /// The prefix of the test's check lines (`sles-bridge: (<c>) ok`).
 const PREFIX: &str = "sles-bridge";
@@ -51,7 +51,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let fixture_dir = fixture(root, &dir)?;
     let env = nb_identity::identity_env(root, &out, fixture_dir)?;
-    let stage = recorder(root, &dir)?;
+    let stage = recorder(root, &out, &dir)?;
     let wrap = qemu_linker::system_wrap(&stage)?;
     let mut runs: Vec<Option<(&str, char)>> = vec![None];
     if !args.no_breaks {
@@ -97,27 +97,14 @@ fn fixture(root: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(fdir)
 }
 
-/// Builds the recorder and stages it as `<dir>/root/system/lib64/libOpenSLES.so`; returns the stage root.
-fn recorder(root: &Path, dir: &Path) -> Result<PathBuf> {
-    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args(["build", "--locked", "-p", PACKAGE, "--example", RECORDER])
-        .env_remove("ATL_NB_BREAK")
-        .current_dir(root);
-    let run =
-        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("building the recorder")?;
-    ensure!(
-        run.status.success(),
-        "cargo build --example {RECORDER}: {}\n{}",
-        run.status,
-        run.stderr
-    );
-    let target =
-        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-    let so = target.join(format!("debug/examples/lib{RECORDER}.so"));
+/// Stages the recorder (gate_build.rs builds it) as `<dir>/root/system/lib64/libOpenSLES.so`; returns the stage root.
+fn recorder(root: &Path, out: &Path, dir: &Path) -> Result<PathBuf> {
+    let built = crate::gate_build::ensure(root, out, &[crate::gate_build::Group::Recorder])?;
+    let so = built.recorder()?;
     let stage = dir.join("root");
     let lib = stage.join(atl_android_paths::SYSTEM_LIB.trim_start_matches('/'));
     std::fs::create_dir_all(&lib).with_context(|| format!("creating {}", lib.display()))?;
-    std::fs::copy(&so, lib.join("libOpenSLES.so"))
+    std::fs::copy(so, lib.join("libOpenSLES.so"))
         .with_context(|| format!("copying {}", so.display()))?;
     Ok(stage)
 }

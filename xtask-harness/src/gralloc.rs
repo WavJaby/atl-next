@@ -140,14 +140,14 @@ fn verdict(role: &str, cases: &[&str], ok: bool, stdout: &str) -> (Vec<String>, 
     (passes, fails)
 }
 
-/// Builds `mapper.atl.so` (crate atl-gralloc-mapper, plain cargo into `<out>/cargo`) and installs it under the file name libui looks for, in `<out>/gralloc/lib`; returns that directory (for LD_LIBRARY_PATH: libui's `android_load_sphal_library` is `dlopen` here).
+/// Where gate_build.rs installs `mapper.atl.so` (crate atl-gralloc-mapper) under the file name libui looks for.
+pub(crate) const MAPPER_DIR: &str = "gralloc/lib";
+
+/// The staged mapper's directory (for LD_LIBRARY_PATH: libui's `android_load_sphal_library` is `dlopen` here), built and staged by gate_build.rs.
 pub fn stage_mapper(root: &Path, out: &Path) -> Result<PathBuf> {
-    crate::cdylib::stage(
-        root,
-        out,
-        "atl-gralloc-mapper",
-        "gralloc/lib",
-        &vintf::mapper_library_name(),
+    Ok(
+        crate::gate_build::ensure(root, out, &[crate::gate_build::Group::Release])?
+            .staged_dir(MAPPER_DIR),
     )
 }
 

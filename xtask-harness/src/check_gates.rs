@@ -3,6 +3,8 @@
 //! one of them cannot land green. A row is a gate that passes on a build machine without the laptop's hardware, leaves the desktop session as it found it, needs no session PipeWire (not audio-pcm,
 //! audio-app, webview) and takes under ~35 s; slower, load-flaky (widgets, dialog) and laptop-only gates stay `xtask test` runs. A host that cannot run a row's gate says so in the gate's own verdict
 //! (`host lacks ...`), never by dropping the row.
+//! Before the lanes the step builds every cargo product the rows run, once (gate_build.rs `ensure`, the function each gate calls itself); a product whose identity changes while the lanes run fails
+//! the step, naming it and the row whose end first saw it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -15,6 +17,7 @@ use atl_layout::Layout;
 use xtask::build_pool::{self, Class};
 use xtask::red_logs;
 
+use crate::gate_build::{self, Group, Moved, Snapshot};
 use crate::verdict::{Outcome, UNDECIDED_WORD};
 use crate::window::{PHASES_LINE, WatchEnd};
 
@@ -208,6 +211,19 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
+    // every cargo product a row runs, built and staged once before any row starts (gate_build.rs), under a cargo grant released before the rows take theirs; rows then find them current
+    let prebuilt = Instant::now();
+    let products = {
+        let _grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
+        gate_build::ensure(root, out, &Group::ALL)?.files()
+    };
+    let snapshot = Snapshot::take(&products);
+    eprintln!(
+        "gates: prebuild {:.1}s ({} products)",
+        prebuilt.elapsed().as_secs_f64(),
+        products.len()
+    );
+    let moved = Mutex::new(Moved::default());
     let run = red_logs::run_id();
     let task = red_logs::task_dir(root)?;
     let at = RowRun {
@@ -227,6 +243,11 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
             done.running = entered.count;
             Ok((done, grant))
         });
+        // after the row's process ended: a product it (or a row beside it) re-linked or re-staged is named now, with this row
+        moved
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note(&snapshot, Some(&row.name()));
         gated.map(|(done, _grant)| done).unwrap_or_else(|e| {
             let line = format!("error: {e:#}");
             Done {
@@ -254,6 +275,15 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     });
     eprintln!("gates: watch ends {}", ends.line());
     eprintln!("gates: {}", stats.line());
+    let mut moved = moved.into_inner().unwrap_or_else(|p| p.into_inner());
+    moved.note(&snapshot, None);
+    let moved = moved.lines();
+    eprintln!("gates: products moved during the lanes: {}", moved.len());
+    for line in &moved {
+        eprintln!("{line}");
+    }
+    // a moved product fails the step as a red row does: a running row may have bound or mapped the file it replaced
+    failed.extend(moved);
     if failed.is_empty() {
         return Ok(undecided);
     }

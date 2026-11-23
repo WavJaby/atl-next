@@ -12,7 +12,7 @@ use atl_layout::Layout;
 
 use crate::tree;
 
-const PROBE: &str = "xtask-harness/testdata/gl-dispatch";
+pub(crate) const PROBE: &str = "xtask-harness/testdata/gl-dispatch";
 /// The fronts' sources, tree-relative: gl_hooks_t is `GL_ENTRY` x entries.in + `MAX_NUMBER_OF_GL_EXTENSIONS` pointers (hooks.h).
 const ENTRIES_IN: &str = "frameworks/native/opengl/libs/entries.in";
 const HOOKS_H: &str = "frameworks/native/opengl/libs/hooks.h";
@@ -37,11 +37,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for l in [&egl, &gles] {
         ensure!(l.is_file(), "missing input {}", l.display());
     }
-    let probe = build_probe(root, &out.join("cargo"))?;
+    let built = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::GlDispatch])?;
+    let probe = built.gl_dispatch()?;
     // the probe dlopens the device libraries by path: their DT_NEEDED (libatl_bionic) resolve through the stage env only (runpath_gate)
     let stage = crate::stage_env::lib_env(&out)?;
     let go = |mode: &str| -> Result<(bool, String)> {
-        let o = Command::new(&probe)
+        let o = Command::new(probe)
             .args([egl.as_os_str(), gles.as_os_str()])
             .arg(size.to_string())
             .arg(mode)
@@ -80,21 +81,6 @@ fn table_pointers(entries: &str, hooks: &str) -> Result<usize> {
         .parse::<usize>()?;
     ensure!(gl > 0, "entries.in: no GL_ENTRY");
     Ok(gl + ext)
-}
-
-fn build_probe(root: &Path, target: &Path) -> Result<PathBuf> {
-    crate::unit_use::exec(
-        crate::cargo_command()
-            .current_dir(root)
-            .args(["build", "--release", "--locked", "--manifest-path"])
-            .arg(root.join(PROBE).join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(target),
-        "cargo build (gl-dispatch probe)",
-    )?;
-    let bin = target.join("release/gl-dispatch-probe");
-    ensure!(bin.is_file(), "{} missing after cargo build", bin.display());
-    Ok(bin)
 }
 
 #[cfg(test)]
