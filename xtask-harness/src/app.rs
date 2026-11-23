@@ -2331,7 +2331,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let work = rt.out.join("app");
     // UI mode on a nested compositor: an app on a desktop has a display, and WebKit cannot make its settings (the default UA's source) without one -- WebKitSettings' constructor
     // dereferences a missing GDK display (atl-webview-linux `default_user_agent`); its AppleWebKit token is a literal in WebKit's UserAgentGLib.cpp, not derivable from webkit_get_*_version
-    // a remote run takes the target's display (remote.rs Display: its session's socket, else labwc nested in its X11 session) and the full judge; with none it falls back to the headless subset ([`REMOTE_SKIPPED`])
+    // a remote run takes the target's display (remote.rs Display: its session's socket, its own headless labwc where that session has no workspace switch, else labwc nested in its X11 session) and the full judge; with none it falls back to the headless subset ([`REMOTE_SKIPPED`])
     let display = match &args.remote {
         Some(r) => {
             let (display, why) = crate::remote::probe_display(&r.host)?;
@@ -2417,6 +2417,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     crate::remote::Display::Session => "on the session's display (the full gate)",
                     crate::remote::Display::NestedX11 =>
                         "on labwc nested in the X11 session (the full gate)",
+                    crate::remote::Display::NestedHeadless =>
+                        "on its own headless labwc (the full gate)",
                 },
                 REMOTE_LIMIT.as_secs()
             );

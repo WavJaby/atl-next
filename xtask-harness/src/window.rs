@@ -3701,13 +3701,13 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     let (kind, why) = crate::remote::probe_display(&a.host)?;
     let kind = match kind {
         Display::Session => kind,
-        Display::NestedX11 if ui => anyhow::bail!(
+        Display::NestedX11 | Display::NestedHeadless if ui => anyhow::bail!(
             "remote test window --stage {stage_name}: the target has {why}; the window gate runs only on a session display"
         ),
         Display::Headless if ui => anyhow::bail!(
             "remote test window --stage {stage_name}: no display on the target: {why}"
         ),
-        Display::NestedX11 | Display::Headless => Display::Headless,
+        Display::NestedX11 | Display::NestedHeadless | Display::Headless => Display::Headless,
     };
     let key = work_key(&args);
     let rt = Runtime::new(

@@ -896,7 +896,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
     let _ = std::fs::remove_dir_all(run.scratch.join(remote::PW_SAMPLES));
-    // the window needs a display: the session's, else labwc nested in its X11 session (remote.rs Display)
+    // the window needs a display: the session's, the run's own headless labwc, or labwc nested in its X11 session (remote.rs Display)
     let (display, why) = remote::probe_display(&a.host)?;
     ensure!(
         display != remote::Display::Headless,
