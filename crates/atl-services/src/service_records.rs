@@ -152,6 +152,13 @@ impl<K: Kinds> StartItem<K> {
     }
 }
 
+/// The foreground state of a service: its notification id and foregroundServiceType (ServiceRecord.foregroundId, foregroundServiceType; isForeground, AS :2165-2249).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Foreground {
+    pub id: i32,
+    pub ty: i32,
+}
+
 /// ServiceRecord, reduced.
 struct Record<K: Kinds> {
     token: K::Token,
@@ -182,6 +189,12 @@ struct Record<K: Kinds> {
     next_restart_time: i64,
     /// mPendingServices: brought up, waiting for the process to attach (the record's app is None until then)
     pending: bool,
+    /// fgRequired: startForegroundService (AS :1202); startForeground is due before the start timeout
+    fg_required: bool,
+    /// fgWaiting: the startForeground timeout is armed and has not fired (AS :7735, :7610-7627)
+    fg_waiting: bool,
+    /// isForeground with foregroundId and foregroundServiceType
+    foreground: Option<Foreground>,
 }
 
 impl<K: Kinds> Record<K> {
@@ -210,6 +223,9 @@ impl<K: Kinds> Record<K> {
             restart_time: 0,
             next_restart_time: 0,
             pending: false,
+            fg_required: false,
+            fg_waiting: false,
+            foreground: None,
         }
     }
 
@@ -913,6 +929,52 @@ impl<K: Kinds> Services<K> {
         true
     }
 
+    /// startServiceInnerLocked with fgRequired (AS :1202, :7735): the record must call startForeground; the caller arms the timeout. False: no record of `component`.
+    pub fn require_foreground(&mut self, component: &(String, String)) -> bool {
+        let Some(r) = self.records.iter_mut().find(|r| &r.component == component) else {
+            return false;
+        };
+        r.fg_required = true;
+        r.fg_waiting = true;
+        true
+    }
+
+    /// setServiceForegroundInnerLocked with an id (AS :2248-2249): the record is foreground and no longer waits. Some(true): its first foreground, the uid's FGS reason starts. Some(false): it replaced one. None: no record of `token`.
+    pub fn set_foreground(&mut self, token: &K::Token, fg: Foreground) -> Option<bool> {
+        let r = self.records.iter_mut().find(|r| &r.token == token)?;
+        r.fg_required = false;
+        r.fg_waiting = false;
+        Some(r.foreground.replace(fg).is_none())
+    }
+
+    /// setServiceForegroundInnerLocked with id 0 (stopForeground): the foreground state ends and is returned; the caller cancels or keeps the notification and drops the uid's FGS reason.
+    pub fn stop_foreground(&mut self, token: &K::Token) -> Option<Foreground> {
+        self.records
+            .iter_mut()
+            .find(|r| &r.token == token)?
+            .foreground
+            .take()
+    }
+
+    /// serviceForegroundTimeout's test (AS :7610-7627): true while the record still waits for startForeground, and the wait ends. The caller stops the service and counts it.
+    pub fn foreground_expired(&mut self, component: &(String, String)) -> bool {
+        let Some(r) = self.records.iter_mut().find(|r| &r.component == component) else {
+            return false;
+        };
+        let expired = r.fg_required && r.fg_waiting;
+        r.fg_waiting = false;
+        expired
+    }
+
+    /// The foreground services hosted by process `pid`, read before the process dies: their notifications go and their uid's FGS reason ends (AS bringDownServiceLocked, cancelForegroundNotificationLocked :3519).
+    pub fn foreground_of_pid(&self, pid: i32) -> Vec<((String, String), Foreground)> {
+        self.records
+            .iter()
+            .filter(|r| r.app.as_ref().is_some_and(|(p, _)| *p == pid))
+            .filter_map(|r| r.foreground.map(|f| (r.component.clone(), f)))
+            .collect()
+    }
+
     /// What the services hold of process `pid` (named `process`, uid `uid`), for uid_state::Holdings: a started service, a BIND_AUTO_CREATE binding. A service waiting for that
     /// process (pending) holds it too, so the process is not ended while its start is on its way.
     pub fn held_by(&self, pid: i32, process: &str, uid: u32) -> Held {
@@ -1585,6 +1647,59 @@ mod tests {
         assert!(out.is_empty());
         s.attach(60, "p", 10_001, &"t", 200, &mut out);
         assert_eq!(trace(&out), ["create", "args 1/0/a"]);
+    }
+
+    /// fgRequired arms the wait; startForeground ends it (AS :1202, :2248-2249). The first foreground starts the uid's FGS reason, a second id replaces it without that; stopForeground returns the last one once.
+    #[test]
+    fn startforeground_ends_the_wait_and_reports_the_first_foreground() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), None, || 9, 0, &mut out);
+        assert!(s.require_foreground(&component("S")));
+        assert_eq!(
+            s.set_foreground(&9, Foreground { id: 1, ty: 1 }),
+            Some(true)
+        );
+        assert_eq!(
+            s.set_foreground(&9, Foreground { id: 2, ty: 1 }),
+            Some(false)
+        );
+        assert!(!s.foreground_expired(&component("S")));
+        assert_eq!(s.stop_foreground(&9), Some(Foreground { id: 2, ty: 1 }));
+        assert_eq!(s.stop_foreground(&9), None);
+        assert_eq!(s.set_foreground(&8, Foreground { id: 1, ty: 1 }), None);
+        assert!(!s.require_foreground(&component("missing")));
+    }
+
+    /// serviceForegroundTimeout (AS :7610-7627): no wait without fgRequired; an expired wait ends once; startForeground before the deadline cancels it.
+    #[test]
+    fn foreground_wait_expires_once_unless_startforeground_came() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), None, || 9, 0, &mut out);
+        assert!(!s.foreground_expired(&component("S")));
+        s.require_foreground(&component("S"));
+        assert!(s.foreground_expired(&component("S")));
+        assert!(!s.foreground_expired(&component("S")));
+        s.require_foreground(&component("S"));
+        s.set_foreground(&9, Foreground { id: 1, ty: 1 });
+        assert!(!s.foreground_expired(&component("S")));
+    }
+
+    /// The foreground services of a process are listed while it hosts them, before its death (AS bringDownServiceLocked, cancelForegroundNotificationLocked :3519).
+    #[test]
+    fn foreground_of_pid_lists_the_services_of_that_process() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), None, || 9, 0, &mut out);
+        s.attach(60, "p", 10_001, &"t", 200, &mut out);
+        assert!(s.foreground_of_pid(60).is_empty());
+        s.set_foreground(&9, Foreground { id: 1, ty: 1 });
+        assert_eq!(
+            s.foreground_of_pid(60),
+            [(component("S"), Foreground { id: 1, ty: 1 })]
+        );
+        assert!(s.foreground_of_pid(61).is_empty());
     }
 
     /// stopService drops the start only: a bound service stays until its last BIND_AUTO_CREATE client unbinds.
