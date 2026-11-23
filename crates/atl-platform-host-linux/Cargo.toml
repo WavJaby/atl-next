@@ -7,13 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown). The desktop's fonts through the safe `fontconfig` crate. The session bus through `zbus` (notifications).
+# The Linux implementation of atl-platform-host-api on GDK (gtk4-rs): with atl-platform-ui-linux, the only crates deny.toml lets depend on GTK. It initialises GTK and reads the monitors; no main loop runs. GDK keeps the display open for the process (GTK has no teardown). The desktop's fonts through the safe `fontconfig` crate. The session bus through `zbus` (notifications). rtnetlink change events through `nix`'s safe socket API (network.rs).
 # `unsafe` only in pipewire_context.rs (the SecurityContext extension's bind + create through the raw method tables, generated from the header by build.rs: no pipewire-rs binding); everything else the safe gtk4-rs / pipewire-rs bindings.
 
 [dependencies]
 atl-platform-host-api = { path = "../atl-platform-host-api" }
 fontconfig.workspace = true
 gtk4.workspace = true
+# rtnetlink change events (network.rs watch) through nix's safe socket API: no unsafe added here
+nix.workspace = true
 # per-app PipeWire security contexts + permission manager (pipewire_context.rs); same libpipewire-0.3 as the app's PCM output (deps.toml [pipewire])
 pipewire = { workspace = true, features = ["v0_3_49"] }
 rustix.workspace = true

@@ -3,7 +3,7 @@
 //! Shaped by the one implementation, GDK on Linux (atl-platform-host-linux): the connection is thread-affine, and a monitor that reports no refresh rate answers `None`.
 //! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
-//! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start.
+//! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start, and again when its watch reports a change.
 //! The host's memory ([`MemorySource`]): total and available RAM, read afresh per call.
 //! The desktop's notification service ([`Notifications`]): shows, replaces and withdraws notifications atld posts on the apps' behalf; tiers probed per session ([`NotificationTier`]).
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
@@ -154,10 +154,14 @@ impl DefaultNetwork {
     }
 }
 
-/// The host's network state, as a native desktop program sees it. Shaped by its one implementation: the kernel's route tables, the resolver file, GIO's network monitor.
+/// The host's network state, as a native desktop program sees it. Shaped by its one implementation: the kernel's route tables, the resolver file, GIO's network monitor, rtnetlink's change events.
 pub trait NetworkSource: Send + Sync {
     /// The default network now; `None` when the host has no default route (offline).
     fn default_network(&self) -> Result<Option<DefaultNetwork>, NetworkError>;
+
+    /// Reports host network changes on `changed`: one `()` per burst of link, address or route events, and one after events were lost. The caller re-reads [`NetworkSource::default_network`] on each.
+    /// Start the watch before the read that seeds the caller's state: a change between the read and the start is missed otherwise. The report ends when the receiver is dropped (noticed at the next event) or the watch fails (one last `()`); a watch that cannot start is an error.
+    fn watch(&self, changed: std::sync::mpsc::Sender<()>) -> Result<(), NetworkError>;
 }
 
 /// The host's memory could not be read (the kernel's report was missing or unparsable).

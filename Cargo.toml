@@ -44,6 +44,8 @@ gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 # v2_42: webkit_cookie_manager_get_all_cookies, the CookieManager copy's source (webview plan D5) -> WebKitGTK floor 2.42 (Debian trixie 2.54, Arch current)
 webkit6 = { version = "0.6", features = ["v2_42"] }
 object ={ version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+# rtnetlink change events (atl-platform-host-linux network.rs): nix's safe socket API, `socket` feature only (nix is already in the graph through its dependents)
+nix = { version = "0.31", features = ["socket"] }
 # PipeWire client (plan A0): the PCM output of atl-platform-ui-linux, over the safe pipewire crate and its pipewire-sys / libspa bindings (libpipewire-0.3: deps.toml [pipewire]); deny.toml keeps it out of every crate but -linux
 pipewire = "0.10.1"
 # build-time: libpipewire-0.3's include dirs for the SecurityContext bindings (atl-platform-host-linux build.rs); already in the graph via system-deps

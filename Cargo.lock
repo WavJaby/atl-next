@@ -570,6 +570,7 @@ dependencies = [
  "bindgen",
  "fontconfig",
  "gtk4",
+ "nix",
  "pipewire",
  "pkg-config",
  "rustix",
@@ -2090,6 +2091,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
