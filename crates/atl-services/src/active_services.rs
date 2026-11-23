@@ -22,8 +22,8 @@ use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
 use super::{
-    AM, Effects, Inner, LostWaiter, ProcessRecord, SERVICE_START_FOREGROUND_TIMEOUT_MS, State,
-    Timer, intent_key, log, security,
+    AM, Effects, Inner, LostWaiter, ProcessRecord, SERVICE_START_FOREGROUND_ANR_DELAY_MS,
+    SERVICE_START_FOREGROUND_TIMEOUT_MS, State, Timer, intent_key, log, security,
 };
 use crate::broadcast_dispatch::ProcKey;
 use crate::notification_display::FLAG_FOREGROUND_SERVICE;
@@ -852,18 +852,48 @@ impl Inner {
         }
     }
 
+    /// The ANR of a startForeground timeout, 10 s after its stop (AS :7640 -> ProcessErrorStateRecord :672-673): a headless process gets the silent background-ANR kill; a
+    /// windowed one is only counted (the ANR dialog is not modelled). A process that ended first is counted and left alone.
+    pub(crate) fn foreground_anr(&self, pid: i32) {
+        let headless = self
+            .state()
+            .processes
+            .iter()
+            .find(|r| r.pid == pid)
+            .map(|r| r.task.is_none());
+        let Some(headless) = headless else {
+            atl_diag::answered(AM, "fgs start timeout: process ended before the ANR");
+            return;
+        };
+        if !headless {
+            atl_diag::answered(AM, "fgs start timeout: ANR not modelled");
+            return;
+        }
+        atl_diag::answered(
+            AM,
+            "fgs start timeout: headless process ended (silent bg ANR)",
+        );
+        self.kill(&[pid]);
+    }
+
     /// The fgRequired timer of `component` (serviceForegroundTimeout, AS :7597-7628): a service still waiting for startForeground is stopped (stopServiceLocked, which clears its
-    /// start). The ANR that follows 10 s later (AS :7640) is not modelled. A timer whose wait is over is discarded (AS :7610-7613).
+    /// start). The ANR follows 10 s later (AS :7640, foreground_anr). A timer whose wait is over is discarded (AS :7610-7613).
     pub(crate) fn foreground_timeout(&self, component: (String, String)) {
         let mut st = self.state();
         if !st.services.foreground_expired(&component) {
             return;
         }
-        atl_diag::answered(AM, "fgs start timeout: ANR not modelled");
+        let pid = st.services.pid_of(&component);
         log(format_args!(
             "service {}/{} did not call startForeground within {SERVICE_START_FOREGROUND_TIMEOUT_MS} ms: stopped",
             component.0, component.1
         ));
+        if let Some(pid) = pid {
+            self.arm(
+                Timer::FgsAnr(pid),
+                self.now_ms() + SERVICE_START_FOREGROUND_ANR_DELAY_MS,
+            );
+        }
         let mut calls = Vec::new();
         st.services.stop_service(&component, &mut calls);
         self.touch_all_locked(&mut st);

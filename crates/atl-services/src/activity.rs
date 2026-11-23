@@ -508,6 +508,8 @@ const PROC_START_TIMEOUT_MS: u64 = 10_000;
 
 /// AMC DEFAULT_SERVICE_START_FOREGROUND_TIMEOUT_MS (ActivityManagerConstants.java:318, 30 s): a startForegroundService's service must call startForeground within it.
 const SERVICE_START_FOREGROUND_TIMEOUT_MS: u64 = 30_000;
+/// AMC DEFAULT_SERVICE_START_FOREGROUND_ANR_DELAY_MS (ActivityManagerConstants.java:320, 10 s): the ANR follows a startForeground timeout this long after its stop (AS :7640).
+const SERVICE_START_FOREGROUND_ANR_DELAY_MS: u64 = 10_000;
 
 /// The activity service's delayed messages (am_handler.rs), keyed by what each concerns.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -530,6 +532,8 @@ enum Timer {
     TempExpiry(u32),
     /// a started foreground service's startForeground deadline (SERVICE_START_FOREGROUND_TIMEOUT_MS), by component; armed when the start is delivered (AS :6199-6204)
     FgsStart((String, String)),
+    /// a startForeground timeout's ANR, 10 s after the stop: the host pid of the process that ran the service (AS :7640)
+    FgsAnr(i32),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -1444,6 +1448,7 @@ impl Inner {
             Timer::ColdStart { key, token } => self.cold_start_timeout(&key, token),
             Timer::TempExpiry(uid) => self.temp_expired(uid),
             Timer::FgsStart(component) => self.foreground_timeout(component),
+            Timer::FgsAnr(pid) => self.foreground_anr(pid),
         }
     }
 

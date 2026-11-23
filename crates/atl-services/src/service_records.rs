@@ -1131,6 +1131,14 @@ impl<K: Kinds> Services<K> {
             .map(|r| (r.process.clone(), r.uid))
     }
 
+    /// The hosting pid of `component`'s record while it runs in a process; None when it runs in none.
+    pub fn pid_of(&self, component: &(String, String)) -> Option<i32> {
+        self.records
+            .iter()
+            .find(|r| &r.component == component)
+            .and_then(|r| r.app.as_ref().map(|(pid, _)| *pid))
+    }
+
     /// startRequested of the record of `component` (false when there is none).
     pub fn start_requested(&self, component: &(String, String)) -> bool {
         self.records
