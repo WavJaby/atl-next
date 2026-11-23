@@ -113,6 +113,8 @@ const KEY_NOT_FOUND: i32 = 7;
 const PERMISSION_DENIED: i32 = 6;
 /// android.hardware.security.keymint.SecurityLevel.SOFTWARE (SecurityLevel.aidl).
 const SOFTWARE: i32 = 0;
+/// android.hardware.security.keymint.ErrorCode.CANNOT_ATTEST_IDS (ErrorCode.aidl:91): the TA's refusal of an attestation ID it holds no value for.
+const CANNOT_ATTEST_IDS: i32 = -66;
 /// The IMEI the HAL's `attestation_id_info` (hardware/interfaces/security/keymint/aidl/default/hal/lib.rs) attested: a device identity D-K1 forbids.
 const CUTTLEFISH_IMEI: &str = "867400022047199";
 
@@ -122,7 +124,7 @@ const HAL_LOOKUPS: u64 = 3;
 const HAL_TYPE: &str = "hal_keymint_service";
 
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 16] {
+fn checks() -> [(&'static str, String); 17] {
     [
         // servicemanager decides from the compiled pinned policy (Access over libselinux, atl-selinux's table): untrusted_app may not find hal_keymint_service (private/app_neverallows.te:254,
         // public/service.te:336: no allow), so checkService / getService answer null (ServiceManager.cpp tryGetService) and isDeclared fails EX_SECURITY (ServiceManager.cpp:716-733)
@@ -183,6 +185,11 @@ fn checks() -> [(&'static str, String); 16] {
         (
             "keystore2's database is outside the app sandbox",
             "AtlKeystore: keystore-dir absent".to_owned(),
+        ),
+        // (b): ATTESTATION_ID_BRAND is not permission-gated by keystore2, so a challenged key reaches the TA, which refuses the ID it has no value for (cert.rs check_attestation_id!)
+        (
+            "a challenged key asking ATTESTATION_ID_BRAND: CANNOT_ATTEST_IDS",
+            format!("AtlKeystore: attest-ids brand-challenge error {CANNOT_ATTEST_IDS}"),
         ),
         // the boot state of an unlocked device with no verified boot (manager 2026-11-23; CONSTANTS in atl-property-service): orange and unlocked, never green
         (
