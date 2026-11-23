@@ -92,6 +92,8 @@ pub enum Request {
         pid: i32,
         finished: bool,
     },
+    /// The host's default network now, read outside the sandbox (GIO's verdict needs the host's main context). Answered [`Response::Network`]. The services ask once at start, after their watch starts, and again on each watch burst.
+    Network,
 }
 
 /// A notification's desktop form, mapped from Android's by the services (notifications plan N4).
@@ -162,6 +164,10 @@ pub enum Response {
     },
     /// A report the host took (no answer of its own).
     Noted,
+    /// The host's default network as `DefaultNetwork::to_arg` writes it (one JSON object); None = no default route.
+    Network {
+        network: Option<String>,
+    },
     Error {
         message: String,
     },

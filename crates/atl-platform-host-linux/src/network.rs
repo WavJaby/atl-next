@@ -2,7 +2,7 @@
 //! The host's default network as a native Linux program sees it: the default route from the kernel's route tables (/proc/net/route, /proc/net/ipv6_route: lowest metric, IPv4 first), the link's kind, address and MTU from sysfs,
 //! the resolver servers and search domains from /etc/resolv.conf (what glibc's stub resolver uses), and the Internet verdict and metered flag from GIO's GNetworkMonitor, which asks NetworkManager (or the portal in a sandbox) where present
 //! and otherwise answers "full" whenever a default route exists (its netlink base). GIO's LOCAL means no route to the Internet: no default network then, whatever the tables say.
-//! Changes: `watch` reports rtnetlink link, address and route events as bursts. It says only that something changed; the caller re-reads `default_network` (GIO's monitor is read there, not on the watch thread).
+//! Changes: `watch` reports rtnetlink link, address and route events as bursts. It says only that something changed; the caller re-reads `default_network`, which dispatches GIO's queued events before it reads GIO's verdict.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -139,6 +139,9 @@ fn read_opt(path: &Path) -> Option<String> {
 
 impl NetworkSource for HostNetwork {
     fn default_network(&self) -> Result<Option<DefaultNetwork>, NetworkError> {
+        // GIO's verdict moves only when the default main context dispatches its netlink source; atld runs no main loop. Dispatch what is queued first (measured: stale without it, ss-s10b-connectivity.md).
+        let ctx = gtk4::glib::MainContext::default();
+        while ctx.iteration(false) {}
         let monitor = gio::NetworkMonitor::default();
         let connectivity = match monitor.connectivity() {
             gio::NetworkConnectivity::Local => return Ok(None),

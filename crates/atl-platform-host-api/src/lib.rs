@@ -3,7 +3,7 @@
 //! Shaped by the one implementation, GDK on Linux (atl-platform-host-linux): the connection is thread-affine, and a monitor that reports no refresh rate answers `None`.
 //! The machine's motion sensors ([`Sensors`]): shaped by the one implementation, Linux IIO. A stream per open, served by the kernel buffer where the environment enabled it and by sysfs reads otherwise ([`Tier`]); the caller paces its reads.
 //! The desktop's fonts ([`FontSource`]): which faces, in what order, for which language; read when atld starts.
-//! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; read when the services start, and again when its watch reports a change.
+//! The host's network ([`NetworkSource`]): the link its default route leaves through, its resolver, and the system's own verdict on reaching the Internet; atld reads it, the services ask atld at start and on each watch report.
 //! The host's memory ([`MemorySource`]): total and available RAM, read afresh per call.
 //! The desktop's notification service ([`Notifications`]): shows, replaces and withdraws notifications atld posts on the apps' behalf; tiers probed per session ([`NotificationTier`]).
 //! No OS or toolkit dependency, no unsafe; core crates use the `atl-platform-host` facade, not this crate or the implementation directly.
@@ -119,7 +119,7 @@ pub enum Connectivity {
 
 /// The host's default network: the link its default route leaves through.
 /// Read where a native program runs, never inside an app sandbox: GIO's monitor there reaches no NetworkManager (no system bus is shown) and falls to another backend; GLib 2.90's systemd one
-/// answers "local" (offline) on a host whose link NetworkManager manages (measured on Arch 2026-11-22). atld reads it and the system services take it as [`DefaultNetwork::to_arg`].
+/// answers "local" (offline) on a host whose link NetworkManager manages (measured on Arch 2026-11-22). atld reads it; the system services get it over the control connection as [`DefaultNetwork::to_arg`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DefaultNetwork {
     /// The interface name (`eth0`, `wlp2s0`).

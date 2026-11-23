@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use atl_layout::Layout;
 
-use crate::atld_run::{Package, Run, Runtime, counter_lines};
+use crate::atld_run::{Package, Run, Runtime, counter_lines, route_fifo, set_default_route};
 use crate::manifest;
 
 #[derive(clap::Args)]
@@ -95,7 +95,7 @@ fn count(text: &str, marker: &str) -> usize {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = Layout::of(root)?;
-    let rt = Runtime::new(
+    let mut rt = Runtime::new(
         root,
         "broadcast",
         &args.host,
@@ -170,7 +170,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     let counted = |name: &str| counters.iter().any(|l| l.contains(name));
     let system_level = format!("{BATTERY_STICKY}{}", crate::app::battery_level());
-    let checks = [
+    let mut checks = vec![
         (
             "runtime receiver got its package's broadcast once",
             count(&s, RUNTIME) == 1,
@@ -239,7 +239,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             services.contains(&end_line),
         ),
     ];
+    checks.extend(connectivity_checks(root, &mut rt, &work)?);
     let mut whys = Vec::new();
+    let total = checks.len();
     for (what, ok) in checks {
         println!("broadcast: {} {what}", if ok { "pass" } else { "FAIL" });
         if !ok {
@@ -249,7 +251,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if whys.is_empty() {
         println!(
             "broadcast: pass ({} checks in {:.1?})",
-            checks.len(),
+            total,
             start.elapsed()
         );
         return Ok(ExitCode::SUCCESS);
@@ -263,4 +265,92 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     println!("---- services log (last {TAIL})\n{}", tail(&services, TAIL));
     println!("{}", crate::verdict::gate("broadcast", &whys));
     Ok(ExitCode::FAILURE)
+}
+
+/// The connectivity row (NetworkCallback + CONNECTIVITY_ACTION sticky): atld runs in a private network namespace with a default route; the gate removes the route and restores
+/// it with `set_default_route` (nsenter into atld's namespaces). Each step waits for the app's log line, the callbacks' sticky reads come 500 ms after each callback.
+const NET_APP: &str = "xtask-harness/testdata/connectivity/app";
+const NET_START: &str = "AtlNet: available 1";
+const NET_LOST: &str = "AtlNet: lost";
+const NET_AGAIN: &str = "AtlNet: available 2";
+const NET_STICKY_START: &str = "AtlNet: sticky after available 1 present noConnectivity=false";
+const NET_STICKY_LOST: &str = "AtlNet: sticky after lost present noConnectivity=true";
+const NET_STICKY_AGAIN: &str = "AtlNet: sticky after available 2 present noConnectivity=false";
+/// Each step's limit: a route change to its callback under a loaded host.
+const NET_STEP: Duration = Duration::from_secs(60);
+
+fn connectivity_checks(
+    root: &Path,
+    rt: &mut Runtime,
+    work: &Path,
+) -> Result<Vec<(&'static str, bool)>> {
+    let dir = work.join("connectivity");
+    let apk = rt
+        .apk
+        .build(&root.join(NET_APP), &dir.join("app"), &[], None, None)?;
+    let package = manifest::read(&rt.apk.aapt2, &apk)?.name;
+    let run = Run {
+        root: dir.join("root"),
+        scratch: dir.join("scratch"),
+        launch: Some(package.clone()),
+        packages: vec![Package::base(apk)],
+        libraries: vec![],
+        shell: None,
+        log_tags: "*:i".into(),
+    };
+    rt.set_routed(true);
+    let started = rt.start_atld(&run);
+    rt.set_routed(false);
+    let mut atld = started?;
+    let (fifo, app) = (route_fifo(&run), run.log(&package));
+    let read = atl_diag::logfiles::read;
+    // waits up to NET_STEP for the app's log to hold `marker`
+    let seen = |marker: &str| -> bool {
+        let start = Instant::now();
+        while start.elapsed() < NET_STEP {
+            if count(&read(&app), marker) >= 1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    };
+    // each step needs the one before it: a failed step leaves the later ones unchecked (false)
+    let start_seen = seen(NET_START);
+    let sticky_start = start_seen && seen(NET_STICKY_START);
+    let lost_seen = start_seen && set_default_route(&fifo, false).is_ok() && seen(NET_LOST);
+    let sticky_lost = lost_seen && seen(NET_STICKY_LOST);
+    let again_seen = lost_seen && set_default_route(&fifo, true).is_ok() && seen(NET_AGAIN);
+    let sticky_again = again_seen && seen(NET_STICKY_AGAIN);
+    let _ = atld.kill();
+    atld.wait()?;
+    let checks = vec![
+        (
+            "NetworkCallback got onAvailable at start, and the sticky was connected",
+            start_seen && sticky_start,
+        ),
+        (
+            "removing the default route in atld's namespace gave the callback onLost",
+            lost_seen,
+        ),
+        (
+            "the sticky after the loss said noConnectivity (sendLegacyNetworkBroadcast DISCONNECTED)",
+            sticky_lost,
+        ),
+        (
+            "restoring the route gave onAvailable again (a new netId), and the sticky was connected",
+            again_seen && sticky_again,
+        ),
+    ];
+    if checks.iter().any(|(_, ok)| !ok) {
+        println!(
+            "---- connectivity app log (last {TAIL})\n{}",
+            tail(&read(&app), TAIL)
+        );
+        println!(
+            "---- connectivity services log (last {TAIL})\n{}",
+            tail(&read(&run.log("services")), TAIL)
+        );
+    }
+    Ok(checks)
 }

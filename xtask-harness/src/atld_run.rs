@@ -299,6 +299,49 @@ const OFFLINE_NET: &str = r#"set -eu
 ip link set lo up
 exec "$@""#;
 
+/// A routed run's network setup inside its fresh namespace: loopback up, the dummy link `atl0` with its address and default route; then a loop in the namespace reads route steps
+/// (`up` / `down`) from the FIFO `$1` and logs each step's result to `$2`, and the command runs (pid stays atld's). The steps run inside: `setns` into a namespace needs
+/// CAP_SYS_ADMIN in the caller's own user namespace, which an unprivileged harness does not have (`nsenter` fails with EPERM).
+const ROUTED_NET: &str = r#"set -eu
+ip link set lo up
+ip link add atl0 type dummy
+ip addr add 192.0.2.10/24 dev atl0
+ip link set atl0 up
+ip route add default via 192.0.2.1 dev atl0
+fifo="$1"
+log="$2"
+shift 2
+( set +e
+  while read -r step < "$fifo"; do
+    case "$step" in
+      down) ip route del default ;;
+      up) ip route add default via 192.0.2.1 dev atl0 ;;
+    esac
+    echo "step $step rc=$?" >> "$log"
+  done ) &
+exec "$@""#;
+
+/// The routed run's step FIFO and step log, under its scratch dir ([`ROUTED_NET`]).
+const ROUTE_LOG: &str = "route.log";
+const ROUTE_FIFO: &str = "route.fifo";
+
+/// The step FIFO of a routed run.
+pub fn route_fifo(run: &Run) -> PathBuf {
+    run.scratch.join(ROUTE_FIFO)
+}
+
+/// Removes the routed namespace's default route (`up` = false) or restores it through atl0: the step goes to the namespace's own loop, which answers in the run's `route.log`.
+pub fn set_default_route(fifo: &Path, up: bool) -> Result<()> {
+    let step = if up { "up" } else { "down" };
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(fifo)
+        .with_context(|| format!("opening {}", fifo.display()))?;
+    f.write_all(format!("{step}\n").as_bytes())
+        .with_context(|| format!("writing {step} to {}", fifo.display()))?;
+    Ok(())
+}
+
 /// The sensors gate's fake kernel views (see [`Runtime::with_fake_devices`]).
 #[derive(Clone)]
 struct FakeDevices {
@@ -438,6 +481,8 @@ pub struct Runtime {
     fake_devices: Option<FakeDevices>,
     /// An offline run ([`Runtime::offline`]): atld in a user + network namespace of its own, loopback only.
     offline: bool,
+    /// A routed run ([`Runtime::set_routed`]): atld in a user + network namespace with a dummy link and a default route through it; the gate removes and restores the route with `nsenter`.
+    routed: bool,
     /// The gate this runtime was staged for: each run writes its record (remote.rs `record_path`) under `out`.
     gate: String,
     /// The AOSP tree (`src/aosp`): the record's root for the `src/aosp/` bundle names.
@@ -978,6 +1023,7 @@ impl Runtime {
             exit_with_last_app: false,
             fake_devices: None,
             offline: false,
+            routed: false,
             site: remote::Site::Host,
             data_root: None,
         })
@@ -1543,6 +1589,12 @@ impl Runtime {
         self.offline = true;
         self
     }
+
+    /// The next [`Runtime::start_atld`] runs atld in a private network namespace with a default route (dummy link `atl0`, 192.0.2.10/24, gateway 192.0.2.1). `false` restores the host
+    /// network for later runs. The gate changes the route with [`set_default_route`].
+    pub fn set_routed(&mut self, on: bool) {
+        self.routed = on;
+    }
 }
 
 /// A gate's throwaway data root: `<root>.data` beside the run's root (atld refuses a data root inside the root), removed with the root at each start. Keeps gates hermetic: atld's default is the user's own.
@@ -2020,7 +2072,25 @@ impl Runtime {
                 c
             }
         };
-        if self.offline {
+        if self.routed {
+            // the routed namespace: its step FIFO is made here, the wrapper's loop reads it (ROUTED_NET)
+            let fifo = route_fifo(run);
+            std::fs::create_dir_all(&run.scratch)
+                .with_context(|| format!("creating {}", run.scratch.display()))?;
+            let _ = std::fs::remove_file(&fifo);
+            let made = Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .context("running mkfifo")?;
+            ensure!(made.success(), "mkfifo {} failed", fifo.display());
+            let inner = cmd;
+            cmd = Command::new("unshare");
+            cmd.args(["-Urn", "--", "sh", "-c", ROUTED_NET, "sh"])
+                .arg(&fifo)
+                .arg(run.scratch.join(ROUTE_LOG))
+                .arg(inner.get_program())
+                .args(inner.get_args());
+        } else if self.offline {
             // outermost: the fake-kernel namespace (if any) nests inside it. unshare(1) leaves lo down in a new namespace; ns-root raises it (needs iproute2's `ip`), then execs on
             let inner = cmd;
             cmd = Command::new("unshare");

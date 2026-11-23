@@ -32,6 +32,15 @@ impl ControlSocket {
         }
     }
 
+    /// The host's default network now, as `DefaultNetwork::to_arg` writes it (atld reads it outside the sandbox); None = no default route.
+    pub fn network(&self) -> io::Result<Option<String>> {
+        match self.call(&Request::Network)? {
+            Response::Network { network } => Ok(network),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("network answered {other:?}"))),
+        }
+    }
+
     /// Renames session `session`'s files to `names`, moves it to `/data/app/<package>` and creates its data dirs.
     pub fn commit(
         &self,

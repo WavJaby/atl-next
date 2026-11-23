@@ -64,9 +64,6 @@ struct Args {
     /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
     display: Option<DisplayModel>,
-    /// The host's default network as atld read it at start, outside the sandbox (atl_platform_host::DefaultNetwork::to_arg, one JSON object). Omitted: no default network (offline).
-    #[arg(long, value_parser = atl_platform_host::DefaultNetwork::parse_arg)]
-    network: Option<atl_platform_host::DefaultNetwork>,
     /// The desktop's UI language as a BCP-47 tag (atld: atl_platform_host::ui_locale). Omitted: none, and the global configuration takes activity.rs DEFAULT_LOCALE.
     #[arg(long)]
     locale: Option<String>,
@@ -251,6 +248,8 @@ fn main() -> Result<()> {
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     // the notification service's display half shares the connection (notifications plan N2)
     let desktop: Arc<dyn atl_services::notification::DesktopNotifications> = control.clone();
+    // the connectivity service asks atld for the host's network on this connection (control `Network`)
+    let network_control = Arc::clone(&control);
     // the package list: installed now through the host's file work (atl_services::install), before any service answers
     let config = install::Config {
         abis: a.abis.clone(),
@@ -420,25 +419,18 @@ fn main() -> Result<()> {
     )
     .context("addService clipboard")?;
     if !a.omit_service.iter().any(|s| s == CONNECTIVITY) {
-        // the host's default network as atld read it (--network): from inside the sandbox the platform layer's monitor reaches no NetworkManager (DefaultNetwork doc)
-        let network = a.network.clone();
-        match &network {
-            Some(n) => writeln!(
-                std::io::stderr(),
-                "connectivity: default network {} {:?} {:?} metered={} dns={}",
-                n.interface,
-                n.kind,
-                n.connectivity,
-                n.metered,
-                n.dns.len()
-            )?,
-            None => writeln!(std::io::stderr(), "connectivity: no default network")?,
-        }
-        binder::add_service(
-            CONNECTIVITY,
-            atl_services::connectivity::new_binder(Arc::clone(&permissions), network.as_ref()),
+        // the host's network comes from atld (control `Network`), never from GIO here: inside the sandbox GIO reaches no NetworkManager (DefaultNetwork doc)
+        let host_control = Arc::clone(&network_control);
+        let sticky_activity = activity.clone();
+        let connectivity = atl_services::connectivity::start(
+            Arc::clone(&permissions),
+            Arc::new(move || host_control.network()),
+            Arc::new(move |intent, max| {
+                sticky_activity.broadcast_as_system_max_api(intent, true, max);
+            }),
         )
-        .context("addService connectivity")?;
+        .context("connectivity watch")?;
+        binder::add_service(CONNECTIVITY, connectivity).context("addService connectivity")?;
     }
     if !a.omit_service.iter().any(|s| s == POWER) {
         binder::add_service(

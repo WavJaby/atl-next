@@ -41,6 +41,8 @@ pub(super) struct SendSpec<'a> {
     pub(super) ordered: bool,
     /// the resultTo handle and the pid of the process that holds it
     pub(super) result_to: Option<(ReceiverHandle, i32)>,
+    /// BroadcastOptions.maxManifestReceiverApiLevel (None = no limit): CONNECTIVITY_ACTION's M (connectivity.rs)
+    pub(super) max_manifest_api: Option<i32>,
 }
 
 /// The dispatch-time skip (BroadcastSkipPolicy.shouldSkipMessage's start-mode part, :229-246): a manifest receiver whose uid is restricted (uid_state::start_mode DELAYED_RIGID) is
@@ -58,6 +60,14 @@ fn dispatch_skip(
     let Some(p) = packages.by_name(&component.package) else {
         return Some(format!("Skipping delivery to {component}: package is gone"));
     };
+    if facts
+        .max_manifest_api
+        .is_some_and(|max| !broadcast::manifest_target_in_range(p.app().target_sdk_version, 0, max))
+    {
+        return Some(format!(
+            "Manifest receiver API level outside the options: {component}"
+        ));
+    }
     let persistent = p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK;
     let mode = uids.start_mode(r.proc.uid, p.app().target_sdk_version, persistent, now);
     if mode != uid_state::StartMode::DelayedRigid {
@@ -497,6 +507,7 @@ impl Inner {
             flags: intent.flags,
             explicit: intent.component.is_some() || intent.package.is_some(),
             signature_perms: self.permissions.is_signature_only(spec.required),
+            max_manifest_api: spec.max_manifest_api,
         };
         let result_to = spec
             .result_to
@@ -749,6 +760,7 @@ impl ActivityManager {
                 sticky: false,
                 ordered: finished.is_some(),
                 result_to: finished.map(|(h, caller)| (ReceiverHandle(h.clone()), caller)),
+                max_manifest_api: None,
             })
             .map(|_| ())
     }
@@ -756,6 +768,16 @@ impl ActivityManager {
     /// A broadcast the services send as the system to every user (ActivityManager.broadcastStickyIntent(intent, USER_ALL) for `sticky`, Context.sendBroadcastAsUser(intent,
     /// UserHandle.ALL) otherwise): system_server's own call clears its calling identity, so the sender is SYSTEM_UID in this process; result code Activity.RESULT_OK (-1).
     pub fn broadcast_as_system(&self, intent: &Intent, sticky: bool) {
+        self.broadcast_as_system_max_api(intent, sticky, None);
+    }
+
+    /// [`Self::broadcast_as_system`] with BroadcastOptions.maxManifestReceiverApiLevel `max_manifest_api` (None = no limit): CONNECTIVITY_ACTION's M.
+    pub fn broadcast_as_system_max_api(
+        &self,
+        intent: &Intent,
+        sticky: bool,
+        max_manifest_api: Option<i32>,
+    ) {
         const RESULT_OK: i32 = -1;
         let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
         if let Err(e) = self.inner.send_broadcast(SendSpec {
@@ -768,6 +790,7 @@ impl ActivityManager {
             sticky,
             ordered: false,
             result_to: None,
+            max_manifest_api,
         }) {
             log(format_args!("system broadcast {:?}: {e}", intent.action));
         }
@@ -840,6 +863,7 @@ impl ActivityManager {
             sticky,
             ordered,
             result_to: result_to.map(|handle| (handle, pid)),
+            max_manifest_api: None,
         })
     }
 }

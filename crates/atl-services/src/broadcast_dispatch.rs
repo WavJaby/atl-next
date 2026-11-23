@@ -53,12 +53,14 @@ pub struct Receiver<R> {
     pub proc: ProcKey,
 }
 
-/// The intent facts the rules read: `flags` (Intent flags), `explicit` (component or package set), `signature_perms` (isSignaturePerm of the required permissions).
+/// The intent facts the rules read: `flags` (Intent flags), `explicit` (component or package set), `signature_perms` (isSignaturePerm of the required permissions),
+/// `max_manifest_api` (BroadcastOptions.maxManifestReceiverApiLevel; None = no limit): a manifest receiver whose targetSdk is above it is skipped (BroadcastSkipPolicy.shouldSkipMessage :105-109).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Facts {
     pub flags: i32,
     pub explicit: bool,
     pub signature_perms: bool,
+    pub max_manifest_api: Option<i32>,
 }
 
 /// A result: code, data and extras (BroadcastRecord.resultCode, resultData, resultExtras). `E` is the caller's extras type.
