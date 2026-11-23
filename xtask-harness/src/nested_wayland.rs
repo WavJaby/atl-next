@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The automated gates' own Wayland compositor: a headless labwc per gate run, so no test window maps on the maintainer's desktop and the maintainer's pointer cannot reach one (maintainer, 2026-11-05); this holds for every local gate and for `check`. `--hold` runs keep the desktop's compositor ($WAYLAND_DISPLAY): the maintainer watches those.
-//! One exception (maintainer, 2026-11-18): an explicitly invoked remote run (`remote test window`, `remote run-apk`, ...) maps its window on the target's session display and may inject input there (the hardware-vsync tier exists only on a real compositor) -- never from `check` or automatically, and on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`; where no switch exists nothing maps on that session: the run starts its own headless labwc, and without labwc it is refused).
+//! One exception (maintainer, 2026-11-18): `remote run-apk` maps its window on the target's session display, on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`). Every other remote test run starts its own headless labwc on the target (decision 2026-11-23, remote.rs `probe_test_display`), configured from [`RC_XML`] and [`labwc_env`]; the window UI stages take the session where the target has no labwc and are refused where it has one, until slice 2 ports them.
 //! Test-environment setup only: the product reads WAYLAND_DISPLAY as it would on any desktop; nothing in a product crate knows about this.
 //!
 //! Why labwc (measured 2026-11-06, all headless, pixman renderer):
@@ -52,7 +52,8 @@ const READY_WAIT: Duration = Duration::from_secs(10);
 const STOP_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 /// labwc's rc.xml: client-side decorations, as WSLg's weston and GNOME have them. labwc's default (server side, offered through `org_kde_kwin_server_decoration_manager`) makes GTK drop its header bar, and the gtk stage's chrome click (surface y 20) then lands in the content (measured 2026-11-06).
-const RC_XML: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n</labwc_config>\n";
+/// Also the config of a remote test run's labwc (remote.rs `display_files`): one text for both, never a copy.
+pub(crate) const RC_XML: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n</labwc_config>\n";
 /// [`RC_XML`] plus a window rule maximizing every window at its first map (labwc-config(5) windowRules, action Maximize): the window gets a configure whose size is binding (state maximized) right
 /// after it maps, as a tiling compositor (Hyprland) tiles a new window before the client is done starting.
 const RC_XML_MAXIMIZE: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n  <windowRules>\n    <windowRule identifier=\"*\">\n      <action name=\"Maximize\"/>\n    </windowRule>\n  </windowRules>\n</labwc_config>\n";
@@ -60,6 +61,16 @@ const RC_XML_MAXIMIZE: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core>
 const RC_XML_PLACED: &str = "<?xml version=\"1.0\"?>\n<labwc_config>\n  <core><decoration>client</decoration></core>\n  <windowRules>\n    <windowRule identifier=\"*\">\n      <action name=\"MoveTo\" x=\"0\" y=\"0\"/>\n    </windowRule>\n  </windowRules>\n</labwc_config>\n";
 /// wlroots' first free name in a fresh runtime dir.
 const SOCKET: &str = "wayland-0";
+
+/// labwc's environment in a gate run, local ([`NestedCompositor::start_rc`]) and remote (remote.rs `nested_headless_script`): wlroots' headless backend with `outputs` outputs, no input devices (the seat gets its pointer from a client), pixman (measured 2026-11-06).
+pub(crate) fn labwc_env(outputs: usize) -> [(&'static str, String); 4] {
+    [
+        ("WLR_BACKENDS", "headless".to_owned()),
+        ("WLR_HEADLESS_OUTPUTS", outputs.to_string()),
+        ("WLR_LIBINPUT_NO_DEVICES", "1".to_owned()),
+        ("WLR_RENDERER", "pixman".to_owned()),
+    ]
+}
 
 /// A child process that is always ended: SIGTERM, then SIGKILL after [`STOP_WAIT`], when this guard drops, so on every return path of the gate, an error or a panic included.
 /// Ctrl-C reaches the child directly (same process group), and `setpriv --pdeathsig` ends it should xtask itself be killed.
@@ -199,10 +210,7 @@ impl NestedCompositor {
             .arg(&config)
             .arg(&log)
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("WLR_BACKENDS", "headless")
-            .env("WLR_HEADLESS_OUTPUTS", outputs.len().to_string())
-            .env("WLR_LIBINPUT_NO_DEVICES", "1")
-            .env("WLR_RENDERER", "pixman")
+            .envs(labwc_env(outputs.len()))
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
             .env_remove("DISPLAY");

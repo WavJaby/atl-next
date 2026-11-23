@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 
-use crate::{arches, gate_goals, gl_probe, out, provided_gate, verdict};
+use crate::{arches, gate_goals, gl_probe, nested_wayland, out, provided_gate, verdict};
 
 /// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted -- except the run lock, which a
 /// push holds itself ([`push_lock_sh`]) and must not unlink under a run or a later push. `--delay-updates`: an interrupted push leaves the old tree whole (new files wait in `.~tmp~`), not new files beside the old marker.
@@ -462,8 +462,8 @@ const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
 /// Restore, two routes, both on the target: the EXIT trap (normal end, failure, HUP/INT/TERM/PIPE) and a guardian started before the switch, detached from the ssh channel, that restores once the
 /// run script is gone without the trap having run (SIGKILL, a dropped ssh the shell died of). `$WS_MARK` (`$WL_DIR/atl-ws-<pid>`) exists while the guardian lives; the trap's restore writes it
 /// non-empty so the guardian does not repeat it. Lines go to stderr (the transcript): `workspace: ...`.
-/// A session without a switch is not given to a run where the target has labwc ([`probe_script`]: [`Display::NestedHeadless`] instead); the refusal here is for a target without labwc and for a
-/// switch that went away between the probe and the run.
+/// Test runs get no session where the target has labwc ([`probe_test_display`]); this switch then serves run-apk and the test runs of a target without labwc. The refusal here is for a session
+/// without a switch and for a switch that went away between the probe and the run.
 fn workspace_script(tag: &str) -> String {
     const SCRIPT: &str = r#"@PROBE@if [ -z "$WS_REFUSE" ]; then
   export XDG_RUNTIME_DIR="$WL_DIR"
@@ -528,8 +528,8 @@ pub enum Display {
     Session,
     /// An X11 session without a Wayland socket: the run starts labwc nested in it ([`nested_script`]) and ends it after atld.
     NestedX11,
-    /// A session whose compositor cannot show the run an empty workspace ([`WS_PROBE`]): D1 rules the session out, so the run starts its own headless labwc ([`nested_headless_script`], as the local
-    /// gates do, nested_wayland.rs) and ends it after atld. Nothing maps on the session.
+    /// The run's own headless labwc ([`nested_headless_script`], as the local gates do, nested_wayland.rs), ended after atld: a test run's answer wherever the target has labwc ([`probe_test_display`]),
+    /// run-apk's where the session has no switch ([`probe_display`]). Nothing maps on the session.
     NestedHeadless,
 }
 
@@ -558,8 +558,15 @@ fn session_probe_sh() -> String {
     )
 }
 
-/// Defines `wl_scan` and runs it once: `WL` = the last `wayland-*` socket (not a lock file) in the session's `$XDG_RUNTIME_DIR` (`WL_DIR`, `/run/user/<uid>`), `WL_N` = how many there are.
-const WL_SCAN: &str = "WL_DIR=\"/run/user/$(id -u)\"\nwl_scan() {\n  WL=\"\"\n  WL_N=0\n  for s in \"$WL_DIR\"/wayland-*; do\n    case \"$s\" in *.lock) continue ;; esac\n    [ -S \"$s\" ] || continue\n    WL=${s##*/}\n    WL_N=$((WL_N + 1))\n  done\n}\nwl_scan\n";
+/// The desktop session's runtime dir as the target's shell names it (`/run/user/<uid>`), for [`wl_scan`].
+const SESSION_DIR: &str = "\"/run/user/$(id -u)\"";
+
+/// Defines `wl_scan` and runs it once: `WL` = the last `wayland-*` socket (not a lock file) in `dir` (a shell word: [`SESSION_DIR`] on a target), `WL_N` = how many there are.
+fn wl_scan(dir: &str) -> String {
+    format!(
+        "WL_DIR={dir}\nwl_scan() {{\n  WL=\"\"\n  WL_N=0\n  for s in \"$WL_DIR\"/wayland-*; do\n    case \"$s\" in *.lock) continue ;; esac\n    [ -S \"$s\" ] || continue\n    WL=${{s##*/}}\n    WL_N=$((WL_N + 1))\n  done\n}}\nwl_scan\n"
+    )
+}
 
 /// The target's X11 session, read only: `XD`/`XA` = `DISPLAY`/`XAUTHORITY` of the first own process naming a DISPLAY whose socket (`/tmp/.X11-unix/X<n>`) is live; empty when none.
 /// From a session process's environment because an ssh login has neither variable.
@@ -571,14 +578,28 @@ const NESTED_WAIT_S: u32 = 10;
 /// The display probe ([`Target::probe_display`]): one line, `session`, `nested-headless <why>`, `nested <DISPLAY>`, or `headless <why>`.
 fn probe_script() -> String {
     let session = session_probe_sh();
+    let wl = wl_scan(SESSION_DIR);
     format!(
-        "{WL_SCAN}if [ \"$WL_N\" -eq 1 ]; then\n{session}exit 0\nfi\n[ \"$WL_N\" -eq 0 ] || {{ echo \"headless $WL_N Wayland sockets in $WL_DIR, want 0 or 1\"; exit 0; }}\ncommand -v labwc >/dev/null 2>&1 || {{ echo \"headless no Wayland socket and no labwc to nest\"; exit 0; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"headless no Wayland socket and no X11 session to nest labwc in\"; exit 0; }}\necho \"nested $XD\"\n"
+        "{wl}if [ \"$WL_N\" -eq 1 ]; then\n{session}exit 0\nfi\n[ \"$WL_N\" -eq 0 ] || {{ echo \"headless $WL_N Wayland sockets in $WL_DIR, want 0 or 1\"; exit 0; }}\ncommand -v labwc >/dev/null 2>&1 || {{ echo \"headless no Wayland socket and no labwc to nest\"; exit 0; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"headless no Wayland socket and no X11 session to nest labwc in\"; exit 0; }}\necho \"nested $XD\"\n"
     )
 }
 
-/// The Wayland display a UI run on target `host` (ssh alias or `local:<dir>`) can have, and why ([`probe_script`], read only): the session's one socket, its own headless labwc where that session has no workspace switch, else labwc nested in its X11 session, else none (headless; the reason says what is missing).
+/// The Wayland display of a run that maps on the session (run-apk) on target `host` (ssh alias or `local:<dir>`), and why ([`probe_script`], read only): the session's one socket, its own headless labwc where that session has no workspace switch, else labwc nested in its X11 session, else none (headless; the reason says what is missing).
 pub fn probe_display(host: &str) -> Result<(Display, String)> {
     parse_probe(&Host::parse(host)?.run_script(&probe_script())?)
+}
+
+/// The Wayland display a test run on target `host` gets, and why ([`test_probe_script`], read only): the run's own headless labwc wherever the target has labwc, whatever the session has (decision 2026-11-23); else the session's one socket; else headless.
+pub fn probe_test_display(host: &str) -> Result<(Display, String)> {
+    parse_probe(&Host::parse(host)?.run_script(&test_probe_script(SESSION_DIR))?)
+}
+
+/// The test run's probe, one line like [`probe_script`] (read only). X11 is not read: the run's labwc is headless whatever display the target has.
+fn test_probe_script(dir: &str) -> String {
+    let wl = wl_scan(dir);
+    format!(
+        "{wl}if command -v labwc >/dev/null 2>&1; then echo \"nested-headless $WL_N Wayland socket(s)\"; exit 0; fi\nif [ \"$WL_N\" -eq 1 ]; then echo session; exit 0; fi\n[ \"$WL_N\" -eq 0 ] || {{ echo \"headless $WL_N Wayland sockets in $WL_DIR, want 0 or 1\"; exit 0; }}\necho \"headless no Wayland socket and no labwc to start\"\n"
+    )
 }
 
 /// Reads [`probe_script`]'s line.
@@ -606,8 +627,9 @@ fn parse_probe(out: &str) -> Result<(Display, String)> {
 /// Starts labwc nested in the target's X11 session (`WLR_BACKENDS=x11`, its own empty config dir `cfg`, output to `log`) and waits for its Wayland socket: sets `WL` and `LW` (labwc's pid).
 /// Exit 5 when a Wayland socket already exists (the session's must be used, not shadowed), no X11 session is found, or labwc makes no socket within [`NESTED_WAIT_S`].
 fn nested_script(tag: &str, cfg: &str, log: &str) -> String {
+    let wl = wl_scan(SESSION_DIR);
     format!(
-        "{WL_SCAN}[ \"$WL_N\" -eq 0 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 0 for a nested labwc\" >&2; exit 5; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"remote run {tag}: no X11 session to nest labwc in\" >&2; exit 5; }}\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" DISPLAY=\"$XD\" XAUTHORITY=\"$XA\" WLR_BACKENDS=x11 labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: nested labwc gave $WL_N Wayland sockets in $WL_DIR, want 1\" >&2; kill \"$LW\" 2>/dev/null; exit 5; }}\n"
+        "{wl}[ \"$WL_N\" -eq 0 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 0 for a nested labwc\" >&2; exit 5; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"remote run {tag}: no X11 session to nest labwc in\" >&2; exit 5; }}\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" DISPLAY=\"$XD\" XAUTHORITY=\"$XA\" WLR_BACKENDS=x11 labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: nested labwc gave $WL_N Wayland sockets in $WL_DIR, want 1\" >&2; kill \"$LW\" 2>/dev/null; exit 5; }}\n"
     )
 }
 
@@ -615,9 +637,19 @@ fn nested_script(tag: &str, cfg: &str, log: &str) -> String {
 /// dir stays the session's). `WL` = the socket's absolute path (libwayland takes one as `WAYLAND_DISPLAY`), `LW` = labwc's pid. Both go with the run script: its normal end ([`Plan::script`]) and the EXIT trap.
 /// Exit 5 when labwc is missing or makes no socket within [`NESTED_WAIT_S`].
 fn nested_headless_script(tag: &str, cfg: &str, log: &str) -> String {
+    let wl = wl_scan(SESSION_DIR);
+    let env = labwc_words();
     format!(
-        "{WL_SCAN}command -v labwc >/dev/null 2>&1 || {{ echo \"remote run {tag}: no labwc on PATH\" >&2; exit 5; }}\nNEST_DIR=\"$WL_DIR/atl-nest-$$\"\nLW=\"\"\nnest_end() {{\n  [ -z \"$LW\" ] || kill -TERM \"$LW\" 2>/dev/null\n  rm -rf \"$NEST_DIR\"\n}}\ntrap nest_end EXIT\ntrap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 141' PIPE\ntrap 'exit 143' TERM\nmkdir -m 700 \"$NEST_DIR\" || exit 5\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\nWL_DIR=\"$NEST_DIR\"\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: headless labwc gave $WL_N Wayland sockets, want 1\" >&2; exit 5; }}\nWL=\"$NEST_DIR/$WL\"\n"
+        "{wl}command -v labwc >/dev/null 2>&1 || {{ echo \"remote run {tag}: no labwc on PATH\" >&2; exit 5; }}\nNEST_DIR=\"$WL_DIR/atl-nest-$$\"\nLW=\"\"\nnest_end() {{\n  [ -z \"$LW\" ] || kill -TERM \"$LW\" 2>/dev/null\n  rm -rf \"$NEST_DIR\"\n}}\ntrap nest_end EXIT\ntrap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 141' PIPE\ntrap 'exit 143' TERM\nmkdir -m 700 \"$NEST_DIR\" || exit 5\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$NEST_DIR\"{env} labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\nWL_DIR=\"$NEST_DIR\"\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: headless labwc gave $WL_N Wayland sockets, want 1\" >&2; exit 5; }}\nWL=\"$NEST_DIR/$WL\"\n"
     )
+}
+
+/// [`nested_wayland::labwc_env`] as the words of a run's labwc command (` NAME=value`): the local gate's environment, one output.
+fn labwc_words() -> String {
+    nested_wayland::labwc_env([nested_wayland::GATE_OUTPUT].len())
+        .iter()
+        .map(|(k, v)| format!(" {k}={v}"))
+        .collect()
 }
 
 /// The host roots a runtime names, absolute on this host: the build dir, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
@@ -725,8 +757,9 @@ fn dq(s: &str) -> String {
 
 /// The target's Wayland socket for a session run: the one `wayland-*` socket that is not a lock file, in the desktop session's `$XDG_RUNTIME_DIR` (`/run/user/<uid>`). Sets `WL` to its name. Any other count stops the run with exit 5 before atld starts, and names the count: a second compositor's socket must not be picked by chance.
 pub(crate) fn session_script(tag: &str) -> String {
+    let wl = wl_scan(SESSION_DIR);
     format!(
-        "{WL_SCAN}[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
+        "{wl}[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 1 (the desktop session's)\" >&2; exit 5; }}\n"
     )
 }
 
@@ -756,6 +789,22 @@ struct Plan {
 
 fn out_path(rel: &str) -> String {
     format!("{BASE_MARK}/out/{rel}")
+}
+
+/// A nested labwc's config dir under a run's scratch dir (`scratch` relative to the out dir): read by [`nested_script`] and [`nested_headless_script`], written by [`display_files`].
+fn labwc_dir(scratch: &str) -> String {
+    format!("{scratch}/labwc")
+}
+
+/// The run files a display needs before its script starts labwc: the test run's own labwc reads the local gate's config text ([`nested_wayland::RC_XML`]) from its config dir, sent here like the other run files.
+fn display_files(display: Display, scratch: &str) -> Vec<(String, String)> {
+    match display {
+        Display::NestedHeadless => vec![(
+            out_path(&format!("{}/rc.xml", labwc_dir(scratch))),
+            nested_wayland::RC_XML.to_owned(),
+        )],
+        Display::Headless | Display::Session | Display::NestedX11 => Vec::new(),
+    }
 }
 
 /// `cmd`'s explicit variables for the target, paths relocated: the target starts atld under `env -i`, so a variable `cmd` removes is simply absent there and is skipped.
@@ -814,7 +863,17 @@ impl Plan {
             word(&out_path(&self.root)),
             word(&out_path(&data.to_string_lossy()))
         ));
-        s.push_str(&format!("mkdir -p {}\n", word(&out_path(&self.scratch))));
+        // the scratch dir and the dirs of the run files (a nested labwc's config dir is one of them), made before any file is written
+        let mut dirs = vec![out_path(&self.scratch)];
+        for (path, _) in &self.files {
+            if let Some((dir, _)) = path.rsplit_once('/')
+                && !dirs.iter().any(|d| d == dir)
+            {
+                dirs.push(dir.to_owned());
+            }
+        }
+        let dirs: Vec<String> = dirs.iter().map(|d| word(d)).collect();
+        s.push_str(&format!("mkdir -p {}\n", dirs.join(" ")));
         for (path, text) in &self.files {
             s.push_str(&format!(
                 "sed \"s|{BASE_MARK}|$BASE|g\" > {} <<'ATL_EOF'\n{text}",
@@ -843,12 +902,12 @@ impl Plan {
             }
             Display::NestedX11 => s.push_str(&nested_script(
                 &self.tag,
-                &word(&out_path(&format!("{}/labwc", self.scratch))),
+                &word(&out_path(&labwc_dir(&self.scratch))),
                 &word(&out_path(&labwc_log)),
             )),
             Display::NestedHeadless => s.push_str(&nested_headless_script(
                 &self.tag,
-                &word(&out_path(&format!("{}/labwc", self.scratch))),
+                &word(&out_path(&labwc_dir(&self.scratch))),
                 &word(&out_path(&labwc_log)),
             )),
         }
@@ -1054,6 +1113,7 @@ impl RemoteRun {
             "remote run: a working directory is not relocated"
         );
         let root_rel = rel_out(&roots.out, root)?;
+        let scratch_rel = rel_out(&roots.out, scratch)?;
         let tag = root_rel
             .strip_suffix("/root")
             .unwrap_or(&root_rel)
@@ -1064,21 +1124,19 @@ impl RemoteRun {
             .get_args()
             .map(|a| Ok(relocate(&utf8(a)?, roots)))
             .collect::<Result<Vec<_>>>()?;
-        let files = written
-            .iter()
-            .map(|path| -> Result<(String, String)> {
-                let body = std::fs::read_to_string(path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                Ok((
-                    relocate(&utf8(path.as_os_str())?, roots),
-                    relocate(&body, roots),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut files = display_files(self.display, &scratch_rel);
+        for path in written {
+            let body = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            files.push((
+                relocate(&utf8(path.as_os_str())?, roots),
+                relocate(&body, roots),
+            ));
+        }
         let plan = Plan {
             tag: tag.clone(),
             root: root_rel,
-            scratch: rel_out(&roots.out, scratch)?,
+            scratch: scratch_rel,
             env,
             session_env,
             program: relocate(&utf8(cmd.get_program())?, roots),
@@ -3497,8 +3555,10 @@ esac
         );
         assert!(
             at("trap nest_end EXIT\n")
-                < at("XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless labwc")
-                && at("WLR_BACKENDS=headless labwc") < at("\nWL=\"$NEST_DIR/$WL\"\n")
+                < at(
+                    "XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman labwc -C"
+                )
+                && at("WLR_RENDERER=pixman labwc -C") < at("\nWL=\"$NEST_DIR/$WL\"\n")
                 && at("\nWL=\"$NEST_DIR/$WL\"\n") < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                 && at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                     < at("kill -TERM \"$LW\" 2>/dev/null || true"),
@@ -3526,6 +3586,107 @@ esac
     fn display_probe_runs_under_sh() {
         let host = Host::Local(std::env::temp_dir());
         parse_probe(&host.run_script(&probe_script()).unwrap()).unwrap();
+    }
+
+    /// The test run's probe by capability ([`test_probe_script`] on a fake runtime dir with real sockets; PATH holds a labwc or nothing; DISPLAY is set, and X11 is not read). Expected values from the
+    /// decision text (2026-11-23), not from the script: labwc present -> the run's own headless labwc whatever the session; no labwc -> the session's one socket, else headless.
+    #[test]
+    fn test_run_probe_answers_by_capability() {
+        let case = |tag: &str, sockets: &[u32], labwc: bool| -> (Display, String) {
+            let dir = temp(&format!("test-probe-{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let (run, bin) = (dir.join("run"), dir.join("bin"));
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            // bound for the probe: `[ -S ]` sees a socket file
+            let _sockets: Vec<std::os::unix::net::UnixListener> = sockets
+                .iter()
+                .map(|n| {
+                    std::os::unix::net::UnixListener::bind(run.join(format!("wayland-{n}")))
+                        .unwrap()
+                })
+                .collect();
+            if labwc {
+                use std::os::unix::fs::PermissionsExt;
+                let fake = bin.join("labwc");
+                std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let out = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &test_probe_script(&sh_quote(&run.display().to_string())),
+                ])
+                .env("PATH", &bin)
+                .env("DISPLAY", ":1")
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            parse_probe(&String::from_utf8(out.stdout).unwrap()).unwrap()
+        };
+        let (display, why) = case("session-labwc", &[1], true);
+        assert_eq!(display, Display::NestedHeadless);
+        assert!(why.contains("1 Wayland socket"), "{why}");
+        assert_eq!(case("session", &[1], false).0, Display::Session);
+        let (display, why) = case("labwc", &[], true);
+        assert_eq!(display, Display::NestedHeadless);
+        assert!(why.contains("0 Wayland socket"), "{why}");
+        assert_eq!(case("nothing", &[], false).0, Display::Headless);
+        assert_eq!(case("two", &[1, 2], false).0, Display::Headless);
+        assert_eq!(case("two-labwc", &[1, 2], true).0, Display::NestedHeadless);
+    }
+
+    /// The test run's probe on this host (`local:`) answers one of the modes, as [`display_probe_runs_under_sh`] does for run-apk's.
+    #[test]
+    fn test_probe_runs_under_sh() {
+        let host = Host::Local(std::env::temp_dir());
+        parse_probe(&host.run_script(&test_probe_script(SESSION_DIR)).unwrap()).unwrap();
+    }
+
+    /// A nested labwc's config is a run file: its dir made, then rc.xml written (the local gate's text, [`nested_wayland::RC_XML`]), both before the script starts labwc. No other display sends one.
+    #[test]
+    fn nested_labwc_config_is_a_run_file() {
+        let files = display_files(Display::NestedHeadless, "app/scratch");
+        assert_eq!(
+            files,
+            vec![(
+                "@BASE@/out/app/scratch/labwc/rc.xml".to_owned(),
+                nested_wayland::RC_XML.to_owned()
+            )]
+        );
+        assert!(display_files(Display::Session, "app/scratch").is_empty());
+        assert!(display_files(Display::Headless, "app/scratch").is_empty());
+        let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
+            tag: "app".to_owned(),
+            root: "app/root".to_owned(),
+            scratch: "app/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: Vec::new(),
+            files,
+            lib_dirs: Vec::new(),
+            limit: 60,
+            display: Display::NestedHeadless,
+            agent: None,
+        };
+        let s = plan.script("atl-next-run/x");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in\n{s}"))
+        };
+        assert!(
+            at("mkdir -p \"$BASE/out/app/scratch\" \"$BASE/out/app/scratch/labwc\"\n")
+                < at("> \"$BASE/out/app/scratch/labwc/rc.xml\""),
+            "{s}"
+        );
+        assert!(
+            at("> \"$BASE/out/app/scratch/labwc/rc.xml\"")
+                < at("labwc -C \"$BASE/out/app/scratch/labwc\""),
+            "{s}"
+        );
     }
 
     /// A run without a session has no discovery: its environment names no Wayland socket.

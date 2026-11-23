@@ -3670,8 +3670,9 @@ pub fn display_probe() -> Result<ExitCode> {
 }
 
 /// `xtask remote test window --stage <s>` (remote.rs `test`): the stage built and recorded here, pushed and checked on the target, its live half run there by the agent ([`agent`]) beside atld, its
-/// logs and `live.json` judged here by the same [`judge`] as `test window`. UI stages open the window on the target's session display (maintainer decision D1, 2026-11-18: on an empty workspace, remote.rs
-/// `workspace_script`) and are judged against that display ([`Rate::Session`]); frames runs headless on the 60 Hz grid as locally.
+/// logs and `live.json` judged here by the same [`judge`] as `test window`. UI stages open the window on the target's session display where the target has no labwc (maintainer decision D1, 2026-11-18:
+/// on an empty workspace, remote.rs `workspace_script`) and are judged against that display ([`Rate::Session`]); where it has labwc they are refused until they run on the run's own labwc (decision 2026-11-23).
+/// Frames runs headless on the 60 Hz grid as locally.
 pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     use crate::remote::{AGENT_LOG, AGENT_RC, Agent, Display, LIVE_JSON, REMOTE_DIR, Target};
     use std::os::unix::process::ExitStatusExt;
@@ -3697,8 +3698,8 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         "remote test window: stage {stage_name} is not remotable (frames, widgets, ui-block)"
     );
     let ui = !matches!(args.stage, Stage::Frames);
-    // frames too takes the session's socket when there is one, without `--ui` (no window): atld's renderer probe mounts the compositor socket even headless, and a local run inherits the desktop's
-    let (kind, why) = crate::remote::probe_display(&a.host)?;
+    // frames too takes the session's socket when the target has no labwc, without `--ui` (no window): atld's renderer probe mounts the compositor socket even headless, and a local run inherits the desktop's
+    let (kind, why) = crate::remote::probe_test_display(&a.host)?;
     let kind = match kind {
         Display::Session => kind,
         Display::NestedX11 | Display::NestedHeadless if ui => anyhow::bail!(
