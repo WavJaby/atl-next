@@ -8,6 +8,7 @@ import java.io.File;
 import java.lang.reflect.Array;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 
 /**
  * `xtask test keystore`: keystore2 as an app sees it over binder. Run as a plain app process (boot class loader: the framework's hidden AIDL classes resolve, reached by reflection since the APK
@@ -39,6 +40,12 @@ public final class Probe {
     private static final int SIGN = 2;
     private static final int P_256 = 1;
     private static final int SHA_2_256 = 4;
+    /** keymint Tag.ATTESTATION_CHALLENGE = TagType.BYTES | 708 (Tag.aidl:652) */
+    private static final int TAG_ATTESTATION_CHALLENGE = (9 << 28) | 708;
+    /** DER of the attestation extension's OID 1.3.6.1.4.1.11129.2.1.17 */
+    private static final byte[] ATTESTATION_OID = {0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, (byte) 0xd6, 0x79, 0x02, 0x01, 0x11};
+    /** CN of AOSP's software attestation intermediate and root (hardware/interfaces/security/keymint/aidl/default/ta/attest.rs): a chain carrying it is the software chain */
+    private static final byte[] SOFTWARE_CHAIN = "Android Keystore Software Attestation".getBytes(StandardCharsets.US_ASCII);
 
     private static void line(String text) {
         Log.i(TAG, text);
@@ -116,6 +123,54 @@ public final class Probe {
         }
     }
 
+    /** Whether `needle` occurs in `haystack` (null: no). */
+    private static boolean contains(byte[] haystack, byte[] needle) {
+        for (int i = 0; haystack != null && i + needle.length <= haystack.length; i++) {
+            int j = 0;
+            while (j < needle.length && haystack[i + j] == needle[j]) {
+                j++;
+            }
+            if (j == needle.length) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * An EC key generated with an attestation challenge: keystore2 asks sec_key_att_app_id_provider for the application id (security_level.rs add_required_parameters) and the HAL signs the
+     * chain. It must be AOSP's software chain (D-K1 (a)): the attestation extension on the leaf and the software roots' CN in the chain, never a hardware claim.
+     */
+    private static void attested(Object ks, Object level) throws Exception {
+        Class<?> pc = Class.forName(KM + "KeyParameter");
+        Object params = Array.newInstance(pc, 6);
+        Array.set(params, 0, param(TAG_ALGORITHM, "algorithm", int.class, EC));
+        Array.set(params, 1, param(TAG_PURPOSE, "keyPurpose", int.class, SIGN));
+        Array.set(params, 2, param(TAG_EC_CURVE, "ecCurve", int.class, P_256));
+        Array.set(params, 3, param(TAG_DIGEST, "digest", int.class, SHA_2_256));
+        Array.set(params, 4, param(TAG_NO_AUTH_REQUIRED, "boolValue", boolean.class, true));
+        Array.set(params, 5, param(TAG_ATTESTATION_CHALLENGE, "blob", byte[].class, "atl-probe-challenge".getBytes(StandardCharsets.US_ASCII)));
+        Class<?> kdc = Class.forName(KS + "KeyDescriptor");
+        Object kd = descriptor("atl-probe-attest-key");
+        Object md;
+        try {
+            md = level.getClass().getMethod("generateKey", kdc, kdc, params.getClass(), int.class, byte[].class)
+                    .invoke(level, kd, null, params, 0, new byte[0]);
+        } catch (Throwable t) {
+            line("attest-chain " + outcome(t));
+            return;
+        }
+        try {
+            // KeyMetadata: certificate is the leaf, certificateChain the certificates above it
+            byte[] leaf = (byte[]) md.getClass().getField("certificate").get(md);
+            byte[] chain = (byte[]) md.getClass().getField("certificateChain").get(md);
+            line("attest-chain " + (contains(leaf, ATTESTATION_OID) && contains(chain, SOFTWARE_CHAIN) ? "software" : "not software"));
+            ks.getClass().getMethod("deleteKey", kdc).invoke(ks, kd);
+        } catch (Throwable t) {
+            line("attest-chain " + outcome(t));
+        }
+    }
+
     private static String present(Object binder) {
         return binder == null ? "null" : "binder";
     }
@@ -179,6 +234,7 @@ public final class Probe {
                 }
                 if (level != null) {
                     generated(ks, level);
+                    attested(ks, level);
                 }
             }
         } catch (Throwable t) {

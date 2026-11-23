@@ -55,6 +55,8 @@ include_dirs = [
     "frameworks/native/libs/permission/aidl",
     "system/hardware/interfaces/media/aidl",
     "system/vold/binder",
+    # android.security.aaid_aidl (frameworks/base/keystore/aaid/Android.bp): IKeyAttestationApplicationIdProvider and its parcelables (key_attestation.rs)
+    "frameworks/base/keystore/aaid/aidl",
 ]
 types = [
     "android.hardware.display.IDisplayManager",
@@ -124,6 +126,8 @@ types = [
     "android.accounts.IAccountManager", # the account service (account.rs)
     "android.os.IDeviceIdleController", # the deviceidle service (device_idle.rs): PowerExemptionManager / DeviceIdleManager
     "android.content.pm.IShortcutService", # the shortcut service (shortcut.rs)
+    # the sec_key_att_app_id_provider service (key_attestation.rs): keystore2's attestation application id
+    "android.security.keystore.IKeyAttestationApplicationIdProvider",
     # test only (atl-aidl-probe --enforce): the smallest framework interface with @EnforcePermission methods
     "android.hardware.ISerialManager",
 ]

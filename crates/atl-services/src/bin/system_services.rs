@@ -23,6 +23,7 @@ use atl_aidl::aidl::android::content::pm::IPackageManager::BnPackageManager;
 use atl_services::activity::{ActivityManager, OrientationReshape, RootBack};
 use atl_services::app_id::AppIds;
 use atl_services::install;
+use atl_services::key_attestation;
 use atl_services::package::PackageManager;
 use atl_services::package_state::PackageUserStates;
 use atl_services::packages::{PackageRecord, Packages, Permissions};
@@ -185,6 +186,8 @@ const BATTERY_PROPERTIES: &str = "batteryproperties";
 const APP_OPS: &str = "appops";
 /// WebViewFactory.WEBVIEW_UPDATE_SERVICE_NAME.
 const WEBVIEW_UPDATE: &str = "webviewupdate";
+/// keystore2's attestation application id source (SystemServer.java:1579-1581, KeyAttestationApplicationIdProviderService).
+const KEY_ATTESTATION_APP_ID: &str = "sec_key_att_app_id_provider";
 
 fn parse_abi(s: &str) -> Result<SupportedAbi, String> {
     let (abi, isa) = s.split_once('=').ok_or("expected <abi>=<isa>")?;
@@ -359,6 +362,11 @@ fn main() -> Result<()> {
     };
     let pm = BnPackageManager::new_binder(manager, BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
+    binder::add_service(
+        KEY_ATTESTATION_APP_ID,
+        key_attestation::new_binder(Arc::clone(&packages)),
+    )
+    .context("addService sec_key_att_app_id_provider")?;
     let focus = Arc::new(atl_services::focus::FocusedProcess::default());
     binder::add_service(
         DISPLAY,

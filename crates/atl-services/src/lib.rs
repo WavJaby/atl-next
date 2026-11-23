@@ -82,6 +82,8 @@ pub mod installed;
 #[cfg(feature = "converter")]
 pub mod job_scheduler;
 #[cfg(feature = "converter")]
+pub mod key_attestation;
+#[cfg(feature = "converter")]
 pub mod locale;
 #[cfg(feature = "converter")]
 pub mod netstats;

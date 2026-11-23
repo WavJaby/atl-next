@@ -10,6 +10,7 @@
 //!   SecurityException) but finds `activity` and the allocator HAL, listServices names everything, and each denial is one avc line in servicemanager's log that atl-diag counts as `denied`.
 //!   Red control `--break-allow-all`: the image's service access table grants everything, so the HAL checks fail.
 //! - the KeyMint HAL's sources carry no copy of the Cuttlefish IMEI its attestation IDs used to hold (plan keystore S3, D-K1; a scan of the sources, not the executable).
+//! - a key generated with an attestation challenge gets AOSP's software attestation chain (plan keystore S3b, D-K1 (a)): keystore2 asks sec_key_att_app_id_provider for the application id, which the service answers from the installed packages' certificates (crates/atl-services/src/key_attestation.rs).
 //!
 //!
 //! App stage (plan keystore S2): AesActivity launched as an app (the launcher installs AndroidKeyStoreProvider as zygote's preload did) generates an AES-256-GCM key, round-trips, reports KeyInfo
@@ -120,7 +121,7 @@ const HAL_LOOKUPS: u64 = 3;
 const HAL_TYPE: &str = "hal_keymint_service";
 
 /// The lines the probe must print (Probe.java), each with what it shows.
-fn checks() -> [(&'static str, String); 13] {
+fn checks() -> [(&'static str, String); 14] {
     [
         // servicemanager decides from the compiled pinned policy (Access over libselinux, atl-selinux's table): untrusted_app may not find hal_keymint_service (private/app_neverallows.te:254,
         // public/service.te:336: no allow), so checkService / getService answer null (ServiceManager.cpp tryGetService) and isDeclared fails EX_SECURITY (ServiceManager.cpp:716-733)
@@ -168,6 +169,11 @@ fn checks() -> [(&'static str, String); 13] {
         (
             "an EC key generated through keystore2: ORIGIN authorization SOFTWARE",
             format!("AtlKeystore: origin-level {SOFTWARE}"),
+        ),
+        // keystore2 asks sec_key_att_app_id_provider for the application id (security_level.rs add_required_parameters); the chain is AOSP's software chain (D-K1 (a)), no hardware claim
+        (
+            "an EC key generated with an attestation challenge: AOSP's software chain",
+            "AtlKeystore: attest-chain software".to_owned(),
         ),
         (
             "the generated key deletes",
