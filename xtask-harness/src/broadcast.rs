@@ -122,11 +122,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let (sender_log, receiver_log) = (run.log(&sender), run.log(&receiver));
     let start = Instant::now();
     let mut ping_seen: Option<Instant> = None;
+    // the headless end follows the receiver's finish by EMPTY_GRACE_MS, which under a loaded host can be later than SETTLE after PING: wait for its line (LIMIT caps the wait)
+    let end_line = format!("process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)");
+    let mut end_seen = false;
     let ended = loop {
         if ping_seen.is_none() && read(&receiver_log).contains(PING_SENT) {
             ping_seen = Some(Instant::now());
         }
-        if ping_seen.is_some_and(|t| t.elapsed() > SETTLE) || start.elapsed() > LIMIT {
+        if ping_seen.is_some() && !end_seen {
+            end_seen = read(&run.log("services")).contains(&end_line);
+        }
+        if ping_seen.is_some_and(|t| t.elapsed() > SETTLE && end_seen) || start.elapsed() > LIMIT {
             break None;
         }
         if let Some(s) = atld.try_wait()? {
@@ -197,9 +203,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
         (
             "the explicit broadcast's receiver process ended once its receiver finished and the grace ran",
-            services.contains(&format!(
-                "process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)"
-            )),
+            services.contains(&end_line),
         ),
     ];
     let mut whys = Vec::new();
