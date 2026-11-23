@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The cargo products the runtime gates run, built and staged by one function ([`ensure`]) that every gate and `check`'s gates step call; nothing else in the harness builds them.
 //! Each group is one fixed cargo invocation: the same package set every time, so feature unification gives one artifact per product and a second call is a no-op that neither recompiles nor
-//! re-uplifts (cargo hard-links `release/<bin>` anew only when another package set built the unit last). Per-row package sets did exactly that: the stub flipped between two artifacts 6 times per
-//! gates step, and a sandbox bound from the unlinked file broke the next bind from it. `check` calls [`ensure`] before its lanes, then [`Snapshot`] proves no product moved while they ran.
+//! re-uplifts (cargo hard-links `release/<bin>` anew only when another package set built the unit last). Per-row package sets did exactly that: the stub flipped between two artifacts 8 times per
+//! gates step (and a gate-built egl probe beside per-row egl driver builds 20 times), and a sandbox bound from the unlinked file broke the next bind from it. `check` calls [`ensure`] before its lanes, then [`Snapshot`] proves no product moved while they ran.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -29,8 +29,14 @@ pub const NATIVE_BRIDGE_DIR: &str = "native-bridge/lib";
 pub const NB_ISA_DIR: &str = "nb-isa-lib";
 
 /// The cdylibs a runtime process dlopens by file name, as `(package, staging dir under <out>, installed name)`; one built file may be staged in several dirs.
-fn staged() -> [(&'static str, &'static str, String); 6] {
+fn staged() -> [(&'static str, &'static str, String); 7] {
     [
+        // the GL driver every atld run with `with_gl_driver` places (egl_driver.rs `placement`)
+        (
+            crate::egl_driver::DRIVER_PACKAGE,
+            crate::egl_driver::DIR,
+            crate::egl_driver::atl_egl_driver_name().to_owned(),
+        ),
         (
             "atl-native-bridge",
             NATIVE_BRIDGE_DIR,

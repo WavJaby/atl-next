@@ -11,7 +11,9 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail, ensure};
 
-const DRIVER_PACKAGE: &str = "atl-egl-driver";
+pub(crate) const DRIVER_PACKAGE: &str = "atl-egl-driver";
+/// The shipped driver's staging dir under `<out>` (gate_build.rs stages it).
+pub(crate) const DIR: &str = "egl";
 const PROBE_PACKAGE: &str = "atl-egl-probe";
 const PROBE_BIN: &str = "atl-egl-driver-probe";
 
@@ -194,28 +196,31 @@ const HARDWARE: &str = "atl";
 /// The app process's GL driver, built and placed as the runtime root holds it: (host file, Android path) pairs -- the driver in /vendor's egl dir as `libEGL_atl.so` and `libGLESv2_atl.so` (one host file: the dynamic loader maps it once, by inode) and a /vendor/build.prop with `ro.hardware.egl` (`<out>/egl`).
 /// The ES1 library (ANGLE's, `libGLESv1_CM_atl.so`) is placed with the ANGLE fronts (atld_run.rs `with_gl_driver`).
 /// It links only system libraries (the host's libEGL is dlopened by atl-egl-host), so no library dir joins the path.
-/// `breaks` (build.rs `BREAKS` names; a gate's red run) stage a faulted driver into `<out>/egl-break-<names>` instead, so the shipped `<out>/egl` is never overwritten.
+/// The shipped driver is gate_build.rs's (staged in `<out>/`[`DIR`]). `breaks` (build.rs `BREAKS` names; a gate's red run, never a `check` row) build a faulted driver with its own features into
+/// `<out>/egl-break-<names>`, so the shipped `<out>/egl` is never overwritten; that build re-links cargo's `release/` copy, which the next gate_build run restores.
 pub fn placement(root: &Path, out: &Path, breaks: &[String]) -> Result<Vec<(PathBuf, String)>> {
-    let features: Vec<String> = breaks.iter().map(|b| format!("break-{b}")).collect();
-    let features: Vec<&str> = features.iter().map(String::as_str).collect();
-    let sub = if breaks.is_empty() {
-        "egl".to_owned()
+    let dir = if breaks.is_empty() {
+        crate::gate_build::ensure(root, out, &[crate::gate_build::Group::Release])?.staged_dir(DIR)
     } else {
-        format!("egl-break-{}", breaks.join("-"))
+        let features: Vec<String> = breaks.iter().map(|b| format!("break-{b}")).collect();
+        let features: Vec<&str> = features.iter().map(String::as_str).collect();
+        crate::cdylib::stage_with(
+            root,
+            out,
+            DRIVER_PACKAGE,
+            &format!("egl-break-{}", breaks.join("-")),
+            atl_egl_driver_name(),
+            &features,
+        )?
     };
-    let dir = crate::cdylib::stage_with(
-        root,
-        out,
-        DRIVER_PACKAGE,
-        &sub,
-        atl_egl_driver_name(),
-        &features,
-    )?;
-    // tmp + rename: check's parallel gates write and read this file at once; a plain write lets a reader see it truncated
+    // sandboxes bind this file: rewritten only when its text differs, so a running app's bind never pins a replaced file; tmp + rename, so a reader never sees it truncated
     let prop = dir.join("vendor-build.prop");
-    let tmp = dir.join(format!(".vendor-build.prop.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("ro.hardware.egl={HARDWARE}\n"))?;
-    std::fs::rename(&tmp, &prop)?;
+    let text = format!("ro.hardware.egl={HARDWARE}\n");
+    if std::fs::read_to_string(&prop).ok().as_deref() != Some(text.as_str()) {
+        let tmp = dir.join(format!(".vendor-build.prop.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &prop)?;
+    }
     let vendor = |name: &str| format!("{}/{name}", atl_android_paths::VENDOR_EGL);
     Ok(vec![
         (
