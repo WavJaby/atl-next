@@ -6,7 +6,7 @@
 //! matches are empty; isRequestPinItemSupported false, requestPinShortcut false (ShortcutRequestPinProcessor without a supporting launcher).
 //! - Limits = ShortcutService's defaults (:176-197; no device config override here): 15 per activity, 10 calls per 24 h interval, icon 96 dp (not a low-RAM device) in px at the display density.
 //! - Rate limit (ShortcutPackage.getApiCallCount :695-728): reset whenever the uid is foreground (procState <= BOUND_FOREGROUND_SERVICE, isUidForegroundLocked :632). ATL reports every app process
-//!   PROCESS_STATE_TOP (running_processes.rs), so a caller is always foreground: its count is reset before each check and it is never limited, as an app in front is on a device.
+//!   foreground: no process state is read here (PROCESS_STATE_TOP, running_processes.rs), so its count is reset before each check and it is never limited, as an app in front is on a device. A background caller's real state is not read: a known gap, outside S11.
 //! - Order: ShortcutPackage keeps an ArrayMap by id, so lists come out by the ids' String.hashCode ascending, equal hashes in insertion order; ranks per activity by adjustRanks (:1558).
 //! - Icons (saveIconAndFixUpShortcutLocked :1536): resource -> iconResId + FLAG_HAS_ICON_RES (own package only), uri -> iconUri + FLAG_HAS_ICON_URI, bitmap -> FLAG_HAS_ICON_FILE; the Icon is dropped.
 //!   AOSP writes the bitmap to a file only a launcher reads (LauncherApps.getShortcutIconFd); there is none, so the pixels are not kept.
@@ -441,7 +441,7 @@ impl ShortcutService {
         Ok(())
     }
 
-    /// isUidForegroundLocked: SYSTEM_UID, or a procState at or below the threshold; every ATL app process is PROCESS_STATE_TOP (module doc).
+    /// isUidForegroundLocked: SYSTEM_UID, or a procState at or below the threshold; no state is read here, so an app caller counts as TOP (module doc).
     fn foreground(uid: u32) -> bool {
         Self::is_system(uid) || PROCESS_STATE_TOP <= PROCESS_STATE_BOUND_FOREGROUND_SERVICE
     }

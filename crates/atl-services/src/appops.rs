@@ -62,7 +62,7 @@ impl AppOps {
 
     /// checkOperationImpl for every check variant: an unknown op throws (verifyIncomingOp); a virtual device -> MODE_IGNORED (none exist); a null package -> MODE_IGNORED (resolvePackageName
     /// gives an app uid no name); an invalid or foreign package -> the op's default mode (checkOperationImpl / checkOperationUnchecked's catch); else the uid's mode. Not raw: MODE_FOREGROUND is
-    /// evaluated against the uid's state, and every app process is reported PROCESS_STATE_TOP (activity.rs), so it reads MODE_ALLOWED.
+    /// evaluated against the uid's state, which is not read here: the uid is assumed TOP, so it reads MODE_ALLOWED.
     fn check(
         &self,
         method: &str,

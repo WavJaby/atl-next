@@ -452,8 +452,11 @@ fn main() -> Result<()> {
     )
     .context("addService audio")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
-    binder::add_service(PROCESS_INFO, atl_services::process_info::new_binder())
-        .context("addService processinfo")?;
+    binder::add_service(
+        PROCESS_INFO,
+        atl_services::process_info::new_binder(activity.clone()),
+    )
+    .context("addService processinfo")?;
     binder::add_service(
         MOUNT,
         atl_services::storage::new_binder(Arc::clone(&permissions)),

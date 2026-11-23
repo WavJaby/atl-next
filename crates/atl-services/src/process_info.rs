@@ -1,29 +1,48 @@
 // SPDX-License-Identifier: MIT
 //! The `processinfo` service (ActivityManagerService's ProcessInfoService): media's resource manager asks it for a client process's state and OOM score (frameworks/av media/utils ProcessInfo.cpp `getPriority` / `isPidTrusted`, both `waitForService("processinfo")` -> blocks forever when absent).
-//! Reference: ActivityManagerService.getProcessStatesAndOomScoresForPIDs. ATL keeps no per-process state or OOM adjustment yet: every app process is a desktop window the user started, so each pid answers as AMS answers a pending-top app (PROCESS_STATE_TOP, FOREGROUND_APP_ADJ). No pid answers NONEXISTENT: the service does not track pids (the caller's pid is in its own sandbox namespace). Revisit when the activity service tracks process states.
+//! Reference: ActivityManagerService.getProcessStatesAndOomScoresForPIDs (AMS :5979-6039). Each pid is the caller's own process as running_processes::state_of_pid numbers it; its state is the process's uid_state::process_state.
+//! A pid that is no attached process of the caller's sandbox answers NONEXISTENT with INVALID_ADJ (AMS :6024-6028; libmedia then consults its override map). Scores: no OomAdjuster numbers yet (plan P1), so every found process answers FOREGROUND_APP_ADJ.
+//! Not modelled: a pid starting an activity answers its holdings' state here; AMS answers TOP for it while the uid is pending top (mPendingStartActivityUids, AMS :6005-6023).
 
 use atl_aidl::aidl::android::os::IProcessInfoService::{BnProcessInfoService, IProcessInfoService};
-use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status};
+use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-/// ActivityManager.PROCESS_STATE_TOP = ProcessStateEnum.TOP (2).
-const PROCESS_STATE_TOP: i32 = 2;
-/// ProcessList.FOREGROUND_APP_ADJ (0).
-const FOREGROUND_APP_ADJ: i32 = 0;
+use crate::activity::ActivityManager;
+use crate::running_processes::process_info_answer;
+use crate::uid_state::ProcessState;
 
-struct ProcessInfoService;
+struct ProcessInfoService {
+    activity: ActivityManager,
+}
 
 impl Interface for ProcessInfoService {}
 
-/// AMS's argument checks: NullPointerException for a null array, IllegalArgumentException when an out array's length differs from `pids`'.
-fn fill(pids: Option<&[i32]>, out: &mut Option<Vec<i32>>, value: i32) -> binder::Result<()> {
+/// AMS's argument checks: NullPointerException for a null array, IllegalArgumentException when an out array's length differs from `pids`'. Then each slot takes the next of `values`, in pid order.
+fn fill(
+    pids: Option<&[i32]>,
+    out: &mut Option<Vec<i32>>,
+    values: impl Iterator<Item = i32>,
+) -> binder::Result<()> {
     let (Some(pids), Some(out)) = (pids, out.as_mut()) else {
         return Err(Status::new_exception(ExceptionCode::NULL_POINTER, None));
     };
     if out.len() != pids.len() {
         return Err(Status::new_exception(ExceptionCode::ILLEGAL_ARGUMENT, None));
     }
-    out.fill(value);
+    for (slot, value) in out.iter_mut().zip(values) {
+        *slot = value;
+    }
     Ok(())
+}
+
+impl ProcessInfoService {
+    /// Each pid's process as the caller numbers it, read at one instant. Empty when `pids` is null: fill refuses that.
+    fn found(&self, pids: Option<&[i32]>) -> Vec<Option<ProcessState>> {
+        pids.map_or_else(Vec::new, |pids| {
+            self.activity
+                .process_states(ThreadState::get_calling_pid(), pids)
+        })
+    }
 }
 
 impl IProcessInfoService for ProcessInfoService {
@@ -33,7 +52,12 @@ impl IProcessInfoService for ProcessInfoService {
         pids: Option<&[i32]>,
         states: &mut Option<Vec<i32>>,
     ) -> binder::Result<()> {
-        fill(pids, states, PROCESS_STATE_TOP)
+        let found = self.found(pids);
+        fill(
+            pids,
+            states,
+            found.iter().map(|f| process_info_answer(*f).0),
+        )
     }
 
     /// ProcessInfoService.getProcessStatesAndOomScoresFromPids. AMS first enforces GET_PROCESS_STATE_AND_OOM_SCORE: held by the media server on Android; here the caller is media code inside the app process itself.
@@ -43,12 +67,22 @@ impl IProcessInfoService for ProcessInfoService {
         states: &mut Option<Vec<i32>>,
         scores: &mut Option<Vec<i32>>,
     ) -> binder::Result<()> {
-        fill(pids, states, PROCESS_STATE_TOP)?;
-        fill(pids, scores, FOREGROUND_APP_ADJ)
+        let found = self.found(pids);
+        fill(
+            pids,
+            states,
+            found.iter().map(|f| process_info_answer(*f).0),
+        )?;
+        fill(
+            pids,
+            scores,
+            found.iter().map(|f| process_info_answer(*f).1),
+        )
     }
 }
 
-/// The service's binder, for `addService`.
-pub fn new_binder() -> SpIBinder {
-    BnProcessInfoService::new_binder(ProcessInfoService, BinderFeatures::default()).as_binder()
+/// The service's binder, for `addService`; `activity` is the process table it answers from.
+pub fn new_binder(activity: ActivityManager) -> SpIBinder {
+    BnProcessInfoService::new_binder(ProcessInfoService { activity }, BinderFeatures::default())
+        .as_binder()
 }

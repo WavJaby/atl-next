@@ -2587,6 +2587,10 @@ const STICKY_FIRST: &str = "AtlTest: sticky: onStartCommand startId=1 action=atl
 const STICKY_RESTART: &str = "AtlTest: sticky: onStartCommand startId=2 action=null";
 const NOT_STICKY_FIRST: &str =
     "AtlTest: notsticky: onStartCommand startId=1 action=atl.test.NOTSTICKY";
+/// AtlSticky's first start logs its process's importance (S11) before STICKY_FIRST: this prefix, then the value. A started service's process is IMPORTANCE_SERVICE (ActivityManager.java:3897):
+/// PROCESS_STATE_SERVICE (10) and RECEIVER (11) fall in procStateToImportance's SERVICE band (:3956-3957).
+const STICKY_IMPORTANCE: &str = "AtlTest: importance: sticky=";
+const IMPORTANCE_SERVICE: i32 = 300;
 /// ActivityManagerConstants.java:223 DEFAULT_SERVICE_RESTART_DURATION: a killed service's restart comes this long after the kill (ActiveServices.scheduleServiceRestartLocked).
 const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
 /// ActivityManagerConstants.java:226 DEFAULT_SERVICE_MIN_RESTART_TIME_BETWEEN: a restart of a service that died with another one waits this long after it.
@@ -2607,6 +2611,8 @@ struct StickyCase {
     kill_failed: Option<String>,
     /// the sticky restart line's stamp, wall ms
     restart_ms: Option<u64>,
+    /// AtlSticky's logged importance (the word after STICKY_IMPORTANCE), read at the kill
+    importance: Option<String>,
 }
 
 impl StickyCase {
@@ -2627,11 +2633,12 @@ impl StickyCase {
     fn poll(&mut self, run: &Run, package: &str) {
         let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
         if self.killed.is_none() {
-            if !(log(STICKY_PROC).contains(STICKY_FIRST)
-                && log(NOT_STICKY_PROC).contains(NOT_STICKY_FIRST))
-            {
+            let sticky = log(STICKY_PROC);
+            if !(sticky.contains(STICKY_FIRST) && log(NOT_STICKY_PROC).contains(NOT_STICKY_FIRST)) {
                 return;
             }
+            // the importance line precedes STICKY_FIRST in AtlSticky's onStartCommand: once that line is in the log, so is this one
+            self.importance = value_after(&sticky, STICKY_IMPORTANCE).map(str::to_owned);
             let atld = atl_diag::logfiles::read(&run.atld_log());
             self.killed = Some((
                 sticky_wall_ms(),
@@ -2667,6 +2674,7 @@ impl StickyCase {
         if let Some(e) = &self.kill_failed {
             return Err(format!("sticky: {e}"));
         }
+        let importance = importance_verdict(self.importance.as_deref())?;
         let Some(restart) = self.restart_ms else {
             return Err(format!("sticky: no {STICKY_RESTART:?} line after the kill"));
         };
@@ -2687,8 +2695,33 @@ impl StickyCase {
             ));
         }
         Ok(format!(
-            "sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: not restarted in {NOT_STICKY_WINDOW_MS} ms"
+            "{importance}; sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: not restarted in {NOT_STICKY_WINDOW_MS} ms"
         ))
+    }
+}
+
+/// The first word after `prefix` on the first log line that holds it (None: no such line, or nothing after it).
+fn value_after<'a>(log: &'a str, prefix: &str) -> Option<&'a str> {
+    log.lines()
+        .find_map(|line| line.split_once(prefix))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+}
+
+/// The started-service process's importance, judged: IMPORTANCE_SERVICE passes; any other value, a missing line or a non-number fails.
+fn importance_verdict(value: Option<&str>) -> Result<String, String> {
+    let Some(value) = value else {
+        return Err(format!(
+            "importance: no {STICKY_IMPORTANCE:?} line in AtlSticky's log"
+        ));
+    };
+    match value.parse::<i32>() {
+        Ok(IMPORTANCE_SERVICE) => Ok(format!(
+            "importance: sticky process {IMPORTANCE_SERVICE} (IMPORTANCE_SERVICE)"
+        )),
+        Ok(other) => Err(format!(
+            "importance: sticky process is {other}, want {IMPORTANCE_SERVICE} (IMPORTANCE_SERVICE)"
+        )),
+        Err(_) => Err(format!("importance: sticky value {value:?} is not an int")),
     }
 }
 
@@ -2746,6 +2779,7 @@ mod sticky_case_tests {
             killed: Some((10_000, 1)),
             kill_failed: None,
             restart_ms: Some(restart),
+            importance: Some("300".to_owned()),
         }
     }
 
@@ -2786,6 +2820,38 @@ mod sticky_case_tests {
         .verdict(&restarted, "com.example.atltest")
         .unwrap_err();
         assert!(why.starts_with("notsticky: 1 start(s)"), "{why}");
+    }
+
+    /// AtlSticky's importance (S11) must be IMPORTANCE_SERVICE: 300 passes; a foreground-service band (125), a missing line and a non-number fail.
+    #[test]
+    fn importance_must_be_the_started_service_band() {
+        assert_eq!(
+            importance_verdict(Some("300")),
+            Ok("importance: sticky process 300 (IMPORTANCE_SERVICE)".to_owned())
+        );
+        assert!(
+            importance_verdict(Some("125"))
+                .unwrap_err()
+                .contains("want 300")
+        );
+        assert!(
+            importance_verdict(None)
+                .unwrap_err()
+                .contains("no \"AtlTest: importance: sticky=\" line")
+        );
+        assert!(
+            importance_verdict(Some("x"))
+                .unwrap_err()
+                .contains("not an int")
+        );
+    }
+
+    /// The word after the prefix on the first line holding it; the importance line's value is the first word after `sticky=`.
+    #[test]
+    fn value_after_is_the_first_word_after_the_prefix() {
+        let log = "1793747156.733 1 2 I AtlTest: importance: sticky=300\n1793747156.800 1 2 I AtlTest: sticky: onStartCommand startId=1";
+        assert_eq!(value_after(log, STICKY_IMPORTANCE), Some("300"));
+        assert_eq!(value_after("no such line", STICKY_IMPORTANCE), None);
     }
 }
 

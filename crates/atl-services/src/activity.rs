@@ -75,7 +75,7 @@ use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::{AppProcess, UiAgents};
-use crate::uid_state::{self, Settle};
+use crate::uid_state::{self, ProcessState, Settle};
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
@@ -1066,6 +1066,25 @@ impl ActivityManager {
     /// The lifecycle the activity_task service (IActivityTaskManager) is built on.
     pub fn activity_tasks(&self) -> Arc<ActivityTasks> {
         Arc::clone(&self.inner.atm)
+    }
+
+    /// processinfo's view (process_info.rs): each pid's process as the caller (binderd tag `calling_tag`) numbers it, read at one instant; None where no attached process of its sandbox is.
+    /// Only the caller's own records can match (pid_seen_by answers 0 for another sandbox's), so only those have their holdings read.
+    pub fn process_states(&self, calling_tag: i32, pids: &[i32]) -> Vec<Option<ProcessState>> {
+        let st = self.inner.state();
+        let own: Vec<(i32, Option<i32>, ProcessState)> = st
+            .processes
+            .iter()
+            .filter(|r| r.pid == calling_tag)
+            .filter_map(|r| {
+                let a = r.attached.as_ref()?;
+                let state = uid_state::process_state(&self.inner.holdings_locked(&st, r));
+                Some((r.pid, a.program_pid, state))
+            })
+            .collect();
+        pids.iter()
+            .map(|&pid| running_processes::state_of_pid(own.iter().copied(), calling_tag, pid))
+            .collect()
     }
 
     /// The display changed (registry SET_DISPLAY): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
@@ -2146,7 +2165,7 @@ impl IActivityManager for ActivityManager {
         Ok(())
     }
 
-    /// ActivityManagerService.getRunningAppProcesses: the attached processes the caller may see (running_processes). Not enforced: enforceNotIsolatedCaller (no isolated uids).
+    /// ActivityManagerService.getRunningAppProcesses: the attached processes the caller may see (running_processes), each with its state's importance and processState (ProcessList.fillInProcMemInfoLOSP :4183-4205). Not enforced: enforceNotIsolatedCaller (no isolated uids).
     fn r#getRunningAppProcesses(
         &self,
     ) -> binder::Result<Option<Vec<Option<ActivityManager_RunningAppProcessInfo>>>> {
@@ -2167,6 +2186,7 @@ impl IActivityManager for ActivityManager {
                 package: &r.package,
                 uid: r.uid,
                 pid: running_processes::pid_seen_by(r.pid, a.program_pid, calling_pid),
+                state: uid_state::process_state(&self.inner.holdings_locked(&st, r)),
             })
         });
         Ok(running_processes::visible(procs, &caller).map(|list| {
@@ -2177,8 +2197,8 @@ impl IActivityManager for ActivityManager {
                         pid: p.pid,
                         uid: p.uid as i32,
                         pkg_list: Some(vec![Some(p.package.to_owned())]),
-                        importance: running_processes::IMPORTANCE_FOREGROUND,
-                        process_state: running_processes::PROCESS_STATE_TOP,
+                        importance: running_processes::importance(p.state),
+                        process_state: p.state as i32,
                         ..Default::default()
                     })
                 })
