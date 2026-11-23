@@ -38,6 +38,10 @@ const IME_LINE_MARK: &str = "atl-ime:";
 const IME_DUMP_LINES: usize = 400;
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
 const IME_WAIT: Duration = Duration::from_secs(10);
+/// The input's layout line, from the fixture's first layout (`onFirstLayout`), written by another writer than the origin line, so either order happens: window-ime run 2 ms after the origin, run-apk run 46 ms before it (2026-11-23 retained logs). Bound as widgets' `LINE_WAIT` (5 s), a fixture line after its trigger, against first paints of 1.3-1.5 s on the same host.
+const LAYOUT_WAIT: Duration = Duration::from_secs(5);
+/// The EditText's layout line, as `widget` reads it.
+const LAYOUT_INPUT_LINE: &str = "AtlWindow: layout input ";
 /// How long the first process's composer may take, before the kill, to log what the post-draw and release sub-checks judge (a paint that released a retired shown buffer). Paints took up to
 /// ~1.3 s with the GPU held by another job (2026-11-20, against 3-9 ms idle); the bound only runs out when that paint never comes (`--break-ignore-hold`), and the check then judges what was logged.
 const SETTLE_WAIT: Duration = Duration::from_secs(30);
@@ -208,6 +212,13 @@ fn confirm_answers(app_log: &Path, ime: &mut Ime, step: &str, want: usize) -> Re
     confirm(app_log, ime, |app| answers_verdict(step, want, app))
 }
 
+/// Waits up to `within` for the input's layout line; the error is the message a red names.
+fn await_layout_input(app_log: &Path, within: Duration) -> Result<(), String> {
+    wait_for_line(app_log, LAYOUT_INPUT_LINE, within)
+        .then_some(())
+        .ok_or_else(|| "no layout line for input".to_owned())
+}
+
 /// The probe: tap the EditText, wait for the second window to close and the IME to activate, then preedit, commit, delete.
 /// Each edit is confirmed before the next; a missing confirmation returns Err naming the step (fail-fast). The fake IME's journal is kept for [`red_dump`].
 pub fn drive(
@@ -250,6 +261,13 @@ fn steps(
     wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
         .then_some(())
         .ok_or("the window never presented")?;
+    // the layout line comes from another writer, before or after the origin: wait for it, then read the snapshot holding both
+    let waited = Instant::now();
+    await_layout_input(app_log, LAYOUT_WAIT)?;
+    println!(
+        "window: layout input line waited {} ms after the origin",
+        waited.elapsed().as_millis()
+    );
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = content_origin(&text)?;
     let r = widgets::widget(&text, "input")?;
@@ -345,17 +363,22 @@ fn steps(
     })
 }
 
-/// The stage's sub-gates over the fixture log; `activate` is the probe's (it fails when the desktop input method never activated); `app_uid` is the fixture's (Runtime::first_app_uid).
+/// The stage's sub-gates over the fixture log. `activate` takes the probe's error when it stopped before its edits (the desktop input method never activated, or a setup step failed); a fail-fast edit stop goes to that edit's sub-gate ([`route_stop`]). `app_uid` is the fixture's (Runtime::first_app_uid).
 pub fn checks(
     app: &str,
     services: &str,
     probe: &Result<Liveness, String>,
     app_uid: u32,
 ) -> Vec<Sub> {
-    let activate = probe
-        .as_ref()
-        .map(|_| "the desktop input method was activated for the focused EditText".to_owned())
-        .map_err(Clone::clone);
+    let activated = "the desktop input method was activated for the focused EditText";
+    let activate = match probe {
+        // the probe reached an edit only once the input method was active: the stop is that edit's
+        Err(err) if stopped_step(err).is_some() => Ok(activated.to_owned()),
+        _ => probe
+            .as_ref()
+            .map(|_| activated.to_owned())
+            .map_err(Clone::clone),
+    };
     let edit =
         |text: String, want: &dyn Fn(&str) -> bool, what: &str| match composing_of(app, &text) {
             Some(c) if want(c) => Ok(format!("text `{text}` composing={c}")),
@@ -366,7 +389,7 @@ pub fn checks(
     let start = INITIAL.encode_utf16().count();
     let end = start + PREEDIT.encode_utf16().count();
     let preedit_span = format!("{start},{end}");
-    vec![
+    let mut subs = vec![
         ("activate", activate),
         (
             "preedit",
@@ -394,7 +417,27 @@ pub fn checks(
         // the relaunch reports too; judge the process the stage drove, as the composer sub-checks do
         ("outbox", outbox_check(first_process(app))),
         ("copy", copy_check(first_process(app))),
-    ]
+    ];
+    if let Err(err) = probe {
+        route_stop(&mut subs, err);
+    }
+    subs
+}
+
+/// The edit step a fail-fast stop named: the probe's error is `edit `<step>` not confirmed: ...` (text_verdict, answers_verdict).
+fn stopped_step(err: &str) -> Option<&str> {
+    let (step, rest) = err.strip_prefix("edit `")?.split_once('`')?;
+    rest.starts_with(" not confirmed").then_some(step)
+}
+
+/// A fail-fast stop's error moves to the sub-gate of the edit it names, so the label names the step; the other sub-gates keep their own results.
+fn route_stop(subs: &mut [Sub], err: &str) {
+    let Some(step) = stopped_step(err) else {
+        return;
+    };
+    for sub in subs.iter_mut().filter(|s| s.0 == step) {
+        sub.1 = Err(err.to_owned());
+    }
 }
 
 /// The input method's lines when an editor answer meets a copy holding its own edits (atl-ime field.rs `surrounding`).
@@ -737,5 +780,81 @@ mod tests {
         );
         assert_eq!(newest(&lines, 1), &lines[1..]);
         assert_eq!(newest(&lines, 5), &lines[..]);
+    }
+
+    /// A layout line written after the probe's first read is waited for: the wait returns once it lands, well inside its bound (the 150 ms write delay is the test's own).
+    #[test]
+    fn a_late_layout_line_is_waited_for() {
+        let file =
+            std::env::temp_dir().join(format!("atl-ime-layout-late-{}.log", std::process::id()));
+        std::fs::write(
+            &file,
+            "AtlWindow: layout label left=16 top=16 width=448 height=33\n",
+        )
+        .unwrap();
+        let writer = {
+            let file = file.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let mut app = std::fs::read_to_string(&file).unwrap();
+                app.push_str("AtlWindow: layout input left=16 top=97 width=448 height=46\n");
+                std::fs::write(&file, app).unwrap();
+            })
+        };
+        assert_eq!(await_layout_input(&file, Duration::from_secs(5)), Ok(()));
+        writer.join().unwrap();
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A layout line that never comes fails at the bound, with the message a red names (the 100 ms bound is the test's own).
+    #[test]
+    fn a_missing_layout_line_fails_at_the_bound() {
+        let file =
+            std::env::temp_dir().join(format!("atl-ime-layout-never-{}.log", std::process::id()));
+        std::fs::write(
+            &file,
+            "AtlWindow: layout label left=16 top=16 width=448 height=33\n",
+        )
+        .unwrap();
+        assert_eq!(
+            await_layout_input(&file, Duration::from_millis(100)),
+            Err("no layout line for input".to_owned())
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A fail-fast stop is reported under the step it names, and `activate` passes: the probe reached the edit only once the input method was active.
+    #[test]
+    fn a_fail_fast_stop_is_reported_under_its_step() {
+        let stop = "edit `commit` not confirmed: no `typed from code仮名` in the app log within 10s; edits: []";
+        let subs = checks("", "", &Err(stop.to_owned()), 10002);
+        let result = |label: &str| {
+            subs.iter()
+                .find(|s| s.0 == label)
+                .map(|s| s.1.clone())
+                .expect("a sub-gate with this label")
+        };
+        assert!(result("activate").is_ok());
+        assert_eq!(result("commit"), Err(stop.to_owned()));
+    }
+
+    /// The step a stop names, read back from the verdicts' own messages; a probe error that is not an edit's names none.
+    #[test]
+    fn a_stop_names_its_step() {
+        let verdict = text_verdict("delete", "typed from code仮", "").unwrap_err();
+        assert_eq!(stopped_step(&verdict), Some("delete"));
+        assert_eq!(
+            stopped_step(
+                "edit `preedit` not confirmed: 0 of 1 editor answers in the app log within 10s"
+            ),
+            Some("preedit")
+        );
+        assert_eq!(
+            stopped_step(
+                "the desktop input method was never activated (no startInput reached the window's TextInput?)"
+            ),
+            None
+        );
+        assert_eq!(stopped_step("no layout line for input"), None);
     }
 }
