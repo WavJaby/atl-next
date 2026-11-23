@@ -23,6 +23,7 @@ pub mod alarm_timer;
 pub mod am_handler;
 pub mod app_id;
 pub mod broadcast;
+pub mod broadcast_dispatch;
 pub mod config_diff;
 pub mod desktop_bounds;
 pub mod focus;

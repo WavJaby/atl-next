@@ -22,6 +22,11 @@ pub const RECEIVER_NOT_EXPORTED: i32 = 0x4;
 pub const USER_ALL: i32 = -1;
 /// Intent.FLAG_RECEIVER_REGISTERED_ONLY (Intent.java:7582): no manifest receiver is resolved (BroadcastController.java:1516).
 pub const FLAG_RECEIVER_REGISTERED_ONLY: i32 = 0x4000_0000;
+/// Intent.FLAG_RECEIVER_FOREGROUND, FLAG_RECEIVER_NO_ABORT, FLAG_RECEIVER_EXCLUDE_BACKGROUND, FLAG_RECEIVER_INCLUDE_BACKGROUND (Intent.java:7603, :7622, :7668, :7660).
+pub const FLAG_RECEIVER_FOREGROUND: i32 = 0x1000_0000;
+pub const FLAG_RECEIVER_NO_ABORT: i32 = 0x0800_0000;
+pub const FLAG_RECEIVER_EXCLUDE_BACKGROUND: i32 = 0x0080_0000;
+pub const FLAG_RECEIVER_INCLUDE_BACKGROUND: i32 = 0x0100_0000;
 /// ActivityManager.BROADCAST_STICKY_CANT_HAVE_PERMISSION.
 pub const BROADCAST_STICKY_CANT_HAVE_PERMISSION: i32 = -1;
 /// BroadcastController.DYNAMIC_RECEIVER_EXPLICIT_EXPORT_REQUIRED (:145-146): @EnabledSince(targetSdkVersion = UPSIDE_DOWN_CAKE), API 34.
@@ -588,6 +593,64 @@ pub fn skip_manifest(
         ));
     }
     None
+}
+
+/// The sysconfig allow list (`data/etc/framework-sysconfig.xml:22-44`): implicit broadcasts whose receivers may start their process from the background. BroadcastController.java:1101-1107 adds INCLUDE_BACKGROUND to such an intent when it is sent.
+pub const ALLOW_IMPLICIT_BROADCASTS: [&str; 23] = [
+    "android.intent.action.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED",
+    "android.intent.action.ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED",
+    "android.intent.action.DATA_SMS_RECEIVED",
+    "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+    "android.intent.action.PACKAGE_CHANGED",
+    "android.intent.action.SIM_STATE_CHANGED",
+    "android.media.action.CLOSE_AUDIO_EFFECT_CONTROL_SESSION",
+    "android.media.action.OPEN_AUDIO_EFFECT_CONTROL_SESSION",
+    "android.provider.Telephony.SECRET_CODE",
+    "android.provider.Telephony.SMS_CB_RECEIVED",
+    "android.provider.Telephony.SMS_DELIVER",
+    "android.provider.Telephony.SMS_RECEIVED",
+    "android.provider.Telephony.SMS_REJECTED",
+    "android.provider.Telephony.WAP_PUSH_DELIVER",
+    "android.provider.Telephony.WAP_PUSH_RECEIVED",
+    "android.telephony.action.CARRIER_CONFIG_CHANGED",
+    "android.telephony.action.DEFAULT_SMS_SUBSCRIPTION_CHANGED",
+    "android.telephony.action.DEFAULT_SUBSCRIPTION_CHANGED",
+    "android.telephony.action.MULTI_SIM_CONFIG_CHANGED",
+    "android.telephony.action.SECRET_CODE",
+    "android.telephony.action.SIM_APPLICATION_STATE_CHANGED",
+    "android.telephony.action.SIM_CARD_STATE_CHANGED",
+    "android.telephony.action.SIM_SLOT_STATUS_CHANGED",
+];
+
+/// BroadcastController.java:1101-1107: the sender adds INCLUDE_BACKGROUND for an allow-listed action.
+pub fn include_background_for(action: Option<&str>) -> bool {
+    action.is_some_and(|a| ALLOW_IMPLICIT_BROADCASTS.contains(&a))
+}
+
+/// BroadcastSkipPolicy.disallowBackgroundStart (:347-354). Consulted only when the manifest receiver's start mode is not NORMAL (:229-247), which the caller checks. `explicit` = component or package set; `signature_perms` = isSignaturePerm(requiredPermissions) (:680).
+pub fn disallow_background_start(flags: i32, explicit: bool, signature_perms: bool) -> bool {
+    flags & FLAG_RECEIVER_EXCLUDE_BACKGROUND != 0
+        || (!explicit && flags & FLAG_RECEIVER_INCLUDE_BACKGROUND == 0 && !signature_perms)
+}
+
+/// Intent.ACTION_PACKAGE_ADDED, ACTION_PACKAGE_RESTARTED, ACTION_PACKAGE_DATA_CLEARED (BroadcastController.java:1579-1581).
+const PACKAGE_OWN_RECEIVERS_EXCLUDED: [&str; 3] = [
+    "android.intent.action.PACKAGE_ADDED",
+    "android.intent.action.PACKAGE_RESTARTED",
+    "android.intent.action.PACKAGE_DATA_CLEARED",
+];
+
+/// BroadcastController.java:1578-1603: these actions do not reach the manifest receivers of the package their data names. `ssp` = the data's scheme-specific part; the caller applies it to manifest receivers only.
+pub fn skips_own_package(action: Option<&str>, ssp: Option<&str>, package: &str) -> bool {
+    action.is_some_and(|a| PACKAGE_OWN_RECEIVERS_EXCLUDED.contains(&a)) && ssp == Some(package)
+}
+
+/// Build.VERSION_CODES.CUR_DEVELOPMENT (Build.java:558): the default maximum manifest receiver API level (BroadcastOptions.java:60).
+pub const CUR_DEVELOPMENT: i32 = 10_000;
+
+/// BroadcastSkipPolicy.shouldSkipMessage:105-109: a manifest receiver whose targetSdk is outside the options' [min, max] is skipped. Defaults: min 0, max CUR_DEVELOPMENT (BroadcastOptions.java:59-60).
+pub fn manifest_target_in_range(target_sdk: i32, min: i32, max: i32) -> bool {
+    (min..=max).contains(&target_sdk)
 }
 
 /// The broadcast state: registrations, stickies by user then action, and per-process FIFOs of jobs for processes that have not attached.
@@ -1329,5 +1392,90 @@ mod tests {
         b.push_pending(300, "y");
         assert_eq!(b.take_pending(300), ["x", "y"]);
         assert!(b.take_pending(300).is_empty());
+    }
+
+    #[test]
+    fn receiver_flags_have_aosp_values() {
+        // Intent.java:7603, :7622, :7668, :7660
+        assert_eq!(FLAG_RECEIVER_FOREGROUND, 0x1000_0000);
+        assert_eq!(FLAG_RECEIVER_NO_ABORT, 0x0800_0000);
+        assert_eq!(FLAG_RECEIVER_EXCLUDE_BACKGROUND, 0x0080_0000);
+        assert_eq!(FLAG_RECEIVER_INCLUDE_BACKGROUND, 0x0100_0000);
+    }
+
+    #[test]
+    fn implicit_intents_disallow_background_start_unless_included() {
+        // BroadcastSkipPolicy.java:347-354: EXCLUDE_BACKGROUND always; else an implicit intent (no component, no package) needs INCLUDE_BACKGROUND or a signature-only permission
+        assert!(disallow_background_start(0, false, false));
+        assert!(disallow_background_start(
+            FLAG_RECEIVER_EXCLUDE_BACKGROUND,
+            true,
+            false
+        ));
+        assert!(disallow_background_start(
+            FLAG_RECEIVER_EXCLUDE_BACKGROUND | FLAG_RECEIVER_INCLUDE_BACKGROUND,
+            false,
+            false
+        ));
+        assert!(!disallow_background_start(
+            FLAG_RECEIVER_INCLUDE_BACKGROUND,
+            false,
+            false
+        ));
+        assert!(!disallow_background_start(0, false, true));
+        // an explicit intent (component or package) is never implicit
+        assert!(!disallow_background_start(0, true, false));
+    }
+
+    #[test]
+    fn sysconfig_allow_list_adds_include_background() {
+        // framework-sysconfig.xml:22 first entry, :26 PACKAGE_CHANGED, :44 last entry
+        assert_eq!(ALLOW_IMPLICIT_BROADCASTS.len(), 23);
+        assert!(include_background_for(Some(
+            "android.intent.action.PACKAGE_CHANGED"
+        )));
+        assert!(include_background_for(Some(
+            "android.telephony.action.SIM_SLOT_STATUS_CHANGED"
+        )));
+        assert!(!include_background_for(Some(
+            "android.intent.action.BATTERY_LOW"
+        )));
+        assert!(!include_background_for(None));
+    }
+
+    #[test]
+    fn package_broadcasts_skip_their_own_manifest_receivers() {
+        // BroadcastController.java:1579-1581 (ADDED, RESTARTED, DATA_CLEARED), :1583-1587 (the data's package)
+        let added = Some("android.intent.action.PACKAGE_ADDED");
+        assert!(skips_own_package(added, Some("p.a"), "p.a"));
+        assert!(skips_own_package(
+            Some("android.intent.action.PACKAGE_RESTARTED"),
+            Some("p.a"),
+            "p.a"
+        ));
+        assert!(skips_own_package(
+            Some("android.intent.action.PACKAGE_DATA_CLEARED"),
+            Some("p.a"),
+            "p.a"
+        ));
+        assert!(!skips_own_package(added, Some("p.b"), "p.a"));
+        assert!(!skips_own_package(added, None, "p.a"));
+        // PACKAGE_REPLACED is not in the list
+        assert!(!skips_own_package(
+            Some("android.intent.action.PACKAGE_REPLACED"),
+            Some("p.a"),
+            "p.a"
+        ));
+    }
+
+    #[test]
+    fn manifest_target_sdk_must_be_in_the_option_range() {
+        // BroadcastOptions.java:59-60 defaults 0 and CUR_DEVELOPMENT (Build.java:558 = 10000); BroadcastSkipPolicy.java:105-109
+        assert_eq!(CUR_DEVELOPMENT, 10_000);
+        assert!(manifest_target_in_range(25, 0, CUR_DEVELOPMENT));
+        // CONNECTIVITY_ACTION maxManifestReceiverApiLevel M = 23 (ConnectivityService.java:4075)
+        assert!(manifest_target_in_range(23, 0, 23));
+        assert!(!manifest_target_in_range(24, 0, 23));
+        assert!(!manifest_target_in_range(25, 30, CUR_DEVELOPMENT));
     }
 }
