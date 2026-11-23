@@ -812,7 +812,9 @@ struct Line {
 /// alarm: Main.alarms: both AlarmManager delivery kinds fire once: the RTC_WAKEUP PendingIntent broadcast reaches the registered receiver, and the ELAPSED_REALTIME OnAlarmListener's onAlarm runs (alarm.rs, pending_intent.rs).
 /// startservice, stopservice, stopself: Main.started's chain of AtlStarted (active_services.rs, service_records.rs: the start, stopService, stopSelf). START's onStartCommand (startId 1);
 /// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. The STICKY restart and the NOT_STICKY process are judged by [`StickyCase`], from their own processes' logs.
-const LOG_LINES: [Line; 32] = [
+/// fgsnotype: Main.foregroundStarts' AtlFgsNoType (targetSdk 36, no foregroundServiceType, main process): startForeground without a type throws `Starting FGS without a type` (AS :2883-2886); the line carries the message's start.
+/// The `fgs` and `fgstimeout` rows are [`ForegroundCase`]'s, from their own processes' logs.
+const LOG_LINES: [Line; 33] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -879,6 +881,12 @@ const LOG_LINES: [Line; 32] = [
         row: "stopself",
         prefix: "AtlTest: stopself: ",
         want: Want::Exact("onDestroy after stopSelf startId=1"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "fgsnotype",
+        prefix: "AtlTest: fgsnotype: ",
+        want: Want::Prefix("Starting FGS without a type"),
         timing: Timing::Async,
     },
     Line {
@@ -1225,10 +1233,12 @@ fn awaited_logged(log: &str) -> (usize, usize) {
         })
 }
 
-/// Whether the watch after the marker goes on: always within WINDOW_MS (a crash shows there), then while an awaited line is missing and the last progress (an awaited line arriving, or the watch's
-/// start) is less than [`RESULT_STALL`] ago.
-fn watch_on(since_watch: Duration, since_progress: Duration, missing: bool) -> bool {
-    since_watch < Duration::from_millis(WINDOW_MS) || (missing && since_progress < RESULT_STALL)
+/// Whether the watch after the marker goes on: always within WINDOW_MS (a crash shows there), then while an awaited line is missing and the last progress (an awaited line arriving, or the
+/// watch's start) is less than [`RESULT_STALL`] ago. `timed`: a [`ForegroundCase`] timer runs (the 30 s start timeout, then the ANR's delay): no step comes in between, so the watch waits it out.
+fn watch_on(since_watch: Duration, since_progress: Duration, missing: bool, timed: bool) -> bool {
+    since_watch < Duration::from_millis(WINDOW_MS)
+        || timed
+        || (missing && since_progress < RESULT_STALL)
 }
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
@@ -2450,6 +2460,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 no_marker: format!("no {MARKER:?} line (atld rc {rc})"),
                 local: None,
                 sticky: &StickyCase::default(),
+                foreground: &ForegroundCase::default(),
                 desktop: None,
             })?;
             println!("remote test app: transcript {}", log.display());
@@ -2503,19 +2514,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     // or RESULT_STALL passes with no new one ([`watch_on`]); the app's death ends the watch, atld outlives it
     let mut ended = ended;
     let mut sticky = StickyCase::default();
+    let mut foreground = ForegroundCase::default();
     if passed && ended.is_none() {
         let watch = Instant::now();
         let (mut seen, mut progress) = (0, watch);
         while ended.is_none() {
+            let now = sticky_wall_ms();
             sticky.poll(&run, &m.name);
+            foreground.poll(&run, &m.name, now);
+            let steps = sticky.steps() + foreground.steps();
             let (got, all) = awaited_logged(&read(&app_log));
-            if got + sticky.steps() > seen {
-                (seen, progress) = (got + sticky.steps(), Instant::now());
+            if got + steps > seen {
+                (seen, progress) = (got + steps, Instant::now());
             }
             if !watch_on(
                 watch.elapsed(),
                 progress.elapsed(),
-                got < all || !sticky.finished(sticky_wall_ms()),
+                got < all || !sticky.finished(now) || !foreground.finished(now),
+                foreground.timer_running(now),
             ) {
                 break;
             }
@@ -2554,6 +2570,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         no_marker,
         local: Some(outside),
         sticky: &sticky,
+        foreground: &foreground,
         desktop: Some(fake.calls()),
     })
 }
@@ -2770,11 +2787,322 @@ mod sticky_case_tests {
     }
 }
 
+/// The `:fgs` process of the `fgs` row (AtlFgs, dataSync) and the `:fgstimeout` process of the `fgstimeout` row (AtlFgsSilent, never startForeground): each its own process,
+/// so its log is `log/<pkg><proc>.log`.
+const FGS_PROC: &str = ":fgs";
+const FGS_TIMEOUT_PROC: &str = ":fgstimeout";
+/// AtlFgs's startForeground returned (logged after the call).
+const FGS_STARTED: &str = "AtlTest: fgs: startForeground ok";
+/// AtlFgsSilent's onStartCommand (the delivered start arms the timer, ActiveServices :6199-6204) and onDestroy (the timeout's stop, ActiveServices :7628).
+const FGS_TIMEOUT_START: &str = "AtlTest: fgstimeout: onStartCommand";
+const FGS_TIMEOUT_STOP: &str = "AtlTest: fgstimeout: onDestroy";
+/// The services' counters the rows prove: the foreground state ends with its process (ActiveServices, uid FGS reason drops); the ANR ends a headless process (AS :7640).
+const FGS_ENDED: &str = "IActivityManager.foreground service ended: uid FGS reason drops";
+const FGS_ANR_KILLED: &str =
+    "IActivityManager.fgs start timeout: headless process ended (silent bg ANR)";
+/// ActivityManagerConstants.java:318 DEFAULT_SERVICE_START_FOREGROUND_TIMEOUT_MS: a started service must call startForeground within this long, else it is stopped (AS :7597).
+const FGS_START_TIMEOUT_MS: u64 = 30_000;
+/// ActivityManagerConstants.java:320 DEFAULT_SERVICE_START_FOREGROUND_ANR_DELAY_MS: the ANR follows the stop this long later (AS :7640), and a headless process ends then.
+const FGS_ANR_DELAY_MS: u64 = 10_000;
+/// The stamps' latency (dispatch, logcat), as STICKY_SLACK_MS.
+const FGS_SLACK_MS: u64 = 1_000;
+/// Sampled this long after the stop, well before the ANR: alive here shows the ANR, not something earlier, is what ends the process.
+const FGS_ALIVE_AFTER_STOP_MS: u64 = 5_000;
+
+/// The FGS rows' state: [`ForegroundCase::poll`] in the watch after the marker, [`ForegroundCase::verdicts`] in the judge. `fgs`: the gate kills `:fgs` once its startForeground is logged,
+/// and the foreground state must end with the process. `fgstimeout`: AtlFgsSilent is left alone; it is stopped 30 s after its start and the headless process ends 10 s after that.
+#[derive(Default)]
+struct ForegroundCase {
+    /// the `:fgs` kill: wall ms when it was sent
+    fgs_killed: Option<u64>,
+    /// the first kill that failed (no pid, or the signal), as the reason
+    kill_failed: Option<String>,
+    /// `:fgstimeout`: onStartCommand's stamp, its host pid (atld's newest `started` line), onDestroy's stamp (wall ms)
+    timeout_start: Option<u64>,
+    timeout_pid: Option<i32>,
+    timeout_stop: Option<u64>,
+    /// the process's state sampled at stop + FGS_ALIVE_AFTER_STOP_MS, and at the ANR's end (stop + FGS_ANR_DELAY_MS + FGS_SLACK_MS): true = gone
+    alive_after_stop: Option<bool>,
+    gone_after_anr: Option<bool>,
+}
+
+impl ForegroundCase {
+    /// Progress steps for the watch: the kill, each stamp, each sample.
+    fn steps(&self) -> usize {
+        [
+            self.fgs_killed.is_some(),
+            self.timeout_start.is_some(),
+            self.timeout_stop.is_some(),
+            self.alive_after_stop.is_some(),
+            self.gone_after_anr.is_some(),
+        ]
+        .into_iter()
+        .filter(|&set| set)
+        .count()
+    }
+
+    /// The latest wall ms the `fgstimeout` case can end at, from its start: the timeout's upper bound, the ANR delay, and the slacks of the stop and of the sample.
+    fn timeout_window_end(start: u64) -> u64 {
+        start + FGS_START_TIMEOUT_MS + FGS_SLACK_MS + FGS_ANR_DELAY_MS + FGS_SLACK_MS + FGS_SLACK_MS
+    }
+
+    /// Whether the `fgstimeout` case has run its course at `now` (wall ms): its ANR's end sampled, or its window run out (the verdict then names what is missing).
+    fn timeout_done(&self, now: u64) -> bool {
+        self.gone_after_anr.is_some()
+            || self
+                .timeout_start
+                .is_some_and(|s| now >= Self::timeout_window_end(s))
+    }
+
+    /// Whether the `fgstimeout` timer runs at `now`: the watch waits it out ([`watch_on`] `timed`), since no progress step comes between the start and the stop.
+    fn timer_running(&self, now: u64) -> bool {
+        self.timeout_start.is_some() && !self.timeout_done(now)
+    }
+
+    /// Whether both rows have run their course at `now`: the `fgs` kill has settled (its counter is written at the death), and `fgstimeout` is done.
+    fn finished(&self, now: u64) -> bool {
+        self.fgs_killed.is_some_and(|at| now >= at + FGS_SLACK_MS) && self.timeout_done(now)
+    }
+
+    /// One watch step: kills `:fgs` once its startForeground is logged; records `:fgstimeout`'s stamps, then the process's state at the two marks (`now`: wall ms).
+    fn poll(&mut self, run: &Run, package: &str, now: u64) {
+        let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
+        let pid_of = |proc: &str| {
+            last_started_pid(&atl_diag::logfiles::read(&run.atld_log()), package, proc)
+        };
+        if self.fgs_killed.is_none() && log(FGS_PROC).contains(FGS_STARTED) {
+            self.fgs_killed = Some(now);
+            let end = pid_of(FGS_PROC)
+                .ok_or_else(|| format!("no `started` line for {package}{FGS_PROC} in atld's log"))
+                .and_then(|pid| {
+                    kill_pid(pid).map_err(|e| format!("killing {package}{FGS_PROC} pid {pid}: {e}"))
+                });
+            if let Err(e) = end {
+                self.kill_failed.get_or_insert(e);
+            }
+        }
+        let timeout = log(FGS_TIMEOUT_PROC);
+        if self.timeout_start.is_none()
+            && let Some(start) = timeout
+                .lines()
+                .find(|l| l.contains(FGS_TIMEOUT_START))
+                .and_then(stamp_ms)
+        {
+            self.timeout_start = Some(start);
+            self.timeout_pid = pid_of(FGS_TIMEOUT_PROC);
+        }
+        if self.timeout_stop.is_none() {
+            self.timeout_stop = timeout
+                .lines()
+                .find(|l| l.contains(FGS_TIMEOUT_STOP))
+                .and_then(stamp_ms);
+        }
+        let (Some(stop), Some(pid)) = (self.timeout_stop, self.timeout_pid) else {
+            return;
+        };
+        if self.alive_after_stop.is_none() && now >= stop + FGS_ALIVE_AFTER_STOP_MS {
+            self.alive_after_stop = Some(process_alive(pid));
+        }
+        if self.gone_after_anr.is_none() && now >= stop + FGS_ANR_DELAY_MS + FGS_SLACK_MS {
+            self.gone_after_anr = Some(!process_alive(pid));
+        }
+    }
+
+    /// One result per row: the pass line, or the reason it failed. `services` is atld's services log: the counters are written at its orderly exit, after the judged run.
+    fn verdicts(&self, services: &str) -> [Result<String, String>; 2] {
+        [self.fgs_verdict(services), self.timeout_verdict(services)]
+    }
+
+    fn fgs_verdict(&self, services: &str) -> Result<String, String> {
+        if let Some(e) = &self.kill_failed {
+            return Err(format!("fgs: {e}"));
+        }
+        if self.fgs_killed.is_none() {
+            return Err(format!(
+                "fgs: no {FGS_STARTED:?} line in log/<pkg>{FGS_PROC}.log (AtlFgs)"
+            ));
+        }
+        let ended = answered_count(services, FGS_ENDED);
+        if ended == 0 {
+            return Err(format!(
+                "fgs: the kill of {FGS_PROC} left no foreground state ended: no {FGS_ENDED:?} count"
+            ));
+        }
+        Ok(format!(
+            "fgs: startForeground ok; the kill ended the foreground state (x{ended})"
+        ))
+    }
+
+    fn timeout_verdict(&self, services: &str) -> Result<String, String> {
+        let (Some(start), Some(stop)) = (self.timeout_start, self.timeout_stop) else {
+            return Err(format!(
+                "fgstimeout: no {FGS_TIMEOUT_START:?} and {FGS_TIMEOUT_STOP:?} lines (AtlFgsSilent)"
+            ));
+        };
+        // the timer is armed at the start's delivery, before onStartCommand logs its stamp (AS :6199-6204): the stop can fall a little before 30 s after the stamp
+        let stopped_after = stop.saturating_sub(start);
+        let (lo, hi) = (
+            FGS_START_TIMEOUT_MS - FGS_SLACK_MS,
+            FGS_START_TIMEOUT_MS + FGS_SLACK_MS,
+        );
+        if !(lo..=hi).contains(&stopped_after) {
+            return Err(format!(
+                "fgstimeout: stopped {stopped_after} ms after its start, want {lo}..={hi} ms (ActivityManagerConstants :318)"
+            ));
+        }
+        if self.timeout_pid.is_none() {
+            return Err(format!(
+                "fgstimeout: no `started` line for {FGS_TIMEOUT_PROC} in atld's log"
+            ));
+        }
+        if self.alive_after_stop != Some(true) {
+            return Err(format!(
+                "fgstimeout: alive {FGS_ALIVE_AFTER_STOP_MS} ms after its stop = {:?}, want Some(true): something ended it before the ANR",
+                self.alive_after_stop
+            ));
+        }
+        if self.gone_after_anr != Some(true) {
+            return Err(format!(
+                "fgstimeout: gone {} ms after its stop = {:?}, want Some(true): the silent bg ANR did not end it",
+                FGS_ANR_DELAY_MS + FGS_SLACK_MS,
+                self.gone_after_anr
+            ));
+        }
+        let killed = answered_count(services, FGS_ANR_KILLED);
+        if killed == 0 {
+            return Err(format!("fgstimeout: no {FGS_ANR_KILLED:?} count"));
+        }
+        Ok(format!(
+            "fgstimeout: stopped {stopped_after} ms after its start (want {lo}..={hi}); alive at +{FGS_ALIVE_AFTER_STOP_MS} ms; ended by the ANR (x{killed})"
+        ))
+    }
+}
+
+/// The total of an `answered` key in atld's services log (`diag: total`, written at its orderly exit); 0 when absent.
+fn answered_count(services: &str, key: &str) -> u64 {
+    counters(services)
+        .iter()
+        .find(|c| c.outcome == "answered" && c.api == key)
+        .map_or(0, |c| c.count)
+}
+
+/// Whether host pid `pid` still runs: `/proc/<pid>/stat` is there and its state is not a zombie (Z) or dead (X), since the parent may not have reaped it yet.
+fn process_alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit(')')
+            .next()
+            .and_then(|rest| rest.trim_start().chars().next())
+            .is_some_and(|state| !matches!(state, 'Z' | 'X'))
+    })
+}
+
+#[cfg(test)]
+mod foreground_case_tests {
+    use super::*;
+
+    /// atld's services log with the two counters' totals.
+    fn services(fgs_ended: u64, anr_killed: u64) -> String {
+        format!(
+            "diag: total answered IActivityManager.foreground service ended: uid FGS reason drops {fgs_ended} first=1793747150.000\n\
+             diag: total answered IActivityManager.fgs start timeout: headless process ended (silent bg ANR) {anr_killed} first=1793747180.000\n"
+        )
+    }
+
+    /// The case as the rows log it: `:fgs` killed at 5 000 ms; `:fgstimeout` started at 10 000 ms, stopped 30 s later (AMC :318), alive 5 s after that and gone at the ANR's end.
+    fn passing() -> ForegroundCase {
+        ForegroundCase {
+            fgs_killed: Some(5_000),
+            kill_failed: None,
+            timeout_start: Some(10_000),
+            timeout_pid: Some(77),
+            timeout_stop: Some(10_000 + 30_000),
+            alive_after_stop: Some(true),
+            gone_after_anr: Some(true),
+        }
+    }
+
+    #[test]
+    fn a_case_as_logged_passes_both_rows() {
+        let verdicts = passing().verdicts(&services(1, 1));
+        assert!(verdicts.iter().all(Result::is_ok), "{verdicts:?}");
+    }
+
+    /// The stop is judged within one slack either side of AOSP's 30 s (ActivityManagerConstants :318): both edges pass, a millisecond past either fails.
+    #[test]
+    fn the_stop_must_come_30_s_after_the_start() {
+        let stopped = |after: u64| ForegroundCase {
+            timeout_stop: Some(10_000 + after),
+            ..passing()
+        };
+        assert!(stopped(30_000).timeout_verdict(&services(1, 1)).is_ok());
+        assert!(stopped(29_000).timeout_verdict(&services(1, 1)).is_ok());
+        assert!(stopped(31_000).timeout_verdict(&services(1, 1)).is_ok());
+        assert!(stopped(31_001).timeout_verdict(&services(1, 1)).is_err());
+        assert!(stopped(28_999).timeout_verdict(&services(1, 1)).is_err());
+    }
+
+    /// The process must run past the ANR's start and end when the ANR is what ends it: alive at +5 s, gone at +11 s (AMC :320 + one slack).
+    #[test]
+    fn the_process_is_alive_before_the_anr_and_gone_after_it() {
+        let alive_at_5 = ForegroundCase {
+            alive_after_stop: Some(false),
+            ..passing()
+        };
+        assert!(
+            alive_at_5
+                .timeout_verdict(&services(1, 1))
+                .unwrap_err()
+                .contains("before the ANR")
+        );
+        let still_there = ForegroundCase {
+            gone_after_anr: Some(false),
+            ..passing()
+        };
+        assert!(
+            still_there
+                .timeout_verdict(&services(1, 1))
+                .unwrap_err()
+                .contains("silent bg ANR")
+        );
+    }
+
+    #[test]
+    fn the_anr_count_and_the_foreground_end_count_must_be_seen() {
+        assert!(
+            passing()
+                .timeout_verdict(&services(1, 0))
+                .unwrap_err()
+                .contains("silent bg ANR")
+        );
+        assert!(
+            passing()
+                .fgs_verdict(&services(0, 1))
+                .unwrap_err()
+                .contains("foreground state ended")
+        );
+        assert!(passing().fgs_verdict(&services(1, 0)).is_ok());
+    }
+
+    /// The timer runs from the start to the window's end (30 s + 1 s, the ANR's 10 s, two 1 s slacks = 43 s), and the watch waits it out.
+    #[test]
+    fn the_timer_runs_until_its_window_ends() {
+        let timed = ForegroundCase {
+            timeout_start: Some(10_000),
+            ..ForegroundCase::default()
+        };
+        assert!(timed.timer_running(10_000 + 42_999));
+        assert!(!timed.timer_running(10_000 + 43_000));
+        assert!(!ForegroundCase::default().timer_running(10_000));
+    }
+}
+
 /// What [`judge`] reads besides the run's logs.
 struct AppJudge<'a> {
     run: &'a Run,
     /// the STICKY case's state (polled by the watch; judged here)
     sticky: &'a StickyCase,
+    /// the FGS rows' state (polled by the watch; judged here)
+    foreground: &'a ForegroundCase,
     app_name: &'a str,
     verbose: bool,
     libs: &'a [PathBuf],
@@ -2822,6 +3150,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     let AppJudge {
         run,
         sticky,
+        foreground,
         app_name,
         verbose,
         libs,
@@ -2890,6 +3219,13 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
         match sticky.verdict(&atld_log, app_name) {
             Ok(pass) => println!("app: pass {pass}"),
             Err(why) => whys.push(why),
+        }
+        // the FGS rows (ForegroundCase) run in the same watch, from their own processes' logs
+        for verdict in foreground.verdicts(&services_log) {
+            match verdict {
+                Ok(pass) => println!("app: pass {pass}"),
+                Err(why) => whys.push(why),
+            }
         }
     }
     if !remote {
@@ -4115,15 +4451,18 @@ mod tests {
         let s = Duration::from_secs;
         let window = Duration::from_millis(WINDOW_MS);
         // a crash window is always watched, even with nothing missing
-        assert!(watch_on(window / 2, window / 2, false));
+        assert!(watch_on(window / 2, window / 2, false, false));
         // after it: everything logged -> done
-        assert!(!watch_on(window + s(1), s(0), false));
+        assert!(!watch_on(window + s(1), s(0), false, false));
         // a missing line with recent progress -> on
-        assert!(watch_on(window + s(1), RESULT_STALL / 2, true));
+        assert!(watch_on(window + s(1), RESULT_STALL / 2, true, false));
         // no progress for RESULT_STALL -> off
-        assert!(!watch_on(window + s(1), RESULT_STALL, true));
+        assert!(!watch_on(window + s(1), RESULT_STALL, true, false));
         // the flags-* case: a chain past the old whole-chain budget (30 s since the watch) still advancing 8 s ago -> on
-        assert!(watch_on(RESULT_STALL * 3, s(8), true));
+        assert!(watch_on(RESULT_STALL * 3, s(8), true, false));
+        // a timer running (fgstimeout's 30 s start timeout) with no step for RESULT_STALL -> on; its end (not timed) -> off
+        assert!(watch_on(RESULT_STALL * 2, RESULT_STALL, true, true));
+        assert!(!watch_on(RESULT_STALL * 2, RESULT_STALL, true, false));
     }
 
     #[test]

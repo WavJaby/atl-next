@@ -204,6 +204,13 @@ mod tests {
         );
     }
 
+    /// S7: the flag a foreground service's notification carries (ActiveServices :2626; NMS fixNotification :8664-8681 keeps only it) is resident on its own.
+    #[test]
+    fn foreground_service_flag_alone_is_resident() {
+        let n = notification(&[], FLAG_FOREGROUND_SERVICE);
+        assert!(content(&n, &channel(3), false).0.resident);
+    }
+
     /// N4 onlyAlertOnce: silent on an update only.
     #[test]
     fn only_alert_once_silences_updates() {

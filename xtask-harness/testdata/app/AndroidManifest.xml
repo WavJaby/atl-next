@@ -14,6 +14,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- the power line (app.rs SERVICE_LINES): BinderService.acquireWakeLock / releaseWakeLock enforce it -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- the foreground-service line (app.rs FGS rows): startForeground needs FOREGROUND_SERVICE (targetSdk >= 28, ActiveServices :2197-2198) and the dataSync type's FOREGROUND_SERVICE_DATA_SYNC (targetSdk >= 34) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application android:label="ATL test">
         <activity android:name=".Main" android:exported="true" android:launchMode="singleTop">
@@ -53,5 +56,9 @@
         <!-- Main.stickyStart's services (app.rs STICKY case): each in its own process, whose log the gate reads as log/<pkg>:<process>.log -->
         <service android:name=".AtlSticky" android:process=":sticky" android:exported="false" />
         <service android:name=".AtlNotSticky" android:process=":notsticky" android:exported="false" />
+        <!-- Main.foregroundStarts' services (app.rs FGS rows): AtlFgs declares dataSync (`:fgs`); AtlFgsNoType declares no type (main process); AtlFgsSilent never calls startForeground (`:fgstimeout`) -->
+        <service android:name=".AtlFgs" android:process=":fgs" android:foregroundServiceType="dataSync" android:exported="false" />
+        <service android:name=".AtlFgsNoType" android:exported="false" />
+        <service android:name=".AtlFgsSilent" android:process=":fgstimeout" android:exported="false" />
     </application>
 </manifest>

@@ -725,6 +725,7 @@ public class Main extends Activity {
         Log.i("AtlTest", "processes: " + processes());
         started();
         stickyStart();
+        foregroundStarts();
         Log.i("AtlTest", "sysanswers: " + sysAnswers());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
@@ -1517,6 +1518,13 @@ public class Main extends Activity {
     private void stickyStart() {
         startService(new Intent(this, AtlSticky.class).setAction("atl.test.STICKY"));
         startService(new Intent(this, AtlNotSticky.class).setAction("atl.test.NOTSTICKY"));
+    }
+
+    /** Main.foregroundStarts: starts AtlFgs (dataSync, `:fgs`), AtlFgsNoType (no type, main process) and AtlFgsSilent (never startForeground, `:fgstimeout`); app.rs's FGS rows read what follows. */
+    private void foregroundStarts() {
+        startForegroundService(new Intent(this, AtlFgs.class));
+        startForegroundService(new Intent(this, AtlFgsNoType.class));
+        startForegroundService(new Intent(this, AtlFgsSilent.class));
     }
 
     private String jobs() {

@@ -3658,12 +3658,17 @@ mod tests {
     }
 
     fn no_app_manager() -> ActivityManager {
+        manager_with(Arc::new(NoProcesses))
+    }
+
+    /// An empty manager whose processes go through `control`.
+    fn manager_with(control: Arc<dyn ProcessControl>) -> ActivityManager {
         let packages = Arc::new(Packages::new(Vec::new(), Default::default()));
         let permissions = Arc::new(Permissions::new(&packages, &[]));
         ActivityManager::new(
             packages,
             permissions,
-            Arc::new(NoProcesses),
+            control,
             Arc::new(Tasks::new(DisplayModel::default(), None)),
             Arc::new(UiAgents::default()),
             true,
@@ -3751,6 +3756,54 @@ mod tests {
             .map(|r| r.start_seq)
             .collect();
         assert_eq!(seqs, [2]);
+    }
+
+    /// The startForeground timeout's ANR by the process's state (`foreground_anr`, AS :7640): a windowed process is only counted (no ANR dialog), a process that ended
+    /// first is counted, a headless one is killed. The row fgstimeout proves the headless kill end to end; this pins the other two counters.
+    #[test]
+    fn fgs_timeout_anr_by_process_state() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = manager_with(control.clone());
+        let record = |pid: i32, task: Option<TaskId>| ProcessRecord {
+            package: "p".into(),
+            process_name: "p:fgs".into(),
+            uid: 10_001,
+            start_seq: 1,
+            pid,
+            attached: None,
+            launch_activity: false,
+            task,
+            instr: None,
+            attach_finished: false,
+            touched: 0,
+            kill_reason: None,
+        };
+        am.inner
+            .state()
+            .processes
+            .push(record(41, TaskId::from_raw(7)));
+        am.inner.state().processes.push(record(43, None));
+        let counted = |api: &str| {
+            atl_diag::counts()
+                .into_iter()
+                .find(|(o, a, _)| o == "answered" && a == api)
+                .map_or(0, |(_, _, n)| n)
+        };
+        let windowed = "IActivityManager.fgs start timeout: ANR not modelled";
+        let ended = "IActivityManager.fgs start timeout: process ended before the ANR";
+        let headless = "IActivityManager.fgs start timeout: headless process ended (silent bg ANR)";
+        let before = (counted(windowed), counted(ended), counted(headless));
+        am.inner.foreground_anr(41);
+        am.inner.foreground_anr(42);
+        am.inner.foreground_anr(43);
+        assert_eq!(counted(windowed) - before.0, 1, "windowed: counted");
+        assert_eq!(counted(ended) - before.1, 1, "no such process: counted");
+        assert_eq!(counted(headless) - before.2, 1, "headless: counted");
+        assert_eq!(
+            *control.kills.lock().expect("kills"),
+            [43],
+            "only the headless process is killed"
+        );
     }
 
     /// Records the process starts, in order, and the kills a test makes.
