@@ -28,8 +28,8 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong
 
 use crate::activity::ActivityManager;
 use crate::activity::log;
-use crate::bound_services::BIND_AUTO_CREATE;
 use crate::packages::{Packages, Permissions};
+use crate::service_records::BIND_AUTO_CREATE;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IJobScheduler";

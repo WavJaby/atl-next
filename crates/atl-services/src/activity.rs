@@ -489,7 +489,7 @@ struct State {
     shared_memory: Option<ApplicationSharedMemory>,
     /// BroadcastController's registrations and stickies, and the deliveries waiting for a process to attach
     broadcasts: Broadcasts<ReceiverHandle, Intent, Job>,
-    /// ActiveServices' bound services (bound_services.rs)
+    /// ActiveServices' service records (service_records.rs)
     services: active_services::Services,
     /// ProviderMap: the providers asked for, starting or published
     providers: Vec<ProviderRecord>,
@@ -2369,7 +2369,7 @@ impl IActivityManager for ActivityManager {
     }
 
     /// ActivityManagerService.bindServiceInstance -> ActiveServices.bindServiceLocked: the caller must be an attached app (SecurityException "Unable to find app for caller"), then the lookup,
-    /// checkComponentPermission and the binding rules (active_services.rs, bound_services.rs). ContextImpl turns -1 into SecurityException and 0 into a false bindService.
+    /// checkComponentPermission and the binding rules (active_services.rs, service_records.rs). ContextImpl turns -1 into SecurityException and 0 into a false bindService.
     fn r#bindServiceInstance(
         &self,
         caller: Option<&Strong<dyn IApplicationThread>>,

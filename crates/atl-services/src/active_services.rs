@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/ActiveServices.java
 //! The activity service's bound services (a child module of activity.rs, so it shares its state lock): the binder half of bindServiceLocked / retrieveServiceLocked (lookup + checkComponentPermission),
-//! publishService, unbindService, unbindFinished, and the sender of the calls bound_services.rs returns. The rules themselves are bound_services.rs.
+//! publishService, unbindService, unbindFinished, and the sender of the calls service_records.rs returns. The rules themselves are service_records.rs.
 //! Calls leave on one thread in the order the state lock produced them (broadcast_queue.rs's reason: no call out of the system process with the lock held; in-process connections, the job runner's,
 //! run their `connected` there too, so they may call back into the services).
 //! Implicit service Intents resolve as retrieveServiceLocked's resolveService does (resolve_implicit: the first of package::query_intent_services, STOCK_PM_FLAGS); no match answers 0, counted. Not modelled: AOSP's MATCH_DEBUG_TRIAGED_MISSING (ActiveServices.java:4877), instanceName (ignored, counted), bindings across users.
@@ -18,14 +18,20 @@ use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
 use super::{AM, Inner, State, intent_key, log};
-use crate::bound_services::{self, Bind, Call, Host, Kinds};
 use crate::package;
+use crate::service_records::{self, Bind, Call, Host, Kinds};
 use atl_services_types::permission::{self, ROOT_UID, SYSTEM_UID};
 
 /// ActivityManager.PROCESS_STATE_UNKNOWN: the processState the scheduled calls carry (process states are not tracked).
 const PROCESS_STATE_UNKNOWN: i32 = -1;
 /// The client pid of a binding the services make for themselves (the job runner): no process record, never dies.
 pub(crate) const SYSTEM_CLIENT: i32 = -1;
+
+/// SystemClock.uptimeMillis (CLOCK_MONOTONIC): the time base of the service rules.
+fn uptime_ms() -> i64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec * 1_000 + t.tv_nsec / 1_000_000
+}
 
 /// The binder handles of the rules.
 pub(crate) struct Svc;
@@ -39,7 +45,7 @@ impl Kinds for Svc {
     type Info = ServiceInfo;
 }
 
-pub(crate) type Services = bound_services::Services<Svc>;
+pub(crate) type Services = service_records::Services<Svc>;
 
 /// An IServiceConnection, equal when the binder is.
 #[derive(Clone)]
@@ -127,6 +133,10 @@ fn send(call: Call<Svc>) {
             "scheduleStopService",
             thread.r#scheduleStopService(Some(&token)),
         ),
+        Call::Args { .. } => {
+            atl_diag::answered(AM, "scheduleServiceArgs: not wired (started services: S6)");
+            return;
+        }
         Call::Connected {
             conn,
             component,
@@ -282,9 +292,12 @@ impl Inner {
             key: intent_key(intent, None),
             conn: ConnHandle(conn),
             client_pid,
+            caller_uid,
             flags,
         };
-        let need = st.services.bind(req, host, crate::token::new, &mut calls);
+        let need = st
+            .services
+            .bind(req, host, crate::token::new, uptime_ms(), &mut calls);
         self.service_calls.post(calls);
         if need == Host::NeedsProcess && !starting {
             if let Err(e) = self.start_process_locked(st, p, &process, false, None) {
@@ -318,10 +331,10 @@ impl Inner {
     /// killServicesLocked + the client half of cleanUpApplicationRecordLocked for a dead or killed process.
     pub(crate) fn services_died(&self, st: &mut State, pid: i32) {
         let mut calls = Vec::new();
-        for _ in 0..st.services.process_died(pid, &mut calls) {
+        for _ in st.services.process_died(pid, true, uptime_ms(), &mut calls) {
             atl_diag::answered(
                 AM,
-                "service process died: restart not modelled (waits for the next bind)",
+                "service process died: restart scheduled, not wired (waits for the next bind)",
             );
         }
         self.service_calls.post(calls);
@@ -337,7 +350,8 @@ impl Inner {
         };
         let (process, uid) = (r.process_name.clone(), r.uid);
         let mut calls = Vec::new();
-        st.services.attach(pid, &process, uid, &thread, &mut calls);
+        st.services
+            .attach(pid, &process, uid, &thread, uptime_ms(), &mut calls);
         self.service_calls.post(calls);
     }
 
