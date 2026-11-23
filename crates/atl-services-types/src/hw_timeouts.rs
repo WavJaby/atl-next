@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! `ro.hw_timeout_multiplier`: AOSP's scale of the framework's timeouts on hardware slower than a phone (Build.HW_TIMEOUT_MULTIPLIER, Build.java:1744-1745).
-//! Plumbing: atld reads the property from its props (vendor build.prop last, as init's later set wins) and passes the multiplier to atl-system-services as `--hw-timeout-multiplier`; each timer is `scale(BASE)`.
+//! Plumbing: atld reads the property from its props (the bundled build.prop, then the host's /etc/atl/vendor.prop, atld's host_props: the later set wins) and passes the multiplier to atl-system-services as `--hw-timeout-multiplier`; each timer is `scale(BASE)`.
 //! Scaled, as the pin scales them: process start, broadcast FG/BG, the cold-start abandon. Not scaled: the FGS timers (ActivityManagerConstants.java:245, :318, :320).
 //! Not scaled because ATL has no such timer: BIND_APPLICATION (ActivityManagerService.java:571) and SERVICE_TIMEOUT (ActivityManagerConstants.java:327).
 

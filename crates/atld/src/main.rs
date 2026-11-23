@@ -59,7 +59,6 @@ use atl_platform_host::{
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
 use atl_services_types::display_model::DisplayModel;
-use atl_services_types::hw_timeouts::HwTimeouts;
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
 use atl_services_types::permission::SYSTEM_PROCESS;
@@ -72,6 +71,7 @@ use signal_hook::iterator::Signals;
 mod applog;
 mod cacerts;
 mod host_layout;
+mod host_props;
 mod installed_code;
 use serde::Deserialize;
 
@@ -1316,9 +1316,14 @@ impl Host {
 }
 
 /// Writes the default property area (system processes map it) and returns the properties it holds, to which each app process's area adds its own.
-/// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`).
+/// Sources as init's property service loads them: /system/build.prop, then /vendor/build.prop when `--file` places one (the device's: `ro.hardware.egl`), then the host's vendor props (`host_vendor`).
 /// `tier`: the Codec2 linear allocator tier the host supports (atl_property_service::LinearTier::probe); its properties go into the set.
-fn property_area(a: &Args, r: &Root, tier: LinearTier) -> Result<Vec<Property>> {
+fn property_area(
+    a: &Args,
+    r: &Root,
+    tier: LinearTier,
+    host_vendor: &[Property],
+) -> Result<Vec<Property>> {
     let mut text = std::fs::read_to_string(&a.build_prop)
         .with_context(|| format!("reading {}", a.build_prop.display()))?;
     let vendor = Path::new("vendor/build.prop");
@@ -1327,7 +1332,7 @@ fn property_area(a: &Args, r: &Root, tier: LinearTier) -> Result<Vec<Property>> 
         text += &std::fs::read_to_string(host)
             .with_context(|| format!("reading {}", host.display()))?;
     }
-    let mut props = atl_property_service::defaults(&text, tier)?;
+    let mut props = host_props::apply(atl_property_service::defaults(&text, tier)?, host_vendor);
     props.push((
         atl_diag::PROP_MAX_KEYS_PROPERTY.to_owned(),
         a.prop_diag_max_keys.to_string(),
@@ -2302,7 +2307,12 @@ fn run(a: &Args) -> Result<ExitCode> {
     std::fs::create_dir_all(r.root.join("log"))?;
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
-    let mut defaults = property_area(a, &r, tier)?;
+    // the host's own vendor props, applied over the bundled ones in property_area; a refused line is logged, the rest stands
+    let host_vendor = host_props::read(Path::new(host_props::HOST_VENDOR_PROP));
+    for m in &host_vendor.refused {
+        log(format_args!("{}: {m}", host_props::HOST_VENDOR_PROP));
+    }
+    let mut defaults = property_area(a, &r, tier, &host_vendor.props)?;
     let boot = system_layout(a, &r)?;
     let fonts = font_layout(a, &r)?;
     vintf_layout(a, &r)?;
@@ -2882,15 +2892,9 @@ fn run(a: &Args) -> Result<ExitCode> {
     // the services' area: the defaults with what the probes above added (ActivityTaskManagerService reads ro.opengles.version); the processes started before the probes keep the first area
     let system_area = r.root.join("properties.d").join("system");
     std::fs::write(&system_area, atl_property_service::area(&defaults)?)?;
-    // AOSP's ro.hw_timeout_multiplier from the props (vendor build.prop comes last, its value wins): the services scale their timers by it
-    let hw = HwTimeouts::from_prop(
-        defaults
-            .iter()
-            .rev()
-            .find(|(k, _)| k == "ro.hw_timeout_multiplier")
-            .map(|(_, v)| v.as_str()),
-    );
-    log(format_args!("hw timeouts: x{}", hw.to_arg()));
+    // AOSP's ro.hw_timeout_multiplier (Build.java:1744): the services scale their timers by it; the host file's value, when set, is the one in `defaults`
+    let (hw, source) = host_props::hw_multiplier(&defaults, &host_vendor.props);
+    log(format_args!("hw timeouts: x{} {source}", hw.to_arg()));
     app_env.extend(a.app_env.iter().cloned());
     log(format_args!("apps' devices {app_devices:?}"));
     let host = Arc::new(Host {
