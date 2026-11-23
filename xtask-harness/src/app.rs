@@ -2598,7 +2598,7 @@ const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
 const STICKY_SLACK_MS: u64 = 1_000;
 /// The not-sticky fence (services log): atld's line for the not-sticky process's death, logged after that death's restart decisions (activity.rs app_died).
 /// A restart starts only from a decision (active_services.rs services_died: `restart of <pkg>/<class> scheduled`), so none logged before this line means none.
-/// No time bound: the former 11 s window (1 s + 10 s) ended before the sticky rule's 12 s bound, so a restart started in between passed.
+/// No time bound: the former 11 s window (1 s + 10 s) ended before the sticky rule's bound (12 s at x1, 22 s at x2), so a restart started in between passed.
 const NOT_STICKY_CLASS: &str = "AtlNotSticky";
 const RESTART_DECIDED: &str = "restart of ";
 
@@ -2620,8 +2620,6 @@ struct StickyCase {
     not_sticky_died: bool,
     /// AtlSticky's logged importance (the word after STICKY_IMPORTANCE), read at the kill
     importance: Option<String>,
-    /// the run's `ro.hw_timeout_multiplier`: the restart's start budget is PROC_START_TIMEOUT_BASE_MS x it
-    hw: HwTimeouts,
 }
 
 impl StickyCase {
@@ -2689,12 +2687,12 @@ impl StickyCase {
         let Some(restart) = self.restart_ms else {
             return Err(format!("sticky: no {STICKY_RESTART:?} line after the kill"));
         };
+        // the start budget is PROC_START_TIMEOUT_BASE_MS x the multiplier atld logged for this run: the host may set it, so never a default
+        let hw = logged_hw(atld)?;
         let gap = restart.saturating_sub(at);
         let (lo, hi) = (
             SERVICE_RESTART_DURATION_MS,
-            SERVICE_RESTART_DURATION_MS
-                + self.hw.scale(PROC_START_TIMEOUT_BASE_MS)
-                + STICKY_SLACK_MS,
+            SERVICE_RESTART_DURATION_MS + hw.scale(PROC_START_TIMEOUT_BASE_MS) + STICKY_SLACK_MS,
         );
         if !(lo..=hi).contains(&gap) {
             return Err(format!(
@@ -2712,6 +2710,17 @@ impl StickyCase {
             "{importance}; sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: no restart decided before its death (services log)"
         ))
     }
+}
+
+/// atld's startup line for the multiplier it applied (main.rs, after the host props): `hw timeouts: x<N> (<source>)`. The bound reads this run's line, not the host file.
+const HW_TIMEOUTS_LINE: &str = "hw timeouts: x";
+
+/// The multiplier atld logged for this run. No line, or a value `parse_arg` refuses: the case fails. A default here would bound the restart at x1 on a host that set x2.
+fn logged_hw(atld: &str) -> Result<HwTimeouts, String> {
+    let value = value_after(atld, HW_TIMEOUTS_LINE).ok_or_else(|| {
+        format!("sticky: no {HW_TIMEOUTS_LINE:?} line in atld's log (the restart bound needs the multiplier)")
+    })?;
+    HwTimeouts::parse_arg(value).map_err(|e| format!("sticky: atld's multiplier: {e}"))
 }
 
 /// The not-sticky fence on the services log: a restart decided for AtlNotSticky before its process's death line is one it must not have. No death line: not judged.
@@ -2806,6 +2815,9 @@ mod sticky_case_tests {
     const ATLD_START: &str = "atld: started com.example.atltest:notsticky (package com.example.atltest): uid 10001, host pid ";
     /// The services log of a not-sticky death with no restart decided before it: the fence passes.
     const SERVICES_DIED: &str = "services: process com.example.atltest:notsticky (pid 7) died\n";
+    /// atld's startup lines for the multiplier (main.rs): x1 is AOSP's unset value, x2 is the rvvm host's `/etc/atl/vendor.prop`.
+    const ATLD_X1: &str = "hw timeouts: x1 (default)\n";
+    const ATLD_X2: &str = "hw timeouts: x2 (from /etc/atl/vendor.prop)\n";
 
     /// The case as killed at wall 10 000 with `restart` logged: the restart's gap from the kill is the verdict's number.
     fn case(restart: u64) -> StickyCase {
@@ -2815,32 +2827,24 @@ mod sticky_case_tests {
             restart_ms: Some(restart),
             not_sticky_died: false,
             importance: Some("300".to_owned()),
-            hw: HwTimeouts::default(),
         }
     }
 
-    /// The bound's upper end follows the multiplier: 1 s + PROC_START (10 s x 2) + 1 s of slack = 22 s here, from the literals.
+    /// The bound's upper end follows the multiplier atld logged: 1 s + PROC_START (10 s x m) + 1 s of slack, from the literals.
+    /// A restart 15 s after the kill is past x1's 12 s bound and inside x2's 22 s: rvvm's attach takes up to 8.5 s, so x1 would fail a legitimate restart there.
     #[test]
-    fn restart_bound_follows_the_multiplier() {
-        let atld = format!("{ATLD_START}7\n");
-        let hw = HwTimeouts::from_prop(Some("2"));
-        let at_bound = StickyCase {
-            hw,
-            ..case(10_000 + 22_000)
+    fn restart_bound_follows_the_logged_multiplier() {
+        let check = |atld: &str, restart: u64| {
+            case(restart).verdict(atld, SERVICES_DIED, "com.example.atltest")
         };
-        assert!(
-            at_bound
-                .verdict(&atld, SERVICES_DIED, "com.example.atltest")
-                .is_ok()
-        );
-        let over = StickyCase {
-            hw,
-            ..case(10_000 + 22_001)
-        };
-        assert!(
-            over.verdict(&atld, SERVICES_DIED, "com.example.atltest")
-                .is_err()
-        );
+        let x2 = format!("{ATLD_X2}{ATLD_START}7\n");
+        assert!(check(&x2, 10_000 + 22_000).is_ok());
+        assert!(check(&x2, 10_000 + 22_001).is_err());
+        assert!(check(&x2, 10_000 + 15_000).is_ok());
+        let x1 = format!("{ATLD_X1}{ATLD_START}7\n");
+        assert!(check(&x1, 10_000 + 12_000).is_ok());
+        assert!(check(&x1, 10_000 + 12_001).is_err());
+        assert!(check(&x1, 10_000 + 15_000).is_err());
     }
 
     /// The case finishes at its fence, not at a wall time: the sticky restart alone does not end it, nor does the death alone without it.
@@ -2905,9 +2909,10 @@ mod sticky_case_tests {
     /// Lower bound: SERVICE_RESTART_DURATION (1 000 ms) after the kill; upper: that plus PROC_START_TIMEOUT (10 000) plus 1 000 of slack = 12 000 ms.
     #[test]
     fn restart_gap_bounds_are_the_rule() {
+        let atld = format!("{ATLD_X1}{ATLD_START}");
         let pass = |restart| {
             case(restart)
-                .verdict(ATLD_START, SERVICES_DIED, "com.example.atltest")
+                .verdict(&atld, SERVICES_DIED, "com.example.atltest")
                 .is_ok()
         };
         assert!(!pass(10_999), "999 ms: before the restart timer");
@@ -2920,13 +2925,13 @@ mod sticky_case_tests {
     #[test]
     fn not_sticky_restart_fails_and_its_first_start_does_not_count() {
         let before = case(11_000);
-        let atld = format!("{ATLD_START}7\n");
+        let atld = format!("{ATLD_X1}{ATLD_START}7\n");
         assert!(
             before
                 .verdict(&atld, SERVICES_DIED, "com.example.atltest")
                 .is_ok()
         );
-        let restarted = format!("{ATLD_START}7\n{ATLD_START}9\n");
+        let restarted = format!("{ATLD_X1}{ATLD_START}7\n{ATLD_START}9\n");
         let why = StickyCase {
             killed: Some((10_000, 1)),
             ..case(11_000)
@@ -2943,7 +2948,8 @@ mod sticky_case_tests {
         let decided = format!(
             "services: restart of {pkg}/{pkg}.AtlNotSticky scheduled (am_handler timer)\n{SERVICES_DIED}"
         );
-        let why = case(11_000).verdict(ATLD_START, &decided, pkg).unwrap_err();
+        let atld = format!("{ATLD_X1}{ATLD_START}");
+        let why = case(11_000).verdict(&atld, &decided, pkg).unwrap_err();
         assert!(
             why.starts_with("notsticky: restart decided before its death"),
             "{why}"
@@ -2980,6 +2986,46 @@ mod sticky_case_tests {
         let log = "1793747156.733 1 2 I AtlTest: importance: sticky=300\n1793747156.800 1 2 I AtlTest: sticky: onStartCommand startId=1";
         assert_eq!(value_after(log, STICKY_IMPORTANCE), Some("300"));
         assert_eq!(value_after("no such line", STICKY_IMPORTANCE), None);
+    }
+
+    /// The multiplier is the value atld logged after its prefix, judged by `parse_arg`: x2 and x1 read; no line, 0 or a non-number fail, never a default.
+    #[test]
+    fn logged_multiplier_is_atlds_value() {
+        let logged = |atld: &str| logged_hw(atld).map(|hw| hw.to_arg());
+        assert_eq!(logged(ATLD_X2), Ok("2".to_owned()));
+        assert_eq!(logged(ATLD_X1), Ok("1".to_owned()));
+        assert_eq!(
+            logged(&format!("{ATLD_START}7\n{ATLD_X2}")),
+            Ok("2".to_owned()),
+            "the line may come after the starts"
+        );
+        assert!(
+            logged(ATLD_START)
+                .unwrap_err()
+                .starts_with("sticky: no \"hw timeouts: x\" line")
+        );
+        assert!(
+            logged("hw timeouts: x0 (from /etc/atl/vendor.prop)\n")
+                .unwrap_err()
+                .starts_with("sticky: atld's multiplier: 0:")
+        );
+        assert!(
+            logged("hw timeouts: xtwo (from build.prop)\n")
+                .unwrap_err()
+                .starts_with("sticky: atld's multiplier: two:")
+        );
+    }
+
+    /// The verdict judges the restart only against atld's logged multiplier: a log without the line fails, it does not fall back to x1.
+    #[test]
+    fn verdict_refuses_a_log_without_the_multiplier() {
+        let why = case(11_000)
+            .verdict(ATLD_START, SERVICES_DIED, "com.example.atltest")
+            .unwrap_err();
+        assert!(
+            why.starts_with("sticky: no \"hw timeouts: x\" line"),
+            "{why}"
+        );
     }
 }
 
