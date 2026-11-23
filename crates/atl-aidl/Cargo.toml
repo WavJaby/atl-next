@@ -102,6 +102,8 @@ types = [
     "android.webkit.IWebViewUpdateService",
     # the permissionmgr service (permission_manager.rs)
     "android.permission.IPermissionManager",
+    # the permission service (permission_controller.rs): keystore2's checkPermission for device-identifier attestation
+    "android.os.IPermissionController",
     "android.app.IApplicationThread",
     "android.app.IActivityManager",
     "android.app.IActivityTaskManager",

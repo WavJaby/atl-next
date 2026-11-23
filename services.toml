@@ -534,6 +534,14 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerServiceImpl.java#checkPermissionInternal",
 ]
 
+[permission]
+src = ["crates/atl-services/src/permission_controller.rs"]
+mirrors = [
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#PermissionController",
+    "frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java#checkPermission",
+    "frameworks/base/core/java/android/app/ActivityManager.java#checkComponentPermission",
+]
+
 [input]
 src = ["crates/atl-services/src/input.rs"]
 mirrors = [

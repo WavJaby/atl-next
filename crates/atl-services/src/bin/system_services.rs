@@ -188,6 +188,8 @@ const APP_OPS: &str = "appops";
 const WEBVIEW_UPDATE: &str = "webviewupdate";
 /// keystore2's attestation application id source (SystemServer.java:1579-1581, KeyAttestationApplicationIdProviderService).
 const KEY_ATTESTATION_APP_ID: &str = "sec_key_att_app_id_provider";
+/// The name keystore2's check_android_permission looks IPermissionController up by (utils.rs:180); AOSP registers it at ActivityManagerService.java:1972.
+const PERMISSION_CONTROLLER: &str = "permission";
 
 fn parse_abi(s: &str) -> Result<SupportedAbi, String> {
     let (abi, isa) = s.split_once('=').ok_or("expected <abi>=<isa>")?;
@@ -582,6 +584,11 @@ fn main() -> Result<()> {
         )
         .context("addService permissionmgr")?;
     }
+    binder::add_service(
+        PERMISSION_CONTROLLER,
+        atl_services::permission_controller::new_binder(Arc::clone(&permissions)),
+    )
+    .context("addService permission")?;
     binder::add_service(NOTIFICATION, notices.binder()).context("addService notification")?;
     binder::add_service(
         ALARM,

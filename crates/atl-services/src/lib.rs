@@ -102,6 +102,8 @@ pub mod packages;
 #[cfg(feature = "converter")]
 pub mod pending_intent;
 #[cfg(feature = "converter")]
+pub mod permission_controller;
+#[cfg(feature = "converter")]
 pub mod permission_manager;
 #[cfg(feature = "converter")]
 pub mod permission_request;
