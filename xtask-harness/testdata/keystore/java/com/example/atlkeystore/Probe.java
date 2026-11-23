@@ -199,6 +199,17 @@ public final class Probe {
         line("list-has-hal " + (all != null && java.util.Arrays.asList(all).contains(hal)));
     }
 
+    /** SystemProperties.get, a hidden framework class reached by reflection as ServiceManager is. */
+    private static String prop(String name) throws Exception {
+        return (String) Class.forName("android.os.SystemProperties").getMethod("get", String.class).invoke(null, name);
+    }
+
+    /** The boot state an app reads: an unlocked device with no verified boot (CONSTANTS in atl-property-service), never "green". */
+    private static void bootState() throws Exception {
+        line("verifiedbootstate " + prop("ro.boot.verifiedbootstate"));
+        line("vbmeta-device-state " + prop("ro.boot.vbmeta.device_state"));
+    }
+
     public static void main(String[] args) {
         line("start uid " + android.os.Process.myUid());
         line("keystore-dir " + (new File("/data/misc/keystore").exists() ? "visible" : "absent"));
@@ -206,6 +217,11 @@ public final class Probe {
             serviceAccess();
         } catch (Throwable t) {
             line("service-access failed " + t);
+        }
+        try {
+            bootState();
+        } catch (Throwable t) {
+            line("boot-state failed " + t);
         }
         try {
             IBinder b = (IBinder) Class.forName("android.os.ServiceManager").getMethod("checkService", String.class).invoke(null, KEYSTORE);

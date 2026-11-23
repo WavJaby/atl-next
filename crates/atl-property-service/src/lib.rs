@@ -55,6 +55,10 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("debug.atrace.tags.enableflags", "0"),
     // ActivityTaskManagerService retrieveSettings writes DisplayProperties.debug_force_rtl from Settings.Global development_force_rtl at system start; ATL has no such setting, so its default 0 -> "false"
     ("debug.force_rtl", "false"),
+    // this device's bootloader state: unlocked, with no verified boot (manager 2026-11-23). "orange" = Unverified; "green" would claim a verified boot ATL cannot back. hal/lib.rs get_boot_info maps orange to Unverified (:53-59); adbd reads orange as unlocked (packages/modules/adb/daemon/main.cpp:221)
+    ("ro.boot.verifiedbootstate", "orange"),
+    // device_state of the same device. hal/lib.rs reads "unlocked" as device_boot_locked = false (:30-40), so the attested verified-boot key is 32 zero bytes (:43-52). Unset reads as "no-prop" and logs an error there. Digest and public key digest stay unset: the HAL reports 32 zero bytes for both (:25, :41-42)
+    ("ro.boot.vbmeta.device_state", "unlocked"),
 ];
 
 /// DisplayMetrics.getDeviceDensity reads it (after `qemu.sf.lcd_density`) into DENSITY_DEVICE / DENSITY_DEVICE_STABLE; SurfaceFlinger likewise. A device's vendor build.prop states its panel's; here the host display's dpi (DisplayModel), the density the services report.
@@ -326,6 +330,15 @@ mod tests {
             Some("0")
         );
         assert_eq!(read(&a, "debug.force_rtl").as_deref(), Some("false"));
+        // the boot state of an unlocked device with no verified boot (CONSTANTS): orange, never green
+        assert_eq!(
+            read(&a, "ro.boot.verifiedbootstate").as_deref(),
+            Some("orange")
+        );
+        assert_eq!(
+            read(&a, "ro.boot.vbmeta.device_state").as_deref(),
+            Some("unlocked")
+        );
         // getprop's view (--dump): every property once, values as written, a long ro. value whole
         let all = a.entries().unwrap();
         assert_eq!(
