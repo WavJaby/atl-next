@@ -11,6 +11,7 @@ use crate::broadcast_dispatch::{
     self as bd, Action, BroadcastId, Component, Dispatcher, Facts, Finish, NewBroadcast, Outcome,
     PENDING_COLD_START_ABANDON_MS, Policy, ProcKey, Receiver, Target,
 };
+use crate::uid_state::TempGrant;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 
 /// What each receiver of a broadcast gets besides its result: the intent, the user, and whether it is a registration's initial sticky (BroadcastRecord.initialSticky).
@@ -19,6 +20,8 @@ pub(super) struct Payload {
     pub(super) intent: Intent,
     pub(super) user: i32,
     pub(super) initial_sticky: bool,
+    /// the broadcast's BroadcastOptions temp allowlist, granted to each receiver's uid as its delivery is scheduled (BroadcastQueueImpl :1178-1190); None for every other send
+    pub(super) grant: Option<TempGrant>,
 }
 
 /// The activity service's dispatcher: every broadcast not yet retired and every process queue (broadcast_dispatch.rs).
@@ -43,6 +46,8 @@ pub(super) struct SendSpec<'a> {
     pub(super) result_to: Option<(ReceiverHandle, i32)>,
     /// BroadcastOptions.maxManifestReceiverApiLevel (None = no limit): CONNECTIVITY_ACTION's M (connectivity.rs)
     pub(super) max_manifest_api: Option<i32>,
+    /// the BroadcastOptions temp allowlist of the send (uid_state::grant_of); None = none
+    pub(super) grant: Option<TempGrant>,
 }
 
 /// The dispatch-time skip (BroadcastSkipPolicy.shouldSkipMessage's start-mode part, :229-246): a manifest receiver whose uid is restricted (uid_state::start_mode DELAYED_RIGID) is
@@ -126,6 +131,11 @@ impl Inner {
                         atl_diag::answered(AM, "broadcast dropped: its process is not attached");
                         continue;
                     };
+                    // BroadcastQueueImpl :1178-1190: the receiver's uid gets the broadcast's temp allowlist as its delivery is scheduled, before the receiver runs
+                    let uid = st.processes.iter().find(|r| r.pid == pid).map(|r| r.uid);
+                    if let (Some(grant), Some(uid)) = (job.payload.grant, uid) {
+                        self.grant_temp_locked(st, uid, grant);
+                    }
                     if let Some(job) = self.wire_job(job) {
                         self.broadcast_queue.enqueue(thread, job);
                     }
@@ -526,6 +536,7 @@ impl Inner {
                 intent: intent.into_owned(),
                 user: spec.user,
                 initial_sticky: false,
+                grant: spec.grant,
             },
         };
         let (_, actions) = self.dispatch(&mut st, |d, p| d.enqueue(b, p));
@@ -572,6 +583,7 @@ impl Inner {
                 intent,
                 user: broadcast::USER_ALL,
                 initial_sticky: true,
+                grant: None,
             },
         };
         let (_, actions) = self.dispatch(st, |d, p| d.enqueue(b, p));
@@ -730,6 +742,7 @@ impl ActivityManager {
                 intent: intent.clone(),
                 user,
                 initial_sticky: false,
+                grant: None,
             },
         };
         let (_, actions) = inner.dispatch(&mut st, |d, p| d.enqueue(b, p));
@@ -746,6 +759,7 @@ impl ActivityManager {
         uid: u32,
         user_id: i32,
         finished: Option<(&Strong<dyn IIntentReceiver>, i32)>,
+        grant: Option<TempGrant>,
     ) -> binder::Result<()> {
         const RESULT_OK: i32 = -1;
         let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
@@ -761,6 +775,7 @@ impl ActivityManager {
                 ordered: finished.is_some(),
                 result_to: finished.map(|(h, caller)| (ReceiverHandle(h.clone()), caller)),
                 max_manifest_api: None,
+                grant,
             })
             .map(|_| ())
     }
@@ -791,6 +806,7 @@ impl ActivityManager {
             ordered: false,
             result_to: None,
             max_manifest_api,
+            grant: None,
         }) {
             log(format_args!("system broadcast {:?}: {e}", intent.action));
         }
@@ -864,6 +880,7 @@ impl ActivityManager {
             ordered,
             result_to: result_to.map(|handle| (handle, pid)),
             max_manifest_api: None,
+            grant: None,
         })
     }
 }

@@ -57,8 +57,58 @@ pub struct Alarm<O, L> {
     pub window: i64,
     pub interval: i64,
     pub flags: i32,
+    /// the BroadcastOptions its PendingIntent send carries (setImpl's idleOptions); None = none. Never read for a listener alarm.
+    pub idle: Option<IdleOptions>,
     pub operation: Option<O>,
     pub listener: Option<L>,
+}
+
+/// AlarmManager.FLAG_ALLOW_WHILE_IDLE (AlarmManager.java:216) and FLAG_PRIORITIZE (:254).
+pub const FLAG_ALLOW_WHILE_IDLE: i32 = 1 << 2;
+pub const FLAG_PRIORITIZE: i32 = 1 << 6;
+/// AlarmManagerService.java:729 DEFAULT_ALLOW_WHILE_IDLE_ALLOWLIST_DURATION (`10 * 1000`): the temp allowlist an alarm's delivery grants.
+pub const ALLOW_WHILE_IDLE_DURATION_MS: i64 = 10 * 1000;
+/// PowerExemptionManager.REASON_ALARM_MANAGER_WHILE_IDLE (:293).
+pub const REASON_ALARM_MANAGER_WHILE_IDLE: i32 = 302;
+
+/// The BroadcastOptions temp allowlist an alarm's PendingIntent send carries: duration, type (uid_state TEMP_TYPE_*), reason (AlarmManagerService mOptsWithFgs :346, mOptsWithoutFgs :348).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleOptions {
+    pub duration_ms: i64,
+    pub kind: i32,
+    pub reason: i32,
+}
+
+/// Which idleOptions AlarmManagerService.setImpl gives an alarm (:2745-2820), reduced. `exact` = windowLength 0 (:2750). `allow_while_idle` and `prioritized` are the flags after
+/// the core-caller conversion (:2735-2748: a core caller's both are cleared). `exact_change` = REQUIRE_EXACT_ALARM_PERMISSION applies, i.e. targetSdk >= S (AlarmManager.java :265-266).
+/// With the change on, an exact alarm gets the FGS-allowed grant (mOptsWithFgs) and an inexact allow-while-idle alarm the FGS-not-allowed one, whose REASON_DENIED grants nothing.
+/// With it off, only an allow-while-idle alarm gets the FGS-allowed grant. Not modelled: the exact-alarm grant and the exempt-app branch (:2818), alarm clocks (refused by atl-parcelables).
+pub fn idle_options(
+    exact: bool,
+    allow_while_idle: bool,
+    prioritized: bool,
+    exact_change: bool,
+) -> Option<IdleOptions> {
+    if prioritized || !(exact || allow_while_idle) {
+        return None;
+    }
+    let fgs = IdleOptions {
+        duration_ms: ALLOW_WHILE_IDLE_DURATION_MS,
+        kind: crate::uid_state::TEMP_TYPE_FGS_ALLOWED,
+        reason: REASON_ALARM_MANAGER_WHILE_IDLE,
+    };
+    if !exact_change {
+        return allow_while_idle.then_some(fgs);
+    }
+    if exact {
+        Some(fgs)
+    } else {
+        Some(IdleOptions {
+            kind: crate::uid_state::TEMP_TYPE_FGS_NOT_ALLOWED,
+            reason: crate::uid_state::REASON_DENIED,
+            ..fgs
+        })
+    }
 }
 
 /// The alarms in set order. A key holds at most one alarm: a set replaces the one it matches.
@@ -179,9 +229,36 @@ mod tests {
             window: 0,
             interval: 0,
             flags: 0,
+            idle: None,
             operation: op,
             listener,
         }
+    }
+
+    #[test]
+    fn idle_options_follow_setimpl_by_target_sdk() {
+        // exact change on (targetSdk >= S): exact -> FGS-allowed grant; inexact allow-while-idle -> FGS-not-allowed, REASON_DENIED (grants nothing)
+        let fgs = IdleOptions {
+            duration_ms: 10_000,
+            kind: 0,
+            reason: 302,
+        };
+        assert_eq!(idle_options(true, false, false, true), Some(fgs));
+        assert_eq!(idle_options(true, true, false, true), Some(fgs));
+        assert_eq!(
+            idle_options(false, true, false, true),
+            Some(IdleOptions {
+                duration_ms: 10_000,
+                kind: 1,
+                reason: -1,
+            })
+        );
+        // exact change off (targetSdk < S): only allow-while-idle gets the FGS-allowed grant
+        assert_eq!(idle_options(true, false, false, false), None);
+        assert_eq!(idle_options(false, true, false, false), Some(fgs));
+        // neither exact nor allow-while-idle, and PRIORITIZE: no options
+        assert_eq!(idle_options(false, false, false, true), None);
+        assert_eq!(idle_options(true, false, true, true), None);
     }
 
     /// An operation alarm of `kind` due at `trigger` ms on its clock, repeating every `interval` ms (0 = one-shot).

@@ -533,8 +533,18 @@ impl Inner {
 
     /// startService from a PendingIntent of kind SERVICE / FOREGROUND_SERVICE (PendingIntentRecord.sendInner :694, startServiceInPackage): the start as the creator `uid`, with no
     /// caller process (callerFg true). The system ignores the start's result (it logs and swallows the exceptions, :696-700), so this reports nothing back.
-    pub(crate) fn start_service_as(&self, intent: &Intent, uid: u32, foreground: bool) {
+    pub(crate) fn start_service_as(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        foreground: bool,
+        grant: Option<crate::uid_state::TempGrant>,
+    ) {
         let mut st = self.state();
+        // the grant is the creator's, applied before the start reads it (PendingIntentRecord :604-613: tempAllowlistForPendingIntent precedes startServiceInPackage)
+        if let Some(grant) = grant {
+            self.grant_temp_locked(&mut st, uid, grant);
+        }
         let _ = self.start_service_locked(&mut st, uid, true, intent, foreground);
         atl_diag::answered(AM, "PendingIntent service send: start result not reported");
     }

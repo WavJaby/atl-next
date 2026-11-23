@@ -126,6 +126,43 @@ pub fn background_start_refused(
         && uids.start_mode(uid, target_sdk, persistent, now) != StartMode::Normal
 }
 
+/// BroadcastOptions temp allowlist type FOREGROUND_SERVICE_ALLOWED (PowerExemptionManager.java :94) and FOREGROUND_SERVICE_NOT_ALLOWED (:98).
+/// NONE is -1 (:90): any other type grants nothing. APP_FREEZING_DELAYED (:107) is an unfreeze, not a grant (BroadcastQueueImpl :1178-1186).
+pub const TEMP_TYPE_NONE: i32 = -1;
+pub const TEMP_TYPE_FGS_ALLOWED: i32 = 0;
+pub const TEMP_TYPE_FGS_NOT_ALLOWED: i32 = 1;
+pub const TEMP_TYPE_APP_FREEZING_DELAYED: i32 = 1 << 2;
+/// PowerExemptionManager.REASON_DENIED (:127). DeviceIdleController.getTempAllowListType maps it to NONE (:3196-3197).
+pub const REASON_DENIED: i32 = -1;
+
+/// A temp allowlist grant as the receiving uid holds it: `duration_ms` (> 0) and whether FGS starts are allowed (AMS tempAllowlistUidLocked :15746-15765; FGS-typed grants go to
+/// mFgsStartTempAllowList).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TempGrant {
+    pub duration_ms: u64,
+    pub fgs: bool,
+}
+
+/// The grant a sender's temp allowlist request makes (BroadcastOptions.setTemporaryAppAllowlist -> tempAllowlistUidLocked): none for a duration <= 0, for REASON_DENIED
+/// (DeviceIdleController :3196-3197 -> NONE, AMS :15751-15753 returns), for a type other than the two FGS ones, and for APP_FREEZING_DELAYED (not a grant; the caller counts it).
+pub fn grant_of(duration_ms: i64, kind: i32, reason: i32) -> Option<TempGrant> {
+    let duration_ms = u64::try_from(duration_ms).ok().filter(|d| *d > 0)?;
+    if reason == REASON_DENIED {
+        return None;
+    }
+    match kind {
+        TEMP_TYPE_FGS_ALLOWED => Some(TempGrant {
+            duration_ms,
+            fgs: true,
+        }),
+        TEMP_TYPE_FGS_NOT_ALLOWED => Some(TempGrant {
+            duration_ms,
+            fgs: false,
+        }),
+        _ => None,
+    }
+}
+
 /// Per-uid state. A uid not in the map is idle with nothing held (a new uid: UidRecord.java :187 mIdle = true).
 #[derive(Debug, Default)]
 pub struct Uids {
@@ -317,6 +354,42 @@ mod tests {
     const APP_UID: u32 = 10_000;
     /// ActivityManagerConstants.java:241 DEFAULT_BOOT_TIME_TEMP_ALLOWLIST_DURATION (`20 * 1000`): the BOOT_COMPLETED grant.
     const BOOT_TEMP_ALLOWLIST_MS: u64 = 20 * 1000;
+
+    #[test]
+    fn grant_follows_the_aosp_type_and_reason_rules() {
+        // PowerExemptionManager.java :90 NONE = -1, :94 FGS_ALLOWED = 0, :98 FGS_NOT_ALLOWED = 1, :107 APP_FREEZING_DELAYED = 1 << 2, :127 REASON_DENIED = -1
+        const TEN_SECONDS: i64 = 10_000;
+        assert_eq!(
+            grant_of(TEN_SECONDS, TEMP_TYPE_FGS_ALLOWED, 302),
+            Some(TempGrant {
+                duration_ms: 10_000,
+                fgs: true
+            })
+        );
+        assert_eq!(
+            grant_of(TEN_SECONDS, TEMP_TYPE_FGS_NOT_ALLOWED, 302),
+            Some(TempGrant {
+                duration_ms: 10_000,
+                fgs: false
+            })
+        );
+        // DeviceIdleController.getTempAllowListType maps REASON_DENIED to NONE, whatever the type
+        assert_eq!(
+            grant_of(TEN_SECONDS, TEMP_TYPE_FGS_NOT_ALLOWED, REASON_DENIED),
+            None
+        );
+        assert_eq!(
+            grant_of(TEN_SECONDS, TEMP_TYPE_FGS_ALLOWED, REASON_DENIED),
+            None
+        );
+        assert_eq!(grant_of(0, TEMP_TYPE_FGS_ALLOWED, 302), None);
+        assert_eq!(grant_of(-5, TEMP_TYPE_FGS_ALLOWED, 302), None);
+        assert_eq!(grant_of(TEN_SECONDS, -1, 302), None);
+        assert_eq!(
+            grant_of(TEN_SECONDS, TEMP_TYPE_APP_FREEZING_DELAYED, 302),
+            None
+        );
+    }
 
     #[test]
     fn constants_match_their_aosp_source() {

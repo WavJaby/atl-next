@@ -15,18 +15,23 @@ use atl_aidl::aidl::android::app::IAlarmCompleteListener::{
 use atl_aidl::aidl::android::app::IAlarmManager::{
     BnAlarmManager, EnforcePermission, IAlarmManager,
 };
-use atl_aidl::aidl::android::content::IIntentSender::IIntentSender;
 use atl_aidl::mangled::_7_android_3_app_14_IAlarmListener as IAlarmListener;
 use atl_parcelables::android::app::AlarmManager_AlarmClockInfo as AlarmClockInfo;
 use atl_parcelables::android::app::PendingIntent;
-use atl_parcelables::android::os::WorkSource;
+use atl_parcelables::android::os::{Bundle, WorkSource};
+use atl_parcelables::codecs::android::os::Bundle::Value;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
 use crate::activity::log;
-use crate::alarm_table::{Alarm, AlarmTable, Clock, ELAPSED_REALTIME, RTC_WAKEUP};
+use crate::alarm_table::{
+    Alarm, AlarmTable, Clock, ELAPSED_REALTIME, FLAG_ALLOW_WHILE_IDLE, FLAG_PRIORITIZE,
+    IdleOptions, RTC_WAKEUP, idle_options,
+};
 use crate::alarm_timer::{self, Timers};
 use crate::packages::Packages;
 use crate::packages::Permissions;
+use crate::pending_intent;
+use crate::uid_state;
 use atl_services_types::permission;
 
 /// The interface name counters use.
@@ -169,6 +174,25 @@ impl IAlarmManager for AlarmService {
                 Some(format!("Invalid alarm type {kind}")),
             ));
         }
+        // setImpl's idleOptions (AlarmManagerService :2735-2820): a core caller's allow-while-idle and prioritize are cleared (:2735-2748, UserHandle.isCore);
+        // a package the services do not know reads as the current targetSdk
+        let core = permission::sees_all_packages(uid);
+        let exact_change = self
+            .0
+            .packages
+            .by_name(package)
+            .is_none_or(|p| p.app().target_sdk_version >= uid_state::SDK_S);
+        let idle = operation
+            .is_some()
+            .then(|| {
+                idle_options(
+                    window_length == 0,
+                    flags & FLAG_ALLOW_WHILE_IDLE != 0 && !core,
+                    flags & FLAG_PRIORITIZE != 0 && !core,
+                    exact_change,
+                )
+            })
+            .flatten();
         let mut table = self.0.lock();
         table.set(Alarm {
             uid,
@@ -178,6 +202,7 @@ impl IAlarmManager for AlarmService {
             window: window_length,
             interval: clamp_interval(interval),
             flags,
+            idle,
             operation: operation.map(|p| p.target.clone()),
             listener: listener.map(|l| l.as_binder()),
         });
@@ -241,7 +266,7 @@ fn run(inner: Arc<Inner>) {
         };
         for alarm in &due {
             if let Some(operation) = &alarm.operation {
-                send(operation);
+                send(operation, alarm.idle);
             } else if let Some(listener) = &alarm.listener {
                 do_alarm(listener);
             }
@@ -249,12 +274,10 @@ fn run(inner: Arc<Inner>) {
     }
 }
 
-/// PendingIntent.send with no intent (AlarmManagerService's mPendingIntent.send): the record's request intent through IIntentSender.send, called in-process on the local binder (pending_intent.rs).
-fn send(operation: &SpIBinder) {
-    let result = match operation.clone().into_interface::<dyn IIntentSender>() {
-        Ok(sender) => sender.r#send(0, None, None, None, None, None, None),
-        Err(e) => Err(e.into()),
-    };
+/// PendingIntent.send with no intent (AlarmManagerService's mPendingIntent.send, with getAlarmOperationBundle's options): the record's request intent through IIntentSender.send,
+/// in-process as the services (pending_intent.rs send_in_process).
+fn send(operation: &SpIBinder, idle: Option<IdleOptions>) {
+    let result = pending_intent::send_in_process(operation, &operation_options(idle));
     match result {
         Ok(()) => {
             atl_diag::sent(INTERFACE, "alarm operation");
@@ -264,6 +287,35 @@ fn send(operation: &SpIBinder) {
             log(format_args!("alarm: operation: {e}"));
         }
     }
+}
+
+/// The Bundle an alarm's send carries (AlarmManagerService.getAlarmOperationBundle): the alarm flag on every send (makeBasicAlarmBroadcastOptions :353), and the temp allowlist
+/// setImpl gave it (pending_intent.rs reads both back).
+fn operation_options(idle: Option<IdleOptions>) -> Bundle {
+    let mut entries = vec![(
+        pending_intent::KEY_FLAGS.to_owned(),
+        Value::Int(pending_intent::FLAG_IS_ALARM_BROADCAST),
+    )];
+    if let Some(idle) = idle {
+        entries.push((
+            pending_intent::KEY_TEMP_DURATION.to_owned(),
+            Value::Long(idle.duration_ms),
+        ));
+        entries.push((
+            pending_intent::KEY_TEMP_TYPE.to_owned(),
+            Value::Int(idle.kind),
+        ));
+        entries.push((
+            pending_intent::KEY_TEMP_REASON_CODE.to_owned(),
+            Value::Int(idle.reason),
+        ));
+        // mOptsWithFgs / mOptsWithoutFgs carry the empty reason string (AlarmManagerService :881-889)
+        entries.push((
+            pending_intent::KEY_TEMP_REASON.to_owned(),
+            Value::String(Some(String::new())),
+        ));
+    }
+    Bundle::from_entries(entries)
 }
 
 /// OnAlarmListener's delivery (IAlarmListener.doAlarm, oneway): the app's onAlarm runs on its executor, then alarmComplete comes back to Completion.

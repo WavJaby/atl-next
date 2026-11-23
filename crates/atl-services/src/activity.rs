@@ -523,6 +523,8 @@ enum Timer {
     Broadcast { pid: i32, id: u64, index: usize },
     /// a cold start's backstop (PENDING_COLD_START_ABANDON_MS): the start of process `key` named by its token; releases the broadcast queue's slot, ends no process
     ColdStart { key: ProcKey, token: u64 },
+    /// a temp allowlist grant's expiry, by uid (uid_state `on_temp_expired`): the uid settles at the deadline that returns (`UidSettle`)
+    TempExpiry(u32),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -697,18 +699,36 @@ impl IntentSink for IntentRoute {
         uid: u32,
         user_id: i32,
         finished: Option<&Strong<dyn IIntentReceiver>>,
+        options: &crate::pending_intent::SendOptions,
+        caller: u32,
     ) -> binder::Result<()> {
         let inner = self
             .0
             .upgrade()
             .ok_or_else(|| illegal_state("PendingIntent send: the service is gone"))?;
+        // BroadcastController :965-988: a temp allowlist request needs one of its permissions from the real caller
+        if options.temp_requested
+            && !crate::pending_intent::may_request_temp_allowlist(|p| inner.holds(caller, p))
+        {
+            atl_diag::refused(
+                AM,
+                "PendingIntent broadcast temp allowlist (permission denied)",
+            );
+            return Err(Status::new_exception_str(
+                ExceptionCode::SECURITY,
+                Some(format!(
+                    "Permission Denial: broadcast temp allowlist from uid {caller} requires CHANGE_DEVICE_IDLE_TEMP_WHITELIST or START_ACTIVITIES_FROM_BACKGROUND or START_FOREGROUND_SERVICES_FROM_BACKGROUND"
+                )),
+            ));
+        }
         // the finishedReceiver belongs to the process that called send (PendingIntentRecord.sendInner's resultToApp)
-        let caller = ThreadState::get_calling_pid();
+        let caller_pid = ThreadState::get_calling_pid();
         ActivityManager { inner }.send_pending_broadcast(
             intent,
             uid,
             user_id,
-            finished.map(|h| (h, caller)),
+            finished.map(|h| (h, caller_pid)),
+            options.grant,
         )
     }
 
@@ -718,12 +738,33 @@ impl IntentSink for IntentRoute {
         uid: u32,
         _user_id: i32,
         foreground: bool,
+        options: &crate::pending_intent::SendOptions,
+        caller: u32,
     ) -> binder::Result<()> {
         let inner = self
             .0
             .upgrade()
             .ok_or_else(|| illegal_state("PendingIntent send: the service is gone"))?;
-        inner.start_service_as(intent, uid, foreground);
+        // PendingIntentRecord :604-613: only a FOREGROUND_SERVICE send grants its options' allowlist, to the creator, and only for a caller that may request one (tempAllowlistForPendingIntentLocked :15723-15733)
+        let grant = match options.grant {
+            Some(grant)
+                if foreground
+                    && crate::pending_intent::may_request_temp_allowlist(|p| {
+                        inner.holds(caller, p)
+                    }) =>
+            {
+                Some(grant)
+            }
+            Some(_) if foreground => {
+                atl_diag::answered(
+                    AM,
+                    "PendingIntent temp allowlist (caller holds no permission)",
+                );
+                None
+            }
+            _ => None,
+        };
+        inner.start_service_as(intent, uid, foreground, grant);
         Ok(())
     }
 }
@@ -1392,6 +1433,7 @@ impl Inner {
             Timer::ProcessStart(start_seq) => self.process_start_timed_out(start_seq),
             Timer::Broadcast { pid, id, index } => self.broadcast_timeout(pid, id, index),
             Timer::ColdStart { key, token } => self.cold_start_timeout(&key, token),
+            Timer::TempExpiry(uid) => self.temp_expired(uid),
         }
     }
 
@@ -1407,6 +1449,27 @@ impl Inner {
         drop(st);
         if became_idle {
             self.end_headless(|r| r.uid == uid);
+        }
+    }
+
+    /// AMS tempAllowlistUidLocked (:15746-15765) for `uid`: the grant makes the uid active until its expiry, which is armed (a later grant's expiry replaces it).
+    fn grant_temp_locked(&self, st: &mut State, uid: u32, grant: uid_state::TempGrant) {
+        let now = self.now_ms();
+        if let Some(at) = st
+            .uids
+            .on_temp_allowlist(uid, now, grant.duration_ms, grant.fgs)
+        {
+            atl_diag::answered(AM, "temp allowlist granted (tempAllowlistUidLocked)");
+            self.arm(Timer::TempExpiry(uid), at);
+        }
+    }
+
+    /// A grant's expiry fired: the uid's settle sweep is armed at the deadline `on_temp_expired` returns, when no other reason holds the uid.
+    fn temp_expired(&self, uid: u32) {
+        let now = self.now_ms();
+        let mut st = self.state();
+        if let Some(at) = st.uids.on_temp_expired(uid, now) {
+            self.arm(Timer::UidSettle(uid), at);
         }
     }
 
