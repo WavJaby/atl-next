@@ -16,8 +16,8 @@
     </queries>
 
     <application android:label="ATL broadcast sender">
-        <!-- not opted in (no autostart setting for this package): LOCKED_BOOT_COMPLETED and BOOT_COMPLETED are skipped here (counter `boot broadcast skipped`) -->
-        <receiver android:name=".BootRecv" android:exported="false" android:directBootAware="true">
+        <!-- not opted in (no autostart setting for this package): BOOT_COMPLETED is skipped (counter `boot broadcast skipped`); not directBootAware, so LOCKED_BOOT_COMPLETED is refused first (counter `LOCKED_BOOT_COMPLETED`) -->
+        <receiver android:name=".BootRecv" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />

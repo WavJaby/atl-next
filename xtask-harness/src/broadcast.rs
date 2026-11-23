@@ -103,6 +103,8 @@ const BOOT_MY_REPLACED: &str = "AtlBcast: boot received android.intent.action.MY
 const BOOT_SERVICE_STARTED: &str = "AtlBcast: boot service started";
 const BOOT_SERVICE_REFUSED: &str = "AtlBcast: boot service refused";
 const BOOT_SKIPPED: &str = "boot broadcast skipped";
+/// The counter key of boot_refusal's directBootAware refusal (its reason's first ':' part).
+const BOOT_LOCKED_REFUSED: &str = "LOCKED_BOOT_COMPLETED";
 
 /// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed).
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -381,6 +383,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 && !s.contains(BOOT_LOCKED)
                 && !s.contains(BOOT_BOOT)
                 && counted(BOOT_SKIPPED),
+        ),
+        (
+            "LOCKED_BOOT_COMPLETED was refused for the receiver that is not directBootAware (counter)",
+            counted(BOOT_LOCKED_REFUSED) && !s.contains(BOOT_LOCKED),
         ),
         (
             "BOOT_COMPLETED reached the opted-in receiver app in the opt-in run",

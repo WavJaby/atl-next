@@ -64,12 +64,6 @@ pub fn install(
             .with_context(|| format!("committing {}", parsed.name))?;
         let version = long_version(&parsed.info);
         let change = change_of(recorded(&parsed.name), version);
-        if let Change::Downgraded { .. } = change {
-            atl_diag::answered(
-                DIAG,
-                "install: lower version than recorded: no replace broadcasts",
-            );
-        }
         reports.push(Reported {
             package: parsed.name.clone(),
             uid,
@@ -109,7 +103,13 @@ pub fn change_of(recorded: Option<i64>, version: i64) -> Change {
     match recorded {
         None => Change::New,
         Some(from) if version > from => Change::Updated { from },
-        Some(from) if version < from => Change::Downgraded { from },
+        Some(from) if version < from => {
+            atl_diag::answered(
+                DIAG,
+                "install: lower version than recorded: no replace broadcasts",
+            );
+            Change::Downgraded { from }
+        }
         Some(_) => Change::Unchanged,
     }
 }
@@ -292,13 +292,24 @@ fn staged_names(app: &ApplicationInfo) -> Result<Vec<StagedName>> {
 mod tests {
     use super::*;
 
-    /// A parse of a dir staged as the pm shell names files (source names) whose split name differs from every file name: the renames follow the parse.
+    /// The count of the downgrade refusal (change_of's diag line).
+    fn downgrades() -> u64 {
+        atl_diag::counts()
+            .into_iter()
+            .find(|(_, api, _)| {
+                api == "IPackageManager.install: lower version than recorded: no replace broadcasts"
+            })
+            .map_or(0, |(_, _, n)| n)
+    }
+
     #[test]
     fn change_compares_longversioncode_against_the_recorded_one() {
         // PackageInfo.getLongVersionCode (PackageInfo.java :93-94): a higher major word beats any minor one
         assert_eq!(change_of(None, 5), Change::New);
         assert_eq!(change_of(Some(4), 5), Change::Updated { from: 4 });
+        let before = downgrades();
         assert_eq!(change_of(Some(5), 4), Change::Downgraded { from: 5 });
+        assert_eq!(downgrades(), before + 1);
         assert_eq!(change_of(Some(5), 5), Change::Unchanged);
         assert_eq!(
             change_of(Some(0xffff_ffff), 1 << 32),
@@ -321,6 +332,7 @@ mod tests {
         assert_eq!(long_version(&plain), 2);
     }
 
+    /// A parse of a dir staged as the pm shell names files (source names) whose split name differs from every file name: the renames follow the parse.
     #[test]
     fn names_come_from_the_parsed_split_names() {
         let staged = |f: &str| Some(format!("{DATA_APP}/vmdl0.tmp/{f}"));
