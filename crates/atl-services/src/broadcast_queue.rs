@@ -4,8 +4,8 @@
 //! IApplicationThread.scheduleRegisteredReceiver (:1211), a manifest receiver through scheduleReceiver (:1227). Both are oneway.
 //! Order: the activity service enqueues under its state lock, so the channel's order is the lock's; one sender thread keeps it, which gives each process its deliveries in FIFO order (AOSP's
 //! BroadcastProcessQueue guarantee for non-ordered broadcasts; no order across processes, as in AOSP). No call leaves the system process with the lock held.
-//! Not modelled: delivery timeouts and ANRs (BroadcastConstants.TIMEOUT: nothing waits on a non-ordered delivery here; a manifest receiver's finishReceiver is accepted and counted), process-state
-//! accounting (processState is PROCESS_STATE_UNKNOWN), shareIdentity (sentFromUid INVALID_UID, sentFromPackage null), the kill of an app a delivery fails to (:1239: logged and counted).
+//! The timers and the order of deliveries are broadcasts_am.rs's and broadcast_dispatch.rs's; this module only sends. Not modelled: process-state accounting (processState is PROCESS_STATE_UNKNOWN),
+//! shareIdentity (sentFromUid INVALID_UID, sentFromPackage null), the kill of an app a delivery fails to (:1239: logged and counted; its delivery ends by timeout).
 
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
@@ -27,24 +27,28 @@ const PROCESS_STATE_UNKNOWN: i32 = -1;
 
 /// What one receiver gets (BroadcastRecord + its receiver at `index`, reduced to the wire arguments).
 pub(crate) enum Job {
-    /// a BroadcastFilter: r.ordered is false and resultTo null, so assumeDelivered (BroadcastRecord.isAssumedDelivered:271-274)
+    /// a BroadcastFilter (scheduleRegisteredReceiver); `assume_delivered` = BroadcastRecord.isAssumedDelivered (:271-274): nothing comes back, else the app answers finishReceiver
     Registered {
         receiver: Strong<dyn IIntentReceiver>,
         intent: Intent,
         result_code: i32,
         data: Option<String>,
         extras: Option<Bundle>,
+        /// BroadcastRecord.ordered: the app's result is kept and passed on
+        ordered: bool,
         /// r.initialSticky: a sticky replayed on registration
         initial_sticky: bool,
+        assume_delivered: bool,
         user: i32,
     },
-    /// a manifest receiver (ResolveInfo.activityInfo): not assumed delivered, the app answers finishReceiver
+    /// a manifest receiver (ResolveInfo.activityInfo, scheduleReceiver): never assumed delivered (its arguments carry assumeDelivered = false), the app answers finishReceiver
     Manifest {
         intent: Intent,
         info: Box<ActivityInfo>,
         result_code: i32,
         data: Option<String>,
         extras: Option<Bundle>,
+        ordered: bool,
         user: i32,
     },
 }
@@ -88,7 +92,9 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
             result_code,
             data,
             extras,
+            ordered,
             initial_sticky,
+            assume_delivered,
             user,
         } => {
             atl_diag::answered(BQ, "scheduleRegisteredReceiver");
@@ -98,9 +104,9 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
                 *result_code,
                 data.as_deref(),
                 extras.as_ref(),
-                false,
+                *ordered,
                 *initial_sticky,
-                true,
+                *assume_delivered,
                 *user,
                 PROCESS_STATE_UNKNOWN,
                 INVALID_UID,
@@ -113,6 +119,7 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
             result_code,
             data,
             extras,
+            ordered,
             user,
         } => {
             atl_diag::answered(BQ, "scheduleReceiver");
@@ -123,7 +130,7 @@ fn deliver(thread: &Strong<dyn IApplicationThread>, job: &Job) -> binder::Result
                 *result_code,
                 data.as_deref(),
                 extras.as_ref(),
-                false,
+                *ordered,
                 false,
                 *user,
                 PROCESS_STATE_UNKNOWN,

@@ -13,9 +13,22 @@ import android.util.Log;
 public class Recv extends BroadcastReceiver {
     static final String TAG = "AtlBcast";
 
+    static final String ORDER = "com.example.atlbcast.ORDER";
+
     @Override
     public void onReceive(Context c, Intent i) {
-        Log.i(TAG, "manifest received " + i.getAction());
+        String action = i.getAction();
+        Log.i(TAG, "manifest received " + action);
+        // the ordered broadcast of the sender: it sees the result the sender's receivers left, and its own result (7) is the final one
+        if (ORDER.equals(action)) {
+            Log.i(TAG, "order manifest code=" + getResultCode() + " data=" + getResultData());
+            setResultCode(7);
+            return;
+        }
+        // ABORT and IMPLICIT reach here only if the dispatcher delivered them (the gate fails on that line)
+        if (!"com.example.atlbcast.EXPLICIT".equals(action)) {
+            return;
+        }
         try {
             c.sendStickyBroadcast(new Intent("com.example.atlbcastrecv.MINE"));
             Log.i(TAG, "sticky allowed");

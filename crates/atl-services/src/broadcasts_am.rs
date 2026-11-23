@@ -1,0 +1,845 @@
+// SPDX-License-Identifier: MIT
+//! The broadcast half of the activity service (child module of activity.rs): BroadcastController's send path and BroadcastQueueImpl's wiring. Every broadcast is one record of the
+//! dispatcher (broadcast_dispatch.rs); this module builds its receiver list, runs the dispatch-time policy (BroadcastSkipPolicy: start mode, disallowBackgroundStart), performs the
+//! dispatcher's actions (sends through broadcast_queue.rs, cold starts through start_headless_locked, timers through am_handler, resultTo) and feeds it the process and binder events.
+//! The rules are broadcast.rs's. A refusal or an unmodelled branch counts `atl_diag::answered(AM, <AOSP message up to its ':'>)`.
+
+use std::collections::VecDeque;
+
+use super::*;
+use crate::broadcast_dispatch::{
+    self as bd, Action, BroadcastId, Component, Dispatcher, Facts, Finish, NewBroadcast, Outcome,
+    PENDING_COLD_START_ABANDON_MS, Policy, ProcKey, Receiver, Target,
+};
+use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
+
+/// What each receiver of a broadcast gets besides its result: the intent, the user, and whether it is a registration's initial sticky (BroadcastRecord.initialSticky).
+#[derive(Clone)]
+pub(super) struct Payload {
+    pub(super) intent: Intent,
+    pub(super) user: i32,
+    pub(super) initial_sticky: bool,
+}
+
+/// The activity service's dispatcher: every broadcast not yet retired and every process queue (broadcast_dispatch.rs).
+pub(super) type Dispatch = Dispatcher<ReceiverHandle, Bundle, Payload>;
+type DispatchAction = Action<ReceiverHandle, Bundle, Payload>;
+type Recv = Receiver<ReceiverHandle>;
+/// Activity.RESULT_OK (-1): the initial result of a send (ContextImpl.sendBroadcast).
+const BROADCAST_RESULT_OK: i32 = -1;
+
+/// One send as the binder side makes it (BroadcastController.broadcastIntentLocked after verifyBroadcastLocked): the sender's (pid, uid), its user, the permissions it required (None =
+/// null, not an empty list), its result (code, data, extras), whether it is sticky and ordered, and the process a result goes back to (resultTo).
+pub(super) struct SendSpec<'a> {
+    pub(super) intent: &'a Intent,
+    pub(super) resolved_type: Option<&'a str>,
+    pub(super) sender: (i32, u32),
+    pub(super) user: i32,
+    pub(super) required: Option<&'a [String]>,
+    pub(super) result: (i32, Option<String>, Option<Bundle>),
+    pub(super) sticky: bool,
+    pub(super) ordered: bool,
+    /// the resultTo handle and the pid of the process that holds it
+    pub(super) result_to: Option<(ReceiverHandle, i32)>,
+}
+
+/// The dispatch-time skip (BroadcastSkipPolicy.shouldSkipMessage's start-mode part, :229-246): a manifest receiver whose uid is restricted (uid_state::start_mode DELAYED_RIGID) is
+/// skipped unless disallowBackgroundStart clears it (explicit, INCLUDE_BACKGROUND or signature-only permissions, :347-354). Registered receivers are not restricted.
+fn dispatch_skip(
+    packages: &Packages,
+    uids: &uid_state::Uids,
+    now: u64,
+    facts: &Facts,
+    r: &Recv,
+) -> Option<String> {
+    let Target::Manifest(component) = &r.target else {
+        return None;
+    };
+    let Some(p) = packages.by_name(&component.package) else {
+        return Some(format!("Skipping delivery to {component}: package is gone"));
+    };
+    let persistent = p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK;
+    let mode = uids.start_mode(r.proc.uid, p.app().target_sdk_version, persistent, now);
+    if mode != uid_state::StartMode::DelayedRigid {
+        return None;
+    }
+    broadcast::disallow_background_start(facts.flags, facts.explicit, facts.signature_perms)
+        .then(|| format!("Background execution not allowed: receiving to {component}"))
+}
+
+/// BroadcastController.java:1608-1643: registered receivers and manifest receivers merged by priority, a registered one first at equal priority (both lists sorted, stable).
+fn merge_by_priority(mut registered: Vec<Recv>, mut manifest: Vec<Recv>) -> Vec<Recv> {
+    registered.sort_by_key(|r| std::cmp::Reverse(r.priority));
+    manifest.sort_by_key(|r| std::cmp::Reverse(r.priority));
+    let mut out = Vec::with_capacity(registered.len() + manifest.len());
+    let (mut r, mut m) = (
+        registered.into_iter().peekable(),
+        manifest.into_iter().peekable(),
+    );
+    loop {
+        let take_registered = match (r.peek(), m.peek()) {
+            (Some(a), Some(b)) => a.priority >= b.priority,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_registered { r.next() } else { m.next() };
+        out.extend(next);
+    }
+    out
+}
+
+impl Inner {
+    /// Runs `f` against the dispatcher with the dispatch-time policy over the caller's state (uids, packages, the clock).
+    pub(super) fn dispatch<T>(
+        &self,
+        st: &mut State,
+        f: impl FnOnce(&mut Dispatch, &mut Policy<'_, ReceiverHandle>) -> T,
+    ) -> T {
+        let now = self.now_ms();
+        let packages = &self.packages;
+        let State {
+            dispatcher, uids, ..
+        } = st;
+        let uids: &uid_state::Uids = uids;
+        let mut policy = |facts: &Facts, r: &Recv| dispatch_skip(packages, uids, now, facts, r);
+        f(dispatcher, &mut policy)
+    }
+
+    /// Performs the dispatcher's actions in order (a failed start feeds its own actions back in). Ends no process: a process ends only at its death, force-stop or start timeout.
+    pub(super) fn perform(&self, st: &mut State, actions: Vec<DispatchAction>) {
+        let mut work: VecDeque<DispatchAction> = actions.into();
+        while let Some(action) = work.pop_front() {
+            match action {
+                Action::Send { pid, job } => {
+                    let Some(thread) = Self::thread_of_pid(st, pid) else {
+                        atl_diag::answered(AM, "broadcast dropped: its process is not attached");
+                        continue;
+                    };
+                    if let Some(job) = self.wire_job(job) {
+                        self.broadcast_queue.enqueue(thread, job);
+                    }
+                }
+                Action::StartProcess { key, component } => {
+                    match self.start_headless_locked(st, &component.package, &key.name, key.uid) {
+                        Ok(true) => {
+                            atl_diag::answered(
+                                AM,
+                                "broadcast cold start (scheduleReceiverColdLocked)",
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            // BroadcastQueueImpl:1037-1050: the start failed, the delivery fails
+                            atl_diag::answered(
+                                AM,
+                                "broadcast dropped: receiver process start failed",
+                            );
+                            log(format_args!(
+                                "Unable to launch app {} for broadcast {component}: {e}",
+                                key.name
+                            ));
+                            let more = self.dispatch(st, |d, p| d.start_failed(&key, p));
+                            work.extend(more);
+                        }
+                    }
+                }
+                Action::ResultTo {
+                    pid,
+                    handle,
+                    result,
+                    payload,
+                } => {
+                    if let Some(thread) = Self::thread_of_pid(st, pid) {
+                        // scheduleResultTo (BroadcastQueueImpl:1263): a registered receiver, assumed delivered; the broadcast's own intent
+                        self.broadcast_queue.enqueue(
+                            thread,
+                            broadcast_queue::Job::Registered {
+                                receiver: handle.0,
+                                intent: payload.intent,
+                                result_code: result.code,
+                                data: result.data,
+                                extras: result.extras,
+                                ordered: false,
+                                initial_sticky: false,
+                                assume_delivered: true,
+                                user: payload.user,
+                            },
+                        );
+                    }
+                }
+                Action::ArmTimeout {
+                    pid,
+                    id,
+                    index,
+                    after_ms,
+                } => {
+                    let at = self.now_ms() + after_ms;
+                    self.arm(Timer::Broadcast { pid, id, index }, at);
+                }
+                Action::ArmColdStart {
+                    key,
+                    token,
+                    after_ms,
+                } => {
+                    let at = self.now_ms() + after_ms;
+                    self.arm(Timer::ColdStart { key, token }, at);
+                }
+                Action::ColdStartAbandoned { key } => {
+                    // the backstop: the slot is released and the delivery re-enqueued or failed. The process is not ended here; an unattached one ends at its start timeout
+                    atl_diag::answered(AM, "cold start abandoned: slot released");
+                    log(format_args!(
+                        "cold start of {} abandoned: not attached within {PENDING_COLD_START_ABANDON_MS} ms",
+                        key.name
+                    ));
+                }
+                Action::Skip { id, index, reason } => {
+                    atl_diag::answered(AM, reason.split(':').next().unwrap_or("skipped"));
+                    log(format_args!("broadcast {id}/{index} skipped: {reason}"));
+                }
+                Action::Retired { .. } => {}
+            }
+        }
+    }
+
+    /// The delivery of a dispatcher job as the sender thread sends it (scheduleReceiver / scheduleRegisteredReceiver). A manifest receiver whose component is gone is dropped here
+    /// (counted); its delivery then ends by timeout.
+    fn wire_job(
+        &self,
+        job: bd::Job<ReceiverHandle, Bundle, Payload>,
+    ) -> Option<broadcast_queue::Job> {
+        let (result_code, data, extras) = (job.result.code, job.result.data, job.result.extras);
+        match job.receiver {
+            Target::Registered(handle) => Some(broadcast_queue::Job::Registered {
+                receiver: handle.0,
+                intent: job.payload.intent,
+                result_code,
+                data,
+                extras,
+                ordered: job.ordered,
+                initial_sticky: job.payload.initial_sticky,
+                assume_delivered: job.assume_delivered,
+                user: job.payload.user,
+            }),
+            Target::Manifest(component) => {
+                let Some(p) = self.packages.by_name(&component.package) else {
+                    atl_diag::answered(AM, "broadcast dropped: receiver package is gone");
+                    return None;
+                };
+                let Some(decl) = p.receiver(&component.class) else {
+                    atl_diag::answered(AM, "broadcast dropped: receiver component is gone");
+                    return None;
+                };
+                // the stored receiver for STOCK_PM_FLAGS (ComputerEngine.queryIntentReceivers' ResolveInfo.activityInfo)
+                let info = package::activity_info(p, &self.packages, decl, package::STOCK_PM_FLAGS);
+                // the receiver's Intent carries its component (BroadcastRecord.getReceiverIntent: setComponent for a ResolveInfo)
+                let mut intent = job.payload.intent;
+                intent.component = Some(ComponentName {
+                    package: p.name().to_owned(),
+                    class: component.class,
+                });
+                Some(broadcast_queue::Job::Manifest {
+                    intent,
+                    info: Box::new(info),
+                    result_code,
+                    data,
+                    extras,
+                    ordered: job.ordered,
+                    user: job.payload.user,
+                })
+            }
+        }
+    }
+
+    /// The attached thread of process `pid` (the dispatcher's sends and resultTo go to it).
+    fn thread_of_pid(st: &State, pid: i32) -> Option<Strong<dyn IApplicationThread>> {
+        st.processes
+            .iter()
+            .find(|r| r.pid == pid)
+            .and_then(|r| r.attached.as_ref().map(|a| a.thread.clone()))
+    }
+
+    /// The dispatcher's queue key of process `pid`: its process name and uid.
+    fn process_key_of(st: &State, pid: i32) -> Option<ProcKey> {
+        st.processes.iter().find(|r| r.pid == pid).map(|r| ProcKey {
+            name: r.process_name.clone(),
+            uid: r.uid,
+        })
+    }
+
+    /// A manifest receiver of package `p` (its declaration `decl`): the permission rules (BroadcastSkipPolicy :133-146, :308-321), then the receiver of its process. The priority is the
+    /// filter's for an implicit receiver, 0 for an explicit one.
+    fn manifest_receiver(
+        &self,
+        sender_uid: u32,
+        required: &[String],
+        p: &PackageRecord,
+        decl: &ActivityInfo,
+        class: &str,
+        priority: i32,
+    ) -> Option<Recv> {
+        let component = Component {
+            package: p.name().to_owned(),
+            class: class.to_owned(),
+        };
+        let target = broadcast::ManifestReceiver {
+            component: &component.to_string(),
+            permission: decl.permission.as_deref(),
+            exported: decl.component.exported,
+            uid: p.uid,
+        };
+        if let Some(why) = broadcast::skip_manifest(
+            &target,
+            sender_uid,
+            required,
+            |perm| self.holds(sender_uid, perm),
+            |perm| self.holds(p.uid, perm),
+        ) {
+            atl_diag::answered(
+                AM,
+                "broadcast skipped: Permission Denial (manifest receiver)",
+            );
+            log(format_args!("{why}"));
+            return None;
+        }
+        let process = decl
+            .component
+            .process_name
+            .as_deref()
+            .unwrap_or(p.process_name())
+            .to_owned();
+        Some(Receiver {
+            target: Target::Manifest(component),
+            priority,
+            proc: ProcKey {
+                name: process,
+                uid: p.uid,
+            },
+        })
+    }
+
+    /// The manifest receiver of an explicit component (broadcastIntentLocked's collectReceiverComponents for a component, :1966-1982).
+    fn explicit_receiver(
+        &self,
+        package: &str,
+        class: &str,
+        sender_uid: u32,
+        required: &[String],
+    ) -> Option<Recv> {
+        let Some(p) = self.packages.by_name(package) else {
+            atl_diag::answered(
+                AM,
+                "broadcast to a component of an unknown package: no receiver",
+            );
+            return None;
+        };
+        let Some(decl) = p
+            .receiver(class)
+            .filter(|r| self.packages.enabled(&r.component, 0))
+        else {
+            atl_diag::answered(
+                AM,
+                "broadcast to a component that is no enabled <receiver>: no receiver",
+            );
+            return None;
+        };
+        self.manifest_receiver(sender_uid, required, p, decl, class, 0)
+    }
+
+    /// The manifest receivers an implicit intent matches (ComputerEngine.queryIntentReceivers, the caller's visible packages), each by its filter's priority.
+    fn implicit_receivers(
+        &self,
+        sender_uid: u32,
+        intent: &Intent,
+        resolved_type: Option<&str>,
+        required: &[String],
+    ) -> Vec<Recv> {
+        let mut out = Vec::new();
+        for info in package::query_intent_receivers(
+            &self.packages,
+            sender_uid,
+            intent,
+            resolved_type,
+            package::STOCK_PM_FLAGS,
+            USER_SYSTEM,
+        ) {
+            let Resolved::Activity(decl) = &info.info else {
+                continue;
+            };
+            let (Some(package), Some(class)) = (
+                decl.component.item.package_name.as_deref(),
+                decl.component.item.name.as_deref(),
+            ) else {
+                continue;
+            };
+            let Some(p) = self.packages.by_name(package) else {
+                continue;
+            };
+            out.extend(self.manifest_receiver(sender_uid, required, p, decl, class, info.priority));
+        }
+        out
+    }
+
+    /// The receivers of a send in delivery-list order: an explicit component's manifest receiver, else the implicit manifest receivers and the registered ones (not for
+    /// FLAG_RECEIVER_REGISTERED_ONLY, which keeps only the registered), merged by priority. Registered receivers of a process that is not attached are not receivers here.
+    fn receivers_locked(
+        &self,
+        st: &State,
+        spec: &SendSpec<'_>,
+        intent: &Intent,
+        key: &crate::broadcast::IntentKey,
+    ) -> Vec<Recv> {
+        let (sender_uid, required) = (spec.sender.1, spec.required.unwrap_or(&[]));
+        let mut manifest = Vec::new();
+        if intent.flags & broadcast::FLAG_RECEIVER_REGISTERED_ONLY == 0 {
+            match &intent.component {
+                Some(c) => manifest
+                    .extend(self.explicit_receiver(&c.package, &c.class, sender_uid, required)),
+                None => manifest.extend(self.implicit_receivers(
+                    sender_uid,
+                    intent,
+                    spec.resolved_type,
+                    required,
+                )),
+            }
+        }
+        // BroadcastController.java:1578-1603: a package's own added / restarted / cleared broadcast does not reach its manifest receivers
+        let ssp = intent
+            .data
+            .as_deref()
+            .and_then(|d| d.split_once(':'))
+            .map(|(_, ssp)| ssp);
+        manifest.retain(|r| match &r.target {
+            Target::Manifest(c) => {
+                let own = broadcast::skips_own_package(intent.action.as_deref(), ssp, &c.package);
+                if own {
+                    atl_diag::answered(AM, "broadcast skipped: package's own receiver");
+                }
+                !own
+            }
+            Target::Registered(_) => true,
+        });
+        let mut registered = Vec::new();
+        if intent.component.is_none() {
+            for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(key, spec.user) {
+                if let Some(why) = broadcast::skip_registered(
+                    &bf,
+                    sender_uid,
+                    ruid,
+                    required,
+                    |p| self.holds(sender_uid, p),
+                    |p| self.holds(ruid, p),
+                ) {
+                    atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
+                    log(format_args!("{why}"));
+                    continue;
+                }
+                let Some(proc) = Self::process_key_of(st, rpid) else {
+                    atl_diag::answered(
+                        AM,
+                        "broadcast skipped: registered receiver of no attached process",
+                    );
+                    continue;
+                };
+                registered.push(Receiver {
+                    target: Target::Registered(receiver),
+                    priority: bf.priority,
+                    proc,
+                });
+            }
+        }
+        merge_by_priority(registered, manifest)
+    }
+
+    /// The send path (BroadcastController.broadcastIntentLocked after verifyBroadcastLocked): a sticky is checked and stored (:1415-1495), then the receivers (receivers_locked) become
+    /// one dispatcher broadcast. Returns BROADCAST_SUCCESS, or the sticky's refusal code.
+    pub(super) fn send_broadcast(&self, spec: SendSpec<'_>) -> binder::Result<i32> {
+        let (pid, uid) = spec.sender;
+        if spec.sticky {
+            let holds = self.holds(uid, permission::BROADCAST_STICKY);
+            let required_any = spec.required.is_some_and(|r| !r.is_empty());
+            match broadcast::sticky_send(
+                holds,
+                pid,
+                uid,
+                required_any,
+                spec.intent.component.is_some(),
+            ) {
+                Ok(()) => {}
+                Err(StickyRefusal::Security(msg)) => {
+                    log(format_args!("{msg}"));
+                    return Err(security(&msg));
+                }
+                Err(StickyRefusal::CantHavePermission) => {
+                    log(format_args!(
+                        "Can't broadcast sticky intent and enforce permissions {:?}",
+                        spec.required
+                    ));
+                    return Ok(broadcast::BROADCAST_STICKY_CANT_HAVE_PERMISSION);
+                }
+            }
+        }
+        let key = intent_key(spec.intent, spec.resolved_type);
+        // the sysconfig allow list adds INCLUDE_BACKGROUND to its actions (BroadcastController.java:1101-1107)
+        let mut intent = std::borrow::Cow::Borrowed(spec.intent);
+        if broadcast::include_background_for(intent.action.as_deref())
+            && intent.flags & broadcast::FLAG_RECEIVER_INCLUDE_BACKGROUND == 0
+        {
+            intent.to_mut().flags |= broadcast::FLAG_RECEIVER_INCLUDE_BACKGROUND;
+        }
+        let mut st = self.state();
+        if spec.sticky {
+            st.broadcasts
+                .put_sticky(spec.user, key.clone(), spec.intent.clone(), uid);
+        }
+        let receivers = self.receivers_locked(&st, &spec, &intent, &key);
+        let facts = Facts {
+            flags: intent.flags,
+            explicit: intent.component.is_some() || intent.package.is_some(),
+            signature_perms: self.permissions.is_signature_only(spec.required),
+        };
+        let result_to = spec
+            .result_to
+            .and_then(|(handle, rpid)| Self::process_key_of(&st, rpid).map(|key| (handle, key)));
+        let b = NewBroadcast {
+            facts,
+            receivers,
+            ordered: spec.ordered,
+            result: Outcome {
+                code: spec.result.0,
+                data: spec.result.1,
+                extras: spec.result.2,
+            },
+            result_to,
+            payload: Payload {
+                intent: intent.into_owned(),
+                user: spec.user,
+                initial_sticky: false,
+            },
+        };
+        let (_, actions) = self.dispatch(&mut st, |d, p| d.enqueue(b, p));
+        self.perform(&mut st, actions);
+        drop(st);
+        Ok(BROADCAST_SUCCESS)
+    }
+
+    /// The registration's initial sticky (registerReceiverWithFeatureTraced:582-604): an unordered broadcast of the stored sticky to this one receiver, flagged initial.
+    pub(super) fn sticky_replay_locked(
+        &self,
+        st: &mut State,
+        pid: i32,
+        receiver: ReceiverHandle,
+        priority: i32,
+        intent: Intent,
+    ) {
+        let Some(proc) = Self::process_key_of(st, pid) else {
+            atl_diag::answered(
+                AM,
+                "registerReceiver: sticky not delivered (no attached process)",
+            );
+            return;
+        };
+        let b = NewBroadcast {
+            facts: Facts {
+                flags: intent.flags,
+                ..Facts::default()
+            },
+            receivers: vec![Receiver {
+                target: Target::Registered(receiver),
+                priority,
+                proc,
+            }],
+            ordered: false,
+            // the result code the replay has always carried (0); AOSP's replay BroadcastRecord code is not checked against source yet
+            result: Outcome {
+                code: 0,
+                data: None,
+                extras: None,
+            },
+            result_to: None,
+            payload: Payload {
+                intent,
+                user: broadcast::USER_ALL,
+                initial_sticky: true,
+            },
+        };
+        let (_, actions) = self.dispatch(st, |d, p| d.enqueue(b, p));
+        self.perform(st, actions);
+    }
+
+    /// The delivery timer of (`pid`, `id`, `index`) fired (BroadcastQueueImpl.broadcastTimeoutLocked). A timer whose delivery ended does nothing. The ANR is not modelled: the
+    /// delivery ends as TIMEOUT, a headless process gets AOSP's silent background-ANR kill (ProcessErrorStateRecord :672-673, plan P2), a windowed one is only counted.
+    pub(super) fn broadcast_timeout(&self, pid: i32, id: BroadcastId, index: usize) {
+        let headless = {
+            let mut st = self.state();
+            if !st.dispatcher.delivering(pid, id, index) {
+                return;
+            }
+            atl_diag::answered(AM, "broadcast timeout: ANR not modelled");
+            let headless = st
+                .processes
+                .iter()
+                .find(|r| r.pid == pid)
+                .is_some_and(|r| r.task.is_none());
+            let actions = self.dispatch(&mut st, |d, p| d.timeout(pid, id, index, p));
+            self.perform(&mut st, actions);
+            headless
+        };
+        if headless {
+            atl_diag::answered(
+                AM,
+                "broadcast timeout: headless process ended (silent bg ANR)",
+            );
+            self.kill(&[pid]);
+        }
+    }
+
+    /// The cold-start backstop timer fired (its ColdStartAbandoned action, performed by [`Self::perform`]); a stale token does nothing.
+    pub(super) fn cold_start_timeout(&self, key: &ProcKey, token: u64) {
+        let mut st = self.state();
+        let actions = self.dispatch(&mut st, |d, p| d.cold_start_timeout(key, token, p));
+        self.perform(&mut st, actions);
+    }
+
+    /// finishReceiver (IActivityManager.aidl:197, oneway): `who` is the app thread's binder, which names the process (LoadedApk :1755, BroadcastReceiver :326). The result and abort go to
+    /// the dispatcher; the process's hold ends with its delivery.
+    pub(super) fn finish_receiver(
+        &self,
+        who: Option<&SpIBinder>,
+        result: Outcome<Bundle>,
+        abort: bool,
+    ) {
+        let mut st = self.state();
+        let pid = who.and_then(|who| {
+            st.processes
+                .iter()
+                .find(|r| {
+                    r.attached
+                        .as_ref()
+                        .is_some_and(|a| a.thread.as_binder() == *who)
+                })
+                .map(|r| r.pid)
+        });
+        match pid {
+            Some(pid) => {
+                let actions =
+                    self.dispatch(&mut st, |d, p| d.finish(pid, Finish { result, abort }, p));
+                self.perform(&mut st, actions);
+            }
+            None => {
+                atl_diag::answered(AM, "finishReceiver: no attached process of that binder");
+            }
+        }
+        self.touch_all_locked(&mut st);
+        drop(st);
+    }
+
+    /// onApplicationAttachedLocked (finishAttachApplicationInner): the process's queue resumes with its pid.
+    pub(super) fn process_attached_locked(&self, st: &mut State, pid: i32) {
+        let Some(key) = Self::process_key_of(st, pid) else {
+            return;
+        };
+        let actions = self.dispatch(st, |d, p| d.process_attached(&key, pid, p));
+        self.perform(st, actions);
+    }
+
+    /// onApplicationCleanupLocked and the ReceiverList cleanup of a dead process: its registrations go, its in-flight delivery fails, its waiting manifest deliveries wait for a new
+    /// process.
+    pub(super) fn broadcasts_died_locked(&self, st: &mut State, pid: i32) {
+        st.broadcasts.process_died(pid);
+        let actions = self.dispatch(st, |d, p| d.process_died(pid, p));
+        self.perform(st, actions);
+    }
+
+    /// cleanupDisabledPackageReceiversLocked (force-stop): the package's waiting manifest deliveries are skipped (a crash keeps them, as AOSP does).
+    pub(super) fn drop_package_locked(&self, st: &mut State, package: &str) {
+        let actions = self.dispatch(st, |d, p| d.drop_package(package, p));
+        self.perform(st, actions);
+    }
+
+    /// A cold start of `key` ended before attach (its record was removed by a start timeout or a force-stop): its delivery fails and the slot is released.
+    pub(super) fn start_failed_locked(&self, st: &mut State, key: &ProcKey) {
+        let actions = self.dispatch(st, |d, p| d.start_failed(key, p));
+        self.perform(st, actions);
+    }
+}
+
+impl ActivityManager {
+    /// A broadcast the services send as the system uid to the registered receivers, of `only_uid` alone when given (see [`Self::broadcast_registered`]'s callers). Returns the receivers queued.
+    pub fn broadcast_registered(&self, intent: &Intent, only_uid: Option<u32>) -> usize {
+        let inner = &self.inner;
+        let user = only_uid.map_or(USER_SYSTEM, |uid| {
+            i32::try_from(uid / permission::PER_USER_RANGE).unwrap_or(USER_SYSTEM)
+        });
+        let key = intent_key(intent, None);
+        let mut st = inner.state();
+        let mut receivers = Vec::new();
+        for (receiver, rpid, ruid, bf) in st.broadcasts.receivers(&key, user) {
+            if only_uid.is_some_and(|uid| ruid != uid) {
+                continue;
+            }
+            if let Some(why) = broadcast::skip_registered(
+                &bf,
+                SYSTEM_UID,
+                ruid,
+                &[],
+                |p| inner.holds(SYSTEM_UID, p),
+                |p| inner.holds(ruid, p),
+            ) {
+                atl_diag::answered(AM, why.split(':').next().unwrap_or("skipped"));
+                continue;
+            }
+            let Some(proc) = Inner::process_key_of(&st, rpid) else {
+                continue;
+            };
+            receivers.push(Receiver {
+                target: Target::Registered(receiver),
+                priority: bf.priority,
+                proc,
+            });
+        }
+        let queued = receivers.len();
+        if queued == 0 {
+            return 0;
+        }
+        let b = NewBroadcast {
+            facts: Facts {
+                flags: intent.flags,
+                ..Facts::default()
+            },
+            receivers,
+            ordered: false,
+            result: Outcome {
+                code: BROADCAST_RESULT_OK,
+                data: None,
+                extras: None,
+            },
+            result_to: None,
+            payload: Payload {
+                intent: intent.clone(),
+                user,
+                initial_sticky: false,
+            },
+        };
+        let (_, actions) = inner.dispatch(&mut st, |d, p| d.enqueue(b, p));
+        inner.perform(&mut st, actions);
+        drop(st);
+        queued
+    }
+
+    /// IIntentSender.send of a BROADCAST record (PendingIntentRecord.sendInner): the request intent to `user_id` as the creator `uid`, through the dispatcher like any other send.
+    /// `finished` = the sender's finishedReceiver: ordered, its final result to the calling process `caller_pid` (PendingIntentRecord :674-677). The sender pid is this process.
+    pub(super) fn send_pending_broadcast(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        user_id: i32,
+        finished: Option<(&Strong<dyn IIntentReceiver>, i32)>,
+    ) -> binder::Result<()> {
+        const RESULT_OK: i32 = -1;
+        let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        self.inner
+            .send_broadcast(SendSpec {
+                intent,
+                resolved_type: None,
+                sender: (pid, uid),
+                user: user_id,
+                required: None,
+                result: (RESULT_OK, None, None),
+                sticky: false,
+                ordered: finished.is_some(),
+                result_to: finished.map(|(h, caller)| (ReceiverHandle(h.clone()), caller)),
+            })
+            .map(|_| ())
+    }
+
+    /// A broadcast the services send as the system to every user (ActivityManager.broadcastStickyIntent(intent, USER_ALL) for `sticky`, Context.sendBroadcastAsUser(intent,
+    /// UserHandle.ALL) otherwise): system_server's own call clears its calling identity, so the sender is SYSTEM_UID in this process; result code Activity.RESULT_OK (-1).
+    pub fn broadcast_as_system(&self, intent: &Intent, sticky: bool) {
+        const RESULT_OK: i32 = -1;
+        let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        if let Err(e) = self.inner.send_broadcast(SendSpec {
+            intent,
+            resolved_type: None,
+            sender: (pid, SYSTEM_UID),
+            user: broadcast::USER_ALL,
+            required: None,
+            result: (RESULT_OK, None, None),
+            sticky,
+            ordered: false,
+            result_to: None,
+        }) {
+            log(format_args!("system broadcast {:?}: {e}", intent.action));
+        }
+    }
+
+    /// broadcastIntentWithFeature's body for its binder caller `caller` = (pid, uid) whose attached process is `app` = (package, persistent) ([`Inner::caller_app`]): verifyBroadcastLocked's
+    /// Intent checks (FLAG_RECEIVER_FROM_SHELL dropped unless root or shell, :1907-1917), broadcastIntentLocked's sender check (:1031-1093, broadcast::sender_check: a protected action
+    /// from a non-system caller is a SecurityException), then [`Inner::send_broadcast`] as that caller. An app never reaches the system identity of
+    /// [`Self::broadcast_as_system`]. `ordered` = serialized or a resultTo; `result_to` = the caller's resultTo handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn broadcast_from_caller(
+        &self,
+        caller: (i32, u32),
+        app: (Option<String>, bool),
+        intent: Option<&Intent>,
+        resolved_type: Option<&str>,
+        ordered: bool,
+        required: Option<&[String]>,
+        result: (i32, Option<String>, Option<Bundle>),
+        sticky: bool,
+        user_id: i32,
+        result_to: Option<ReceiverHandle>,
+    ) -> binder::Result<i32> {
+        let Some(intent) = intent else {
+            return Err(Status::new_exception_str(
+                ExceptionCode::NULL_POINTER,
+                Some("broadcastIntent: null Intent"),
+            ));
+        };
+        if intent.has_file_descriptors() {
+            return Err(illegal_argument("File descriptors passed in Intent"));
+        }
+        if intent.flags & FLAG_RECEIVER_BOOT_UPGRADE != 0 {
+            return Err(illegal_argument(
+                "Can't use FLAG_RECEIVER_BOOT_UPGRADE here",
+            ));
+        }
+        let (pid, uid) = caller;
+        let mut intent = std::borrow::Cow::Borrowed(intent);
+        if intent.flags & broadcast::FLAG_RECEIVER_FROM_SHELL != 0
+            && ![ROOT_UID, SHELL_UID].contains(&uid)
+        {
+            intent.to_mut().flags &= !broadcast::FLAG_RECEIVER_FROM_SHELL;
+        }
+        let (package, persistent) = app;
+        let action = intent.action.as_deref();
+        match broadcast::sender_check(
+            action,
+            self.inner.packages.is_protected_broadcast(action),
+            pid,
+            uid,
+            package.as_deref(),
+            persistent,
+            intent.component.as_ref().map(|c| c.package.as_str()),
+        ) {
+            Ok(None) => {}
+            Ok(Some(own)) => intent.to_mut().package = Some(own),
+            Err(msg) => {
+                log(format_args!("{msg}"));
+                return Err(security(&msg));
+            }
+        }
+        self.inner.send_broadcast(SendSpec {
+            intent: &intent,
+            resolved_type,
+            sender: (pid, uid),
+            user: incoming_user(user_id),
+            required,
+            result,
+            sticky,
+            ordered,
+            result_to: result_to.map(|handle| (handle, pid)),
+        })
+    }
+}

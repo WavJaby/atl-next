@@ -37,7 +37,14 @@ pub const FLAG_IMMUTABLE: i32 = 1 << 26;
 /// What a sent record goes through: a BROADCAST record's intent to `user_id` as the creator `uid` (activity.rs's broadcast path), and a SERVICE record's start as that uid
 /// (`foreground`: FOREGROUND_SERVICE, whose foreground rules are S7's).
 pub trait IntentSink: Send + Sync {
-    fn send_as(&self, intent: &Intent, uid: u32, user_id: i32) -> binder::Result<()>;
+    /// `finished` = the sender's finishedReceiver: the broadcast is then ordered, its final result goes back to the calling process (PendingIntentRecord.sendInner :674-677).
+    fn send_as(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        user_id: i32,
+        finished: Option<&Strong<dyn IIntentReceiver>>,
+    ) -> binder::Result<()>;
     fn start_service_as(
         &self,
         intent: &Intent,
@@ -138,7 +145,7 @@ impl IIntentSender for Sender {
         intent: Option<&Intent>,
         _resolved_type: Option<&str>,
         _whitelist_token: Option<&SpIBinder>,
-        _finished_receiver: Option<&Strong<dyn IIntentReceiver>>,
+        finished_receiver: Option<&Strong<dyn IIntentReceiver>>,
         _required_permission: Option<&str>,
         _options: Option<&Bundle>,
     ) -> binder::Result<()> {
@@ -157,7 +164,8 @@ impl IIntentSender for Sender {
         let empty = Intent::default();
         let request = sent.intent.as_ref().or(intent).unwrap_or(&empty);
         if kind == INTENT_SENDER_BROADCAST {
-            sent.sink.send_as(request, sent.uid, sent.user_id)
+            sent.sink
+                .send_as(request, sent.uid, sent.user_id, finished_receiver)
         } else {
             let foreground = kind == INTENT_SENDER_FOREGROUND_SERVICE;
             sent.sink

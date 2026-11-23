@@ -9,6 +9,13 @@
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
 
     <application android:label="ATL broadcast receiver">
-        <receiver android:name=".Recv" android:exported="true" />
+        <!-- the sender's ordered and implicit rows (xtask-harness/testdata/broadcast/sender): an implicit intent reaches this receiver only through these filters -->
+        <receiver android:name=".Recv" android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.atlbcast.ORDER" />
+                <action android:name="com.example.atlbcast.ABORT" />
+                <action android:name="com.example.atlbcast.IMPLICIT" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

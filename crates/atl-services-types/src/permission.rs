@@ -73,6 +73,8 @@ pub const PLATFORM_PACKAGE: &str = "android";
 
 /// PermissionInfo.PROTECTION_FLAG_APPOP: the permission is granted through its app op.
 const PROTECTION_FLAG_APPOP: u32 = 0x40;
+/// PermissionInfo.PROTECTION_FLAG_PRIVILEGED: a signature permission that privileged apps may hold too, so not signature-only.
+const PROTECTION_FLAG_PRIVILEGED: u32 = 0x10;
 
 /// The registry's view of one permission (PermissionRegistry / Permission): who defines it, its base protection and its protection flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +93,11 @@ impl Definition {
     /// Permission.isAppOp: PROTECTION_FLAG_APPOP set.
     pub fn is_app_op(&self) -> bool {
         self.flags & PROTECTION_FLAG_APPOP != 0
+    }
+
+    /// One permission of BroadcastSkipPolicy.isSignaturePerm (:690-700): base SIGNATURE and not PROTECTION_FLAG_PRIVILEGED.
+    pub fn is_signature_only(&self) -> bool {
+        self.base == PROTECTION_SIGNATURE && self.flags & PROTECTION_FLAG_PRIVILEGED == 0
     }
 }
 

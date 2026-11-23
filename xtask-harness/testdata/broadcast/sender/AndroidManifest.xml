@@ -8,6 +8,10 @@
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
     <uses-permission android:name="android.permission.BROADCAST_STICKY" />
+    <!-- package visibility: an implicit broadcast reaches the receiver app's manifest receiver only when this app can see it (AppsFilter, ComputerEngine.queryIntentReceivers) -->
+    <queries>
+        <package android:name="com.example.atlbcastrecv" />
+    </queries>
 
     <application android:label="ATL broadcast sender">
         <!-- no window and no hardware rendering: the gate is about broadcasts; a hardware-accelerated activity makes ActivityThread.handleLaunchActivity preload HWUI (HardwareRenderer.preload), whose EGL

@@ -3,13 +3,13 @@
 //! frameworks/base/core/java/android/app/ActivityManager.java (checkComponentPermission).
 //! Broadcast policy, P1 subset, no binder: runtime receivers (BroadcastController.mRegisteredReceivers / ReceiverList / BroadcastFilter), the sticky store (mStickyBroadcasts), intent-filter matching,
 //! the sender's first-line check (protected broadcasts), the register-time export flags, the per-receiver skip rules, and the per-process FIFO of deliveries waiting for a cold-started process to attach.
-//! Generic over the receiver handle `R`, the intent `I` and the queued job `J`, so the binder side (activity.rs, broadcast_queue.rs) keeps its types and these rules are unit-tested without the converter.
+//! Generic over the receiver handle `R` and the intent `I`, so the binder side (activity.rs, broadcast_queue.rs) keeps its types and these rules are unit-tested without the converter.
 //! Lives under the activity service's state lock; nothing here calls out. Whether an action is protected is the caller's answer (packages.rs `Packages::is_protected_broadcast`).
 //! Not modelled (P2 or later): ordered broadcasts, priorities, implicit manifest receivers (the sysconfig allow list applies there: BroadcastController.java:1100-1106 adds FLAG_RECEIVER_INCLUDE_BACKGROUND for
 //! SystemConfig.getAllowImplicitBroadcasts actions, BroadcastSkipPolicy.disallowBackgroundStart:347-354 skips the rest at :241; an explicit-component broadcast never hits it), app ops, instant apps,
 //! BroadcastOptions, multi-user beyond USER_ALL + user 0, ACTION_CLOSE_SYSTEM_DIALOGS' checkCanCloseSystemDialogs (:1391-1398).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use atl_services_types::permission;
 
@@ -498,6 +498,8 @@ pub fn sticky_send(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastFilter {
     pub filter: Filter,
+    /// IntentFilter.getPriority: the receivers of a broadcast are merged by it (BroadcastController.java:1608-1643)
+    pub priority: i32,
     /// the registering package (BroadcastFilter.packageName): an intent with a package reaches only its filters
     pub package: String,
     /// what a sender must hold (registerReceiver's broadcastPermission)
@@ -653,25 +655,23 @@ pub fn manifest_target_in_range(target_sdk: i32, min: i32, max: i32) -> bool {
     (min..=max).contains(&target_sdk)
 }
 
-/// The broadcast state: registrations, stickies by user then action, and per-process FIFOs of jobs for processes that have not attached.
+/// The registrations and stickies. Deliveries are the dispatcher's (broadcast_dispatch.rs), which holds what a process must receive until it attaches.
 #[derive(Debug)]
-pub struct Broadcasts<R, I, J> {
+pub struct Broadcasts<R, I> {
     lists: Vec<ReceiverList<R>>,
     sticky: BTreeMap<i32, BTreeMap<String, Vec<Sticky<I>>>>,
-    pending: BTreeMap<i32, VecDeque<J>>,
 }
 
-impl<R, I, J> Default for Broadcasts<R, I, J> {
+impl<R, I> Default for Broadcasts<R, I> {
     fn default() -> Self {
         Broadcasts {
             lists: Vec::new(),
             sticky: BTreeMap::new(),
-            pending: BTreeMap::new(),
         }
     }
 }
 
-impl<R: Clone + PartialEq, I: Clone, J> Broadcasts<R, I, J> {
+impl<R: Clone + PartialEq, I: Clone> Broadcasts<R, I> {
     /// registerReceiverWithFeatureTraced:530-579: a new ReceiverList, or the existing one of the same caller (another uid / pid / user is IllegalArgumentException); an equal filter already there is not
     /// added again (logged by AOSP). Ok(true) = added.
     pub fn register(
@@ -728,10 +728,9 @@ impl<R: Clone + PartialEq, I: Clone, J> Broadcasts<R, I, J> {
         self.lists.len() != before
     }
 
-    /// The process died (ProcessRecord.mReceivers -> removeReceiverLocked; its queue goes with it): its registrations and its waiting jobs; the number of jobs dropped.
-    pub fn process_died(&mut self, pid: i32) -> usize {
+    /// The process died (ProcessRecord.mReceivers -> removeReceiverLocked): its registrations go.
+    pub fn process_died(&mut self, pid: i32) {
         self.lists.retain(|l| l.pid != pid);
-        self.pending.remove(&pid).map_or(0, |q| q.len())
     }
 
     /// The registered filters `key` reaches for `user` (mReceiverResolver.queryIntent): per matching filter, as IntentResolver lists them; an intent with a package only reaches that package's filters.
@@ -800,21 +799,6 @@ impl<R: Clone + PartialEq, I: Clone, J> Broadcasts<R, I, J> {
         }
         out
     }
-
-    /// Queues `job` for process `pid` until it attaches.
-    pub fn push_pending(&mut self, pid: i32, job: J) {
-        self.pending.entry(pid).or_default().push_back(job);
-    }
-
-    /// The jobs waiting for `pid`, in order, leaving none.
-    pub fn take_pending(&mut self, pid: i32) -> VecDeque<J> {
-        self.pending.remove(&pid).unwrap_or_default()
-    }
-
-    /// Some job waits for `pid` to attach: a receiver the process must run (uid_state::Holdings.receiver until S8's dispatcher).
-    pub fn has_pending(&self, pid: i32) -> bool {
-        self.pending.get(&pid).is_some_and(|q| !q.is_empty())
-    }
 }
 
 #[cfg(test)]
@@ -838,6 +822,7 @@ mod tests {
     fn bf(actions: &[&str], package: &str, exported: bool) -> BroadcastFilter {
         BroadcastFilter {
             filter: filter(actions),
+            priority: 0,
             package: package.into(),
             required_permission: None,
             exported,
@@ -1335,7 +1320,7 @@ mod tests {
 
     #[test]
     fn sticky_store_replaces_by_filter_equals_and_answers_a_filter() {
-        let mut b: Broadcasts<u32, &str, ()> = Broadcasts::default();
+        let mut b: Broadcasts<u32, &str> = Broadcasts::default();
         b.put_sticky(0, key("a.S"), "first", 10_123);
         b.put_sticky(0, key("a.S"), "second", 10_123);
         let mut other = key("a.S");
@@ -1359,7 +1344,7 @@ mod tests {
 
     #[test]
     fn registrations_are_per_receiver_and_die_with_the_process() {
-        let mut b: Broadcasts<u32, (), &str> = Broadcasts::default();
+        let mut b: Broadcasts<u32, ()> = Broadcasts::default();
         assert_eq!(
             b.register(7, 100, 10_123, 0, bf(&["a.X"], "p.a", true)),
             Ok(true)
@@ -1389,14 +1374,8 @@ mod tests {
             [8]
         );
         assert!(b.unregister(&8) && !b.unregister(&8));
-        b.push_pending(100, "one");
-        b.push_pending(100, "two");
-        assert_eq!(b.process_died(100), 2);
+        b.process_died(100);
         assert!(b.receivers(&key("a.X"), 0).is_empty());
-        b.push_pending(300, "x");
-        b.push_pending(300, "y");
-        assert_eq!(b.take_pending(300), ["x", "y"]);
-        assert!(b.take_pending(300).is_empty());
     }
 
     #[test]

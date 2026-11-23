@@ -211,10 +211,36 @@ pub(crate) fn query_intent_services(
     .collect()
 }
 
+/// ComputerEngine.queryIntentReceiversInternal for an implicit broadcast: every `<receiver>` of the caller's visible packages whose `<intent-filter>` matches (the same resolver as
+/// activities and services, ReceiverIntents), higher priority first, disabled ones dropped (STOCK_PM_FLAGS has no MATCH_DISABLED_COMPONENTS). The stored ResolveInfo gives the
+/// receiver's ActivityInfo and the filter's priority (BroadcastController.java:1608-1643 merges on it). Not modelled: instant apps, ComponentResolver's per-user filters beyond user 0.
+pub(crate) fn query_intent_receivers(
+    packages: &Packages,
+    caller: u32,
+    intent: &Intent,
+    resolved_type: Option<&str>,
+    flags: i64,
+    user: i32,
+) -> Vec<ResolveInfo> {
+    query_intent(
+        packages,
+        caller,
+        intent,
+        resolved_type,
+        flags,
+        user,
+        Component::Receiver,
+    )
+    .into_iter()
+    .map(|(_, r)| r)
+    .collect()
+}
+
 /// Which component table a query reads (ComputerEngine's per-kind IntentResolver).
 #[derive(Clone, Copy)]
 enum Component {
     Activity,
+    Receiver,
     Service,
 }
 
@@ -222,6 +248,7 @@ impl Component {
     fn kind(self) -> Kind {
         match self {
             Component::Activity => Kind::ActivityIntents,
+            Component::Receiver => Kind::ReceiverIntents,
             Component::Service => Kind::ServiceIntents,
         }
     }
@@ -232,6 +259,7 @@ impl Component {
         }
         match self {
             Component::Activity => p.activities().map(|a| name(&a.component)).collect(),
+            Component::Receiver => p.receivers().map(|a| name(&a.component)).collect(),
             Component::Service => p.services().map(|s| name(&s.component)).collect(),
         }
     }
@@ -247,6 +275,12 @@ impl Component {
         match self {
             Component::Activity => {
                 find_activity_info(p, packages, class, flags).map(Resolved::Activity)
+            }
+            Component::Receiver => {
+                let decl = p
+                    .receiver(class)
+                    .filter(|d| packages.enabled(&d.component, flags))?;
+                Some(Resolved::Activity(activity_info(p, packages, decl, flags)))
             }
             Component::Service => {
                 let mut s = packages.service_info(p, class, flags)?;

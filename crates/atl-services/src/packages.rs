@@ -583,6 +583,14 @@ impl Permissions {
         permission::holds(uid, permissions, any, |p| self.granted(uid, p))
     }
 
+    /// BroadcastSkipPolicy.isSignaturePerm (:680-705): null is false; every permission must be defined and signature-only (an empty list is vacuously true).
+    pub fn is_signature_only(&self, perms: Option<&[String]>) -> bool {
+        perms.is_some_and(|list| {
+            list.iter()
+                .all(|p| self.registry.get(p).is_some_and(|d| d.is_signature_only()))
+        })
+    }
+
     /// `permission::holds` of one permission against `uid`'s grants; a null permission is not held.
     pub fn check(&self, uid: u32, p: Option<&str>) -> bool {
         p.is_some_and(|p| self.holds(uid, &[p], false))

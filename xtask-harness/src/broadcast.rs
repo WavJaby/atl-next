@@ -10,6 +10,8 @@
 //! - protected broadcasts (BroadcastController.broadcastIntentLocked:1061-1067, the list from framework-res's manifest): the sender's BATTERY_LOW and its sticky BATTERY_CHANGED (it holds BROADCAST_STICKY)
 //!   are SecurityExceptions naming the action; registerReceiver(null, BATTERY_CHANGED) returns the battery service's sticky (the host's level, app::battery_level), not the fake level 1; a receiver for only protected actions needs no export flag at targetSdk 36
 //!   (:470-472), one for an unprotected action without a flag is a SecurityException (:457-460). The unprotected PING still delivers (the runtime row).
+//! - ordered: two registered receivers (priority 10, 0) and the receiver app's manifest receiver pass a result on; resultTo gets the final code (ORDER); abortBroadcast skips the rest (ABORT);
+//!   an implicit intent is skipped for the restricted manifest receiver (counter `Background execution not allowed`).
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
@@ -60,6 +62,19 @@ const BATTERY_STICKY: &str = "AtlBcast: battery sticky level=";
 /// The level the sender's fake BATTERY_CHANGED carries.
 const FAKE_LEVEL: &str = "AtlBcast: battery sticky level=1";
 const PROTECTED_ONLY_REGISTERED: &str = "AtlBcast: protected-only register without flag: ok";
+/// The sender's ordered rows (testdata sender `orderedBroadcasts`): what each receiver logs, the receiver app's manifest receiver included (its log is read too).
+const ORDER_FIRST: &str = "AtlBcast: order first code=0 data=null";
+const ORDER_SECOND: &str = "AtlBcast: order second code=5 data=first";
+const ORDER_MANIFEST: &str = "AtlBcast: order manifest code=5 data=first";
+const ORDER_RESULT: &str = "AtlBcast: order resultTo code=7 data=first";
+const ABORT_FIRST: &str = "AtlBcast: abort first code=0 data=null";
+const ABORT_SECOND: &str = "AtlBcast: abort second";
+const ABORT_RESULT: &str = "AtlBcast: abort resultTo code=0 data=null";
+/// The receiver app's manifest receiver never gets the aborted ABORT, nor the implicit IMPLICIT (its restricted uid: BroadcastSkipPolicy :229-246).
+const MANIFEST_ABORT: &str = "AtlBcast: manifest received com.example.atlbcast.ABORT";
+const MANIFEST_IMPLICIT: &str = "AtlBcast: manifest received com.example.atlbcast.IMPLICIT";
+/// BroadcastSkipPolicy.java:244's message up to its ':' (the counter name the services count).
+const RESTRICTED_SKIP: &str = "Background execution not allowed";
 /// BroadcastController.java:457-460's message, callerPackage first.
 const UNFLAGGED_DENIED: &str = "AtlBcast: unflagged register denied: com.example.atlbcast: One of RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED should be specified when a receiver isn't being registered exclusively for system broadcasts";
 /// Counter names the services count (activity.rs): the cold start of a manifest receiver's process, and the skip of an unexported registered receiver.
@@ -200,6 +215,24 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "a receiver of an unprotected action without an export flag threw SecurityException",
             s.contains(UNFLAGGED_DENIED),
+        ),
+        (
+            "an ordered broadcast passed the result on through two registered receivers and the receiver app's manifest receiver, and resultTo got the final code",
+            s.contains(ORDER_FIRST)
+                && s.contains(ORDER_SECOND)
+                && r.contains(ORDER_MANIFEST)
+                && s.contains(ORDER_RESULT),
+        ),
+        (
+            "abortBroadcast skipped the later receivers (manifest included) and resultTo still got the result",
+            s.contains(ABORT_FIRST)
+                && !s.contains(ABORT_SECOND)
+                && !r.contains(MANIFEST_ABORT)
+                && s.contains(ABORT_RESULT),
+        ),
+        (
+            "an implicit broadcast was skipped for the receiver app's restricted manifest receiver (counter)",
+            !r.contains(MANIFEST_IMPLICIT) && counted(RESTRICTED_SKIP),
         ),
         (
             "the explicit broadcast's receiver process ended once its receiver finished and the grace ran",

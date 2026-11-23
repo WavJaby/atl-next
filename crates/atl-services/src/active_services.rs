@@ -20,7 +20,8 @@ use atl_parcelables::codecs::android::app::ServiceStartArgs::ServiceStartArgs;
 use atl_parcelables::codecs::android::content::pm::ResolveInfo::Resolved;
 use binder::{SpIBinder, Strong};
 
-use super::{AM, Inner, State, Timer, intent_key, log};
+use super::{AM, Inner, ProcessRecord, State, Timer, intent_key, log};
+use crate::broadcast_dispatch::ProcKey;
 use crate::package;
 use crate::service_records::{self, Bind, Call, Host, Kinds, Start};
 use crate::uid_state::{self, StartMode};
@@ -227,7 +228,7 @@ fn running_host(
     st.processes
         .iter()
         .find(|r| r.process_name == process && r.uid == uid)
-        .filter(|r| r.broadcasts_attached)
+        .filter(|r| r.attach_finished)
         .and_then(|r| r.attached.as_ref().map(|a| (r.pid, a.thread.clone())))
 }
 
@@ -327,6 +328,31 @@ impl Inner {
         }))
     }
 
+    /// The one headless process start (ProcessList.startProcessLocked with no activity launch), shared by services (bringUpServiceLocked) and manifest receivers (a broadcast's cold start).
+    /// Nothing starts while a record of (process, uid) exists, attached or starting: Ok(false). Ok(true) = a process was started.
+    pub(crate) fn start_headless_locked(
+        &self,
+        st: &mut State,
+        package: &str,
+        process: &str,
+        uid: u32,
+    ) -> Result<bool, String> {
+        if st
+            .processes
+            .iter()
+            .any(|r| r.process_name == process && r.uid == uid)
+        {
+            return Ok(false);
+        }
+        match self.packages.by_name(package) {
+            Some(p) => self
+                .start_process_locked(st, p, process, false, None)
+                .map(|()| true)
+                .map_err(|e| e.to_string()),
+            None => Err(format!("no package {package}")),
+        }
+    }
+
     /// bringUpServiceLocked's process start, reduced: a service call that needs a process starts it headless, once per process name and uid (`starting`: a record exists).
     /// A failed start brings the services waiting for it down (`start_failed`) and returns the reason.
     pub(crate) fn bring_up_locked(
@@ -337,22 +363,12 @@ impl Inner {
         uid: u32,
         need: Host,
     ) -> Result<(), String> {
-        if need != Host::NeedsProcess
-            || st
-                .processes
-                .iter()
-                .any(|r| r.process_name == process && r.uid == uid)
-        {
+        if need != Host::NeedsProcess {
             return Ok(());
         }
-        let started = match self.packages.by_name(package) {
-            Some(p) => self
-                .start_process_locked(st, p, process, false, None)
-                .map_err(|e| e.to_string()),
-            None => Err(format!("no package {package}")),
-        };
-        match started {
-            Ok(()) => {
+        match self.start_headless_locked(st, package, process, uid) {
+            Ok(false) => Ok(()),
+            Ok(true) => {
                 atl_diag::answered(AM, "service cold start (bringUpServiceLocked)");
                 Ok(())
             }
@@ -669,17 +685,29 @@ impl Inner {
             "process {} (pid {}) failed to attach: start timeout",
             rec.process_name, rec.pid
         ));
+        self.unattached_ended_locked(&mut st, &rec);
+        if let Some(task) = rec.task {
+            self.task_gone_locked(&mut st, task);
+        }
+        self.touch_all_locked(&mut st);
+        drop(st);
+        self.kill(&[rec.pid]);
+    }
+
+    /// The end of an unattached process, its record already out of the table: both sides are told from here, and only here. The services waiting for the process come down
+    /// (processStartTimedOutLocked :6969); the broadcast side's cold start fails and its registrations go (onApplicationTimeoutLocked -> onApplicationCleanupLocked, BroadcastQueueImpl
+    /// :709-745). Called by the start timeout and by force-stop; the caller kills the pid.
+    pub(crate) fn unattached_ended_locked(&self, st: &mut State, rec: &ProcessRecord) {
         let mut calls = Vec::new();
         st.services
             .start_failed(&rec.process_name, rec.uid, &mut calls);
         self.service_calls.post(calls);
-        if let Some(task) = rec.task {
-            self.task_gone_locked(&mut st, task);
-        }
-        Self::broadcasts_died(&mut st, rec.pid);
-        self.touch_all_locked(&mut st);
-        drop(st);
-        self.kill(&[rec.pid]);
+        let key = ProcKey {
+            name: rec.process_name.clone(),
+            uid: rec.uid,
+        };
+        self.start_failed_locked(st, &key);
+        self.broadcasts_died_locked(st, rec.pid);
     }
 
     /// stopInBackgroundLocked (AS :1685), from a uid's settle sweep: its started services whose start mode is not NORMAL stop (a targetSdk 26+ app, now idle, not persistent).

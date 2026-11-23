@@ -25,6 +25,12 @@ public class Main extends Activity {
     static final String EXPLICIT = "com.example.atlbcast.EXPLICIT";
     /** The receiver app's answer, sent after its PING: the PING's skip is decided by then (both are its synchronous broadcastIntent calls, in order). */
     static final String DONE = "com.example.atlbcast.DONE";
+    /** The ordered rules (orderedBroadcasts) and the implicit skip: the receiver app's manifest receiver filters these. */
+    static final String ORDER = "com.example.atlbcast.ORDER";
+    static final String ABORT = "com.example.atlbcast.ABORT";
+    static final String IMPLICIT = "com.example.atlbcast.IMPLICIT";
+    /** Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND (Intent.java:7660): a hidden API, absent from the public stubs this fixture compiles against, so its value. */
+    static final int INCLUDE_BACKGROUND = 0x0100_0000;
     /** How long onCreate waits for DONE: under the gate's 180 s LIMIT; a cold start of the receiver app takes ~1 s. */
     static final long DONE_WAIT_S = 60;
 
@@ -64,6 +70,8 @@ public class Main extends Activity {
 
         sendBroadcast(new Intent(EXPLICIT).setComponent(new ComponentName("com.example.atlbcastrecv", "com.example.atlbcastrecv.Recv")));
         protectedBroadcasts(app);
+        // on the DONE thread, not the main looper: the main thread waits for DONE below, and an ordered delivery in flight would hold DONE back in this process's queue
+        orderedBroadcasts(app, new Handler(doneThread.getLooper()));
         Log.i(TAG, "onCreate done");
         // the not-exported receiver must still be registered when the PING comes: since 3be29e97 a finished last activity ends this process (window-close-esc plan, point 4), and Theme.NoDisplay
         // needs finish() before onResume, so the wait is here
@@ -112,5 +120,51 @@ public class Main extends Activity {
             Log.i(TAG, "unflagged register denied: " + e.getMessage());
         }
         app.unregisterReceiver(ignore);
+    }
+
+    /**
+     * The ordered rules (BroadcastController :1520-1545, BroadcastRecord :786-795, BroadcastQueueImpl :1381-1412) and the implicit skip. ORDER: a priority-10 receiver sets code 5 and data
+     * "first", the priority-0 one sees it, the receiver app's manifest receiver (INCLUDE_BACKGROUND, so its restricted uid gets it) sees it and sets 7, and resultTo gets the final code.
+     * ABORT: the priority-10 receiver aborts, so the rest is skipped and resultTo still gets the result. IMPLICIT, sent without INCLUDE_BACKGROUND, is skipped for the receiver
+     * app's restricted uid (BroadcastSkipPolicy :229-246): the gate reads its counter.
+     */
+    void orderedBroadcasts(Context app, Handler scheduler) {
+        BroadcastReceiver high = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                String which = ORDER.equals(i.getAction()) ? "order" : "abort";
+                Log.i(TAG, which + " first code=" + getResultCode() + " data=" + getResultData());
+                if (ORDER.equals(i.getAction())) {
+                    setResultCode(5);
+                    setResultData("first");
+                } else {
+                    abortBroadcast();
+                }
+            }
+        };
+        BroadcastReceiver low = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                String which = ORDER.equals(i.getAction()) ? "order" : "abort";
+                Log.i(TAG, which + " second code=" + getResultCode() + " data=" + getResultData());
+            }
+        };
+        IntentFilter highFilter = new IntentFilter(ORDER);
+        highFilter.addAction(ABORT);
+        highFilter.setPriority(10);
+        IntentFilter lowFilter = new IntentFilter(ORDER);
+        lowFilter.addAction(ABORT);
+        app.registerReceiver(high, highFilter, null, scheduler, Context.RECEIVER_NOT_EXPORTED);
+        app.registerReceiver(low, lowFilter, null, scheduler, Context.RECEIVER_NOT_EXPORTED);
+        BroadcastReceiver resultTo = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                String which = ORDER.equals(i.getAction()) ? "order" : "abort";
+                Log.i(TAG, which + " resultTo code=" + getResultCode() + " data=" + getResultData());
+            }
+        };
+        app.sendOrderedBroadcast(new Intent(ORDER).addFlags(INCLUDE_BACKGROUND), null, resultTo, scheduler, 0, null, null);
+        app.sendOrderedBroadcast(new Intent(ABORT).addFlags(INCLUDE_BACKGROUND), null, resultTo, scheduler, 0, null, null);
+        app.sendBroadcast(new Intent(IMPLICIT));
     }
 }
