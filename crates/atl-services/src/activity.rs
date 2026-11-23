@@ -6,7 +6,7 @@
 //! half: registerReceiverWithFeature / unregisterReceiver, non-ordered broadcastIntentWithFeature to registered receivers and explicit-component manifest receivers, stickies, unbroadcastIntent;
 //! the rules are broadcast.rs, the sends broadcast_queue.rs). A manifest receiver whose process is not running gets it started headless (no activity launch); its deliveries wait for the attach.
 //! Processes are started and killed through [`ProcessControl`] (the zygote / Process.killProcess seam); a crash report (handleApplicationCrash) is logged; every other method is counted unimplemented (counters).
-//! PendingIntent records (getIntentSenderWithFeature, cancelIntentSender) are pending_intent.rs's; IIntentSender.send of a BROADCAST record is send_pending_broadcast (below), other kinds are counted, not modelled.
+//! PendingIntent records (getIntentSenderWithFeature, cancelIntentSender) are pending_intent.rs's; IIntentSender.send of a BROADCAST record is send_pending_broadcast (below), of a SERVICE record start_service_as (active_services.rs); the activity kinds are counted, not modelled.
 //! Locking: one state lock (AMS's `this` + mProcLock). Nothing blocking runs under it but the control socket's start request (as AOSP starts a process under the lock); a kill, and every call into a watcher
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
 
@@ -67,7 +67,7 @@ use crate::memory_levels;
 use crate::package;
 use crate::packages::{PackageRecord, Packages, Permissions};
 use crate::pattern_matcher;
-use crate::pending_intent::{self, BroadcastSink, PendingIntents};
+use crate::pending_intent::{self, IntentSink, PendingIntents};
 use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::running_processes;
@@ -487,7 +487,7 @@ enum KillReason {
 }
 
 /// The activity service's delayed messages (am_handler.rs), keyed by what each concerns.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Timer {
     /// removeTask's kill (KILL_TASK_PROCESSES_TIMEOUT): the Task's processes end unless its destroy came first
     KillTask(TaskId),
@@ -495,6 +495,8 @@ enum Timer {
     UidSettle(u32),
     /// an empty headless process's grace, by ProcessRecord.start_seq
     EmptyProcess(i64),
+    /// a service's restart (service_records.rs `Restart.at`, ActiveServices.scheduleServiceRestartLocked's restarter): one per component, re-armed by each scheduled restart
+    Restart((String, String)),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -657,16 +659,31 @@ impl Reporter {
     }
 }
 
-/// The broadcast path a BROADCAST PendingIntent record sends through (pending_intent.rs): send_broadcast as the record's creator. Weak, so the records do not keep the service alive.
-struct BroadcastRoute(Weak<Inner>);
+/// The paths a PendingIntent record sends through (pending_intent.rs): a BROADCAST record's send_broadcast and a SERVICE record's start, as the record's creator. Weak, so the records do not keep the service alive.
+struct IntentRoute(Weak<Inner>);
 
-impl BroadcastSink for BroadcastRoute {
+impl IntentSink for IntentRoute {
     fn send_as(&self, intent: &Intent, uid: u32, user_id: i32) -> binder::Result<()> {
         let inner = self
             .0
             .upgrade()
             .ok_or_else(|| illegal_state("PendingIntent send: the service is gone"))?;
         ActivityManager { inner }.send_pending_broadcast(intent, uid, user_id)
+    }
+
+    fn start_service_as(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        _user_id: i32,
+        foreground: bool,
+    ) -> binder::Result<()> {
+        let inner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| illegal_state("PendingIntent send: the service is gone"))?;
+        inner.start_service_as(intent, uid, foreground);
+        Ok(())
     }
 }
 
@@ -849,7 +866,7 @@ impl ActivityManager {
                     tasks,
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
-                    pending: PendingIntents::new(Arc::new(BroadcastRoute(inner.clone()))),
+                    pending: PendingIntents::new(Arc::new(IntentRoute(inner.clone()))),
                     service_calls: active_services::Outbox::new(),
                     bind_services,
                     kill_armed: Mutex::default(),
@@ -1266,7 +1283,7 @@ impl ActivityManager {
         if newly_armed {
             let timer = Timer::KillTask(task);
             self.inner.handler.post(
-                timer,
+                timer.clone(),
                 timer,
                 std::time::Instant::now() + KILL_TASK_PROCESSES_TIMEOUT,
             );
@@ -1521,16 +1538,21 @@ impl Inner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Elapsed ms on the uid state's clock (origin = Inner construction): uid_state's deadlines are in these units.
+    /// Elapsed ms on the uid state's clock (origin = Inner construction): uid_state's deadlines are in these units. The services' clock is the same one (services_now).
     fn now_ms(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// now_ms as service_records.rs times (i64; only differences and order are read).
+    fn services_now(&self) -> i64 {
+        i64::try_from(self.now_ms()).unwrap_or(i64::MAX)
     }
 
     /// Replaces the pending message of `timer` with one due at `at_ms` (now_ms units).
     fn arm(&self, timer: Timer, at_ms: u64) {
         self.handler.remove(&timer);
         self.handler.post(
-            timer,
+            timer.clone(),
             timer,
             self.origin + std::time::Duration::from_millis(at_ms),
         );
@@ -1593,28 +1615,37 @@ impl Inner {
             Timer::KillTask(task) => self.kill_task_processes_on_timeout(task),
             Timer::UidSettle(uid) => self.settle_uid(uid),
             Timer::EmptyProcess(seq) => self.end_headless(|r| r.start_seq == seq),
+            Timer::Restart(component) => self.restart_service(component),
         }
     }
 
-    /// The uid's settle sweep (idleUids :3996-4008): BecameIdle ends the uid's headless processes whose grace has run. stopInBackgroundLocked (services) joins here in S6.
+    /// The uid's settle sweep (idleUids :3996-4008): BecameIdle stops the uid's started services whose start mode is not NORMAL (stopInBackgroundLocked, active_services.rs), then
+    /// ends the uid's headless processes whose grace has run.
     fn settle_uid(&self, uid: u32) {
         let now = self.now_ms();
-        let became_idle = self.state().uids.settle(uid, now) == Settle::BecameIdle;
+        let mut st = self.state();
+        let became_idle = st.uids.settle(uid, now) == Settle::BecameIdle;
+        if became_idle {
+            self.stop_in_background_locked(&mut st, uid);
+        }
+        drop(st);
         if became_idle {
             self.end_headless(|r| r.uid == uid);
         }
     }
 
-    /// What holds the process (uid_state::Holdings). FGS (S7) and started services (S6) hold nothing yet.
+    /// What holds the process (uid_state::Holdings): a visible Task, a started service or BIND_AUTO_CREATE binding (service_records.rs held_by, a waiting start included).
+    /// FGS (S7) holds nothing yet.
     fn holdings_locked(&self, st: &State, r: &ProcessRecord) -> uid_state::Holdings {
+        let held = st.services.held_by(r.pid, &r.process_name, r.uid);
         uid_state::Holdings {
             task: r
                 .attached
                 .as_ref()
                 .is_some_and(|a| self.atm.hosts_activity(&a.thread.as_binder())),
             fgs: false,
-            started_service: false,
-            auto_create_binding: st.services.serves(r.pid),
+            started_service: held.started,
+            auto_create_binding: held.bound,
             receiver: st.broadcasts.has_pending(r.pid) || r.receiving > 0,
             provider: st
                 .providers
@@ -2689,17 +2720,94 @@ impl IActivityManager for ActivityManager {
         Ok(())
     }
 
-    /// serviceDoneExecuting: the app finished a scheduled service call. Accepted: nothing waits on it (no service ANR timeouts).
+    /// ActivityManagerService.startService -> ActiveServices.startServiceLocked (active_services.rs). A caller that names an app must be an attached one
+    /// (SecurityException). The answer is the ComponentName ContextImpl reads: the service's own, the `!` / `?` / `!!` sentinels, or null for no such service.
+    /// `require_foreground` (startForegroundService) is accepted as a start: the foreground rules are S7's, counted there.
+    fn r#startService(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        service: Option<&Intent>,
+        _resolved_type: Option<&str>,
+        require_foreground: bool,
+        _calling_package: Option<&str>,
+        _calling_feature_id: Option<&str>,
+        _user_id: i32,
+    ) -> binder::Result<Option<ComponentName>> {
+        let uid = ThreadState::get_calling_uid();
+        let Some(service) = service else {
+            return Ok(None);
+        };
+        let inner = &self.inner;
+        let mut st = inner.state();
+        let caller_fg = match caller {
+            None => true,
+            Some(c) => {
+                if Inner::record_for_thread(&st, c).is_none() {
+                    return Err(security(&format!(
+                        "Unable to find app for caller (pid={}) when starting service",
+                        ThreadState::get_calling_pid()
+                    )));
+                }
+                inner.atm.hosts_activity(&c.as_binder())
+            }
+        };
+        Ok(inner.start_service_locked(&mut st, uid, caller_fg, service, require_foreground))
+    }
+
+    /// ActivityManagerService.stopService -> ActiveServices.stopServiceLocked: 1 the service's start was dropped, 0 no such service, -1 a refused permission
+    /// (ContextImpl throws SecurityException on -1 and returns `res != 0`).
+    fn r#stopService(
+        &self,
+        caller: Option<&Strong<dyn IApplicationThread>>,
+        service: Option<&Intent>,
+        _resolved_type: Option<&str>,
+        _user_id: i32,
+    ) -> binder::Result<i32> {
+        let uid = ThreadState::get_calling_uid();
+        let inner = &self.inner;
+        let mut st = inner.state();
+        if let Some(c) = caller
+            && Inner::record_for_thread(&st, c).is_none()
+        {
+            return Err(security(&format!(
+                "Unable to find app for caller (pid={}) when stopping service",
+                ThreadState::get_calling_pid()
+            )));
+        }
+        let Some(service) = service else {
+            return Ok(0);
+        };
+        Ok(inner.stop_service_locked(&mut st, uid, service))
+    }
+
+    /// ActivityManagerService.stopServiceToken -> ActiveServices.stopServiceTokenLocked (stopSelf): true when the service stopped.
+    fn r#stopServiceToken(
+        &self,
+        class_name: Option<&ComponentName>,
+        token: Option<&SpIBinder>,
+        start_id: i32,
+    ) -> binder::Result<bool> {
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        let mut st = self.inner.state();
+        Ok(self
+            .inner
+            .stop_self_locked(&mut st, class_name, token, start_id))
+    }
+
+    /// serviceDoneExecuting (oneway): the app finished a scheduled service call (ActiveServices.serviceDoneExecutingLocked, active_services.rs).
     fn r#serviceDoneExecuting(
         &self,
-        _token: Option<&SpIBinder>,
-        _type: i32,
-        _start_id: i32,
-        _res: i32,
+        token: Option<&SpIBinder>,
+        kind: i32,
+        start_id: i32,
+        res: i32,
         _intent: Option<&Intent>,
     ) -> binder::Result<()> {
-        atl_diag::answered(AM, "serviceDoneExecuting");
-        Ok(())
+        let mut st = self.inner.state();
+        self.inner
+            .service_done_executing_locked(&mut st, token, kind, start_id, res)
     }
 
     /// ActivityManagerService.getContentProvider:7074 -> ContentProviderHelper.getContentProvider:134: a null caller is a SecurityException (:137-141), as is a callingPackage not

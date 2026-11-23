@@ -2,8 +2,9 @@
 //! Derived from the Android Open Source Project: frameworks/base/services/core/java/com/android/server/am/ActiveServices.java, ServiceRecord.java, ActivityManagerConstants.java and core/java/android/app/Service.java
 //! ActiveServices' service records as plain state: one record per component (ServiceRecord, reduced). Bound half: bindServiceLocked, publishServiceLocked, removeConnectionLocked, unbindFinishedLocked, bringDownServiceLocked. Started half: startServiceInnerLocked, stopServiceLocked, stopServiceTokenLocked, serviceDoneExecutingLocked (START), sendServiceArgsLocked. Restart half: scheduleServiceRestartLocked, performServiceRestartLocked, unscheduleServiceRestartLocked, killServicesLocked, and the restart kick in attachApplicationLocked.
 //! No binder here: each step returns the [`Call`]s the activity service sends after releasing its lock (all are oneway: IApplicationThread is a oneway interface, IServiceConnection.connected oneway), in order. A scheduled restart is returned as a [`Restart`]; the caller's timer calls [`Services::restart`] at its time.
-//! Records are keyed by component (ActiveServices' ServiceMap by ComponentName, one user); bindings by Intent.FilterComparison ([`IntentKey`]). Times are uptime in ms (SystemClock.uptimeMillis).
-//! Not modelled: instanceName / isolated / sdk-sandbox services, per-client AppBindRecord (a binding's clients are its connections), persistent apps (FLAG_PERSISTENT restarts at once), crash counts (BOUND_SERVICE_MAX_CRASH_RETRY, crashCount), short FGS (canStopIfKilled's isShortFgs), restartCount (dump only), mEarliestRestartTime and the reschedule of pending restarts (memory-pressure delay: normal level, 0), per-package backoff off (always on), delayed stops, startCommandResult, ANR timeouts (serviceDoneExecuting is accepted, not waited for), oom-adj and process-state accounting.
+//! Records are keyed by component (ActiveServices' ServiceMap by ComponentName, one user); bindings by Intent.FilterComparison ([`IntentKey`]). Times are ms on the activity service's clock (`Inner::now_ms`, the clock of am_handler and uid_state): only differences and order matter.
+//! A record waiting for its process (`pending`, AS mPendingServices) is not brought down by a stop or an unbind; attach starts it and drops it if nothing needs it any more (AS bringDownServiceIfNeededLocked :6290, attachApplicationLocked :6914-6925).
+//! Not modelled: instanceName / isolated / sdk-sandbox services, per-client AppBindRecord (a binding's clients are its connections), persistent apps (FLAG_PERSISTENT restarts at once), crash counts (BOUND_SERVICE_MAX_CRASH_RETRY, crashCount), short FGS (canStopIfKilled's isShortFgs), restartCount (dump only), mEarliestRestartTime and the reschedule of pending restarts (memory-pressure delay: normal level, 0), per-package backoff off (always on), delayed stops and the background-caller delayed start (mDelayedStartList, counted in active_services.rs), startCommandResult, ANR timeouts (serviceDoneExecuting is accepted, not waited for), oom-adj and process-state accounting.
 
 use crate::broadcast::IntentKey;
 
@@ -179,6 +180,8 @@ struct Record<K: Kinds> {
     restart_time: i64,
     /// nextRestartTime: when the pending restart fires
     next_restart_time: i64,
+    /// mPendingServices: brought up, waiting for the process to attach (the record's app is None until then)
+    pending: bool,
 }
 
 impl<K: Kinds> Record<K> {
@@ -206,6 +209,7 @@ impl<K: Kinds> Record<K> {
             restart_delay: 0,
             restart_time: 0,
             next_restart_time: 0,
+            pending: false,
         }
     }
 
@@ -290,6 +294,13 @@ impl<K: Kinds> Record<K> {
             });
         }
     }
+}
+
+/// What a process holds through the services ([`Services::held_by`]): a started service, a BIND_AUTO_CREATE binding (uid_state::Holdings' two fields).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    pub started: bool,
+    pub bound: bool,
 }
 
 /// What the activity service must do for a bind beyond the calls.
@@ -405,6 +416,7 @@ impl<K: Kinds> Services<K> {
             info: r.info.clone(),
         });
         r.app = Some((pid, thread));
+        r.pending = false;
         r.restart_time = now;
         for bi in 0..r.bindings.len() {
             Self::request(seq, r, bi, false, out);
@@ -436,7 +448,10 @@ impl<K: Kinds> Services<K> {
                 Self::real_start(seq, r, pid, thread, now, out);
                 Host::Ready
             }
-            None => Host::NeedsProcess,
+            None => {
+                r.pending = true;
+                Host::NeedsProcess
+            }
         }
     }
 
@@ -559,7 +574,8 @@ impl<K: Kinds> Services<K> {
         self.bring_up(ri, host, now, out)
     }
 
-    /// attachApplicationLocked: the services of `process` (uid) that wait for it start in the new process; a restart pending for one is kicked (taken off the restarting list).
+    /// attachApplicationLocked: the services of `process` (uid) that wait for it start in the new process: the pending ones (mPendingServices), and a restart pending for one is kicked
+    /// (AS :6938-6952 posts its restarter at once). A waiting service nothing needs any more is then brought down (AS :6914-6925).
     pub fn attach(
         &mut self,
         pid: i32,
@@ -573,14 +589,25 @@ impl<K: Kinds> Services<K> {
             .records
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.app.is_none() && r.process == process && r.uid == uid && r.needed())
+            .filter(|(_, r)| {
+                r.app.is_none()
+                    && r.process == process
+                    && r.uid == uid
+                    && (r.pending || self.restarting.contains(&r.component))
+            })
             .map(|(i, _)| i)
             .collect();
         let seq = &mut self.bind_seq;
-        for ri in waiting {
+        for &ri in &waiting {
             let r = &mut self.records[ri];
             self.restarting.retain(|k| k != &r.component);
             Self::real_start(seq, r, pid, thread.clone(), now, out);
+        }
+        for &ri in waiting.iter().rev() {
+            if !self.records[ri].needed() {
+                let r = self.records.remove(ri);
+                self.bring_down(r, out);
+            }
         }
     }
 
@@ -770,9 +797,9 @@ impl<K: Kinds> Services<K> {
         found
     }
 
-    /// bringDownServiceIfNeededLocked: a record that nothing needs goes down.
+    /// bringDownServiceIfNeededLocked: a record that nothing needs goes down, unless it waits for its process (AS :6290: the attach decides).
     fn bring_down_if_needed(&mut self, ri: usize, out: &mut Vec<Call<K>>) {
-        if self.records[ri].needed() {
+        if self.records[ri].needed() || self.records[ri].pending {
             return;
         }
         let r = self.records.remove(ri);
@@ -886,11 +913,51 @@ impl<K: Kinds> Services<K> {
         true
     }
 
-    /// `pid` hosts a needed service (started, or bound with BIND_AUTO_CREATE): what keeps the process alive (uid_state::Holdings). S6 wires starts; until then only bindings count.
-    pub fn serves(&self, pid: i32) -> bool {
+    /// What the services hold of process `pid` (named `process`, uid `uid`), for uid_state::Holdings: a started service, a BIND_AUTO_CREATE binding. A service waiting for that
+    /// process (pending) holds it too, so the process is not ended while its start is on its way.
+    pub fn held_by(&self, pid: i32, process: &str, uid: u32) -> Held {
+        let mut held = Held::default();
+        for r in &self.records {
+            let hosted = r.app.as_ref().is_some_and(|(p, _)| *p == pid);
+            let waiting = r.pending && r.process == process && r.uid == uid;
+            if hosted || waiting {
+                held.started |= r.start_requested;
+                held.bound |= r.has_auto_create();
+            }
+        }
+        held
+    }
+
+    /// The components of `uid` that are started (startRequested): stopInBackgroundLocked's candidates (AS :1685).
+    pub fn started_of_uid(&self, uid: u32) -> Vec<(String, String)> {
         self.records
             .iter()
-            .any(|r| r.needed() && r.app.as_ref().is_some_and(|(p, _)| *p == pid))
+            .filter(|r| r.uid == uid && r.start_requested)
+            .map(|r| r.component.clone())
+            .collect()
+    }
+
+    /// The process name and uid a record runs in (retrieveServiceLocked's processName), while the record exists.
+    pub fn process_of(&self, component: &(String, String)) -> Option<(String, u32)> {
+        self.records
+            .iter()
+            .find(|r| &r.component == component)
+            .map(|r| (r.process.clone(), r.uid))
+    }
+
+    /// startRequested of the record of `component` (false when there is none).
+    pub fn start_requested(&self, component: &(String, String)) -> bool {
+        self.records
+            .iter()
+            .any(|r| &r.component == component && r.start_requested)
+    }
+
+    /// The component of the record `token` names (findServiceLocked checks the ComponentName against the token).
+    pub fn component_of(&self, token: &K::Token) -> Option<(String, String)> {
+        self.records
+            .iter()
+            .find(|r| &r.token == token)
+            .map(|r| r.component.clone())
     }
 
     /// killServicesLocked + the client half of cleanUpApplicationRecordLocked for a dead or killed process: clients hear dead, and each hosted record is restarted (`allow_restart`) or brought down. Returns the restarts scheduled, in record order.
@@ -959,11 +1026,11 @@ impl<K: Kinds> Services<K> {
         }
     }
 
-    /// Records of `uid` hosted in `process` that are needed but not running: what a failed process start leaves waiting (bringUpServiceLocked's failure path brings them down).
+    /// Records of `uid` waiting in `process` for a start that failed: brought down (bringUpServiceLocked's failure path).
     pub fn start_failed(&mut self, process: &str, uid: u32, out: &mut Vec<Call<K>>) {
         let (failed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.records)
             .into_iter()
-            .partition(|r| r.app.is_none() && r.process == process && r.uid == uid);
+            .partition(|r| r.pending && r.process == process && r.uid == uid);
         self.records = kept;
         for r in failed {
             self.bring_down(r, out);
@@ -1547,5 +1614,69 @@ mod tests {
             Host::Ready
         );
         assert!(out.is_empty());
+    }
+
+    /// stopService while the process starts: the record waits (bringDownServiceIfNeededLocked :6290 returns for a pending record), and the attach creates it, delivers its
+    /// pending start, then brings it down because nothing needs it (attachApplicationLocked :6914-6925): create, the start, stop.
+    #[test]
+    fn stop_before_attach_runs_pending_start_then_stops() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        assert_eq!(
+            s.start(start_req("S", "a"), None, || 9, 0, &mut out),
+            Host::NeedsProcess
+        );
+        assert!(s.stop_service(&component("S"), &mut out));
+        assert!(out.is_empty());
+        s.attach(60, "p", 10_001, &"t", 200, &mut out);
+        assert_eq!(trace(&out), ["create", "args 1/0/a", "stop"]);
+        assert_eq!(s.host_of(&9), None);
+    }
+
+    /// held_by: a started service holds the pid it runs in; a pending bind holds the process it waits for, and nothing else is held by another pid.
+    #[test]
+    fn held_by_reports_started_and_bound_per_process() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), Some((60, "t")), || 9, 0, &mut out);
+        assert_eq!(
+            s.held_by(60, "p", 10_001),
+            Held {
+                started: true,
+                bound: false
+            }
+        );
+        assert_eq!(s.held_by(61, "p", 10_001), Held::default());
+        s.bind(
+            req("B", 1, 50, "b", BIND_AUTO_CREATE),
+            None,
+            || 8,
+            0,
+            &mut out,
+        );
+        assert_eq!(
+            s.held_by(61, "p", 10_001),
+            Held {
+                started: false,
+                bound: true
+            }
+        );
+    }
+
+    /// stopInBackgroundLocked's candidates: the started components of the uid (a bound-only one is not started).
+    #[test]
+    fn started_of_uid_lists_started_components() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), Some((60, "t")), || 9, 0, &mut out);
+        s.bind(
+            req("B", 1, 50, "b", BIND_AUTO_CREATE),
+            Some((60, "t")),
+            || 8,
+            0,
+            &mut out,
+        );
+        assert_eq!(s.started_of_uid(10_001), vec![component("S")]);
+        assert!(s.started_of_uid(10_002).is_empty());
     }
 }

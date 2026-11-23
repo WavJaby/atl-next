@@ -13,6 +13,7 @@ use super::PackageInfo::PackageInfo;
 use super::ResolveInfo::ResolveInfo;
 use super::ShortcutInfo::ShortcutInfo;
 use crate::codecs::android::app::NotificationChannel::NotificationChannel;
+use crate::codecs::android::app::ServiceStartArgs::ServiceStartArgs;
 use crate::codecs::android::app::job::JobInfo::JobInfo;
 use crate::parcel::*;
 use crate::parts::*;
@@ -85,6 +86,8 @@ elements! {
     NotificationChannel => "android.app.NotificationChannel",
     // IJobScheduler.getAllPendingJobs / getAllPendingJobsInNamespace
     JobInfo => "android.app.job.JobInfo",
+    // IApplicationThread.scheduleServiceArgs: the delivered starts of a started service
+    ServiceStartArgs => "android.app.ServiceStartArgs",
     // IShortcutService.setDynamicShortcuts / addDynamicShortcuts / updateShortcuts / getShortcuts
     ShortcutInfo => "android.content.pm.ShortcutInfo",
 }

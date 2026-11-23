@@ -810,7 +810,9 @@ struct Line {
 /// display: Main.onCreate's Display.getAppVsyncOffsetNanos and getPresentationDeadlineNanos less the period of getRefreshRate: SurfaceFlinger.cpp getDynamicDisplayInfoInternal's appVsyncOffset
 /// and `period - sfVsyncOffset + 1 ms`, with both offsets 0 (the compositor sends app vsync and latches at the tick itself), so 0 and 1 000 000 at any refresh rate.
 /// alarm: Main.alarms: both AlarmManager delivery kinds fire once: the RTC_WAKEUP PendingIntent broadcast reaches the registered receiver, and the ELAPSED_REALTIME OnAlarmListener's onAlarm runs (alarm.rs, pending_intent.rs).
-const LOG_LINES: [Line; 29] = [
+/// startservice, stopservice, stopself: Main.started's chain of AtlStarted (active_services.rs, service_records.rs: the start, stopService, stopSelf). START's onStartCommand (startId 1);
+/// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. Not judged here: a STICKY restart (its process ends; the gate reads only the main process's log, not `<pkg>:<process>.log`).
+const LOG_LINES: [Line; 32] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -859,6 +861,24 @@ const LOG_LINES: [Line; 29] = [
         row: "alarm",
         prefix: "AtlTest: alarm: ",
         want: Want::Exact("broadcast=1 listener=1"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "startservice",
+        prefix: "AtlTest: startservice: ",
+        want: Want::Exact("onStartCommand startId=1 action=atl.test.START"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "stopservice",
+        prefix: "AtlTest: stopservice: ",
+        want: Want::Exact("onDestroy"),
+        timing: Timing::Async,
+    },
+    Line {
+        row: "stopself",
+        prefix: "AtlTest: stopself: ",
+        want: Want::Exact("onDestroy after stopSelf startId=1"),
         timing: Timing::Async,
     },
     Line {

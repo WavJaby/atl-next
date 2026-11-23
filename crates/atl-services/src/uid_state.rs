@@ -110,6 +110,22 @@ pub fn fgs_bg_restricted(service_target_sdk: i32, caller_target_sdk: Option<i32>
     service_target_sdk >= SDK_S && caller_ok
 }
 
+/// ActiveServices.startServiceLocked's background check (:1080-1105): refused (`?`) when the start is neither of a started service nor a foreground one
+/// (AS: `forcedStandby || (!r.startRequested && !fgRequired)`, forcedStandby not modelled) and the target uid's start mode is not NORMAL.
+pub fn background_start_refused(
+    uids: &Uids,
+    uid: u32,
+    target_sdk: i32,
+    persistent: bool,
+    start_requested: bool,
+    require_foreground: bool,
+    now: u64,
+) -> bool {
+    !start_requested
+        && !require_foreground
+        && uids.start_mode(uid, target_sdk, persistent, now) != StartMode::Normal
+}
+
 /// Per-uid state. A uid not in the map is idle with nothing held (a new uid: UidRecord.java :187 mIdle = true).
 #[derive(Debug, Default)]
 pub struct Uids {
@@ -572,5 +588,93 @@ mod tests {
                 "{h:?}"
             );
         }
+    }
+
+    /// ActiveServices.startServiceLocked :1085-1100: an idle uid, targetSdk 26+, not started, not foreground -> refused (`?`).
+    #[test]
+    fn background_start_of_an_idle_app_is_refused() {
+        let uids = Uids::default();
+        assert!(background_start_refused(
+            &uids, APP_UID, SDK_O, false, false, false, 0
+        ));
+        // targetSdk below O: NORMAL (AMS :6281 applies DELAYED_RIGID from O on)
+        assert!(!background_start_refused(
+            &uids,
+            APP_UID,
+            SDK_O - 1,
+            false,
+            false,
+            false,
+            0
+        ));
+    }
+
+    /// The check is skipped for a service already started (`!r.startRequested`) and for a foreground start (`!fgRequired`), and an active, persistent or temp-granted uid passes.
+    #[test]
+    fn background_start_check_skips_started_and_foreground_starts() {
+        let mut uids = Uids::default();
+        assert!(!background_start_refused(
+            &uids, APP_UID, 36, false, true, false, 0
+        ));
+        assert!(!background_start_refused(
+            &uids, APP_UID, 36, false, false, true, 0
+        ));
+        assert!(!background_start_refused(
+            &uids, APP_UID, 36, true, false, false, 0
+        ));
+        uids.on_temp_allowlist(APP_UID, 0, BOOT_TEMP_ALLOWLIST_MS, false);
+        assert!(!background_start_refused(
+            &uids,
+            APP_UID,
+            36,
+            false,
+            false,
+            false,
+            BOOT_TEMP_ALLOWLIST_MS - 1
+        ));
+        // the grant ends at its expiry, but the uid stays non-idle until its sweep runs 60 s later (AMC :253; AMS :6419 reads isIdle, not the grant)
+        let sweep = BOOT_TEMP_ALLOWLIST_MS + BACKGROUND_SETTLE_TIME_MS;
+        assert_eq!(
+            uids.on_temp_expired(APP_UID, BOOT_TEMP_ALLOWLIST_MS),
+            Some(sweep)
+        );
+        assert!(!background_start_refused(
+            &uids,
+            APP_UID,
+            36,
+            false,
+            false,
+            false,
+            BOOT_TEMP_ALLOWLIST_MS
+        ));
+        assert_eq!(uids.settle(APP_UID, sweep), Settle::BecameIdle);
+        assert!(background_start_refused(
+            &uids, APP_UID, 36, false, false, false, sweep
+        ));
+    }
+
+    /// A Task of the uid makes it active: its background starts pass until the settle sweep (BACKGROUND_SETTLE_TIME_MS, AMC :253) has run.
+    #[test]
+    fn active_uid_passes_until_it_settles() {
+        let mut uids = Uids::default();
+        uids.on_task_added(APP_UID);
+        assert!(!background_start_refused(
+            &uids, APP_UID, 36, false, false, false, 0
+        ));
+        let at = uids.on_task_removed(APP_UID, 5_000).expect("sweep armed");
+        assert_eq!(at, 5_000 + BACKGROUND_SETTLE_TIME_MS);
+        assert!(!background_start_refused(
+            &uids,
+            APP_UID,
+            36,
+            false,
+            false,
+            false,
+            at - 1
+        ));
+        assert_eq!(uids.settle(APP_UID, at), Settle::BecameIdle);
+        assert!(background_start_refused(
+            &uids, APP_UID, 36, false, false, false, at
+        ));
     }
 }

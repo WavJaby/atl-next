@@ -723,6 +723,7 @@ public class Main extends Activity {
         bindMissing();
         Log.i("AtlTest", "pendingintent: " + pendingIntent());
         Log.i("AtlTest", "processes: " + processes());
+        started();
         Log.i("AtlTest", "sysanswers: " + sysAnswers());
         Log.i("AtlTest", "settings: " + settings());
         Log.i("AtlTest", "features: " + features());
@@ -1504,6 +1505,11 @@ public class Main extends Activity {
         if (alarmBroadcasts == 1 && alarmListeners == 1) {
             Log.i("AtlTest", "alarm: broadcast=1 listener=1");
         }
+    }
+
+    /** Main.started: starts AtlStarted's chain (app.rs LOG_LINES startservice, stopservice, stopself). The service logs each row itself. */
+    private void started() {
+        startService(new Intent(this, AtlStarted.class).setAction(AtlStarted.ACTION_START));
     }
 
     private String jobs() {

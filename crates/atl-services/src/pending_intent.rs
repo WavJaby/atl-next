@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The PendingIntent records of the activity service: the table (pending_intent_table.rs) under a lock, and the IIntentSender binder each record is handed out as.
 //! Same key -> same record -> same binder: PendingIntent.equals compares the binder, and AlarmManager matches an alarm by it (alarm_table.rs).
-//! IIntentSender.send of a BROADCAST record (PendingIntentRecord.sendInner) sends the record's request intent through [`BroadcastSink`] as the creator uid. The alarm service makes the same call in-process when an alarm is due. Other kinds (activity, service, activity result) are not modelled: the call is answered UNKNOWN_TRANSACTION and counted.
-//! Not modelled: the send-time intent (AOSP fills it over the request intent; here the request intent is sent, counted as `fill-in`), the send-time options, the finishedReceiver's onSendFinished, requiredPermission, cancel listeners, the activity-result kind (activity.rs refuses it), the sender's pid (this process).
+//! IIntentSender.send (PendingIntentRecord.sendInner) of a BROADCAST record sends the request intent through [`IntentSink`] as the creator uid; a SERVICE or FOREGROUND_SERVICE record starts its service the same way (startServiceInPackage).
+//! The alarm service makes the same broadcast call in-process when an alarm is due. The activity kind and the activity result kind are not modelled: the call is answered UNKNOWN_TRANSACTION and counted.
+//! Not modelled: the send-time intent (AOSP fills it over the request intent; here the request intent is sent, counted as `fill-in`), the send-time options, the finishedReceiver's onSendFinished, requiredPermission, cancel listeners, the sender's pid (this process), the start's result (AOSP ignores it too: PendingIntentRecord :696-700 logs and swallows the exceptions).
 //! Records last until cancelled. AOSP lets a record go with its last remote reference (WeakReference, PendingIntentController.java:163-164); here it is held, so a FLAG_NO_CREATE lookup can find a record AOSP would have dropped.
 //! userId is part of the key, and a broadcast goes to that user.
 
@@ -23,17 +24,27 @@ const FLAG_UPDATE_CURRENT: i32 = 1 << 27;
 /// Read by getIntentSender and cleared from the key (PendingIntentController.java:155-156).
 const LOOKUP_FLAGS: i32 = FLAG_NO_CREATE | FLAG_CANCEL_CURRENT | FLAG_UPDATE_CURRENT;
 
-/// ActivityManager.INTENT_SENDER_BROADCAST and INTENT_SENDER_ACTIVITY_RESULT (ActivityManager.java:666, 681).
+/// ActivityManager.INTENT_SENDER_BROADCAST, _ACTIVITY_RESULT, _SERVICE, _FOREGROUND_SERVICE (ActivityManager.java:666, 681, 688, 695).
 pub const INTENT_SENDER_BROADCAST: i32 = 1;
 pub const INTENT_SENDER_ACTIVITY_RESULT: i32 = 3;
+pub const INTENT_SENDER_SERVICE: i32 = 4;
+pub const INTENT_SENDER_FOREGROUND_SERVICE: i32 = 5;
 /// ActivityManager.INTENT_SENDER_UNKNOWN (ActivityManager.java:659): the type getInfoForIntentSender reports for a sender that is not a record of this service.
 pub const INTENT_SENDER_UNKNOWN: i32 = 0;
 /// PendingIntent.FLAG_IMMUTABLE (PendingIntent.java:266): not a lookup flag, so it stays in the key, where getInfoForIntentSender reads it.
 pub const FLAG_IMMUTABLE: i32 = 1 << 26;
 
-/// What a BROADCAST record sends through: the intent sent to `user_id` as the creator `uid` (activity.rs's broadcast path).
-pub trait BroadcastSink: Send + Sync {
+/// What a sent record goes through: a BROADCAST record's intent to `user_id` as the creator `uid` (activity.rs's broadcast path), and a SERVICE record's start as that uid
+/// (`foreground`: FOREGROUND_SERVICE, whose foreground rules are S7's).
+pub trait IntentSink: Send + Sync {
     fn send_as(&self, intent: &Intent, uid: u32, user_id: i32) -> binder::Result<()>;
+    fn start_service_as(
+        &self,
+        intent: &Intent,
+        uid: u32,
+        user_id: i32,
+        foreground: bool,
+    ) -> binder::Result<()>;
 }
 
 /// A record as [`PendingIntents::info`] reports it.
@@ -47,11 +58,11 @@ pub struct RecordInfo {
 /// The records, under one lock, and the broadcast path a sent record goes through.
 pub struct PendingIntents {
     table: Mutex<PendingIntentTable<SpIBinder>>,
-    sink: Arc<dyn BroadcastSink>,
+    sink: Arc<dyn IntentSink>,
 }
 
 impl PendingIntents {
-    pub fn new(sink: Arc<dyn BroadcastSink>) -> Self {
+    pub fn new(sink: Arc<dyn IntentSink>) -> Self {
         PendingIntents {
             table: Mutex::new(PendingIntentTable::default()),
             sink,
@@ -112,7 +123,7 @@ struct Sent {
     uid: u32,
     user_id: i32,
     intent: Option<Intent>,
-    sink: Arc<dyn BroadcastSink>,
+    sink: Arc<dyn IntentSink>,
 }
 
 /// The IIntentSender a record is handed out as: send (module doc).
@@ -132,7 +143,11 @@ impl IIntentSender for Sender {
         _options: Option<&Bundle>,
     ) -> binder::Result<()> {
         let sent = &self.0;
-        if sent.r#type != INTENT_SENDER_BROADCAST {
+        let kind = sent.r#type;
+        if !matches!(
+            kind,
+            INTENT_SENDER_BROADCAST | INTENT_SENDER_SERVICE | INTENT_SENDER_FOREGROUND_SERVICE
+        ) {
             atl_diag::refused("IIntentSender", "send (kind not modelled)");
             return Err(binder::StatusCode::UNKNOWN_TRANSACTION.into());
         }
@@ -141,7 +156,13 @@ impl IIntentSender for Sender {
         }
         let empty = Intent::default();
         let request = sent.intent.as_ref().or(intent).unwrap_or(&empty);
-        sent.sink.send_as(request, sent.uid, sent.user_id)
+        if kind == INTENT_SENDER_BROADCAST {
+            sent.sink.send_as(request, sent.uid, sent.user_id)
+        } else {
+            let foreground = kind == INTENT_SENDER_FOREGROUND_SERVICE;
+            sent.sink
+                .start_service_as(request, sent.uid, sent.user_id, foreground)
+        }
     }
 }
 

@@ -17,6 +17,7 @@ pub mod android {
         pub mod Notification;
         pub mod NotificationChannel;
         pub mod PendingIntent;
+        pub mod ServiceStartArgs;
         pub mod SyncNotedAppOp;
         pub mod job {
             pub mod JobInfo;
