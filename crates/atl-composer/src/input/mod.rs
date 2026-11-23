@@ -669,13 +669,31 @@ mod publish {
                         finished.seq,
                         finished.handled
                     );
-                    let keys = state.fallbacks.borrow_mut().finished(
+                    let decision = state.fallbacks.borrow_mut().finished(
                         token,
                         finished.seq,
                         finished.handled,
                         |device, code, meta| fallback_action(state, device, code, meta),
                     );
-                    for k in &keys {
+                    // not a key (a motion, a focus event): no decision
+                    let Some(decision) = decision else {
+                        continue;
+                    };
+                    if !finished.handled {
+                        // logged before the decision's keys go out: one composer thread and log stream, so a Back for this key is published after this line;
+                        // the absence fence of xtask-harness window/webview_overlay.rs. `fallback none`: the map gives the key no fallback.
+                        let fallback = decision
+                            .publish
+                            .first()
+                            .map_or_else(|| "none".to_owned(), |k| k.key_code.to_string());
+                        tracing::info!(
+                            "input: unhandled key seq {} action {} code {} fallback {fallback}",
+                            finished.seq,
+                            decision.key.action,
+                            decision.key.key_code
+                        );
+                    }
+                    for k in &decision.publish {
                         if !publish_key(state, token, publisher, k) {
                             break;
                         }

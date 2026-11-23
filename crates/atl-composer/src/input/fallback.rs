@@ -53,6 +53,15 @@ pub struct Fallbacks<K> {
     windows: Vec<(K, Window)>,
 }
 
+/// A window's answer to one key in flight ([`Fallbacks::finished`]).
+#[derive(Debug)]
+pub struct Decision {
+    /// The key as published to the window: the original, or a fallback key.
+    pub key: Key,
+    /// Published to the window next: an unhandled key's fallback (none: the map has none, or the key is a fallback), or a handled key's cancel of its held fallback.
+    pub publish: Vec<Key>,
+}
+
 impl<K> Default for Fallbacks<K> {
     fn default() -> Self {
         Self {
@@ -79,19 +88,32 @@ impl<K: PartialEq + Clone> Fallbacks<K> {
         self.pending.insert(seq, (window.clone(), k));
     }
 
-    /// `window` finished `seq`: the fallback keys to publish to it, in order (each goes through [`Fallbacks::published`] too). `fallback(device, keycode, meta)`: the device map's fallback (keycode, meta), None for none.
-    /// A seq not recorded here (a motion, a focus event) -> nothing.
+    /// `window` finished `seq`: its [`Decision`]; each key it publishes goes through [`Fallbacks::published`] too. `fallback(device, keycode, meta)`: the device map's fallback (keycode, meta), None for none.
+    /// None for a seq not recorded here (a motion, a focus event) or published to another window.
     pub fn finished(
         &mut self,
         window: &K,
         seq: u32,
         handled: bool,
         fallback: impl FnOnce(i32, i32, i32) -> Option<(i32, i32)>,
+    ) -> Option<Decision> {
+        let (owner, key) = self.pending.remove(&seq)?;
+        if owner != *window {
+            return None;
+        }
+        let publish = self.answer(window, key, handled, fallback);
+        Some(Decision { key, publish })
+    }
+
+    /// The keys to publish to `window` for its finish of `k` ([`Decision::publish`]).
+    fn answer(
+        &mut self,
+        window: &K,
+        k: Key,
+        handled: bool,
+        fallback: impl FnOnce(i32, i32, i32) -> Option<(i32, i32)>,
     ) -> Vec<Key> {
-        let Some((owner, k)) = self.pending.remove(&seq) else {
-            return Vec::new();
-        };
-        if owner != *window || k.flags & FLAG_FALLBACK != 0 {
+        if k.flags & FLAG_FALLBACK != 0 {
             return Vec::new();
         }
         let w = self.window(window);
@@ -189,7 +211,10 @@ mod tests {
     /// Publishes `k` as `seq` to window 1 and finishes it.
     fn run(f: &mut Fallbacks<u8>, seq: u32, k: Key, handled: bool) -> Vec<Key> {
         f.published(&1, seq, k);
-        let out = f.finished(&1, seq, handled, map);
+        let out = f
+            .finished(&1, seq, handled, map)
+            .map(|d| d.publish)
+            .unwrap_or_default();
         for (i, o) in out.iter().enumerate() {
             f.published(&1, 1000 + seq * 10 + i as u32, *o);
         }
@@ -231,7 +256,10 @@ mod tests {
         let mut f = Fallbacks::default();
         let back = run(&mut f, 1, key(ACTION_DOWN, ESCAPE, 0, 10), false);
         // the BACK DOWN itself finished unhandled: nothing more
-        assert!(f.finished(&1, 1010, false, map).is_empty());
+        assert!(
+            f.finished(&1, 1010, false, map)
+                .is_some_and(|d| d.publish.is_empty())
+        );
         assert_eq!(back.len(), 1);
     }
 
@@ -243,7 +271,7 @@ mod tests {
         f.published(&1, 2, key(ACTION_UP, A, 0, 20));
         assert!(
             f.finished(&1, 2, false, |_, _, _| Some((BACK, 0)))
-                .is_empty()
+                .is_some_and(|d| d.publish.is_empty())
         );
     }
 
@@ -254,7 +282,7 @@ mod tests {
         f.published(&1, 1, key(ACTION_DOWN, ESCAPE, 2, 10));
         assert!(
             f.finished(&1, 1, false, |_, _, _| panic!("looked up"))
-                .is_empty()
+                .is_some_and(|d| d.publish.is_empty())
         );
     }
 
@@ -338,7 +366,7 @@ mod tests {
         let mut f = Fallbacks::default();
         f.published(&1, 1, key(ACTION_DOWN, ESCAPE, 0, 10));
         f.retain(|k| *k != 1);
-        assert!(f.finished(&1, 1, false, map).is_empty());
+        assert!(f.finished(&1, 1, false, map).is_none());
         assert!(f.windows.is_empty());
     }
 
@@ -348,9 +376,28 @@ mod tests {
         run(&mut f, 1, key(ACTION_DOWN, ESCAPE, 0, 10), false);
         // window 2's ESC UP (its DOWN never seen) has no latch there
         f.published(&2, 2, key(ACTION_UP, ESCAPE, 0, 20));
-        assert!(f.finished(&2, 2, false, map).is_empty());
+        assert!(
+            f.finished(&2, 2, false, map)
+                .is_some_and(|d| d.publish.is_empty())
+        );
         // a finish reported by another window than the one published to is not this seq's
         f.published(&1, 3, key(ACTION_UP, ESCAPE, 0, 20));
-        assert!(f.finished(&2, 3, false, map).is_empty());
+        assert!(f.finished(&2, 3, false, map).is_none());
+    }
+
+    /// AOSP's map: Esc has no fallback, so its UP is decided with none, and the decision names the key. A seq never published (a motion) has no decision.
+    #[test]
+    fn fallback_none_is_a_decision_naming_the_key() {
+        let mut f = Fallbacks::default();
+        f.published(&1, 1, key(ACTION_DOWN, ESCAPE, 0, 10));
+        f.published(&1, 2, key(ACTION_UP, ESCAPE, 0, 20));
+        let down = f.finished(&1, 1, false, |_, _, _| None);
+        assert!(down.is_some_and(|d| d.publish.is_empty()));
+        let up = f
+            .finished(&1, 2, false, |_, _, _| None)
+            .expect("a decision");
+        assert_eq!((up.key.action, up.key.key_code), (ACTION_UP, ESCAPE));
+        assert!(up.publish.is_empty());
+        assert!(f.finished(&1, 3, false, |_, _, _| None).is_none());
     }
 }
