@@ -13,10 +13,10 @@ atl-android-paths = { path = "../crates/atl-android-paths" }
 atl-bridgegen = { path = "../crates/atl-bridgegen" }
 atl-broker = { path = "../crates/atl-broker" }
 atl-bwrap = { path = "../crates/atl-bwrap" }
-atl-cpu-pressure = { path = "../crates/atl-cpu-pressure", features = ["serde"] }
 atl-fonts = { path = "../crates/atl-fonts" }
 atl-fonts-table = { path = "../crates/atl-fonts-table" }
 atl-gralloc = { path = "../crates/atl-gralloc" }
+atl-host-load = { path = "../crates/atl-host-load", features = ["serde"] }
 atl-layout = { path = "../crates/atl-layout" }
 atl-native-bridge = { path = "../crates/atl-native-bridge" }
 atl-sigaction-hook = { path = "../crates/atl-sigaction-hook" }

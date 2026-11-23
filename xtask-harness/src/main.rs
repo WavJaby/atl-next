@@ -323,6 +323,8 @@ fn main() -> Result<ExitCode> {
         Command::DisplayProbe => return window::display_probe(),
         _ => {}
     }
+    // a test gate runs in its own scope when the host can make one (atl-host-load): begun here, its `host load:` line printed after its verdict
+    let gate = matches!(cli.command, Command::Test { .. }).then(atl_host_load::Gate::begin);
     let root = checkout_root()?;
     let name = verdict_name(&cli.command);
     let result = match cli.command {
@@ -484,6 +486,9 @@ fn main() -> Result<ExitCode> {
         Command::CheckStep { step, out } => check_step(&root, step, &out),
         Command::WindowLive(_) | Command::DisplayProbe => unreachable!("dispatched above"),
     };
+    if let Some(gate) = gate {
+        println!("{}", gate.finish());
+    }
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
         println!("{}", verdict::error(name, e));

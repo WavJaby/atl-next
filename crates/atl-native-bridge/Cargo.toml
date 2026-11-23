@@ -139,8 +139,8 @@ atl-bridgegen = { path = "../atl-bridgegen" }
 atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 
 [dev-dependencies]
-# g4's starvation share over its run: the measure xtask's cadence window is judged with (atl-cpu-pressure)
-atl-cpu-pressure = { path = "../atl-cpu-pressure" }
+# g4's starvation share over its run: the measure xtask's cadence window is judged with (atl-host-load)
+atl-host-load = { path = "../atl-host-load" }
 
 [lints]
 workspace = true

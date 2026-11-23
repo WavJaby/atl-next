@@ -230,8 +230,8 @@ uses = ["generators"]
 # atl-sigaction-hook: the install seam host signal handlers are wrapped at (an executable invokes its interposer; the bridge registers the hook)
 crates = ["atl-native-bridge", "atl-guest-dlsym", "atl-sigaction-hook"]
 exports = ["atl-native-bridge", "atl-sigaction-hook"]
-# cpu-pressure: g4's starvation share over its run (test-only dev-dependency); engine-api: the engine C ABI the QEMU crossing calls the engine `.so` through (plain dependency, no code; the engine is a dlopen, not a cargo edge); diag: OpenSL ES refusals counted as `unimplemented` (the app process links no converter libatl_diag)
-uses = ["generators", "android-paths", "cpu-pressure", "engine-api", "diag"]
+# host-load: g4's starvation share over its run (test-only dev-dependency); engine-api: the engine C ABI the QEMU crossing calls the engine `.so` through (plain dependency, no code; the engine is a dlopen, not a cargo edge); diag: OpenSL ES refusals counted as `unimplemented` (the app process links no converter libatl_diag)
+uses = ["generators", "android-paths", "host-load", "engine-api", "diag"]
 
 # the QEMU translator engine (QEMU bridge plan Q2 spike): QEMU's linux-user core dlopened as a library, P1's svc hook, the fault chain in front of QEMU's handler; CPU layouts generated from QEMU's cpu.h; exports its `Trap` to the native bridge's QEMU crossing (Q4)
 # atl-qemu-boot: the engine's guest executables (boot, cpuinfo probe); atl-engine-cpuinfo: the host runner atld starts once for the guest cpuinfo (android-paths: the installed engine and probe)
@@ -257,10 +257,10 @@ uses = ["layout"]
 crates = ["atl-layout"]
 exports = ["atl-layout"]
 
-# host CPU starvation over a window (PSI `some` stall share) and the one judgement made over it (`judge_window`): the cadence window and g4 share it; a host measurement, no product code
-[cpu-pressure]
-crates = ["atl-cpu-pressure"]
-exports = ["atl-cpu-pressure"]
+# host load over a test gate's run (the gate's scope against the busy CPU of its set: stall, own and foreign CPU) and the system-wide PSI judgement (`judge_window`) the cadence window and g4 keep; a host measurement, no product code
+[host-load]
+crates = ["atl-host-load"]
+exports = ["atl-host-load"]
 
 # definition crates below (no build script, no runtime crate): shared by the product and xtask, so the bootstrap tool builds without the product
 # bubblewrap's argv, spelled once (F1.1): the broker's sandbox profiles and xtask's build-tree namespace
@@ -296,5 +296,5 @@ uses = ["layout", "bwrap", "services-types", "android-paths", "fonts-table"]
 # the runtime harness: `cargo xtask test|run-apk|remote` and the check steps that need product logic (gl-proxies), run by xtask as a process
 [xtask-harness]
 crates = ["xtask-harness"]
-# xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; cpu-pressure: the cadence window's starvation share (judge_window); generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back; property-service: the default property set the installer gate maps, with the device ABI list replaced for its break abi-arm64; fonts + fonts-table: the product's font list over the desktop's fontconfig, as atld builds it (step host-fonts); sepolicy: the service access table and spawn domains the sepolicy gate checks
-uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "cpu-pressure", "generators", "property-service", "diag", "fonts", "fonts-table", "sepolicy"]
+# xtask: its library; broker: its control protocol, mounts and launcher, used by the runtime gates; bwrap: the task-bind gate's namespace argv; services-types: the package manifest records the gates write for atld; gralloc: the VINTF declarations and mapper library name the gralloc gate and atld share; native-bridge: its library name, staged for atld runs, its binding table (step gl-proxies) and its `isSupported` classifier the jni-fixture gate runs on the fixture; android-paths: the guest paths of the records it writes; platform-host: the app sandbox's access and the PipeWire socket; host-load: the cadence window's starvation share (judge_window) and the gate's host-load record; generators: the aarch64 thunk-pool emitter (atl_bridgegen::aarch64) writes the QEMU spike fixture's pool, and the spike check reads it back; property-service: the default property set the installer gate maps, with the device ABI list replaced for its break abi-arm64; fonts + fonts-table: the product's font list over the desktop's fontconfig, as atld builds it (step host-fonts); sepolicy: the service access table and spawn domains the sepolicy gate checks
+uses = ["xtask", "layout", "broker", "bwrap", "services-types", "gralloc", "platform-host", "native-bridge", "android-paths", "host-load", "generators", "property-service", "diag", "fonts", "fonts-table", "sepolicy"]

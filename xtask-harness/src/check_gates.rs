@@ -7,10 +7,10 @@
 //! the step, naming it and the row whose end first saw it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
@@ -437,20 +437,25 @@ impl RowRun<'_> {
             .stderr(file)
             .spawn()
             .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
-        let peak = peak_while(&mut child)?;
+        let status = child.wait().context("waiting for the gate")?;
         let took = started.elapsed().as_secs_f64();
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         let phases = phases_field(&text);
+        // the gate's own record (atl-host-load), its last `host load:` line: the scope's peak and the stall share of its span
+        let seen = atl_host_load::Seen::read(&text);
         let measured = format!(
-            "peak={}MiB{} work={}",
-            peak.kib / 1024,
+            "peak={}{} work={} stall={}",
+            seen.peak_mib
+                .map_or("unknown".to_owned(), |m| format!("{m}MiB")),
             phases
                 .as_ref()
                 .map(|p| format!(" {}", p.field))
                 .unwrap_or_default(),
-            runtime_work(&text).unwrap_or("-")
+            runtime_work(&text).unwrap_or("-"),
+            seen.stall_pct
+                .map_or("unknown".to_owned(), |p| format!("{p:.0}%")),
         );
-        let outcome = Outcome::of_exit(peak.status.code());
+        let outcome = Outcome::of_exit(status.code());
         let verdict = match outcome {
             Outcome::Undecided => undecided_line(&text, row.cmd()),
             Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
@@ -486,76 +491,6 @@ impl RowRun<'_> {
             running: 0,
         })
     }
-}
-
-/// How often a row's process tree is sampled for its memory. A gate runs for seconds (a cold start alone 12-15 s), so 5 samples a second see its plateau; a spike shorter than this is missed,
-/// which makes the printed peak a lower bound of the true one.
-const PEAK_SAMPLE: Duration = Duration::from_millis(200);
-
-/// A row's exit and the largest summed resident memory of its process tree seen while it ran.
-struct Peak {
-    status: ExitStatus,
-    kib: u64,
-}
-
-/// Waits for `child`, sampling its process tree's summed VmRSS every [`PEAK_SAMPLE`]. The tree is the child and its descendants by parent pid: a process that double-forks away from it
-/// (reparented to init) is not counted. No cgroup per row: this host's processes sit in the root cgroup (`0::/init.scope`, no delegation), so `memory.peak` of a row scope is not available.
-fn peak_while(child: &mut Child) -> Result<Peak> {
-    let root = child.id();
-    let mut kib = 0;
-    loop {
-        if let Some(status) = child.try_wait().context("waiting for the gate")? {
-            return Ok(Peak { status, kib });
-        }
-        kib = kib.max(tree_rss_kib(root));
-        std::thread::sleep(PEAK_SAMPLE);
-    }
-}
-
-/// The summed VmRSS (KiB) of `root` and its descendants, from `/proc`; a process gone between listing and reading counts 0.
-fn tree_rss_kib(root: u32) -> u64 {
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return 0;
-    };
-    let procs: Vec<(u32, u32)> = dir
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            Some((pid, ppid_of_stat(&stat)?))
-        })
-        .collect();
-    descendants(root, &procs)
-        .into_iter()
-        .filter_map(|pid| vm_rss_kib(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?))
-        .sum()
-}
-
-/// The parent pid in a `/proc/<pid>/stat` line (proc(5): `pid (comm) state ppid ...`; comm may hold spaces and parentheses, so the fields after the last `)`).
-fn ppid_of_stat(stat: &str) -> Option<u32> {
-    let (_, rest) = stat.rsplit_once(')')?;
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// `VmRSS:` in a `/proc/<pid>/status` text, KiB (proc(5)); a kernel thread has none.
-fn vm_rss_kib(status: &str) -> Option<u64> {
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    line.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// `root` and every pid whose parent chain in `procs` (`(pid, ppid)`) reaches it.
-fn descendants(root: u32, procs: &[(u32, u32)]) -> Vec<u32> {
-    let mut tree = vec![root];
-    let mut i = 0;
-    while let Some(&parent) = tree.get(i) {
-        tree.extend(
-            procs
-                .iter()
-                .filter(|(_, pp)| *pp == parent)
-                .map(|(p, _)| *p),
-        );
-        i += 1;
-    }
-    tree
 }
 
 /// A window row's phases (window.rs `PHASES_LINE`): the `key=value` fields for the gates line, and the word naming what ended its watch.
@@ -662,6 +597,7 @@ pub(crate) fn verdict_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::time::Duration;
 
     /// Lines as the window and composer gates printed them (job rgm-done1).
     #[test]
@@ -817,35 +753,6 @@ mod tests {
             "window-slow-display host GPU starved (render max 205 ms > 100 ms)"
         );
         assert_eq!(undecided_line("window: pass x\n", "window"), None);
-    }
-
-    /// proc(5) lines by hand: a comm with spaces and a `)` must not shift the ppid field; VmRSS is the second word of its line, in kB.
-    #[test]
-    fn proc_fields_by_hand() {
-        assert_eq!(
-            ppid_of_stat("4242 (a) b) (c) S 17 4242 4242 0 -1"),
-            Some(17)
-        );
-        assert_eq!(ppid_of_stat("1 (init) S 0 1 1"), Some(0));
-        assert_eq!(ppid_of_stat("garbage"), None);
-        let status = "Name:\tatld\nVmHWM:\t  9000 kB\nVmRSS:\t  5120 kB\nThreads:\t4\n";
-        assert_eq!(vm_rss_kib(status), Some(5120));
-        assert_eq!(vm_rss_kib("Name:\tkthreadd\n"), None);
-    }
-
-    /// The tree is the root and every pid whose parent chain reaches it; a sibling of the root and its child are not in it.
-    #[test]
-    fn descendants_follow_parent_chains() {
-        let procs = [(10, 1), (11, 10), (12, 11), (13, 10), (20, 1), (21, 20)];
-        let mut tree = descendants(10, &procs);
-        tree.sort_unstable();
-        assert_eq!(tree, [10, 11, 12, 13]);
-    }
-
-    /// The sampler responds: this test process's own tree has resident memory (a dead probe would read 0 for every row).
-    #[test]
-    fn the_sampler_sees_this_process() {
-        assert!(tree_rss_kib(std::process::id()) > 0);
     }
 
     /// The phases field as window.rs prints it, and the tally of what ended each watch; a word the tally does not know is counted, not dropped.

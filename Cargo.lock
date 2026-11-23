@@ -281,14 +281,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atl-cpu-pressure"
-version = "0.0.0"
-dependencies = [
- "rustix",
- "serde",
-]
-
-[[package]]
 name = "atl-diag"
 version = "0.0.0"
 dependencies = [
@@ -433,6 +425,14 @@ name = "atl-guest-dlsym"
 version = "0.0.0"
 
 [[package]]
+name = "atl-host-load"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+ "serde",
+]
+
+[[package]]
 name = "atl-ime"
 version = "0.0.0"
 dependencies = [
@@ -519,9 +519,9 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-bridgegen",
- "atl-cpu-pressure",
  "atl-diag",
  "atl-engine-api",
+ "atl-host-load",
  "atl-sigaction-hook",
  "libc",
  "object",
@@ -3075,11 +3075,11 @@ dependencies = [
  "atl-bridgegen",
  "atl-broker",
  "atl-bwrap",
- "atl-cpu-pressure",
  "atl-diag",
  "atl-fonts",
  "atl-fonts-table",
  "atl-gralloc",
+ "atl-host-load",
  "atl-layout",
  "atl-native-bridge",
  "atl-platform-host",

@@ -34,7 +34,7 @@ use crate::gles2_fixture;
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
-use atl_cpu_pressure::{Sampler, Samples, judge_window};
+use atl_host_load::{Sampler, Samples, judge_window};
 
 mod aux_process;
 mod capture;
@@ -2046,7 +2046,7 @@ fn frame_time(line: &str) -> Option<u64> {
 /// Sub-gate (b): the first FRAME_CALLBACKS callbacks after the marker come once per display period. The mean interval is within CADENCE_TOLERANCE of the period, and no
 /// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's (the display clock's grid point each callback was scheduled for, not a wall-clock stamp of the app's own),
 /// so the mean does not depend on when the app ran its callbacks; a missed interval is a vsync the client did not ask for in time. A failed judgement while the host was starved
-/// (`atl_cpu_pressure::judge_window`, share over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
+/// (`atl_host_load::judge_window`, share over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
 pub(crate) fn cadence_check(
     after: &[&str],
     refresh_hz: f32,
@@ -4671,7 +4671,7 @@ mod tests {
     /// PASS on both (a pass under load is a pass). Pressure samples bracket the window at the threshold's half and double.
     #[test]
     fn cadence_undecidable_only_when_starved() {
-        use atl_cpu_pressure::{STARVED_STALL_SHARE, Sample};
+        use atl_host_load::{STARVED_STALL_SHARE, Sample};
         const STEP: u64 = 16_666_667;
         const T0: u64 = 5_000_000_000;
         let pressure = |share: f64| {
@@ -4680,10 +4680,12 @@ mod tests {
                 Sample {
                     at_ns: T0 as i64 - 1,
                     stall_us: 0,
+                    ..Default::default()
                 },
                 Sample {
                     at_ns: T0 as i64 - 1 + wall_ns,
                     stall_us: (share * wall_ns as f64 / 1e3) as u64,
+                    ..Default::default()
                 },
             ])
         };
