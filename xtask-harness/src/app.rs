@@ -2533,7 +2533,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             if !watch_on(
                 watch.elapsed(),
                 progress.elapsed(),
-                got < all || !sticky.finished(now) || !foreground.finished(now),
+                got < all || !sticky.finished() || !foreground.finished(now),
                 foreground.timer_running(now),
             ) {
                 break;
@@ -2594,12 +2594,18 @@ const STICKY_IMPORTANCE: &str = "AtlTest: importance: sticky=";
 const IMPORTANCE_SERVICE: i32 = 300;
 /// ActivityManagerConstants.java:223 DEFAULT_SERVICE_RESTART_DURATION: a killed service's restart comes this long after the kill (ActiveServices.scheduleServiceRestartLocked).
 const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
-/// ActivityManagerConstants.java:226 DEFAULT_SERVICE_MIN_RESTART_TIME_BETWEEN: a restart of a service that died with another one waits this long after it.
-const SERVICE_MIN_RESTART_TIME_BETWEEN_MS: u64 = 10_000;
 /// Above the upper bound: the death's binder notice and the spawn's own latency, which the rule's numbers do not count.
 const STICKY_SLACK_MS: u64 = 1_000;
-/// After the kill, the not-sticky process must stay down this long: the rule's restart of a second service that died with the first one, with its own delay.
-const NOT_STICKY_WINDOW_MS: u64 = SERVICE_RESTART_DURATION_MS + SERVICE_MIN_RESTART_TIME_BETWEEN_MS;
+/// The not-sticky fence (services log): atld's line for the not-sticky process's death, logged after that death's restart decisions (activity.rs app_died).
+/// A restart starts only from a decision (active_services.rs services_died: `restart of <pkg>/<class> scheduled`), so none logged before this line means none.
+/// No time bound: the former 11 s window (1 s + 10 s) ended before the sticky rule's 12 s bound, so a restart started in between passed.
+const NOT_STICKY_CLASS: &str = "AtlNotSticky";
+const RESTART_DECIDED: &str = "restart of ";
+
+/// The services log's death line of the not-sticky process: the fence's end.
+fn not_sticky_died_line(package: &str) -> String {
+    format!("process {package}{NOT_STICKY_PROC} (pid ")
+}
 
 /// The STICKY case's state: [`StickyCase::poll`] in the watch after the marker, [`StickyCase::verdict`] in the judge.
 #[derive(Default)]
@@ -2610,6 +2616,8 @@ struct StickyCase {
     kill_failed: Option<String>,
     /// the sticky restart line's stamp, wall ms
     restart_ms: Option<u64>,
+    /// the not-sticky death line is in the services log (the fence): from here the not-sticky verdict reads nothing later
+    not_sticky_died: bool,
     /// AtlSticky's logged importance (the word after STICKY_IMPORTANCE), read at the kill
     importance: Option<String>,
     /// the run's `ro.hw_timeout_multiplier`: the restart's start budget is PROC_START_TIMEOUT_BASE_MS x it
@@ -2622,15 +2630,12 @@ impl StickyCase {
         usize::from(self.killed.is_some()) + usize::from(self.restart_ms.is_some())
     }
 
-    /// Whether the case has run its course at `now` (wall ms): the restart is logged and the not-sticky window has passed.
-    fn finished(&self, now: u64) -> bool {
-        match (self.killed, self.restart_ms) {
-            (Some((at, _)), Some(_)) => now >= at + NOT_STICKY_WINDOW_MS,
-            _ => false,
-        }
+    /// Whether the case has run its course: the restart is logged and the not-sticky death is (the fence).
+    fn finished(&self) -> bool {
+        self.killed.is_some() && self.restart_ms.is_some() && self.not_sticky_died
     }
 
-    /// One watch step: once both first starts are logged, kills both processes; then looks for the sticky restart line.
+    /// One watch step: once both first starts are logged, kills both processes; then looks for the sticky restart line and the not-sticky death (the fence).
     fn poll(&mut self, run: &Run, package: &str) {
         let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
         if self.killed.is_none() {
@@ -2663,10 +2668,15 @@ impl StickyCase {
                 .find(|l| l.contains(STICKY_RESTART))
                 .and_then(stamp_ms);
         }
+        if !self.not_sticky_died {
+            let services = atl_diag::logfiles::read(&run.log("services"));
+            self.not_sticky_died = services.contains(&not_sticky_died_line(package));
+        }
     }
 
     /// The pass line, or the reason the case failed. `atld` is atld's log at judge time: a not-sticky start after the kill is the restart it must not have.
-    fn verdict(&self, atld: &str, package: &str) -> Result<String, String> {
+    /// `services` is the services log at judge time: the not-sticky fence ([`not_sticky_fence`]).
+    fn verdict(&self, atld: &str, services: &str, package: &str) -> Result<String, String> {
         let Some((at, starts_before)) = self.killed else {
             return Err(
                 "sticky: the first starts were never logged (AtlSticky, AtlNotSticky)".to_owned(),
@@ -2697,9 +2707,28 @@ impl StickyCase {
                 "notsticky: {restarted} start(s) after its process was ended: a NOT_STICKY service is not restarted (killServicesLocked, canStopIfKilled)"
             ));
         }
+        not_sticky_fence(services, package)?;
         Ok(format!(
-            "{importance}; sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: not restarted in {NOT_STICKY_WINDOW_MS} ms"
+            "{importance}; sticky: restart {gap} ms after the kill (want {lo}..={hi}), notsticky: no restart decided before its death (services log)"
         ))
+    }
+}
+
+/// The not-sticky fence on the services log: a restart decided for AtlNotSticky before its process's death line is one it must not have. No death line: not judged.
+fn not_sticky_fence(services: &str, package: &str) -> Result<(), String> {
+    let died = not_sticky_died_line(package);
+    let end = services
+        .find(&died)
+        .ok_or_else(|| format!("notsticky: no `{died}` line in the services log"))?;
+    match services[..end]
+        .lines()
+        .find(|l| l.contains(RESTART_DECIDED) && l.contains(NOT_STICKY_CLASS))
+    {
+        Some(line) => Err(format!(
+            "notsticky: restart decided before its death: {}",
+            line.trim()
+        )),
+        None => Ok(()),
     }
 }
 
@@ -2775,6 +2804,8 @@ mod sticky_case_tests {
     use super::*;
 
     const ATLD_START: &str = "atld: started com.example.atltest:notsticky (package com.example.atltest): uid 10001, host pid ";
+    /// The services log of a not-sticky death with no restart decided before it: the fence passes.
+    const SERVICES_DIED: &str = "services: process com.example.atltest:notsticky (pid 7) died\n";
 
     /// The case as killed at wall 10 000 with `restart` logged: the restart's gap from the kill is the verdict's number.
     fn case(restart: u64) -> StickyCase {
@@ -2782,6 +2813,7 @@ mod sticky_case_tests {
             killed: Some((10_000, 1)),
             kill_failed: None,
             restart_ms: Some(restart),
+            not_sticky_died: false,
             importance: Some("300".to_owned()),
             hw: HwTimeouts::default(),
         }
@@ -2796,12 +2828,69 @@ mod sticky_case_tests {
             hw,
             ..case(10_000 + 22_000)
         };
-        assert!(at_bound.verdict(&atld, "com.example.atltest").is_ok());
+        assert!(
+            at_bound
+                .verdict(&atld, SERVICES_DIED, "com.example.atltest")
+                .is_ok()
+        );
         let over = StickyCase {
             hw,
             ..case(10_000 + 22_001)
         };
-        assert!(over.verdict(&atld, "com.example.atltest").is_err());
+        assert!(
+            over.verdict(&atld, SERVICES_DIED, "com.example.atltest")
+                .is_err()
+        );
+    }
+
+    /// The case finishes at its fence, not at a wall time: the sticky restart alone does not end it, nor does the death alone without it.
+    #[test]
+    fn finished_waits_for_the_not_sticky_death() {
+        let mut c = case(11_000);
+        assert!(!c.finished(), "the death line is not logged yet");
+        c.not_sticky_died = true;
+        assert!(c.finished());
+        let no_restart = StickyCase {
+            restart_ms: None,
+            not_sticky_died: true,
+            ..case(11_000)
+        };
+        assert!(!no_restart.finished(), "the sticky restart line is missing");
+    }
+
+    /// The fence is the death line in the services log: without it nothing is judged, and a decision for AtlNotSticky before it is the restart.
+    #[test]
+    fn not_sticky_fence_orders_the_decision_before_the_death() {
+        let pkg = "com.example.atltest";
+        let no_death = "services: restart of com.example.atltest/com.example.atltest.AtlSticky scheduled (am_handler timer)\n";
+        assert!(
+            not_sticky_fence(no_death, pkg)
+                .unwrap_err()
+                .starts_with("notsticky: no `process com.example.atltest:notsticky (pid `")
+        );
+        assert!(not_sticky_fence(SERVICES_DIED, pkg).is_ok());
+        let sticky_only = format!(
+            "services: restart of {pkg}/{pkg}.AtlSticky scheduled (am_handler timer)\n{SERVICES_DIED}"
+        );
+        assert!(
+            not_sticky_fence(&sticky_only, pkg).is_ok(),
+            "AtlSticky's own decision is not AtlNotSticky's"
+        );
+        let decided = format!(
+            "{SERVICES_DIED}services: restart of {pkg}/{pkg}.AtlNotSticky scheduled (am_handler timer)\n"
+        );
+        assert!(
+            not_sticky_fence(&decided, pkg).is_ok(),
+            "a decision after the death line is outside the fence"
+        );
+        let before = format!(
+            "services: restart of {pkg}/{pkg}.AtlNotSticky scheduled (am_handler timer)\n{SERVICES_DIED}"
+        );
+        let why = not_sticky_fence(&before, pkg).unwrap_err();
+        assert!(
+            why.starts_with("notsticky: restart decided before its death: services: restart of"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -2818,7 +2907,7 @@ mod sticky_case_tests {
     fn restart_gap_bounds_are_the_rule() {
         let pass = |restart| {
             case(restart)
-                .verdict(ATLD_START, "com.example.atltest")
+                .verdict(ATLD_START, SERVICES_DIED, "com.example.atltest")
                 .is_ok()
         };
         assert!(!pass(10_999), "999 ms: before the restart timer");
@@ -2832,15 +2921,33 @@ mod sticky_case_tests {
     fn not_sticky_restart_fails_and_its_first_start_does_not_count() {
         let before = case(11_000);
         let atld = format!("{ATLD_START}7\n");
-        assert!(before.verdict(&atld, "com.example.atltest").is_ok());
+        assert!(
+            before
+                .verdict(&atld, SERVICES_DIED, "com.example.atltest")
+                .is_ok()
+        );
         let restarted = format!("{ATLD_START}7\n{ATLD_START}9\n");
         let why = StickyCase {
             killed: Some((10_000, 1)),
             ..case(11_000)
         }
-        .verdict(&restarted, "com.example.atltest")
+        .verdict(&restarted, SERVICES_DIED, "com.example.atltest")
         .unwrap_err();
         assert!(why.starts_with("notsticky: 1 start(s)"), "{why}");
+    }
+
+    /// A decision for AtlNotSticky before its death fails the verdict even though no start was logged yet: the decision is what the fence orders.
+    #[test]
+    fn decided_restart_fails_before_any_start() {
+        let pkg = "com.example.atltest";
+        let decided = format!(
+            "services: restart of {pkg}/{pkg}.AtlNotSticky scheduled (am_handler timer)\n{SERVICES_DIED}"
+        );
+        let why = case(11_000).verdict(ATLD_START, &decided, pkg).unwrap_err();
+        assert!(
+            why.starts_with("notsticky: restart decided before its death"),
+            "{why}"
+        );
     }
 
     /// AtlSticky's importance (S11) must be IMPORTANCE_SERVICE: 300 passes; a foreground-service band (125), a missing line and a non-number fail.
@@ -3305,7 +3412,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
     }
     // the STICKY case runs only in the local watch; a remote run has no watch and judges nothing here
     if passed && !remote {
-        match sticky.verdict(&atld_log, app_name) {
+        match sticky.verdict(&atld_log, &services_log, app_name) {
             Ok(pass) => println!("app: pass {pass}"),
             Err(why) => whys.push(why),
         }

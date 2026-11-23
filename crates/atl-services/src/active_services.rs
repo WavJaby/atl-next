@@ -693,6 +693,11 @@ impl Inner {
         self.services_out(st, calls);
         for restart in restarts {
             atl_diag::answered(AM, "service restart scheduled (am_handler timer)");
+            // the harness's not-sticky fence reads this line before the death line app_died logs after this call
+            log(format_args!(
+                "restart of {}/{} scheduled (am_handler timer)",
+                restart.component.0, restart.component.1
+            ));
             let at = u64::try_from(restart.at).unwrap_or(0);
             self.arm(Timer::Restart(restart.component), at);
         }
