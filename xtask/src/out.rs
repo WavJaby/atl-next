@@ -54,6 +54,9 @@ pub enum Out {
         /// Print only this checkout's run dir (out_run.rs: app data roots and bulky regenerable run data, never cited by a report), making it when missing.
         #[arg(long)]
         run: bool,
+        /// Print only this checkout's own paths, as one JSON object; makes nothing. A path may not exist yet; `run_dir` is null until made, `run_dirs` lists where it can be made, `store_dir` is null without a ram store, `task_copies` is null on main or a detached HEAD.
+        #[arg(long, conflicts_with = "run")]
+        json: bool,
     },
     /// Deletes the build dirs and run dirs whose checkout is gone, every base but the newest two, and each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs) (dry run unless --execute).
     ///
@@ -1575,15 +1578,60 @@ pub fn live_dirs(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `out show --json`: every path checkout `id` owns, from the functions the builds use. Read-only. A ram build dir's own record names its store (it may differ from the configured `store`).
+fn paths_json(
+    root: &Path,
+    ws: &Path,
+    id: &str,
+    copies: Option<&Path>,
+    store: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let dir = dir_of(ws, id);
+    let delta = crate::delta::record(&dir)?;
+    let tier = match &delta {
+        Some(_) => Some("ram"),
+        None if present(&dir)? => Some("pool"),
+        None => None,
+    };
+    let store_dir = delta
+        .as_ref()
+        .map(|rec| rec.dir(id))
+        .or_else(|| store.map(|s| s.join(id)));
+    let run = crate::out_run::locate(ws, store, id)?;
+    let mut run_dirs = vec![crate::out_run::run_dir_of(ws, id)];
+    run_dirs.extend(store.map(|s| crate::out_run::ram_run_dir_of(s, id)));
+    Ok(serde_json::json!({
+        "workspace": ws,
+        "checkout": root,
+        "id": id,
+        "build_dir": dir,
+        "build_tier": tier,
+        "boot_dir": boot_of(&target_of(&dir)),
+        "store_dir": store_dir,
+        "run_dir": run.as_ref().map(|(p, _)| p),
+        "run_tier": run.as_ref().map(|(_, rec)| &rec.tier),
+        "run_dirs": run_dirs,
+        "task_copies": copies,
+    }))
+}
+
 pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
     let ws = Layout::of(root)?.workspace().to_owned();
     let live = live_ids_of(root)?;
     match cmd {
-        Out::Show { run: true } => {
+        Out::Show { run: true, .. } => {
             let (_, run, _held) = crate::out_run::ensure(root)?;
             println!("{}", run.display());
         }
-        Out::Show { run: false } => {
+        Out::Show { json: true, .. } => {
+            let cfg = crate::ws_config::load(&ws)?;
+            let layout = Layout::of(root)?;
+            let copies = layout.task().map(|(_, dir)| dir);
+            let store = cfg.delta.ram_store.value.as_deref();
+            let paths = paths_json(root, &ws, &checkout_id(root)?, copies, store)?;
+            println!("{paths:#}");
+        }
+        Out::Show { .. } => {
             let id = checkout_id(root)?;
             let dir = dir_of(&ws, &id);
             if let Some(rec) = crate::delta::record(&dir)? {
@@ -2844,6 +2892,59 @@ mod tests {
             "#!/bin/sh\necho mine\n"
         );
         std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// `out show --json` names the paths AGENTS.md documents (the literals), before anything is made and once the dirs exist, and makes nothing itself.
+    #[test]
+    fn show_json_paths_are_the_documented_ones() {
+        let ws = scratch("show-json");
+        let store = ws.join("store");
+        let root = ws.join("wt/t");
+        let copies = ws.join("src-wt/b");
+        let json = || paths_json(&root, &ws, "t", Some(&copies), Some(&store)).expect("json");
+        let text = |p: &Path| p.to_str().expect("utf-8").to_owned();
+        let pool_run = ws.join("out/pool/run/t");
+        let ram_run = store.join(".run/t");
+
+        let v = json();
+        assert_eq!(v["checkout"], text(&root));
+        assert_eq!(v["build_dir"], text(&ws.join("out/pool/ws/t")));
+        assert_eq!(v["boot_dir"], text(&ws.join("out/pool/boot/t")));
+        assert_eq!(v["store_dir"], text(&store.join("t")));
+        assert_eq!(v["task_copies"], text(&copies));
+        assert_eq!(
+            v["run_dirs"],
+            serde_json::json!([text(&pool_run), text(&ram_run)])
+        );
+        assert!(v["run_dir"].is_null() && v["run_tier"].is_null() && v["build_tier"].is_null());
+        assert!(!ws.join("out").exists() && !store.exists());
+
+        std::fs::create_dir_all(ws.join("out/pool/ws/t")).expect("build dir");
+        std::fs::create_dir_all(&ram_run).expect("ram run dir");
+        std::fs::write(
+            ram_run.join(".run"),
+            format!("tier=ram\nworkspace={}\n", ws.display()),
+        )
+        .expect("record");
+        let v = json();
+        assert_eq!(v["build_tier"], "pool");
+        assert_eq!(v["run_dir"], text(&ram_run));
+        assert_eq!(v["run_tier"], "ram");
+
+        // a ram build dir's record wins over the configured store
+        std::fs::write(
+            ws.join("out/pool/ws/t").join(crate::delta::RECORD),
+            "base=abc\nstore=/other\n",
+        )
+        .expect("delta record");
+        let v = json();
+        assert_eq!(v["build_tier"], "ram");
+        assert_eq!(v["store_dir"], "/other/t");
+
+        let v = paths_json(&root, &ws, "t", None, None).expect("json");
+        assert!(v["task_copies"].is_null() && v["run_dir"].is_null());
+        assert_eq!(v["run_dirs"], serde_json::json!([text(&pool_run)]));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     #[test]
