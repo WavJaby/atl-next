@@ -6,16 +6,18 @@
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
 //! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its build dir.
 //! Busy: a build holds the dir lock (`build_pool::hold_dir`); prune takes it exclusive without waiting and skips the dir. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
-//! Symlinks are refused, never followed: a link under a root could point the prune outside it.
+//! Symlinks are never followed. One inside a unit (cxx links a crate's sources in its build dir) is content: unlinked with it. One that is a unit's dir skips that unit (named, counted); one on the way to a unit (a root, a tree, `.fingerprint`, `build`, `deps`) refuses the call. Removal resolves the parent with `openat2` from the workspace, so a link swapped in after the plan is refused too ([`remove`]).
 //! Land ([`prune_land`]): before Publish, ws/land with window [`LAND_PRUNE_DAYS`], inside the dir's namespace, so the base it becomes holds what recent builds read; a tree with no use record keeps every unit there. Published bases are never pruned: they are the lowers of live overlays.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use rustix::fs::{Mode as RawMode, OFlags, ResolveFlags};
 
 use crate::build_pool;
 use crate::flock::{Flock, Mode};
@@ -77,6 +79,8 @@ pub struct TreePlan {
     pub units: usize,
     pub stale: Vec<Unit>,
     pub kept: usize,
+    /// Units refused and kept whole: why, one line each. In neither `kept` nor `stale`.
+    pub skipped: Vec<String>,
     /// Units with no record entry; judged by mtime. Counted in `kept` or `stale` too.
     pub unrecorded: usize,
     /// Fingerprint entries that are no unit. Kept.
@@ -117,13 +121,24 @@ pub struct Session {
     _held: Option<Flock>,
 }
 
-/// Totals of one sweep: stale units, stale sessions and their bytes, and the build dirs or trees that failed.
+/// Totals of one sweep: stale units, stale sessions and their bytes, the refused units, and the build dirs or trees that failed.
 #[derive(Debug, Default)]
 pub struct Sweep {
     pub units: usize,
     pub sessions: usize,
     pub bytes: u64,
+    pub skipped: usize,
     pub failed: usize,
+}
+
+impl Sweep {
+    /// The summary lines' ending: nothing when no unit was refused.
+    fn skipped_note(&self) -> String {
+        match self.skipped {
+            0 => String::new(),
+            n => format!("; skipped {n} refused units"),
+        }
+    }
 }
 
 /// A target tree found under a root.
@@ -182,10 +197,11 @@ pub fn sweep(
         "dry run, would remove (add --execute)"
     };
     println!(
-        "unit prune: {verb} {} stale units and {} stale sessions, {}",
+        "unit prune: {verb} {} stale units and {} stale sessions, {}{}",
         total.units,
         total.sessions,
-        human(total.bytes)
+        human(total.bytes),
+        total.skipped_note()
     );
     Ok(total)
 }
@@ -215,12 +231,16 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
             human(plan.session_bytes()),
             plan.kept_sessions
         );
+        for why in &plan.skipped {
+            println!("{}: unit skipped: {why}", plan.tree);
+        }
         let bytes = plan.stale_bytes() + plan.session_bytes();
         let sum = roots.entry(plan.root.clone()).or_default();
         for target in [&mut *total, sum] {
             target.units += plan.stale.len();
             target.sessions += plan.sessions.len();
             target.bytes += bytes;
+            target.skipped += plan.skipped.len();
         }
     }
 }
@@ -277,11 +297,12 @@ pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<St
         "dry run, would remove"
     };
     Ok(format!(
-        "land unit prune: ws/{id}: {verb} {} units and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned)",
+        "land unit prune: ws/{id}: {verb} {} units and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned){}",
         total.units,
         total.sessions,
         human(total.bytes),
-        plans.len()
+        plans.len(),
+        total.skipped_note()
     ))
 }
 
@@ -440,7 +461,7 @@ fn prune_trees(
     if execute {
         for plan in &plans {
             if !plan.busy {
-                remove_plan(plan)?;
+                remove_plan(ws, plan)?;
             }
         }
     }
@@ -449,10 +470,10 @@ fn prune_trees(
 }
 
 /// Removes what `plan` names: stale units (their record entries go after), then stale sessions.
-fn remove_plan(plan: &TreePlan) -> Result<()> {
+fn remove_plan(ws: &Path, plan: &TreePlan) -> Result<()> {
     for unit in &plan.stale {
         for path in &unit.paths {
-            remove(&plan.dir, path)?;
+            remove(ws, &plan.dir, path)?;
         }
     }
     let hashes: Vec<String> = plan.stale.iter().map(|u| u.hash.clone()).collect();
@@ -460,7 +481,7 @@ fn remove_plan(plan: &TreePlan) -> Result<()> {
         unit_use::forget(&plan.dir, &hashes)?;
     }
     for session in &plan.sessions {
-        remove_session(&plan.dir, session)?;
+        remove_session(ws, &plan.dir, session)?;
     }
     Ok(())
 }
@@ -513,17 +534,21 @@ fn plan_units(
         return Ok(());
     }
     let mut units: Vec<(PathBuf, String)> = Vec::new();
-    for dir in children(&tree.join(FINGERPRINT))? {
+    for dir in entries(&tree.join(FINGERPRINT))? {
         plan.units += 1;
-        match unit_use::unit_hash(&file_name(&dir)) {
-            Some(hash) => units.push((dir, hash.to_owned())),
-            None => plan.unattributed += 1,
+        let Some(hash) = unit_use::unit_hash(&file_name(&dir)).map(str::to_owned) else {
+            plan.unattributed += 1;
+            continue;
+        };
+        match link_refusal(&dir)? {
+            Some(why) => plan.skipped.push(why),
+            None => units.push((dir, hash)),
         }
     }
     let owned: BTreeSet<String> = units.iter().map(|(_, hash)| hash.clone()).collect();
     let mut outputs: Vec<(PathBuf, Option<String>)> = Vec::new();
     for sub in [DEPS, EXAMPLES] {
-        for file in children(&tree.join(sub))? {
+        for file in entries(&tree.join(sub))? {
             let owner =
                 unit_use::output_hash(&file_name(&file)).filter(|hash| owned.contains(hash));
             outputs.push((file, owner));
@@ -539,7 +564,7 @@ fn plan_units(
         }
     }
     let mut uplifted: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    for file in children(tree)? {
+    for file in entries(tree)? {
         let meta =
             fs::symlink_metadata(&file).with_context(|| format!("reading {}", file.display()))?;
         if !meta.is_file() {
@@ -549,6 +574,9 @@ fn plan_units(
             uplifted.entry(owner.clone()).or_default().push(file);
         }
     }
+    let build_dir = tree.join(BUILD);
+    // refuses the tree when `build` itself is a link: every unit's build dir would be reached through it
+    real_dir(&build_dir)?;
     for (dir, hash) in units {
         let last_use = match record.as_ref().and_then(|r| r.units.get(&hash)) {
             Some(&at) => at,
@@ -562,8 +590,12 @@ fn plan_units(
             continue;
         }
         let mut paths = vec![dir.clone()];
-        let build = tree.join(BUILD).join(file_name(&dir));
+        let build = build_dir.join(file_name(&dir));
         if exists(&build)? {
+            if let Some(why) = link_refusal(&build)? {
+                plan.skipped.push(why);
+                continue;
+            }
             paths.push(build);
         }
         paths.extend(
@@ -760,15 +792,15 @@ fn lock_held(lock: &Path) -> Result<bool> {
 }
 
 /// Removes a stale session: a held lock leaves it alone; otherwise the dir, then its lock file.
-fn remove_session(tree: &Path, session: &Session) -> Result<()> {
+fn remove_session(ws: &Path, tree: &Path, session: &Session) -> Result<()> {
     // no re-probe: the plan holds the lock since it was planned (Session `_held`)
     if let Some(dir) = &session.dir {
-        remove(tree, dir)?;
+        remove(ws, tree, dir)?;
     }
     if let Some(lock) = &session.lock
         && exists(lock)?
     {
-        remove(tree, lock)?;
+        remove(ws, tree, lock)?;
     }
     Ok(())
 }
@@ -786,7 +818,7 @@ fn unique_bytes(paths: &[PathBuf]) -> Result<u64> {
 fn add_bytes(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> Result<()> {
     let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     if meta.is_dir() {
-        for child in children(path)? {
+        for child in entries(path)? {
             add_bytes(&child, seen, total)?;
         }
     } else if seen.insert((meta.dev(), meta.ino())) {
@@ -795,21 +827,55 @@ fn add_bytes(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> Re
     Ok(())
 }
 
-/// Removes a path under `tree`. Refused outside it; a symlink is removed as a link.
-fn remove(tree: &Path, path: &Path) -> Result<()> {
+/// Removes a path under `tree` (under workspace `ws`). Refused outside them or when any dir between `ws` and `path` is a symlink; `path` itself a symlink is removed as a link.
+/// The parent is resolved once, by the kernel (`openat2`), and the removal starts from that fd: no link swapped in later redirects it. Below it `fs::remove_dir_all` opens each dir without following and unlinks links.
+fn remove(ws: &Path, tree: &Path, path: &Path) -> Result<()> {
     ensure!(
         path.starts_with(tree),
         "refused: {} is outside {}",
         path.display(),
         tree.display()
     );
-    let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    let inside = path
+        .strip_prefix(ws)
+        .with_context(|| format!("refused: {} is outside {}", path.display(), ws.display()))?;
+    let (Some(parent), Some(name)) = (inside.parent(), inside.file_name()) else {
+        bail!("refused: {} names no entry", path.display());
+    };
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let anchor = rustix::fs::open(ws, flags, RawMode::empty())
+        .with_context(|| format!("opening {}", ws.display()))?;
+    let held = rustix::fs::openat2(
+        &anchor,
+        parent,
+        flags,
+        RawMode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .with_context(|| {
+        format!(
+            "refused: the dir of {} does not resolve without a symlink",
+            path.display()
+        )
+    })?;
+    let at = Path::new("/proc/self/fd")
+        .join(held.as_raw_fd().to_string())
+        .join(name);
+    let meta = fs::symlink_metadata(&at).with_context(|| format!("reading {}", path.display()))?;
     let removed = if meta.is_dir() {
-        fs::remove_dir_all(path)
+        fs::remove_dir_all(&at)
     } else {
-        fs::remove_file(path)
+        fs::remove_file(&at)
     };
     removed.with_context(|| format!("removing {}", path.display()))
+}
+
+/// Why a unit whose dir is `path` is skipped: the dir is a symlink. None: it is not.
+fn link_refusal(path: &Path) -> Result<Option<String>> {
+    let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(meta
+        .is_symlink()
+        .then(|| format!("refused: {} is a symlink", path.display())))
 }
 
 /// Whether `path` is a directory of its own. Missing or not a directory: false. A symlink is an error.
@@ -836,22 +902,29 @@ fn exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// The entries of `dir`, sorted. Missing or not a directory: none. A symlink entry is an error.
+/// The entries of `dir`, sorted. Missing or not a directory: none. A symlink entry is an error: for dirs whose entries are walked into (roots, trees, sessions).
 fn children(dir: &Path) -> Result<Vec<PathBuf>> {
+    let out = entries(dir)?;
+    for path in &out {
+        if let Some(why) = link_refusal(path)? {
+            bail!(why);
+        }
+    }
+    Ok(out)
+}
+
+/// The entries of `dir`, sorted, symlinks included. Missing or not a directory: none. `dir` itself a symlink: an error.
+fn entries(dir: &Path) -> Result<Vec<PathBuf>> {
     if !real_dir(dir)? {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry
-            .with_context(|| format!("reading {}", dir.display()))?
-            .path();
-        ensure!(
-            !fs::symlink_metadata(&path)?.is_symlink(),
-            "refused: {} is a symlink",
-            path.display()
+        out.push(
+            entry
+                .with_context(|| format!("reading {}", dir.display()))?
+                .path(),
         );
-        out.push(path);
     }
     out.sort();
     Ok(out)
@@ -1760,6 +1833,133 @@ mod tests {
         fs::write(dir.join(crate::delta::RECORD), "").expect("delta record");
         let err = prune_land(&ws, NOW, true, false).expect_err("outside the namespace");
         assert!(format!("{err:#}").contains("ram delta"), "{err:#}");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The unit dir whose out dir cxx filled, as land-q114 met it.
+    const CXX: &str = "atl-audio-bridge-1dab79eb66ef12f7";
+
+    /// `land_fixture` + `land_uses` with one more stale unit, [`CXX`]: its build dir holds a link to a dir and one to a file, both outside the tree. Returns (tree, linked dir, linked file).
+    fn cxx_fixture(ws: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let release = land_fixture(ws);
+        let tree = release
+            .parent()
+            .and_then(Path::parent)
+            .expect("ws/land")
+            .join("cargo-converter/release");
+        fs::create_dir_all(tree.parent().expect("root")).expect("root dir");
+        fs::rename(&release, &tree).expect("as cargo-converter");
+        let mut uses = land_uses();
+        uses.push((CXX, NOW - 30 * DAY));
+        write_record(&tree, &uses);
+        sized(
+            &tree.join(FINGERPRINT).join(CXX).join("run-build-script"),
+            5,
+        );
+        let sources = ws.join("wt/land/crates/atl-audio-bridge");
+        sized(&sources.join("src/lib.rs"), 7);
+        let header = ws.join("wt/land/cxx.h");
+        sized(&header, 9);
+        let bridge = tree.join(BUILD).join(CXX).join("out/cxxbridge");
+        sized(&bridge.join("sources/lib.rs.cc"), 20);
+        fs::create_dir_all(bridge.join("crate")).expect("crate dir");
+        fs::create_dir_all(bridge.join("include/rust")).expect("include dir");
+        symlink(&sources, bridge.join("crate/atl-audio-bridge")).expect("dir link");
+        symlink(&header, bridge.join("include/rust/cxx.h")).expect("file link");
+        (tree, sources, header)
+    }
+
+    /// Links inside a stale unit are content: the land prune completes, the unit goes, the targets stay. Break targets: `add_bytes` over `children` refuses the tree (land-q114); a removal that follows links empties the targets.
+    #[test]
+    fn land_removes_a_unit_holding_symlinks_and_leaves_their_targets() {
+        let ws = scratch("cxx-unit");
+        let (tree, sources, header) = cxx_fixture(&ws);
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert!(line.contains("removed 6 units"), "{line}");
+        assert!(line.ends_with("busy: not pruned)"), "{line}");
+        assert_eq!(fingerprints(&tree), LAND_KEPT);
+        assert!(!exists(&tree.join(BUILD).join(CXX)).expect("build dir"));
+        assert!(sources.join("src/lib.rs").is_file(), "dir target emptied");
+        assert!(header.is_file(), "file target removed");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A unit whose fingerprint or build dir is a link is skipped whole, named and counted; the other stale units go. Break target: without `link_refusal` the links are planned as units and unlinked.
+    #[test]
+    fn a_unit_dir_that_is_a_symlink_is_skipped_and_named() {
+        let ws = scratch("unit-dir-link");
+        let (tree, _, _) = cxx_fixture(&ws);
+        let outside = ws.join("outside");
+        sized(&outside.join("keep"), 3);
+        let fp = tree.join(FINGERPRINT).join(OLD);
+        let build = tree.join(BUILD).join(STALE);
+        for dir in [&fp, &build] {
+            fs::remove_dir_all(dir).expect("real dir");
+            symlink(&outside, dir).expect("link");
+        }
+        let dry =
+            only_plan(prune_dir(&ws, out::LAND_ID, LAND_WINDOW, NOW, false).expect("dry run"));
+        assert_eq!(
+            dry[0].skipped,
+            [&fp, &build].map(|p| format!("refused: {} is a symlink", p.display()))
+        );
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert!(line.contains("removed 4 units"), "{line}");
+        assert!(line.ends_with("; skipped 2 refused units"), "{line}");
+        assert!(tree.join(FINGERPRINT).join(STALE).is_dir(), "skipped unit");
+        assert!(
+            tree.join(DEPS)
+                .join("libatl_old-eeeeeeeeeeeeeeee.rlib")
+                .is_file(),
+            "a skipped unit keeps its outputs"
+        );
+        for link in [&fp, &build] {
+            assert!(link.is_symlink(), "{} was removed", link.display());
+        }
+        assert!(outside.join("keep").is_file(), "link target pruned");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A link on the way to the units refuses the call and removes nothing: the tree, its root, or `build`. Break target: without the `real_dir` check of `build`, or the one in `is_tree`, no refusal.
+    #[test]
+    fn a_symlink_on_the_way_to_the_units_is_refused() {
+        for part in ["", "..", BUILD] {
+            let ws = scratch(&format!("path-link-{}", part.len()));
+            let (tree, _, _) = cxx_fixture(&ws);
+            let dir = match part {
+                ".." => tree.parent().expect("root").to_owned(),
+                part => ws
+                    .join("out/pool/ws/land/cargo-converter/release")
+                    .components()
+                    .chain(Path::new(part).components())
+                    .collect(),
+            };
+            let outside = ws.join("outside");
+            fs::rename(&dir, &outside).expect("move");
+            symlink(&outside, &dir).expect("link");
+            let err = prune_land(&ws, NOW, true, false).expect_err("link refused");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("refused: {} is a symlink", dir.display())),
+                "{text}"
+            );
+            assert!(tree.join(FINGERPRINT).join(STALE).exists(), "pruned");
+            assert!(tree.join(BUILD).join(CXX).exists(), "pruned");
+            fs::remove_dir_all(&ws).expect("cleanup");
+        }
+    }
+
+    /// The removal itself resolves no link, whatever the plan saw: a parent swapped for a link after the plan is refused. Break target: `remove` by path deletes the outside dir.
+    #[test]
+    fn a_parent_swapped_for_a_symlink_after_the_plan_is_refused() {
+        let ws = scratch("swap");
+        let (tree, _, _) = cxx_fixture(&ws);
+        let outside = ws.join("outside");
+        fs::rename(tree.join(BUILD), &outside).expect("move");
+        symlink(&outside, tree.join(BUILD)).expect("link");
+        let err = remove(&ws, &tree, &tree.join(BUILD).join(CXX)).expect_err("swap refused");
+        assert!(format!("{err:#}").contains("refused"), "{err:#}");
+        assert!(outside.join(CXX).is_dir(), "deleted through the link");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 

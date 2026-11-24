@@ -56,6 +56,9 @@ pub struct Args {
     /// Internal: the unit prune child in the land worktree (`prune_units_child`); removes from ws/land the cargo units no recorded build used for `out_prune::LAND_PRUNE_DAYS`, inside its namespace. The branch argument is not read.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts", "build_dir"])]
     prune_units: bool,
+    /// Internal, with --prune-units: print what it would remove, delete nothing. Run it in the land worktree.
+    #[arg(long, hide = true, requires = "prune_units")]
+    plan_only: bool,
 }
 
 /// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
@@ -203,9 +206,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let inside = crate::delta::stage().is_some();
         println!(
             "{}",
-            out_prune::prune_land(&ws, unit_use::now()?, true, inside)?
+            out_prune::prune_land(&ws, unit_use::now()?, !args.plan_only, inside)?
         );
-        out::count(&ws, "land-unit-prune");
+        if !args.plan_only {
+            out::count(&ws, "land-unit-prune");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let started = Instant::now();
