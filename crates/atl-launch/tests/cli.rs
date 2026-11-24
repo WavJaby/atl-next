@@ -9,7 +9,6 @@
     reason = "integration test: a failed setup step is the failure"
 )]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,10 +23,9 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// Writes a `#!/bin/sh` script (mode 0755) with `atl_exec_fixture::write_exe`: no fork of another test thread can hold its write fd at the launcher's exec.
 fn script(dir: &Path, name: &str, body: &str) {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    atl_exec_fixture::write_exe(&dir.join(name), &format!("#!/bin/sh\n{body}\n"));
 }
 
 #[test]

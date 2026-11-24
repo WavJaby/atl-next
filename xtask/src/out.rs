@@ -1984,6 +1984,7 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atl_exec_fixture::write_exe;
 
     /// A scratch workspace whose delta store is absent (pool tier): a test never reaches the host's store, which every workspace shares by id (2026-11-21 and 2026-11-22: scratch runs wrote and deleted store dirs of live ids).
     fn scratch(name: &str) -> PathBuf {
@@ -2844,11 +2845,8 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("repo");
         git(Some(&repo), &["init", "-q"]).expect("git init");
         let hook = d.join("post-checkout");
-        assert!(
-            write_hook(&hook, &hook_text(&d.join("pool")))
-                .expect("write")
-                .is_some()
-        );
+        // write_exe, not write_hook: no write fd of this process may be open on the file the exec below runs
+        write_exe(&hook, &hook_text(&d.join("pool")));
         let run = |prev: &str| {
             let st = Command::new(&hook)
                 .args([prev, "1111111111111111111111111111111111111111", "1"])
@@ -2872,12 +2870,23 @@ mod tests {
     /// Ours is rewritten when its text changes and left alone when equal; a foreign hook is refused with the move-aside command.
     #[test]
     fn a_foreign_hook_is_refused_and_ours_is_kept_current() {
+        use std::os::unix::fs::PermissionsExt;
         let d = scratch("hook-write");
         let hook = d.join("hooks/post-checkout");
         assert!(
             write_hook(&hook, &hook_text(Path::new("/p1")))
                 .expect("new")
                 .is_some()
+        );
+        // no exec test runs write_hook's file now, so its mode bits and shebang are asserted here
+        assert_eq!(
+            std::fs::metadata(&hook).expect("stat").permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            std::fs::read_to_string(&hook)
+                .expect("read")
+                .starts_with("#!/bin/sh\n")
         );
         assert!(
             write_hook(&hook, &hook_text(Path::new("/p1")))

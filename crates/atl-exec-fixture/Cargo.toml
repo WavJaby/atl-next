@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-exec-fixture"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Test support: writes the executables a test exec's, so no fork of the test process holds a write fd on them at exec (ETXTBSY). Dev-dependency of xtask, xtask-harness and atl-launch only; no product crate depends on it.
+
+[lints]
+workspace = true

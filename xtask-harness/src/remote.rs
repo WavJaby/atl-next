@@ -3059,11 +3059,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::create_dir_all(dir.join("out/cargo")).unwrap();
         std::fs::write(dir.join(format!(".bundle-{TEST_SHA}")), "").unwrap();
-        let exe = |path: PathBuf, text: &str| {
-            std::fs::write(&path, text).unwrap();
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
-        };
+        let exe = |path: PathBuf, text: &str| atl_exec_fixture::write_exe(&path, text);
         exe(
             dir.join("out/cargo/atld"),
             "#!/bin/sh\nsh -c 'trap \"echo term > $1/daemon-term; exit 0\" TERM; while :; do sleep 0.1; done' sh \"$1\" &\nd=$!\necho \"$$ $d\" > \"$1/pids\"\ntrap 'kill -KILL $d; exit 143' TERM\nwhile :; do sleep 0.1; done\n",
@@ -3293,7 +3289,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let bin = dir.join("bin/hyprctl");
-        std::fs::write(
+        atl_exec_fixture::write_exe(
             &bin,
             r#"#!/bin/sh
 d="$FAKE_HYPR"
@@ -3311,10 +3307,7 @@ dispatch)
   esac ;;
 esac
 "#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(dir.join("form"), form).unwrap();
         std::fs::write(dir.join("active"), format!("{active}\n")).unwrap();
         let used: Vec<String> = used.iter().map(u32::to_string).collect();

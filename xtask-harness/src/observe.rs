@@ -797,14 +797,10 @@ clients-end
         }
         std::fs::create_dir_all(&bin).expect("bin");
         let fake = bin.join("hyprctl");
-        std::fs::write(
+        atl_exec_fixture::write_exe(
             &fake,
             "#!/bin/sh\n[ \"$HYPRLAND_INSTANCE_SIGNATURE\" = live ] || exit 1\n[ \"$2\" = clients ] && echo '[]'\nexit 0\n",
-        )
-        .expect("fake hyprctl");
-        let mut perm = std::fs::metadata(&fake).expect("meta").permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        std::fs::set_permissions(&fake, perm).expect("chmod");
+        );
         let plan = Plan {
             base: tmp.to_string_lossy().into_owned(),
             root: "r".into(),

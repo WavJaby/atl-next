@@ -44,5 +44,8 @@ xtask = { path = "../xtask" }
 zbus = { workspace = true, features = ["service"] }
 zip.workspace = true
 
+[dev-dependencies]
+atl-exec-fixture = { path = "../crates/atl-exec-fixture" }
+
 [lints]
 workspace = true

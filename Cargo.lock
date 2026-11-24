@@ -341,6 +341,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-exec-fixture"
+version = "0.0.0"
+
+[[package]]
 name = "atl-flatpak-spawn"
 version = "0.0.0"
 dependencies = [
@@ -457,6 +461,7 @@ name = "atl-launch"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atl-exec-fixture",
  "clap",
  "serde",
  "thiserror",
@@ -3068,6 +3073,7 @@ dependencies = [
  "anyhow",
  "atl-android-paths",
  "atl-bwrap",
+ "atl-exec-fixture",
  "atl-fonts-table",
  "atl-layout",
  "atl-services-types",
@@ -3093,6 +3099,7 @@ dependencies = [
  "atl-broker",
  "atl-bwrap",
  "atl-diag",
+ "atl-exec-fixture",
  "atl-fonts",
  "atl-fonts-table",
  "atl-gralloc",
