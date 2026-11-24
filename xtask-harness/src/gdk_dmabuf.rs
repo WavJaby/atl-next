@@ -44,7 +44,7 @@ pub struct Verdict {
     /// Scene buffers downloaded (an own render's readback not counted).
     pub downloaded: usize,
     pub failed: usize,
-    /// [`NO_IMPORT`] lines: the renderer has no dma-buf import.
+    /// [`NO_IMPORT`] lines followed by their failed import: the renderer has no dma-buf import. A lone one is a process killed between the two writes.
     pub no_import: usize,
     /// GDK's own renders read back (captures): each [`EXPORTED`] line (excusing the one import and the one download after it), and each texture created, imported and downloaded with
     /// nothing between (a Vulkan [`CREATING`]).
@@ -66,6 +66,8 @@ impl Verdict {
         let mut created: Option<(&str, bool)> = None;
         // the renderer is GskVulkanRenderer: it has imported a scene buffer
         let mut vulkan = false;
+        // a NO_IMPORT whose failed import is still to come, in the same texture's group
+        let mut no_import = false;
         for line in log.lines() {
             if line.contains(EXPORTED) {
                 v.own_readbacks += 1;
@@ -74,6 +76,7 @@ impl Verdict {
                 created = None;
             } else if line.contains(CREATING) {
                 created = format_of(line).map(|f| (f, false));
+                no_import = false;
             } else if line.contains(VULKAN_IMPORTED) {
                 v.imported += 1;
                 vulkan = true;
@@ -101,9 +104,10 @@ impl Verdict {
                 created = None;
             } else if FAILED.iter().any(|f| line.contains(f)) {
                 v.failed += 1;
+                v.no_import += usize::from(std::mem::take(&mut no_import));
                 created = None;
             } else if line.contains(NO_IMPORT) {
-                v.no_import += 1;
+                no_import = true;
             }
         }
         v
@@ -244,6 +248,14 @@ mod tests {
         // ... nor admits downloads GDK does not explain: the driver tier alone is red
         let mmap = "Gdk-DEBUG: Used mmap for downloading 562x900 dmabuf (format AB24:0)\n";
         assert_eq!(tier_of(&format!("{readback}{mmap}")), None);
+        // the log cut by a SIGKILL after a frame's no-import line: the unpaired line is no failed import (2 lines of `frame`)
+        let cut: String = frame.lines().take(2).map(|l| format!("{l}\n")).collect();
+        assert_eq!(tier_of(&format!("{three}{cut}")), Some("gdk-no-import"));
+        // ... nor does it excuse a later texture's failure
+        let later = format!(
+            "{three}{cut}Creating dmabuf texture, format ZZ99:0\nImport of 4x4 ZZ99:0 dmabuf failed\n"
+        );
+        assert_eq!(tier_of(&later), None);
         // a failure GDK does not explain by missing import: red
         let other = format!("{three}Import of 4x4 ZZ99:0 dmabuf failed\n");
         assert_eq!(tier_of(&other), None);
