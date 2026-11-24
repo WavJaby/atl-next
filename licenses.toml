@@ -513,8 +513,8 @@ licence = "Apache-2.0"
 reason = "Android's additions (README.android names src/android/android.c; the directory is absent upstream); no notices, so Apache-2.0 as include/selinux/android.h"
 
 [upstream.aosp.paths."external/selinux/libselinux/rust/selinux.h"]
-licence = "LicenseRef-Public-Domain"
-reason = "no notice; the input of libselinux's rust_bindgen (Android.bp libselinux_bindgen, wrapper_src). libselinux/LICENSE: \"This library (libselinux) is public domain software, i.e. not copyrighted\"; not an Android change: README.android (selinux root) lists Android's changes as its build files, the MODULE_LICENSE_* files, libselinux/include/selinux/android.h and libselinux/src/android/android.c; rust/selinux.h is not among them. The package's Soong kinds (Apache-2.0, GPL-2.0, legacy_unencumbered) give no default, as for include/ and src/"
+licence = "Apache-2.0"
+reason = "Android's addition, absent upstream: raw.githubusercontent.com/SELinuxProject/selinux main has no libselinux/rust/selinux.h (404; include/selinux/avc.h: 200). It feeds only Android.bp's rust_bindgen libselinux_bindgen (wrapper_src). No notice, so the package's one Android licence kind, Apache-2.0"
 
 [upstream.aosp.paths."external/speex/include/speex/speexdsp_config_types.h"]
 licence = "BSD-3-Clause"
