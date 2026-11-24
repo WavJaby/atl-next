@@ -59,11 +59,13 @@ pub fn install(
             .with_context(|| format!("session {session}: no ApplicationInfo"))
             .and_then(staged_names)
             .with_context(|| format!("session {session}"))?;
+        // checked before the commit, so a refused session leaves the installed code as it was (InstallPackageHelper.java :2884-2920 refuses ahead of any file move)
+        let version = long_version(&parsed.info);
+        let change = change_of(recorded(&parsed.name), version)
+            .with_context(|| format!("session {session}: {}", parsed.name))?;
         control
             .commit(session, &parsed.name, uid, names)
             .with_context(|| format!("committing {}", parsed.name))?;
-        let version = long_version(&parsed.info);
-        let change = change_of(recorded(&parsed.name), version);
         reports.push(Reported {
             package: parsed.name.clone(),
             uid,
@@ -92,25 +94,25 @@ pub enum Change {
     New,
     /// A higher version than `from`: PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED, MY_PACKAGE_REPLACED to the package (BroadcastHelper.java sendPostInstallBroadcasts :600-720).
     Updated { from: i64 },
-    /// A lower version than `from`: AOSP refuses this install (INSTALL_FAILED_VERSION_DOWNGRADE); here it installs as before, with no replace broadcast (counted).
-    Downgraded { from: i64 },
     /// The recorded version: nothing.
     Unchanged,
 }
 
 /// What an install of `version` does to a package recorded at `recorded` (None: never recorded). Compared as longVersionCode.
-pub fn change_of(recorded: Option<i64>, version: i64) -> Change {
+/// A lower version is refused, counted: PackageManagerServiceUtils.checkDowngrade :1426-1429 (message text), and isDowngradePermitted :988-992 permits one only on INSTALL_REQUEST_DOWNGRADE, which
+/// nothing here sets. The refusal fails the install, as any failed session does (all or nothing, module doc); the installed code and its data stay.
+/// Gap: AOSP's equal-version baseRevisionCode / split revision checks (:1430-1455) need revision codes recorded; not modelled.
+pub fn change_of(recorded: Option<i64>, version: i64) -> Result<Change> {
     match recorded {
-        None => Change::New,
-        Some(from) if version > from => Change::Updated { from },
+        None => Ok(Change::New),
+        Some(from) if version > from => Ok(Change::Updated { from }),
         Some(from) if version < from => {
-            atl_diag::answered(
-                DIAG,
-                "install: lower version than recorded: no replace broadcasts",
-            );
-            Change::Downgraded { from }
+            atl_diag::refused(DIAG, "install: INSTALL_FAILED_VERSION_DOWNGRADE");
+            anyhow::bail!(
+                "INSTALL_FAILED_VERSION_DOWNGRADE: Update version code {version} is older than current {from}"
+            )
         }
-        Some(_) => Change::Unchanged,
+        Some(_) => Ok(Change::Unchanged),
     }
 }
 
@@ -296,25 +298,33 @@ mod tests {
     fn downgrades() -> u64 {
         atl_diag::counts()
             .into_iter()
-            .find(|(_, api, _)| {
-                api == "IPackageManager.install: lower version than recorded: no replace broadcasts"
-            })
+            .find(|(_, api, _)| api == "IPackageManager.install: INSTALL_FAILED_VERSION_DOWNGRADE")
             .map_or(0, |(_, _, n)| n)
     }
 
     #[test]
     fn change_compares_longversioncode_against_the_recorded_one() {
         // PackageInfo.getLongVersionCode (PackageInfo.java :93-94): a higher major word beats any minor one
-        assert_eq!(change_of(None, 5), Change::New);
-        assert_eq!(change_of(Some(4), 5), Change::Updated { from: 4 });
-        let before = downgrades();
-        assert_eq!(change_of(Some(5), 4), Change::Downgraded { from: 5 });
-        assert_eq!(downgrades(), before + 1);
-        assert_eq!(change_of(Some(5), 5), Change::Unchanged);
+        assert_eq!(change_of(None, 5).unwrap(), Change::New);
+        assert_eq!(change_of(Some(4), 5).unwrap(), Change::Updated { from: 4 });
+        assert_eq!(change_of(Some(5), 5).unwrap(), Change::Unchanged);
         assert_eq!(
-            change_of(Some(0xffff_ffff), 1 << 32),
+            change_of(Some(0xffff_ffff), 1 << 32).unwrap(),
             Change::Updated { from: 0xffff_ffff }
         );
+    }
+
+    #[test]
+    fn a_lower_version_is_refused_and_counted() {
+        // checkDowngrade :1426-1429: the failure code and message text; minor word 0xffff_ffff of major 0 is below major 1
+        let before = downgrades();
+        let e = change_of(Some(5), 4).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "INSTALL_FAILED_VERSION_DOWNGRADE: Update version code 4 is older than current 5"
+        );
+        assert!(change_of(Some(1 << 32), 0xffff_ffff).is_err());
+        assert_eq!(downgrades(), before + 2);
     }
 
     #[test]

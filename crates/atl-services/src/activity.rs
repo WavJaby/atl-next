@@ -532,6 +532,8 @@ enum Timer {
     FgsStart((String, String)),
     /// a startForeground timeout's ANR, 10 s after the stop: the host pid of the process that ran the service (AS :7640)
     FgsAnr(i32),
+    /// a launch held behind its package's first-start boot broadcasts, released (due now) by BOOT_COMPLETED's final result: the launch runs here, off the state lock; by start_seq
+    HeldLaunch(i64),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -561,6 +563,10 @@ struct State {
     uids: uid_state::Uids,
     /// the launch Tasks counted in `uids`, with their uid: a Task leaves once (task_gone_locked)
     open_tasks: std::collections::BTreeMap<TaskId, u32>,
+    /// the packages that got the boot broadcasts at a first process start this run (D2 clause 2, broadcast::first_start_boot)
+    booted: std::collections::BTreeSet<String>,
+    /// processes (by start_seq) whose activity launch waits for their package's first-start BOOT_COMPLETED to finish (broadcasts_am.rs release_held_launches_locked)
+    held_launches: std::collections::BTreeSet<i64>,
 }
 
 /// An IIntentReceiver as a registration key: equal when the binder is (mRegisteredReceivers is keyed by `receiver.asBinder()`). `System` is the services' own resultTo (AOSP's in-process
@@ -1498,6 +1504,34 @@ impl Inner {
             Timer::TempExpiry(uid) => self.temp_expired(uid),
             Timer::FgsStart(component) => self.foreground_timeout(component),
             Timer::FgsAnr(pid) => self.foreground_anr(pid),
+            Timer::HeldLaunch(seq) => self.launch_attached(seq),
+        }
+    }
+
+    /// The launch ActivityTaskManager makes for an attached process started with one (realStartActivityLocked): its Task's launcher record pushed and sent (activity_task.rs). No lock held; a
+    /// process that died or launched meanwhile is a no-op.
+    fn launch_attached(&self, start_seq: i64) {
+        let st = self.state();
+        let Some(rec) = st
+            .processes
+            .iter()
+            .find(|r| r.start_seq == start_seq && r.launch_activity)
+        else {
+            return;
+        };
+        let (Some(thread), Some(task)) =
+            (rec.attached.as_ref().map(|a| a.thread.clone()), rec.task)
+        else {
+            return;
+        };
+        let (pid, uid, package) = (rec.pid, rec.uid, rec.package.clone());
+        drop(st);
+        if let Some(p) = self.packages.by_name(&package)
+            && let Some(activity) = self.packages.launcher(p)
+        {
+            // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app was bound with its Task's configuration (bind_configuration).
+            self.atm
+                .launch_launcher(thread, pid, uid, &package, activity, task);
         }
     }
 
@@ -2401,20 +2435,13 @@ impl IActivityManager for ActivityManager {
             inner.kill(&[pid]);
             return Ok(());
         };
-        let (package, launch, task) = (rec.package.clone(), rec.launch_activity, rec.task);
-        let Some(thread) = rec.attached.as_ref().map(|a| a.thread.clone()) else {
-            return Ok(());
-        };
+        let (package, launch, seq) = (rec.package.clone(), rec.launch_activity, rec.start_seq);
+        let mut st = st;
+        // D2 clause 2: a package's first process start of the run gets its boot broadcasts ahead of its first activity: the launch waits for BOOT's final result (Timer::HeldLaunch)
+        let boot = inner.first_start_boot_locked(&mut st, &package, launch.then_some(seq));
         drop(st);
-        if launch
-            && let Some(task) = task
-            && let Some(p) = inner.packages.by_name(&package)
-            && let Some(activity) = inner.packages.launcher(p)
-        {
-            // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app was bound with its Task's configuration (bind_configuration).
-            inner
-                .atm
-                .launch_launcher(thread.clone(), pid, uid, &package, activity, task);
+        if launch && !boot {
+            inner.launch_attached(seq);
         }
         let mut st = inner.state();
         if let Some(r) = st.processes.iter_mut().find(|r| r.pid == pid) {

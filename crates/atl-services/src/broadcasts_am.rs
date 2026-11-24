@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 
 use super::*;
 
+use crate::broadcast::BootAudience;
 use crate::broadcast_dispatch::{
     self as bd, Action, BroadcastId, Component, Dispatcher, Facts, Finish, NewBroadcast, Outcome,
     Policy, ProcKey, Receiver, Target,
@@ -36,12 +37,13 @@ type Recv = Receiver<ReceiverHandle>;
 const BROADCAST_RESULT_OK: i32 = -1;
 
 /// The services' own resultTo continuations (AOSP's in-process IIntentReceiver.Stub, UserController :712-730 and :943-960): run by [`Inner::system_step`] on the broadcast's final result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Each carries the boot send's audience (D2): the opted-in packages at atld start, or one package's first start, whose held launch BootDone releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SystemStep {
     /// LOCKED_BOOT_COMPLETED is done: BOOT_COMPLETED goes next.
-    LockedBootDone,
+    LockedBootDone(BootAudience),
     /// BOOT_COMPLETED is done (AOSP sets mBootCompleted here).
-    BootDone,
+    BootDone(BootAudience),
 }
 
 /// The process queue of the services' own resultTo. The services are the process, so no app thread attaches; the queue exists so the dispatcher hands the result back in process.
@@ -94,13 +96,15 @@ fn dispatch_skip(
     let Some(p) = packages.by_name(&component.package) else {
         return Some(format!("Skipping delivery to {component}: package is gone"));
     };
-    if let Some(scope) = facts.boot {
-        // the boot broadcasts' gate (broadcast::boot_refusal): D2's opt-in, and LOCKED's directBootAware
+    if let Some((scope, audience)) = &facts.boot {
+        // the boot broadcasts' gate (broadcast::boot_refusal): D2's audience, and LOCKED's directBootAware
         let aware = p
             .receiver(&component.class)
             .is_some_and(|d| d.component.direct_boot_aware);
         let opted_in = packages.user_state().autostart(&component.package);
-        if let Some(why) = broadcast::boot_refusal(scope, aware, opted_in) {
+        if let Some(why) =
+            broadcast::boot_refusal(*scope, aware, audience, &component.package, opted_in)
+        {
             return Some(format!("{why}: {component}"));
         }
     }
@@ -574,7 +578,15 @@ impl Inner {
             explicit: intent.component.is_some() || intent.package.is_some(),
             signature_perms: self.permissions.is_signature_only(spec.required),
             max_manifest_api: spec.max_manifest_api,
-            boot: broadcast::boot_scope(intent.action.as_deref()),
+            boot: broadcast::boot_scope(intent.action.as_deref()).map(|s| {
+                let audience = match &spec.result_to {
+                    Some((ReceiverHandle::System(SystemStep::LockedBootDone(a)), _))
+                    | Some((ReceiverHandle::System(SystemStep::BootDone(a)), _)) => a.clone(),
+                    // a boot action from anyone but the services' own send: protected (only the system sends it), so the opted-in rule stands
+                    _ => BootAudience::OptedIn,
+                };
+                (s, audience)
+            }),
         };
         let result_to = match spec.result_to {
             // the services' own resultTo: its queue is the system's whatever pid the caller names (system_proc)
@@ -609,18 +621,63 @@ impl Inner {
     /// The services' own resultTo continuations (SystemStep), run on the final result of an ordered broadcast the services sent. LOCKED's result sends BOOT_COMPLETED.
     fn system_step(&self, st: &mut State, step: SystemStep) {
         match step {
-            SystemStep::LockedBootDone => {
+            SystemStep::LockedBootDone(audience) => {
                 log(format_args!(
-                    "LOCKED_BOOT_COMPLETED finished: sending BOOT_COMPLETED"
+                    "LOCKED_BOOT_COMPLETED finished ({audience:?}): sending BOOT_COMPLETED"
                 ));
                 self.send_boot(
                     st,
                     broadcast::ACTION_BOOT_COMPLETED,
                     broadcast::REASON_BOOT_COMPLETED,
-                    SystemStep::BootDone,
+                    SystemStep::BootDone(audience),
                 );
             }
-            SystemStep::BootDone => log(format_args!("BOOT_COMPLETED finished")),
+            SystemStep::BootDone(audience) => {
+                log(format_args!("BOOT_COMPLETED finished ({audience:?})"));
+                if let BootAudience::FirstStart(package) = audience {
+                    self.release_held_launches_locked(st, &package);
+                }
+            }
+        }
+    }
+
+    /// D2 clause 2 at a process's finishAttachApplication: when this is `package`'s first process start of the run and it is not opted in, LOCKED_BOOT_COMPLETED goes out for it alone (then
+    /// BOOT_COMPLETED, system_step) and true is returned; the launch of process `hold` (a start_seq) is held until BOOT's final result (release_held_launches_locked). Held before the send: with
+    /// no receivers both sends finish inside it.
+    pub(super) fn first_start_boot_locked(
+        &self,
+        st: &mut State,
+        package: &str,
+        hold: Option<i64>,
+    ) -> bool {
+        let opted_in = self.packages.user_state().autostart(package);
+        if !broadcast::first_start_boot(&mut st.booted, package, opted_in) {
+            return false;
+        }
+        st.held_launches.extend(hold);
+        atl_diag::sent(AM, "boot broadcasts at first process start");
+        self.send_boot(
+            st,
+            broadcast::ACTION_LOCKED_BOOT_COMPLETED,
+            broadcast::REASON_LOCKED_BOOT_COMPLETED,
+            SystemStep::LockedBootDone(BootAudience::FirstStart(package.to_owned())),
+        );
+        true
+    }
+
+    /// `package`'s first-start BOOT_COMPLETED finished: each of its held launches is posted due now (Timer::HeldLaunch), so it runs off this lock.
+    fn release_held_launches_locked(&self, st: &mut State, package: &str) {
+        let seqs: Vec<i64> = st
+            .processes
+            .iter()
+            .filter(|r| r.package == package && st.held_launches.contains(&r.start_seq))
+            .map(|r| r.start_seq)
+            .collect();
+        let now = self.now_ms();
+        for seq in seqs {
+            st.held_launches.remove(&seq);
+            atl_diag::answered(AM, "launch released after first-start boot broadcasts");
+            self.arm(Timer::HeldLaunch(seq), now);
         }
     }
 
@@ -898,7 +955,7 @@ impl ActivityManager {
 
     /// The start-time package broadcasts of the install's reports (BroadcastHelper.sendPostInstallBroadcasts :600-720), before the boot ones: a new package gets PACKAGE_ADDED; an updated
     /// one PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED to every receiver, and MY_PACKAGE_REPLACED to its own receivers alone with the REASON_PACKAGE_REPLACED temp allowlist.
-    /// Unchanged and downgraded packages send nothing (install.rs change_of).
+    /// Unchanged packages send nothing; a downgrade never gets here (install.rs change_of refuses it).
     pub fn package_broadcasts(&self, reports: &[install::Reported]) {
         for r in reports {
             match r.change {
@@ -915,7 +972,7 @@ impl ActivityManager {
                         Some(r.package.as_str()),
                     );
                 }
-                install::Change::Downgraded { .. } | install::Change::Unchanged => {}
+                install::Change::Unchanged => {}
             }
         }
     }
@@ -977,7 +1034,8 @@ impl ActivityManager {
     }
 
     /// The boot at services start (UserController's chain, :712-730 then :943-960): the system queue is attached so the in-process resultTo is delivered, then LOCKED_BOOT_COMPLETED
-    /// goes out ordered; its final result sends BOOT_COMPLETED (system_step). Both reach only the opted-in packages (D2, dispatch_skip).
+    /// goes out ordered; its final result sends BOOT_COMPLETED (system_step). Both reach only the opted-in packages (D2, dispatch_skip); the others get theirs at their first process start
+    /// (first_start_boot_locked).
     pub fn boot_completed(&self) {
         let mut st = self.inner.state();
         let actions = self.inner.dispatch(&mut st, |d, p| {
@@ -988,7 +1046,7 @@ impl ActivityManager {
             &mut st,
             broadcast::ACTION_LOCKED_BOOT_COMPLETED,
             broadcast::REASON_LOCKED_BOOT_COMPLETED,
-            SystemStep::LockedBootDone,
+            SystemStep::LockedBootDone(BootAudience::OptedIn),
         );
     }
 

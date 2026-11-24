@@ -694,17 +694,42 @@ pub fn boot_scope(action: Option<&str>) -> Option<BootScope> {
 }
 
 /// Why a manifest receiver of a boot broadcast is skipped (Some(reason), dispatch-time policy; the reason's first ':' part is its counter). LOCKED_BOOT_COMPLETED reaches
-/// directBootAware receivers only (plan S9; AOSP's direct-boot match of the receiver query is ComputerEngine.java :5649-5651). Both reach an opted-in package only (decision D2:
-/// per-app autostart, default off); the others get them at their first process start, which is not modelled yet (plan S9 gap).
+/// directBootAware receivers only (plan S9; AOSP's direct-boot match of the receiver query is ComputerEngine.java :5649-5651). Each send reaches the packages of its `audience` only (decision D2):
+/// the one at atld start the opted-in packages (per-app autostart, default off), a first-start send the one package whose first process started.
 pub fn boot_refusal(
     scope: BootScope,
     direct_boot_aware: bool,
+    audience: &BootAudience,
+    package: &str,
     opted_in: bool,
 ) -> Option<&'static str> {
     if scope == BootScope::Locked && !direct_boot_aware {
         return Some("LOCKED_BOOT_COMPLETED: receiver not directBootAware");
     }
-    (!opted_in).then_some("boot broadcast skipped: package not opted in (autostart off, D2)")
+    match audience {
+        BootAudience::OptedIn => (!opted_in)
+            .then_some("boot broadcast skipped: package not opted in (autostart off, D2)"),
+        BootAudience::FirstStart(p) => {
+            (p != package).then_some("boot broadcast skipped: first start of another package (D2)")
+        }
+    }
+}
+
+/// Who one boot send is for (decision D2): the opted-in packages at atld start, or the one package whose first process of the run started (its activity waits for it, activity.rs
+/// finishAttachApplication).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootAudience {
+    OptedIn,
+    FirstStart(String),
+}
+
+/// Whether `package`'s first process start of this run gets the boot broadcasts (D2 clause 2): not opted in (those got them at atld start) and not delivered before this run; marks it delivered.
+pub fn first_start_boot(
+    booted: &mut std::collections::BTreeSet<String>,
+    package: &str,
+    opted_in: bool,
+) -> bool {
+    !opted_in && booted.insert(package.to_owned())
 }
 
 /// The registrations and stickies. Deliveries are the dispatcher's (broadcast_dispatch.rs), which holds what a process must receive until it attaches.
@@ -1540,21 +1565,39 @@ mod tests {
         // D2 default: a package not opted in gets neither boot broadcast at start; LOCKED reaches directBootAware receivers only
         const NOT_OPTED: &str = "boot broadcast skipped: package not opted in (autostart off, D2)";
         const NOT_AWARE: &str = "LOCKED_BOOT_COMPLETED: receiver not directBootAware";
-        assert_eq!(boot_refusal(BootScope::Boot, false, true), None);
-        assert_eq!(boot_refusal(BootScope::Locked, true, true), None);
-        assert_eq!(boot_refusal(BootScope::Boot, true, false), Some(NOT_OPTED));
+        let all = BootAudience::OptedIn;
+        let r = |scope, aware, opted| boot_refusal(scope, aware, &all, "p", opted);
+        assert_eq!(r(BootScope::Boot, false, true), None);
+        assert_eq!(r(BootScope::Locked, true, true), None);
+        assert_eq!(r(BootScope::Boot, true, false), Some(NOT_OPTED));
+        assert_eq!(r(BootScope::Locked, true, false), Some(NOT_OPTED));
+        assert_eq!(r(BootScope::Locked, false, true), Some(NOT_AWARE));
+        assert_eq!(r(BootScope::Locked, false, false), Some(NOT_AWARE));
+    }
+
+    #[test]
+    fn a_first_start_send_reaches_its_package_alone_once_per_run() {
+        // D2 clause 2: the package whose first process started, opted in or not; LOCKED still directBootAware only
+        const OTHER: &str = "boot broadcast skipped: first start of another package (D2)";
+        let first = BootAudience::FirstStart("p".to_owned());
         assert_eq!(
-            boot_refusal(BootScope::Locked, true, false),
-            Some(NOT_OPTED)
+            boot_refusal(BootScope::Boot, false, &first, "p", false),
+            None
         );
         assert_eq!(
-            boot_refusal(BootScope::Locked, false, true),
-            Some(NOT_AWARE)
+            boot_refusal(BootScope::Boot, false, &first, "q", true),
+            Some(OTHER)
         );
         assert_eq!(
-            boot_refusal(BootScope::Locked, false, false),
-            Some(NOT_AWARE)
+            boot_refusal(BootScope::Locked, false, &first, "p", false),
+            Some("LOCKED_BOOT_COMPLETED: receiver not directBootAware")
         );
+        // opted-in packages got theirs at atld start; every other package once
+        let mut booted = std::collections::BTreeSet::new();
+        assert!(!first_start_boot(&mut booted, "o", true));
+        assert!(first_start_boot(&mut booted, "p", false));
+        assert!(!first_start_boot(&mut booted, "p", false));
+        assert!(first_start_boot(&mut booted, "q", false));
     }
 
     #[test]

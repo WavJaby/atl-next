@@ -15,9 +15,11 @@
 //! - alarm grant (the receiver app sets its own RTC_WAKEUP alarms from Recv.java): an inexact alarm's receiver starts AlarmSvc and the start is refused for the background uid (log `app is in background uid`, counter `startService: background start refused`; AlarmManagerService :2751, :2762 gives an inexact alarm no temp allowlist); an exact alarm set after that refusal grants the start (counter `temp allowlist granted`, AlarmManagerService :2765-2781), and AlarmSvc starts once.
 //!
 //! - boot (plan S9, decision D2): LOCKED_BOOT_COMPLETED, then BOOT_COMPLETED through its resultTo, reach the opted-in receiver app (`--autostart`) headless; BOOT's receiver starts its service inside the 20 s
-//!   temp allowlist; the sender, not opted in, gets neither (counter `boot broadcast skipped`).
+//!   temp allowlist; the sender, not opted in, gets neither at start (counter `boot broadcast skipped`), and BOOT_COMPLETED at its first process start, ahead of its activity (D2 clause 2).
+//!   The receiver's boot receiver exists in its version 2 only, so the first run's restricted-start rows see no boot grant.
 //! - reinstall (plan S9): a second atld run over the same data root installs version 2 of the receiver: the services classify it `Updated { from: 1 }` and MY_PACKAGE_REPLACED reaches it alone;
 //!   the sender, unchanged, gets none.
+//! - downgrade (S9b): a third run installs version 1 again: refused INSTALL_FAILED_VERSION_DOWNGRADE, and the start fails.
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
@@ -109,6 +111,12 @@ const BOOT_SERVICE_REFUSED: &str = "AtlBcast: boot service refused";
 const BOOT_SKIPPED: &str = "boot broadcast skipped";
 /// The counter key of boot_refusal's directBootAware refusal (its reason's first ':' part).
 const BOOT_LOCKED_REFUSED: &str = "LOCKED_BOOT_COMPLETED";
+/// D2 clause 2's counters (broadcasts_am.rs first_start_boot_locked, release_held_launches_locked).
+const FIRST_START_SENT: &str = "boot broadcasts at first process start";
+const LAUNCH_RELEASED: &str = "launch released after first-start boot broadcasts";
+/// install.rs change_of's refusal text (PackageManagerServiceUtils.checkDowngrade :1427-1429), version 1 over the recorded 2.
+const DOWNGRADE_REFUSED: &str =
+    "INSTALL_FAILED_VERSION_DOWNGRADE: Update version code 1 is older than current 2";
 
 /// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed).
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -259,10 +267,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         copy_tree(&root.join(RECEIVER), &v2)?;
         let manifest_file = v2.join("AndroidManifest.xml");
         let text = std::fs::read_to_string(&manifest_file)?;
-        std::fs::write(
-            &manifest_file,
-            text.replace("android:versionCode=\"1\"", "android:versionCode=\"2\""),
-        )?;
+        let v2_text = text
+            .replace("android:versionCode=\"1\"", "android:versionCode=\"2\"")
+            .replace("\n        BOOT_RECEIVER_V2 ", " -->\n        ")
+            .replace(" BOOT_RECEIVER_V2_END -->", "");
+        anyhow::ensure!(
+            v2_text.contains("android:versionCode=\"2\"") && !v2_text.contains("BOOT_RECEIVER_V2"),
+            "{}: the version-2 edits did not apply",
+            manifest_file.display()
+        );
+        std::fs::write(&manifest_file, v2_text)?;
         rt.apk
             .build(&v2, &work.join("receiver-v2-build"), &[], None, None)?
     };
@@ -320,6 +334,44 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let services2 = read(&run2.log("services"));
     for l in counter_lines(&services2) {
         println!("broadcast: reinstall counter {l}");
+    }
+    // the downgrade row: version 1 of the receiver again over the same data root, recorded at 2. The install refuses it (INSTALL_FAILED_VERSION_DOWNGRADE) and, all or nothing, the start fails
+    let run3 = Run {
+        root: work.join("root3"),
+        scratch: work.join("scratch3"),
+        launch: None,
+        packages: vec![
+            Package::base(apk_paths[0].clone()),
+            Package::base(apk_paths[1].clone()),
+        ],
+        libraries: vec![],
+        shell: None,
+        log_tags: "*:i".into(),
+    };
+    let start3 = Instant::now();
+    let mut atld3 = kept_runtime(&[])?.start_atld(&run3)?;
+    let ended3 = loop {
+        if let Some(s) = atld3.try_wait()? {
+            break Some(s);
+        }
+        if start3.elapsed() > LIMIT {
+            let _ = atld3.kill();
+            atld3.wait()?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!(
+        "broadcast: downgrade run {:.1?} (atld start to its exit)",
+        start3.elapsed()
+    );
+    let services3 = read(&run3.log("services"));
+    let refused3 = services3.contains(DOWNGRADE_REFUSED);
+    if !refused3 {
+        println!(
+            "---- downgrade run services log (last {TAIL})\n{}",
+            tail(&services3, TAIL)
+        );
     }
     let mut checks = vec![
         (
@@ -405,16 +457,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 && services.contains("services: install com.example.atlbcastrecv version 1 New"),
         ),
         (
-            "with no opt-in, neither package got a boot broadcast at start, and each skip is counted",
-            !r.contains(BOOT_LOCKED)
-                && !r.contains(BOOT_BOOT)
-                && !s.contains(BOOT_LOCKED)
-                && !s.contains(BOOT_BOOT)
-                && counted(BOOT_SKIPPED),
+            "with no opt-in, the start-time boot broadcasts were skipped for the sender (counter), and the receiver app's version 1 (no boot receiver) got none",
+            !r.contains(BOOT_LOCKED) && !r.contains(BOOT_BOOT) && counted(BOOT_SKIPPED),
         ),
         (
             "LOCKED_BOOT_COMPLETED was refused for the receiver that is not directBootAware (counter)",
             counted(BOOT_LOCKED_REFUSED) && !s.contains(BOOT_LOCKED),
+        ),
+        (
+            "the sender, not opted in, got BOOT_COMPLETED at its first process start, once, ahead of its activity (D2 clause 2; its launch was held and released, counters)",
+            count(&s, BOOT_BOOT) == 1
+                && matches!((s.find(BOOT_BOOT), s.find(STICKY_RETURNED)), (Some(b), Some(a)) if b < a)
+                && counted(FIRST_START_SENT)
+                && counted(LAUNCH_RELEASED),
         ),
         (
             "BOOT_COMPLETED reached the opted-in receiver app in the opt-in run",
@@ -449,6 +504,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         (
             "a same-version reinstall sent the sender no MY_PACKAGE_REPLACED",
             !s2.contains(BOOT_MY_REPLACED),
+        ),
+        (
+            "a lower versionCode over the recorded one was refused INSTALL_FAILED_VERSION_DOWNGRADE and the start failed (all or nothing)",
+            refused3 && ended3.is_some_and(|s| !s.success()),
         ),
     ];
     checks.extend(connectivity_checks(root, &mut rt, &work)?);

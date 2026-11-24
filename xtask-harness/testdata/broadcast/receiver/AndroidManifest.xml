@@ -23,14 +23,17 @@
         </receiver>
         <!-- started by the alarm chain's receiver starts (Recv.java startOrLog); not exported: only this app's explicit intents reach it -->
         <service android:name=".AlarmSvc" android:exported="false" />
-        <!-- S9 boot rows: directBootAware so LOCKED_BOOT_COMPLETED reaches it; MY_PACKAGE_REPLACED is explicit to this package (the reinstall row) -->
-        <receiver android:name=".BootRecv" android:exported="false" android:directBootAware="true">
+        <!-- S9 boot rows: version 2 only (broadcast.rs receiver_v2 uncomments it). Version 1 declares no boot receiver: its first process start would get the boot broadcasts (D2) and their temp allowlist, which the restricted-start rows of the first run must not have.
+             Directboot aware, so LOCKED_BOOT_COMPLETED reaches it; MY_PACKAGE_REPLACED is explicit to this package (the reinstall row).
+        BOOT_RECEIVER_V2 <receiver android:name=".BootRecv" android:exported="false" android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
-        </receiver>
+        </receiver> BOOT_RECEIVER_V2_END -->
+
+
         <!-- started by BootRecv inside the BOOT_COMPLETED temp allowlist -->
         <service android:name=".BootSvc" android:exported="false" />
     </application>

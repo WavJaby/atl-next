@@ -54,14 +54,14 @@ pub struct Receiver<R> {
 
 /// The intent facts the rules read: `flags` (Intent flags), `explicit` (component or package set), `signature_perms` (isSignaturePerm of the required permissions),
 /// `max_manifest_api` (BroadcastOptions.maxManifestReceiverApiLevel; None = no limit): a manifest receiver whose targetSdk is above it is skipped (BroadcastSkipPolicy.shouldSkipMessage :105-109).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
     pub flags: i32,
     pub explicit: bool,
     pub signature_perms: bool,
     pub max_manifest_api: Option<i32>,
-    /// The system boot action (LOCKED / BOOT_COMPLETED): its receivers are gated by broadcast::boot_refusal at dispatch.
-    pub boot: Option<crate::broadcast::BootScope>,
+    /// The system boot action (LOCKED / BOOT_COMPLETED) and who the send is for: its receivers are gated by broadcast::boot_refusal at dispatch.
+    pub boot: Option<(crate::broadcast::BootScope, crate::broadcast::BootAudience)>,
 }
 
 /// A result: code, data and extras (BroadcastRecord.resultCode, resultData, resultExtras). `E` is the caller's extras type.
@@ -690,7 +690,7 @@ impl<R: Clone, E: Clone, P: Clone> Dispatcher<R, E, P> {
         policy: &mut Policy<'_, R>,
     ) -> Option<String> {
         let rec = self.records.get(&id)?;
-        let (facts, receiver) = (rec.facts, rec.receivers[index].clone());
+        let (facts, receiver) = (rec.facts.clone(), rec.receivers[index].clone());
         policy(&facts, &receiver)
     }
 
