@@ -177,9 +177,8 @@ pub struct Args {
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
-    /// Stage capture only, a manual run of the starvation rule (gate-starved-red-design H4): from the first close until its sub-gates read the logs, burners at CPUWeight 10000 hold every CPU
-    /// this gate may use (host_load.rs `Burners`), so the fixture's destroy misses the 1 s removeTask kill timer. Expected: `undecided` naming the timer once its line carries `at=` (H6);
-    /// until then the timer is unknown and the run stays red.
+    /// Stage capture only, a manual run of the starvation rule (gate-starved-red-design H4): from the first close until its sub-gates read the logs, one burner at CPUWeight 10000 holds the
+    /// gate's last CPU (host_load.rs `Burners`) and the gate's tree is pinned to it, so the fixture's destroy misses the 1 s removeTask kill timer. Expected: `undecided` naming the timer.
     #[arg(long)]
     starve_close: bool,
     /// Stage capture only (the control of --starve-close): F11 arms the fixture's delayed onDestroy before the first close, so the kill timer ends the process on a quiet host: a real

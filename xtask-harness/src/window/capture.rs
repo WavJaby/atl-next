@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustix::io::Errno;
+use rustix::process::Pid;
+use rustix::thread::{CpuSet, sched_setaffinity};
+
 use super::{
     ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, Proxy, ProxyEvent, Sub, parse_wxh,
     quadrant_pixels,
@@ -108,7 +112,7 @@ pub(super) struct Probe {
     pub component: String,
     /// Sub-gate (d) runs: false with `--exit-with-last-app`, where atld ends the run at the first close.
     pub timeout_close: bool,
-    /// `--starve-close`: burners hold every CPU from the first close until its sub-gates read the logs.
+    /// `--starve-close`: from the first close until its sub-gates read the logs, one burner on the gate's last CPU, the gate's tree pinned to it ([`Starved`]).
     pub starve_close: bool,
     /// `--break-delayed-close`: F11 arms the delayed onDestroy before the first close.
     pub delayed_close: bool,
@@ -310,13 +314,8 @@ pub(super) fn drive(
     if probe.delayed_close {
         arm_delayed_destroy(&proxy, app_log)?;
     }
-    let burners = if probe.starve_close {
-        let cpus =
-            atl_host_load::allowed_cpus().ok_or_else(|| "--starve-close: no CPU set".to_owned())?;
-        Some(
-            crate::host_load::Burners::start(&cpus, crate::host_load::STARVE_WEIGHT, None)
-                .map_err(|e| format!("--starve-close: {e:#}"))?,
-        )
+    let starved = if probe.starve_close {
+        Some(Starved::start(atld)?)
     } else {
         None
     };
@@ -346,7 +345,7 @@ pub(super) fn drive(
         seen.destroy = Some(destroy_judged(&app));
         seen.ended = Some(ended_judged(&services, still));
     }
-    drop(burners);
+    drop(starved);
     // after the rows above read their logs: the second close's lines must not reach them
     if probe.timeout_close {
         let timeout = timed_close(&proxy, app_log, services_log, probe);
@@ -620,6 +619,76 @@ fn descendants(atld: u32) -> Vec<u32> {
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
         .filter(|&pid| super::descends_from(pid, atld))
         .collect()
+}
+
+/// `--starve-close`: one burner on the gate's last CPU (host-load's `every` picks the same), the gate's tree pinned to it: this process, atld and every process under atld.
+/// The sampler, the services and the app then share the starved CPU, as host-load's starved case does (its gate is pinned to one CPU). Drop: the tree back to the gate's CPU set, then the burner ends.
+struct Starved {
+    atld: u32,
+    all: Vec<u32>,
+    _burners: crate::host_load::Burners,
+}
+
+impl Starved {
+    fn start(atld: u32) -> Result<Self, String> {
+        let all = atl_host_load::allowed_cpus().ok_or("--starve-close: no CPU set")?;
+        let cpu = *all.last().ok_or("--starve-close: an empty CPU set")?;
+        let burners =
+            crate::host_load::Burners::start(&[cpu], crate::host_load::STARVE_WEIGHT, None)
+                .map_err(|e| format!("--starve-close: {e:#}"))?;
+        // the guard exists before the pin: a refused pin still unpins the threads done so far and ends the burner
+        let starved = Self {
+            atld,
+            all,
+            _burners: burners,
+        };
+        let pinned = pin_tree(atld, &[cpu])?;
+        println!("starve-close: pinned {pinned} threads to cpu {cpu}");
+        Ok(starved)
+    }
+}
+
+impl Drop for Starved {
+    fn drop(&mut self) {
+        if let Err(e) = pin_tree(self.atld, &self.all) {
+            println!("starve-close: unpin failed: {e}");
+        }
+    }
+}
+
+/// Pins every thread of this process, of atld and of every process under atld to `cpus`; a thread created later inherits its creator's set.
+/// Returns the threads pinned. A thread that exited meanwhile is skipped; any other refusal is an error (the stage fails, not undecided).
+fn pin_tree(atld: u32, cpus: &[u32]) -> Result<usize, String> {
+    let mut set = CpuSet::new();
+    for &cpu in cpus {
+        set.set(cpu as usize);
+    }
+    let mut pinned = 0;
+    // descendants() excludes atld itself (its ancestor walk starts above it)
+    for pid in [std::process::id(), atld]
+        .into_iter()
+        .chain(descendants(atld))
+    {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            let Some(tid) = task
+                .file_name()
+                .to_str()
+                .and_then(|t| t.parse::<i32>().ok())
+                .and_then(Pid::from_raw)
+            else {
+                continue;
+            };
+            match sched_setaffinity(Some(tid), &set) {
+                Ok(()) => pinned += 1,
+                Err(Errno::SRCH) => {}
+                Err(e) => return Err(format!("--starve-close: pin of pid {pid}: {e}")),
+            }
+        }
+    }
+    Ok(pinned)
 }
 
 /// atld logged that the last app's end ends the run (`--exit-with-last-app` on).
