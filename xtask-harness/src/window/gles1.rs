@@ -9,8 +9,9 @@ use atl_services_types::display_model::DisplayModel;
 
 use super::capture;
 use super::gles2::{composed_check, present_check, readback_check};
-use super::{ACK_WAIT, Liveness, Sub, await_event, opening_size, wait_for_line};
+use super::{ACK_WAIT, Liveness, Sub, opening_size};
 use crate::gles2_fixture::java_probes;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 pub const FIXTURE: &str = "xtask-harness/testdata/gles1";
@@ -23,14 +24,21 @@ const READBACK_LINE: &str = "AtlGles1: readback";
 const VERSION_LINE: &str = "AtlGles1: version ";
 
 /// The probe: the window is acked, the fixture has read back, and its picture has settled (after the app's last present).
-pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, READBACK_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never read back")?;
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "readback",
+        "the fixture never read back",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(READBACK_LINE),
+    ))?;
     probe.record_settled();
     Ok(Liveness::default())
 }

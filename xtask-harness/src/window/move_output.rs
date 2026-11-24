@@ -7,16 +7,17 @@
 //! config diff (ActivityRecord.getConfigurationChanges: `diffPublicOnly`), so there is no second relaunch.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atl_services_types::display_model::DisplayModel;
 
 use super::{
     ACK_WAIT, CREATE_LINE, DRAW_LINE, INPUT_SETTLE, Liveness, RELAUNCH_COUNTER, RELAUNCHED_COUNTER,
-    Sub, await_event, counter, wait_for_line,
+    Sub, counter,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output, OutputControl};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The second output: the gate output's mode at scale 1.6, so density 160 x 1.6 = 256 (DisplayModel::from_monitor), a fractional scale as on a typical HiDPI laptop panel.
@@ -44,32 +45,39 @@ const UNCHANGED: &str = " unchanged";
 const LAST_FRAME: &str = "AtlWindow: frame 31 ";
 
 /// The probe: once the window has drawn on the first output, the first output goes off.
-pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
+pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
     std::thread::sleep(INPUT_SETTLE);
     outputs.only(1).map_err(|e| format!("{e:#}"))?;
     // the relaunched (second) instance ran its frame callbacks: the move's configuration change is over
-    let start = Instant::now();
-    while std::fs::read_to_string(app_log).map_or(0, |log| log.matches(LAST_FRAME).count()) < 2 {
-        if start.elapsed() > RELAUNCH_WAIT {
-            return Err("the relaunched instance never ran its frames".to_owned());
-        }
-        std::thread::sleep(INPUT_SETTLE);
-    }
+    until(&Wait::log(
+        "relaunch-frames",
+        "the relaunched instance never ran its frames",
+        RELAUNCH_WAIT,
+        app_log,
+        &|t: &str| t.matches(LAST_FRAME).count() >= 2,
+    ))?;
     outputs
         .set_transform(1, ROTATED_TRANSFORM)
         .map_err(|e| format!("{e:#}"))?;
     // the policy was exercised: the app's context asked for globals and missed the withheld ones
     if proxy.withheld().dropped() == 0 {
-        return Err(format!(
+        return Err(Miss::Wrong(format!(
             "the app's security context was never denied {WITHHELD:?}: the sandbox policy was not exercised"
-        ));
+        )));
     }
     Ok(Liveness {
         answered: false,

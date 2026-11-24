@@ -17,11 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, Proxy, ProxyEvent, Sub, await_event,
-    parse_wxh, quadrant_pixels, wait_for_line,
+    ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, Proxy, ProxyEvent, Sub, parse_wxh,
+    quadrant_pixels,
 };
 use crate::atld_run::capture_at;
 use crate::composer::{fnv1a64, word};
+use crate::wait::{Miss, Wait, until};
 
 /// The fixture's log line for its GET_COMPOSER (xtask-harness/testdata/window Main.java): `composer GET_COMPOSER status=<ok|SECURITY|error> uid=<uid>`.
 const COMPOSER_LINE: &str = "composer GET_COMPOSER status=";
@@ -144,7 +145,14 @@ impl Probe {
 
     /// Records one settled picture after the fixture's first draw (and the input settle). Without the draw, the record is the error.
     pub(super) fn record_after_draw(&self, app_log: &Path) {
-        let picture = if wait_for_line(app_log, DRAW_LINE, ACK_WAIT) {
+        let drawn = until(&Wait::log(
+            "draw",
+            "the fixture never drew",
+            ACK_WAIT,
+            app_log,
+            &|t: &str| t.contains(DRAW_LINE),
+        ));
+        let picture = if drawn.is_ok() {
             std::thread::sleep(INPUT_SETTLE);
             self.settle()
         } else {
@@ -260,32 +268,55 @@ pub(super) fn drive(
     services_log: &Path,
     probe: &Probe,
     atld: u32,
-) -> Result<Liveness, String> {
+) -> Result<Liveness, Miss> {
     probe.record_after_draw(app_log);
     let refusal = refused(app_log, probe);
     if let Ok(mut seen) = probe.seen.lock() {
         seen.refusal = Some(refusal);
     }
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 1 }
-    })
-    .is_some();
+    let answered = until(&Wait::event(
+        "pong",
+        "no pong to the first ping",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
+    ))
+    .is_ok();
     // the foreign probe's trigger (Main.java onKeyUp): only this stage presses F12; its refusal is counted before the close
     for pressed in [true, false] {
         proxy
             .inject_key(KEY_F12, pressed)
             .map_err(|e| e.to_string())?;
     }
-    wait_for_line(services_log, FOREIGN_CAUSE, CLOSE_WAIT);
+    // not a probe stop: the close sub-gate judges what the services logged (close_judged)
+    let _ = until(&Wait::log(
+        "foreign-cause",
+        "no foreign refusal logged",
+        CLOSE_WAIT,
+        services_log,
+        &|t: &str| t.contains(FOREIGN_CAUSE),
+    ));
     let ran = descendants(atld);
     if let Ok(mut seen) = probe.seen.lock() {
         seen.ran = ran;
     }
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
-    wait_for_line(services_log, REMOVED_LINE, CLOSE_WAIT);
-    wait_for_line(services_log, KILLED_LINE, CLOSE_WAIT);
+    let _ = until(&Wait::log(
+        "removed",
+        "no removal logged",
+        CLOSE_WAIT,
+        services_log,
+        &|t: &str| t.contains(REMOVED_LINE),
+    ));
+    let _ = until(&Wait::log(
+        "killed",
+        "no kill logged",
+        CLOSE_WAIT,
+        services_log,
+        &|t: &str| t.contains(KILLED_LINE),
+    ));
     let read = atl_diag::logfiles::read;
     let services = read(services_log);
     let still = killed_pids(&services).map(gone_within);
@@ -628,7 +659,15 @@ fn foreign_judged(services: &str) -> Result<String, String> {
 /// Sub-gate (b): the fixture's own GET_COMPOSER (its log line) must be refused with SECURITY, the status an app uid gets. Under the break, `ok` is the expected status,
 /// so the real refusal fails the sub-gate. A missing line fails it too.
 fn refused(app_log: &Path, probe: &Probe) -> Result<String, String> {
-    if !wait_for_line(app_log, COMPOSER_LINE, ACK_WAIT) {
+    if until(&Wait::log(
+        "composer-line",
+        "the fixture never logged its GET_COMPOSER",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(COMPOSER_LINE),
+    ))
+    .is_err()
+    {
         return Err("the fixture never logged its GET_COMPOSER".to_owned());
     }
     let text = std::fs::read_to_string(app_log).unwrap_or_default();

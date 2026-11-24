@@ -10,8 +10,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::{ACK_WAIT, Liveness, Sub, await_event, line_stamp, wait_for_line};
+use super::{ACK_WAIT, Liveness, Sub, line_stamp};
 use crate::composer::word;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The fixture's dir (window-aux: the window fixture's java, its own manifest).
@@ -48,14 +49,21 @@ const AGENT_DIED_PREFIX: &str = "services: UI agent of uid ";
 const AGENT_REGISTERED_PREFIX: &str = "services: registered the UI agent and compositor of uid ";
 
 /// The probe: the window acked a configure, then the fixture logged its last line, then the counters settle. It injects nothing.
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    if !wait_for_line(app_log, LAST, DIALOG_WAIT) {
-        return Err(format!("the fixture never logged `{LAST}`"));
-    }
+pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "last-line",
+        format!("the fixture never logged `{LAST}`"),
+        DIALOG_WAIT,
+        app_log,
+        &|t: &str| t.contains(LAST),
+    ))?;
     std::thread::sleep(COUNTERS_SETTLE);
     Ok(Liveness::default())
 }

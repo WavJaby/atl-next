@@ -11,8 +11,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::{ACK_WAIT, Liveness, Sub, await_event, wait_for_line, widgets};
+use super::{ACK_WAIT, Liveness, Sub, widgets};
 use crate::composer::word;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
 
 /// What the page tap is (`--tap-origin`): the physical input decides whether it focuses the WebView ([`tap_focus_check`]).
@@ -387,16 +388,29 @@ fn esc(proxy: &Proxy) -> Result<(), String> {
 }
 
 /// The probe: configure acked, page loaded and painted; resize; click the page's button; three Escs, each waiting for its answer (a missing answer is its sub-gate's failure, not the probe's).
-pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, LOADED, ACK_WAIT)
-        .then_some(())
-        .ok_or("the page never finished loading")?;
+pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "page-loaded",
+        "the page never finished loading",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(LOADED),
+    ))?;
     // the hidden preload loads too before any input: shown by mistake, it is the topmost widget and takes the click (its sub-gate reports a missing load)
-    let _ = wait_for_line(app_log, PRELOAD_LOADED, ACK_WAIT);
+    let _ = until(&Wait::log(
+        "preload-loaded",
+        "the preload never loaded",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(PRELOAD_LOADED),
+    ));
     std::thread::sleep(PAINT_SETTLE);
     // each resize waits for its answers, not a fixed time ([`resize_answered`]); one never answered is the resize sub-gate's failure, and the probe goes on after ACK_WAIT
     for (w, h, serial) in RESIZES {
@@ -406,14 +420,21 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
         proxy
             .inject_configure(w, h, serial, &[])
             .map_err(|e| e.to_string())?;
-        let _ = await_event(&proxy.events, ACK_WAIT, |e| {
-            *e == ProxyEvent::Acked { serial }
+        let _ = until(&Wait::event(
+            "resize-ack",
+            "no ack of the resize",
+            ACK_WAIT,
+            &proxy.events,
+            &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
+        ));
+        let _ = widgets::wait_until("resize-answered", app_log, ACK_WAIT, |t| {
+            resize_answered(t, layouts)
         });
-        let _ = widgets::wait_until(app_log, ACK_WAIT, |t| resize_answered(t, layouts));
     }
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let (ox, oy) = super::content_origin(&text)?;
-    let (cw, ch) = window_size(&text).ok_or("no layout line from the fixture")?;
+    let (cw, ch) =
+        window_size(&text).ok_or(Miss::Wrong("no layout line from the fixture".to_owned()))?;
     let centre = (
         f64::from(cw / 2) + f64::from(ox),
         f64::from(ch / 2) + f64::from(oy),
@@ -446,14 +467,16 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
                 .map_err(|e| e.to_string())?;
         }
     }
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(&format!("{TITLE}tap1")));
+    let _ = widgets::wait_until("tap1", app_log, INPUT_WAIT, |t| {
+        t.contains(&format!("{TITLE}tap1"))
+    });
     widgets::inject(
         &proxy,
         vec![PointerAction::Wheel {
             notches: WHEEL_NOTCHES,
         }],
     )?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| {
+    let _ = widgets::wait_until("scrolled", app_log, INPUT_WAIT, |t| {
         t.contains(&format!("{TITLE}scrolled"))
     });
     // each Esc waits for one more back line of any kind, so a wrong answer does not cost the next Esc its time.
@@ -463,7 +486,8 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
         let text = std::fs::read_to_string(app_log).unwrap_or_default();
         let (backs_before, none_before) = (backs(&text), decided_none(&text));
         esc(&proxy)?;
-        let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| {
+        // the H7 fence: an Esc whose UP is decided with no fallback ends here (no back can follow); otherwise its back line
+        let _ = widgets::wait_until("esc-answer", app_log, INPUT_WAIT, |t| {
             backs(t) > backs_before || decided_none(t) > none_before
         });
     }

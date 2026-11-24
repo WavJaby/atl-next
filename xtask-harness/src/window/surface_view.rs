@@ -13,9 +13,10 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use super::capture;
-use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, wait_for_line};
+use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub};
 use crate::composer::{fnv1a64, word};
 use crate::nested_wayland::{GATE_OUTPUT, Output};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The fixture's dir.
@@ -300,19 +301,30 @@ fn replaced_check(app: &str) -> Result<String, String> {
 }
 
 /// The probe: the window's configure is acked, the fixture laid out, then one ping; after the settled picture, a key makes A post a second frame over the shown one ([`replaced_check`]).
-pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, LAYOUT, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never laid out")?;
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "layout",
+        "the fixture never laid out",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(LAYOUT),
+    ))?;
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 1 }
-    })
-    .is_some();
+    let answered = until(&Wait::event(
+        "pong",
+        "no pong to the first ping",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
+    ))
+    .is_ok();
     probe.record_settled();
     // the settled picture shows A's first frame, so the window holds it: the key's frame replaces a shown buffer
     proxy
@@ -321,9 +333,13 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     proxy
         .inject_key(KEY_SPACE, false)
         .map_err(|e| e.to_string())?;
-    wait_for_line(app_log, REDREW, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never redrew A on the key")?;
+    until(&Wait::log(
+        "redrew",
+        "the fixture never redrew A on the key",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(REDREW),
+    ))?;
     // B offscreen: ENTER reparents it to null; the second settled picture is judged by `offscreen_check`
     proxy
         .inject_key(KEY_ENTER, true)
@@ -331,9 +347,13 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     proxy
         .inject_key(KEY_ENTER, false)
         .map_err(|e| e.to_string())?;
-    wait_for_line(app_log, OFFSCREEN, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never committed B's reparent to null")?;
+    until(&Wait::log(
+        "offscreen",
+        "the fixture never committed B's reparent to null",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(OFFSCREEN),
+    ))?;
     probe.record_settled();
     Ok(Liveness {
         answered,

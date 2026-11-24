@@ -16,9 +16,10 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub, await_event, wait_for_line};
+use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub};
 use super::{capture, widgets};
 use crate::composer::{fnv1a64, word};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// A page title (Main.java onReceivedTitle): every click the page gets sets `tap<n>`.
@@ -617,9 +618,11 @@ fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
         }],
     )?;
     click(proxy, page)?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap1"));
+    let _ = widgets::wait_until("tap1", app_log, INPUT_WAIT, |t| t.contains("wv title tap1"));
     click(proxy, overlay)?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(OVERLAY_TAP));
+    let _ = widgets::wait_until("overlay-tap", app_log, INPUT_WAIT, |t| {
+        t.contains(OVERLAY_TAP)
+    });
     let start = s(dx, dy);
     widgets::inject(
         proxy,
@@ -638,45 +641,72 @@ fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     }
     std::thread::sleep(std::time::Duration::from_millis(DRAG_STEP_MS));
     widgets::inject(proxy, vec![widgets::press(false)])?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(INTERCEPTED));
+    let _ = widgets::wait_until("intercepted", app_log, INPUT_WAIT, |t| {
+        t.contains(INTERCEPTED)
+    });
     click(proxy, page)?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains("wv title tap2"));
+    let _ = widgets::wait_until("tap2", app_log, INPUT_WAIT, |t| t.contains("wv title tap2"));
     // the page has the focus (clicked): Esc its handler takes, then Esc it leaves
     let esc = || -> Result<(), String> {
         proxy.inject_key(KEY_ESC, true).map_err(|e| e.to_string())?;
         proxy.inject_key(KEY_ESC, false).map_err(|e| e.to_string())
     };
     esc()?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(ESC_PREVENTED));
+    let _ = widgets::wait_until("esc-prevented", app_log, INPUT_WAIT, |t| {
+        t.contains(ESC_PREVENTED)
+    });
     std::thread::sleep(ESC_SETTLE);
     esc()?;
-    let _ = widgets::wait_until(app_log, INPUT_WAIT, |t| t.contains(ESC_LEFT));
+    let _ = widgets::wait_until("esc-left", app_log, INPUT_WAIT, |t| t.contains(ESC_LEFT));
     // a back (esc-back on) comes after the title; off, the settle shows none came
-    let _ = widgets::wait_until(app_log, ESC_SETTLE, |t| t.contains(BACK_LINE));
+    let _ = widgets::wait_until("back-settle", app_log, ESC_SETTLE, |t| {
+        t.contains(BACK_LINE)
+    });
     Ok(())
 }
 
 /// The probe: the window's configure is acked, the fixture laid out and its page loaded (or the fixture said it has no WebView), WebKit's paint settles, then one settled picture and a ping,
 /// then the input ([`drive_input`]).
-pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, LAYOUT, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never laid out")?;
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "layout",
+        "the fixture never laid out",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(LAYOUT),
+    ))?;
     // a missing page is the readback's failure (the break), not the probe's: a fixture without a WebView said so in onCreate, before its layout line, and has no load to wait for
     let no_webview = std::fs::read_to_string(app_log).is_ok_and(|l| l.contains(NO_WEBVIEW));
-    if !no_webview && wait_for_line(app_log, LOADED, ACK_WAIT) {
+    // the load's line is optional: without it the paint settle is skipped, and the page checks judge the log
+    if !no_webview
+        && until(&Wait::log(
+            "loaded",
+            "the page never loaded",
+            ACK_WAIT,
+            app_log,
+            &|t: &str| t.contains(LOADED),
+        ))
+        .is_ok()
+    {
         std::thread::sleep(PAINT_SETTLE);
     }
     probe.record_settled();
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 1 }
-    })
-    .is_some();
+    let answered = until(&Wait::event(
+        "pong",
+        "no pong to the first ping",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
+    ))
+    .is_ok();
     if !no_webview {
         drive_input(&proxy, app_log)?;
     }

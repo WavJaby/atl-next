@@ -18,7 +18,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +32,8 @@ use crate::composer::{fnv1a64, word};
 use crate::gles2_fixture;
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
+pub(crate) use crate::wait::POLL;
+use crate::wait::{Miss, Wait, settle, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 use atl_host_load::{Sampler, Samples, judge_window};
 
@@ -557,8 +558,6 @@ const ACTION_UP: u32 = 1;
 const ACTION_MOVE: u32 = 2;
 /// The pointer count of each touch: the script has one pointer.
 const POINTERS: u32 = 1;
-/// How often the logs are read while waiting.
-pub(crate) const POLL: Duration = Duration::from_millis(50);
 /// Lines shown of a log on failure.
 pub(crate) const TAIL: usize = 40;
 
@@ -1425,21 +1424,32 @@ struct Liveness {
 }
 
 /// The gtk stage's probe, from the proxy's side: the window's configure is acked; a ping is answered; the pointer script goes in; then a click whose UP sleeps the UI thread (past BLOCK_MIN_X). A ping sent meanwhile gets no pong until the sleep ends.
-fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
+fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
     // the fixture's first draw: its window takes input from then on (the headless stage injects after the first frame too)
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
     std::thread::sleep(INPUT_SETTLE);
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 1 }
-    })
-    .is_some();
+    let answered = until(&Wait::event(
+        "pong",
+        "no pong to the first ping",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
+    ))
+    .is_ok();
     let press = |pressed| PointerAction::Button {
         button: BTN_LEFT,
         pressed,
@@ -1462,13 +1472,23 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
     std::thread::sleep(BLOCK_SETTLE);
     let sent = Instant::now();
     proxy.inject_ping(2).map_err(|e| e.to_string())?;
-    let silent = await_event(&proxy.events, SILENT_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 2 }
-    })
-    .is_none();
-    let resumed_ms = await_event(&proxy.events, RESUME_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 2 }
-    })
+    // absence: the pong's timeout is the answer (the UI thread sleeps), so a Late miss is `silent`
+    let silent = until(&Wait::event(
+        "silent",
+        "a pong came while the UI thread slept",
+        SILENT_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 2 },
+    ))
+    .is_err();
+    let resumed_ms = until(&Wait::event(
+        "resumed",
+        "no pong after the sleep",
+        RESUME_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 2 },
+    ))
+    .ok()
     .map(|at| at.duration_since(sent).as_millis());
     Ok(Liveness {
         answered,
@@ -1489,18 +1509,18 @@ struct AppIdsSeen {
 }
 
 /// The app-id stage's probe, from the proxy's side: once the window has drawn, the requests it made before its first commit are in the proxy's channel. Its app ids go to `seen`, split at the first commit; the settle leaves room for one sent just after the draw.
-fn drive_app_id(
-    proxy: Proxy,
-    app_log: &Path,
-    seen: &Mutex<AppIdsSeen>,
-) -> Result<Liveness, String> {
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
+fn drive_app_id(proxy: Proxy, app_log: &Path, seen: &Mutex<AppIdsSeen>) -> Result<Liveness, Miss> {
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
     std::thread::sleep(INPUT_SETTLE);
     let events: Vec<ProxyEvent> = proxy.events.try_iter().map(|(_, event)| event).collect();
     if !events.iter().any(|e| matches!(e, ProxyEvent::Acked { .. })) {
-        return Err("the window never acked a configure".to_owned());
+        return Err(Miss::Wrong("the window never acked a configure".to_owned()));
     }
     let mut split = AppIdsSeen::default();
     for event in events {
@@ -1518,14 +1538,14 @@ fn drive_app_id(
 }
 
 /// The title stage's probe, from the proxy's side: once the fixture logged its setTaskDescription ([`TASK_LINE`]), and a settle for the retitle to reach the window, the titles it sent go to `seen`.
-fn drive_title(
-    proxy: Proxy,
-    app_log: &Path,
-    seen: &Mutex<Vec<String>>,
-) -> Result<Liveness, String> {
-    wait_for_line(app_log, TASK_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never set its task description")?;
+fn drive_title(proxy: Proxy, app_log: &Path, seen: &Mutex<Vec<String>>) -> Result<Liveness, Miss> {
+    until(&Wait::log(
+        "task-line",
+        "the fixture never set its task description",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(TASK_LINE),
+    ))?;
     std::thread::sleep(RESIZE_SETTLE);
     let titles = proxy
         .events
@@ -1541,24 +1561,36 @@ fn drive_title(
 
 /// The resize stage's probe, from the proxy's side: once the window is up and has drawn, it is configured to each of [`RESIZE_STEPS`] in turn. Each configure must be acked; then the probe leaves the client [`RESIZE_SETTLE`] to relayout and present.
 /// The window's picture is recorded after each of the two steps' settle, so the pictures are grow's, then shrink's ([`frame_check`]).
-fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
+fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
     std::thread::sleep(INPUT_SETTLE);
     let (mut configured, [grow, shrink]) = (Vec::new(), RESIZE_STEPS);
-    let step = |(width, height, serial): (i32, i32, u32)| -> Result<bool, String> {
+    let step = |(width, height, serial): (i32, i32, u32)| -> Result<bool, Miss> {
         proxy
             .inject_configure(width, height, serial, &[])
             .map_err(|e| e.to_string())?;
-        let acked = await_event(&proxy.events, PONG_WAIT, |e| {
-            *e == ProxyEvent::Acked { serial }
-        })
-        .is_some();
+        // a configure's ack that does not come is a judged answer (configure_check), not a probe stop
+        let acked = until(&Wait::event(
+            "configure-acked",
+            "no ack of the configure",
+            PONG_WAIT,
+            &proxy.events,
+            &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
+        ))
+        .is_ok();
         std::thread::sleep(RESIZE_SETTLE);
         Ok(acked)
     };
@@ -1597,35 +1629,6 @@ fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<
         idle: None,
         minimized: false,
     })
-}
-
-/// Whether `needle` shows up in the file within `within` (polled: the app log is written by another process).
-fn wait_for_line(file: &Path, needle: &str, within: Duration) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if atl_diag::logfiles::read(file).contains(needle) {
-            return true;
-        }
-        std::thread::sleep(POLL);
-    }
-    false
-}
-
-/// The arrival time of the first event `want` accepts within `within`; the events before it are dropped.
-fn await_event(
-    events: &Receiver<(Instant, ProxyEvent)>,
-    within: Duration,
-    want: impl Fn(&ProxyEvent) -> bool,
-) -> Option<Instant> {
-    let deadline = Instant::now() + within;
-    loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        match events.recv_timeout(left) {
-            Ok((at, event)) if want(&event) => return Some(at),
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-    }
 }
 
 /// Stage `gtk`: the real launcher's module armed its ping hold (atl-platform-ui-linux ping.rs `report`; display-thread plan D3): libgtk's `wl_proxy_add_listener` bound to the module and GDK's xdg_wm_base listener was kept. Its line is logged once, at attach; not armed names its reason.
@@ -2881,7 +2884,7 @@ struct LiveIn<'a> {
 
 /// What the live half saw: the judge's inputs besides the logs.
 struct LiveOut {
-    liveness: Result<Liveness, String>,
+    liveness: Result<Liveness, Miss>,
     captured: Arc<Mutex<capture::Seen>>,
     app_ids: Arc<Mutex<AppIdsSeen>>,
     titles: Arc<Mutex<Vec<String>>>,
@@ -2957,14 +2960,14 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
                         capture_probe.record_after_draw(&log);
                         drive(p, &log)
                     }
-                    None => Err("no capture probe".to_owned()),
+                    None => Err(Miss::Wrong("no capture probe".to_owned())),
                 }
             }
             (Stage::Capture, _, _) => match &capture_probe {
                 Some(capture_probe) => {
                     capture::drive(p, &log, &services_log, capture_probe, atld_pid)
                 }
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::Ime, _, Some(ime)) => {
                 ime::drive(p, &log, ime, ime_breaks, atld_pid, &services_log, relaunch)
@@ -2973,15 +2976,15 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
                 Some(capture_probe) => {
                     widgets::drive(p, &log, break_mouse_back, esc_back, capture_probe)
                 }
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::SurfaceView, _, _) => match &capture_probe {
                 Some(capture_probe) => surface_view::drive(p, &log, capture_probe),
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::WebView, _, _) => match &capture_probe {
                 Some(capture_probe) => webview::drive(p, &log, capture_probe),
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::WebViewOverlay, _, _) => webview_overlay::drive(p, &log, tap_origin),
             (Stage::UiBlock, _, _) => ui_block::drive(p, &log),
@@ -2992,20 +2995,20 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
             (Stage::MouseTouch, _, _) => widgets::drive_mouse_touch(p, &log),
             (Stage::Dialog, _, _) => match &capture_probe {
                 Some(capture_probe) => dialog::drive(p, &log, capture_probe),
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::Gles2, _, _) => match &capture_probe {
                 Some(capture_probe) => gles2::drive(p, &log, capture_probe),
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::Gles1, _, _) => match &capture_probe {
                 Some(capture_probe) => gles1::drive(p, &log, capture_probe),
-                None => Err("no capture probe".to_owned()),
+                None => Err(Miss::Wrong("no capture probe".to_owned())),
             },
             (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, _, _) => {
                 match &capture_probe {
                     Some(capture_probe) => drive_resize(p, &log, capture_probe),
-                    None => Err("no capture probe".to_owned()),
+                    None => Err(Miss::Wrong("no capture probe".to_owned())),
                 }
             }
             (Stage::AppId, _, _) => drive_app_id(p, &log, &seen),
@@ -3031,6 +3034,8 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     // when this loop first saw the probe finished (a stage without a probe: never)
     let mut probe_done_ms = None;
     let mut marker_ms = None;
+    // the marker's declared wait: bounded by the run's LIMIT (plus a hold); recorded once the loop ends
+    let marker_bound = LIMIT + Duration::from_secs(args.hold.unwrap_or(0));
     let end = loop {
         let app = read(&app_log);
         if matches!(args.stage, Stage::Splash) {
@@ -3058,11 +3063,15 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
             ended = Some(atld.stop(run)?);
             break (at, WatchEnd::Ended);
         }
-        if started.elapsed() > LIMIT + Duration::from_secs(args.hold.unwrap_or(0)) {
+        if started.elapsed() > marker_bound {
             break (now_ms(), WatchEnd::Limit);
         }
         std::thread::sleep(POLL);
     };
+    let marker_took = marker_ms.map_or(started.elapsed(), |t| {
+        Duration::from_millis(t.saturating_sub(start_ms))
+    });
+    crate::wait::record("marker", marker_took, marker_bound, None);
     let teardown = Instant::now();
     let mut stopped = None;
     if ended.is_none() {
@@ -3076,8 +3085,10 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
     let liveness = match probe {
         Some(handle) => handle
             .join()
-            .unwrap_or_else(|_| Err("the probe thread panicked".to_owned())),
-        None => Err("no probe: only the gtk, widgets and resize stages run one".to_owned()),
+            .unwrap_or_else(|_| Err(Miss::Wrong("the probe thread panicked".to_owned()))),
+        None => Err(Miss::Wrong(
+            "no probe: only the gtk, widgets and resize stages run one".to_owned(),
+        )),
     };
     // start: the launch (after the fixture's build and the stack's start); watch: marker -> the loop's end; teardown: stopping the apps and atld, joining the probe
     let (end_ms, why) = end;
@@ -3153,6 +3164,9 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         commits,
         tiled,
     } = out;
+    // the probe's miss is judged once, by `settle` below; the checks read its text
+    let probe_miss = liveness.as_ref().err().cloned();
+    let liveness: Result<Liveness, String> = liveness.map_err(|m| m.text());
     let read = atl_diag::logfiles::read;
     let app_log = run.log(package);
     let services_log = run.log("services");
@@ -3235,7 +3249,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         (Stage::Suspended, Some(_)) => suspended::checks(&after_marker(&app, marker), &liveness),
         (Stage::Ime, Some(_)) => {
             let mut sub = ime::checks(&app, &services, &liveness, app_uid);
-            sub.push(("run", run_survives_check(&read(&run.atld_log()), stopped)));
+            // the run's control lines follow the probe's end: a probe that stopped early never reaches them (settle: not reached)
+            let run_check = match &probe_miss {
+                Some(miss) => Err(miss.text()),
+                None => run_survives_check(&read(&run.atld_log()), stopped),
+            };
+            sub.push(("run", run_check));
             sub
         }
         (Stage::Widgets, Some(_)) => widgets::checks(
@@ -3424,11 +3443,17 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         sub.extend(judged);
         undecided = unjudged;
     }
-    let sub_fault = sub.iter().find_map(|(_, r)| r.as_ref().err().cloned());
+    let sub = settle(sub, probe_miss.as_ref());
+    // a `not reached` check is no failure of its own: the probe's one FAIL is the stage's first error
+    let sub_fault = sub.iter().find_map(|(_, r)| match r {
+        Err(m) if !matches!(m, Miss::NotReached { .. }) => Some(m.text()),
+        _ => None,
+    });
     for (name, result) in &sub {
         match result {
             Ok(s) => println!("window: {name}: pass {s}"),
-            Err(s) => println!("window: {name}: FAIL {s}"),
+            Err(m @ Miss::NotReached { .. }) => println!("window: {name}: {}", m.text()),
+            Err(m) => println!("window: {name}: FAIL {}", m.text()),
         }
     }
     for (name, why, result) in &undecided {
@@ -3547,7 +3572,7 @@ const PID_WAIT: Duration = Duration::from_secs(30);
 /// script's `atld.rc`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LiveRecord {
-    liveness: Result<Liveness, String>,
+    liveness: Result<Liveness, Miss>,
     captured: capture::Seen,
     ended: bool,
     stopped: bool,

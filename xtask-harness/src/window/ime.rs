@@ -22,9 +22,10 @@ use crate::nested_wayland::{Arg, Ime, im_op};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 use super::{
-    ACK_WAIT, CONTENT_ORIGIN_LINE, Liveness, Sub, await_event, content_origin, wait_for_line,
+    ACK_WAIT, CONTENT_ORIGIN_LINE, Liveness, Sub, content_origin,
     widgets::{self},
 };
+use crate::wait::{Miss, Wait, record, until};
 
 /// The fixture's EditText text before the IME (Main.java setText).
 const INITIAL: &str = "typed from code";
@@ -97,13 +98,15 @@ fn composer_settled(app: &str) -> bool {
         && (n("releases_fenced") > 0 || n("releases_fenced_unmatched") > 0)
 }
 
+/// A settle, not a judged wait: the composer's counters are read after it, whatever it saw.
 fn wait_settled(app_log: &Path) {
-    let deadline = Instant::now() + SETTLE_WAIT;
-    while Instant::now() < deadline
+    let start = Instant::now();
+    while start.elapsed() < SETTLE_WAIT
         && !composer_settled(&std::fs::read_to_string(app_log).unwrap_or_default())
     {
         std::thread::sleep(Duration::from_millis(50));
     }
+    record("composer-settled", start.elapsed(), SETTLE_WAIT, None);
 }
 
 /// The deliberate breaks.
@@ -115,11 +118,12 @@ pub struct Breaks {
 
 /// Pumps until the IME's surrounding text is `text` (it follows the editor asynchronously) or the wait ends; the last one seen is kept for `checks`.
 fn wait_surrounding(ime: &mut Ime, text: &str) {
-    let deadline = Instant::now() + IME_WAIT;
-    while Instant::now() < deadline && ime.surrounding.as_ref().is_none_or(|s| s.0 != text) {
+    let start = Instant::now();
+    while start.elapsed() < IME_WAIT && ime.surrounding.as_ref().is_none_or(|s| s.0 != text) {
         let _ = ime.pump();
         std::thread::sleep(Duration::from_millis(20));
     }
+    record("surrounding", start.elapsed(), IME_WAIT, None);
     *SURROUNDING.lock().unwrap_or_else(|e| e.into_inner()) = ime.surrounding.clone();
 }
 
@@ -183,40 +187,50 @@ fn answers_verdict(step: &str, want: usize, app: &str) -> Result<(), String> {
     ))
 }
 
-/// Pumps until `verdict` passes on the app log or [`IME_WAIT`] ends; the error is the last verdict's.
+/// Pumps until `verdict` passes on the app log or [`IME_WAIT`] ends; a miss is late, its reason the last verdict's.
 fn confirm(
     app_log: &Path,
     ime: &mut Ime,
     verdict: impl Fn(&str) -> Result<(), String>,
-) -> Result<(), String> {
-    let deadline = Instant::now() + IME_WAIT;
-    loop {
+) -> Result<(), Miss> {
+    let start = Instant::now();
+    let last = loop {
         let app = std::fs::read_to_string(app_log).unwrap_or_default();
         let last = verdict(&app);
-        if last.is_ok() || Instant::now() >= deadline {
-            return last;
+        if last.is_ok() || start.elapsed() >= IME_WAIT {
+            break last;
         }
         let _ = ime.pump();
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
+    record("edit", start.elapsed(), IME_WAIT, None);
+    last.map_err(|why| Miss::Late {
+        name: "edit".to_owned(),
+        why,
+    })
 }
 
 /// An edit whose text never reaches the fixture stops the probe here: the error names `step`, so a red costs one [`IME_WAIT`], not one per later edit.
-fn confirm_text(app_log: &Path, ime: &mut Ime, step: &str, text: &str) -> Result<(), String> {
+fn confirm_text(app_log: &Path, ime: &mut Ime, step: &str, text: &str) -> Result<(), Miss> {
     confirm(app_log, ime, |app| text_verdict(step, text, app))
 }
 
 /// As [`confirm_text`], for the editor answers the batch must have. The answer is async (outbox -> the editor's UI thread -> a binder thread -> the display thread), and one that lands after the
 /// next edit is stale and dropped by design (field.rs `surrounding`; measured 120-190 ms late at load ~8, under the probe's ~200 ms between edits): the next edit, and the kill, wait for it.
-fn confirm_answers(app_log: &Path, ime: &mut Ime, step: &str, want: usize) -> Result<(), String> {
+fn confirm_answers(app_log: &Path, ime: &mut Ime, step: &str, want: usize) -> Result<(), Miss> {
     confirm(app_log, ime, |app| answers_verdict(step, want, app))
 }
 
-/// Waits up to `within` for the input's layout line; the error is the message a red names.
-fn await_layout_input(app_log: &Path, within: Duration) -> Result<(), String> {
-    wait_for_line(app_log, LAYOUT_INPUT_LINE, within)
-        .then_some(())
-        .ok_or_else(|| "no layout line for input".to_owned())
+/// Waits up to `within` for the input's layout line; a miss names the layout line.
+fn await_layout_input(app_log: &Path, within: Duration) -> Result<(), Miss> {
+    until(&Wait::log(
+        "layout-input",
+        "no layout line for input",
+        within,
+        app_log,
+        &|t: &str| t.contains(LAYOUT_INPUT_LINE),
+    ))
+    .map(|_| ())
 }
 
 /// The probe: tap the EditText, wait for the second window to close and the IME to activate, then preedit, commit, delete.
@@ -229,7 +243,7 @@ pub fn drive(
     atld: u32,
     services_log: &Path,
     relaunch: (PathBuf, String),
-) -> Result<Liveness, String> {
+) -> Result<Liveness, Miss> {
     ime.restart_journal();
     let result = steps(
         &proxy,
@@ -252,15 +266,22 @@ fn steps(
     atld: u32,
     services_log: &Path,
     relaunch: (PathBuf, String),
-) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
+) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
     // the content origin is logged at the window's first present: the window has shown a frame
-    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the window never presented")?;
+    until(&Wait::log(
+        "content-origin",
+        "the window never presented",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(CONTENT_ORIGIN_LINE),
+    ))?;
     // the layout line comes from another writer, before or after the origin: wait for it, then read the snapshot holding both
     let waited = Instant::now();
     await_layout_input(app_log, LAYOUT_WAIT)?;
@@ -291,7 +312,7 @@ fn steps(
         std::thread::sleep(Duration::from_millis(20));
     }
     if !ime.active {
-        return Err("the desktop input method was never activated (no startInput reached the window's TextInput?)".to_owned());
+        return Err(Miss::Wrong("the desktop input method was never activated (no startInput reached the window's TextInput?)".to_owned()));
     }
     let byte_len = |s: &str| i32::try_from(s.len()).unwrap_or(i32::MAX);
     ime.settle().map_err(|e| e.to_string())?;
@@ -334,14 +355,21 @@ fn steps(
     // mid-session, input bound: SIGKILL the app (no Java-side teardown, so only the binder death can tell the services), then give the death notification time to arrive
     let apps = super::app_pids(atld);
     if apps.is_empty() {
-        return Err("no app process to kill".to_owned());
+        return Err(Miss::Wrong("no app process to kill".to_owned()));
     }
     for pid in &apps {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .status();
     }
-    wait_for_line(services_log, DEATH_LINE, DEATH_WAIT);
+    // not a probe stop: a missing death is judged by the death sub-gate (services log)
+    let _ = until(&Wait::log(
+        "death",
+        "the services never counted the death",
+        DEATH_WAIT,
+        services_log,
+        &|t: &str| t.contains(DEATH_LINE),
+    ));
     *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = std::fs::metadata(app_log)
         .ok()
         .and_then(|m| usize::try_from(m.len()).ok());
@@ -350,9 +378,16 @@ fn steps(
     let reply = crate::atld_run::control_at(&root, &format!("start {component}"))
         .map_err(|e| format!("relaunch: {e:#}"))?;
     if !reply.starts_with("ok") {
-        return Err(format!("relaunch refused: {reply}"));
+        return Err(Miss::Wrong(format!("relaunch refused: {reply}")));
     }
-    wait_for_line(services_log, REBOUND_LINE, RELAUNCH_WAIT);
+    // not a probe stop: a missing rebind is judged by the relaunch sub-gate (services log)
+    let _ = until(&Wait::log(
+        "rebound",
+        "the services never bound the relaunch",
+        RELAUNCH_WAIT,
+        services_log,
+        &|t: &str| t.contains(REBOUND_LINE),
+    ));
     Ok(Liveness {
         answered: true,
         silent: true,
@@ -430,12 +465,15 @@ fn stopped_step(err: &str) -> Option<&str> {
     rest.starts_with(" not confirmed").then_some(step)
 }
 
-/// A fail-fast stop's error moves to the sub-gate of the edit it names, so the label names the step; the other sub-gates keep their own results.
+/// A fail-fast stop: the sub-gate of the edit it names carries the error, and so does every sub-gate after it (they need the steps the probe did not reach); `settle` prints the first as FAIL and the rest `not reached`. Earlier sub-gates keep their own results.
 fn route_stop(subs: &mut [Sub], err: &str) {
     let Some(step) = stopped_step(err) else {
         return;
     };
-    for sub in subs.iter_mut().filter(|s| s.0 == step) {
+    let Some(at) = subs.iter().position(|s| s.0 == step) else {
+        return;
+    };
+    for sub in subs.iter_mut().skip(at) {
         sub.1 = Err(err.to_owned());
     }
 }
@@ -818,7 +856,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             await_layout_input(&file, Duration::from_millis(100)),
-            Err("no layout line for input".to_owned())
+            Err(Miss::Late {
+                name: "layout-input".to_owned(),
+                why: "no layout line for input".to_owned(),
+            })
         );
         let _ = std::fs::remove_file(&file);
     }
@@ -836,6 +877,41 @@ mod tests {
         };
         assert!(result("activate").is_ok());
         assert_eq!(result("commit"), Err(stop.to_owned()));
+    }
+
+    /// The 11-23 red's shape through the real checks: an edit that never confirms stops the probe. `activate` and `preedit` judged their own lines; the sub-gates from the stop on carry it, so `settle` prints one FAIL and `not reached` for the rest.
+    #[test]
+    fn a_stop_at_an_edit_is_one_fail_and_the_rest_not_reached() {
+        use crate::wait::settle;
+        let stop = "edit `commit` not confirmed: no `typed from code仮名` in the app log within 10s; edits: [\"typed from codeかな composing=15,17\"]";
+        let app = format!("{TEXT_LINE}typed from codeかな composing=15,17\n");
+        let miss = Miss::Late {
+            name: "edit".to_owned(),
+            why: stop.to_owned(),
+        };
+        let shape: Vec<String> =
+            settle(checks(&app, "", &Err(stop.to_owned()), 10002), Some(&miss))
+                .into_iter()
+                .map(|(name, r)| match r {
+                    Ok(_) => format!("{name}: pass"),
+                    Err(Miss::NotReached { .. }) => format!("{name}: not reached"),
+                    Err(_) => format!("{name}: FAIL"),
+                })
+                .collect();
+        assert_eq!(
+            shape,
+            [
+                "activate: pass",
+                "preedit: pass",
+                "commit: FAIL",
+                "surrounding: not reached",
+                "delete: not reached",
+                "death: not reached",
+                "relaunch: not reached",
+                "outbox: not reached",
+                "copy: not reached",
+            ]
+        );
     }
 
     /// The step a stop names, read back from the verdicts' own messages; a probe error that is not an edit's names none.

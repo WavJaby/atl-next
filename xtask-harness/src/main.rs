@@ -78,6 +78,7 @@ mod test_fonts;
 mod tree_gate;
 mod ui_module;
 mod vk_driver;
+mod wait;
 mod wayland_proxy;
 mod window;
 

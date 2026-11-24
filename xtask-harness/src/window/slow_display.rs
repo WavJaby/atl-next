@@ -10,8 +10,9 @@
 
 use super::starvation::{Fakes, Timed, render_max_us, span};
 use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, number, period_ms, result_line};
-use super::{ACK_WAIT, Checks, Liveness, Sub, await_event, line_stamp, wait_for_line};
+use super::{ACK_WAIT, Checks, Liveness, Sub, line_stamp};
 use crate::composer::word;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
 use std::time::Duration;
@@ -207,15 +208,22 @@ pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Checks {
 }
 
 /// The probe: once the window acks its configure, the proxy slows its frame callbacks; then the fixture's result line. The throttle's counts reach the checks through the live half (window.rs `live`).
-pub fn drive(proxy: Proxy, app_log: &Path, refresh_hz: f32) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
+pub fn drive(proxy: Proxy, app_log: &Path, refresh_hz: f32) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
     proxy.throttle_frames(Duration::from_secs_f64(throttle_ms(refresh_hz) / 1_000.0));
-    wait_for_line(app_log, RESULT, RESULT_WAIT)
-        .then_some(())
-        .ok_or("no `ub result` line in time")?;
+    until(&Wait::log(
+        "ub-result",
+        "no `ub result` line in time",
+        RESULT_WAIT,
+        app_log,
+        &|t: &str| t.contains(RESULT),
+    ))?;
     Ok(Liveness::default())
 }
 

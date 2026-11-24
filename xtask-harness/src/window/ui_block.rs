@@ -13,8 +13,9 @@
 //! - Timeouts (every run): no dequeue timed out (`-110`).
 
 use super::starvation::{Fakes, Timed, span};
-use super::{ACK_WAIT, Checks, Liveness, await_event, wait_for_line};
+use super::{ACK_WAIT, Checks, Liveness};
 use crate::composer::word;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
 use std::time::Duration;
@@ -202,14 +203,21 @@ pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Checks 
 }
 
 /// The probe: the window's configure is acked, then the fixture's result line (the phases are the app's own doing).
-pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, RESULT, RESULT_WAIT)
-        .then_some(())
-        .ok_or("no `ub result` line in time")?;
+pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "ub-result",
+        "no `ub result` line in time",
+        RESULT_WAIT,
+        app_log,
+        &|t: &str| t.contains(RESULT),
+    ))?;
     Ok(Liveness::default())
 }
 

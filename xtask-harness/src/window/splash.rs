@@ -10,10 +10,11 @@ use std::path::Path;
 use anyhow::Result;
 use atl_services_types::compositor_registry::{SPLASH_PROPERTY, Splash};
 
-use super::{ACK_WAIT, DRAW_LINE, Liveness, Sub, wait_for_line};
+use super::{ACK_WAIT, DRAW_LINE, Liveness, Sub};
 use crate::atld_run::Runtime;
 use crate::nested_wayland::NestedCompositor;
 use crate::screencopy::{self, Image};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::Proxy;
 
 /// The splash colour (ARGB): opaque, no channel at 0 or 255 and all three different, so neither the fixture's quadrants nor GTK's grey chrome nor an empty (black or transparent) window can match it.
@@ -38,10 +39,15 @@ pub fn setup(rt: Runtime, break_splash: bool) -> Result<Runtime> {
 }
 
 /// The probe: keeps the proxy until the fixture drew, so the window lives through the picture.
-pub fn drive(_proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(Liveness::default())
-        .ok_or_else(|| "the fixture never drew".to_owned())
+pub fn drive(_proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
+    Ok(Liveness::default())
 }
 
 /// The picture taken while the splash shows: the output, and whether the app's first present was already logged once it was read (then it is not the splash's).

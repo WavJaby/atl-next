@@ -5,10 +5,8 @@
 
 use std::path::Path;
 
-use super::{
-    ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event,
-    wait_for_line,
-};
+use super::{ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy, XDG_STATE_MAXIMIZED, XDG_STATE_SUSPENDED};
 
 /// The configures in order, each with its serial: maximized, cleared, suspended, cleared. A configure carries no size (0 x 0: the client keeps its own).
@@ -24,14 +22,21 @@ const WANT: [(bool, bool); 4] = [(true, false), (false, false), (false, true), (
 
 /// The suspended stage's probe, from the proxy's side: once the window has drawn, each of [`STEPS`] is injected and must be acked, then the probe leaves the client [`RESIZE_SETTLE`] to report it.
 /// `skip_suspended` is the break: the suspended configure is never sent, so the states check fails.
-pub fn drive(proxy: Proxy, app_log: &Path, skip_suspended: bool) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, DRAW_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never drew")?;
+pub fn drive(proxy: Proxy, app_log: &Path, skip_suspended: bool) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "draw",
+        "the fixture never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(DRAW_LINE),
+    ))?;
     std::thread::sleep(INPUT_SETTLE);
     let mut configured = Vec::new();
     for (states, serial) in STEPS {
@@ -41,10 +46,15 @@ pub fn drive(proxy: Proxy, app_log: &Path, skip_suspended: bool) -> Result<Liven
         proxy
             .inject_configure(0, 0, serial, states)
             .map_err(|e| e.to_string())?;
-        let acked = await_event(&proxy.events, PONG_WAIT, |e| {
-            *e == ProxyEvent::Acked { serial }
-        })
-        .is_some();
+        // a configure's ack that does not come is the step's answer, not a probe stop
+        let acked = until(&Wait::event(
+            "configure-acked",
+            "no ack of the configure",
+            PONG_WAIT,
+            &proxy.events,
+            &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
+        ))
+        .is_ok();
         std::thread::sleep(RESIZE_SETTLE);
         configured.push(acked);
     }

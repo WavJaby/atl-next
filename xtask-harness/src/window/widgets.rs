@@ -9,7 +9,7 @@
 //! What `idle` proves: the app requests no frame while nothing is injected. It does not observe the composer's clock: the composer logs nothing while it is parked, so whether the clock parks is not directly observed here.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use atl_services_types::display_model::DisplayModel;
 use std::sync::Mutex;
@@ -18,11 +18,12 @@ use atl_services_types::input_devices;
 
 use super::capture;
 use super::{
-    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, POLL, Rate, Sub, await_event, cadence_check,
-    content_origin, content_to_surface, wait_for_line,
+    ACK_WAIT, BTN_LEFT, CONTENT_ORIGIN_LINE, Liveness, Rate, Sub, cadence_check, content_origin,
+    content_to_surface,
 };
 use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
 use atl_host_load::Samples;
 
@@ -987,22 +988,26 @@ pub(super) fn inject(proxy: &Proxy, actions: Vec<PointerAction>) -> Result<(), S
     Ok(())
 }
 
-/// Whether the app log satisfies `want` within `within` (polled: the app process writes the log).
-pub(super) fn wait_until(app_log: &Path, within: Duration, want: impl Fn(&str) -> bool) -> bool {
-    let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if std::fs::read_to_string(app_log).is_ok_and(|text| want(&text)) {
-            return true;
-        }
-        std::thread::sleep(POLL);
-    }
-    false
+/// Whether the app log satisfies `want` within `within`. Not a probe stop: the injection's check judges the log, so a miss only leaves that check to fail (the record prints the wait).
+pub(super) fn wait_until(
+    name: &'static str,
+    app_log: &Path,
+    within: Duration,
+    want: impl Fn(&str) -> bool,
+) -> bool {
+    until(&Wait::log(name, "", within, app_log, &|t: &str| want(t))).is_ok()
 }
 
-pub(super) fn wait_line(app_log: &Path, needle: &str) -> Result<(), String> {
-    wait_for_line(app_log, needle, LINE_WAIT)
-        .then_some(())
-        .ok_or_else(|| format!("no `{needle}` line within {LINE_WAIT:?}"))
+/// A fixture line an injection needs before the next one: a miss stops the probe.
+pub(super) fn wait_line(app_log: &Path, needle: &str) -> Result<(), Miss> {
+    until(&Wait::log(
+        "line",
+        format!("no `{needle}` line within {LINE_WAIT:?}"),
+        LINE_WAIT,
+        app_log,
+        &|t: &str| t.contains(needle),
+    ))
+    .map(|_| ())
 }
 
 /// The widgets probe: after the software frame and the first readback (so both show the picture before the input), presses the header, taps the Button, taps the EditText, waits for the second window to close and taps the Button again, hovers over the ListView, turns the wheel down and swipes up over it, drags it up, waits for the readback of the final frame, and presses the mouse's back and forward side buttons over the label.
@@ -1013,18 +1018,29 @@ pub fn drive(
     break_mouse_back: bool,
     esc_back: bool,
     probe: &capture::Probe,
-) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, SOFTWARE_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never logged its software frame")?;
+) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "software-frame",
+        "the fixture never logged its software frame",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(SOFTWARE_LINE),
+    ))?;
     // the content origin is logged at the window's first present: the software frame is on screen once it is there
-    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the window never presented")?;
+    until(&Wait::log(
+        "content-origin",
+        "the window never presented",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(CONTENT_ORIGIN_LINE),
+    ))?;
     probe.record_settled();
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let centre = |name: &str| -> Result<(f64, f64), String> {
@@ -1046,15 +1062,16 @@ pub fn drive(
         tap(HEADER_POINT)?;
     }
     for n in (1..=HEADER_ACTIONS).filter(|_| has_header) {
-        await_event(&proxy.events, LINE_WAIT, |e| {
-            *e == ProxyEvent::PointerInjected
-        })
-        .ok_or_else(|| {
+        until(&Wait::event(
+            "header-injected",
             format!(
                 "the proxy reported {} of the header press's {HEADER_ACTIONS} actions",
                 n - 1
-            )
-        })?;
+            ),
+            LINE_WAIT,
+            &proxy.events,
+            &|e: &ProxyEvent| *e == ProxyEvent::PointerInjected,
+        ))?;
     }
     tap(centre("button")?)?;
     wait_line(app_log, "AtlWindow: click count=1")?;
@@ -1083,7 +1100,7 @@ pub fn drive(
             PointerAction::Leave,
         ],
     )?;
-    wait_until(app_log, LINE_WAIT, |t| cursor_check(t).is_ok());
+    wait_until("cursor", app_log, LINE_WAIT, |t| cursor_check(t).is_ok());
     // keys: Shift+A, a, then a held A (the client's own repeat runs while it is down)
     let key = |code: u32, pressed: bool| proxy.inject_key(code, pressed).map_err(|e| e.to_string());
     for (code, pressed) in [
@@ -1099,7 +1116,7 @@ pub fn drive(
     }
     std::thread::sleep(KEY_HOLD);
     key(KEY_A, false)?;
-    wait_until(app_log, LINE_WAIT, |t| keys_check(t).is_ok());
+    wait_until("keys", app_log, LINE_WAIT, |t| keys_check(t).is_ok());
     let (x, y) = centre("list")?;
     // hover, wheel and swipe over the list: each waits for its own check, and a miss leaves that check to fail alone (the drag and the cadence run after it still run)
     inject(
@@ -1113,7 +1130,7 @@ pub fn drive(
             PointerAction::Leave,
         ],
     )?;
-    wait_until(app_log, LINE_WAIT, |t| hover_check(t).is_ok());
+    wait_until("hover", app_log, LINE_WAIT, |t| hover_check(t).is_ok());
     inject(
         &proxy,
         vec![
@@ -1123,7 +1140,7 @@ pub fn drive(
             },
         ],
     )?;
-    wait_until(app_log, LINE_WAIT, |t| wheel_check(t).is_ok());
+    wait_until("wheel", app_log, LINE_WAIT, |t| wheel_check(t).is_ok());
     for _ in 0..SWIPE_STEPS {
         inject(
             &proxy,
@@ -1136,7 +1153,7 @@ pub fn drive(
     }
     inject(&proxy, vec![PointerAction::FingerStop])?;
     // the fling ends idle (state 0) before the drag
-    wait_until(app_log, FLING_WAIT, |t| {
+    wait_until("swipe-idle", app_log, FLING_WAIT, |t| {
         swipe_check(t).is_ok()
             && t.rfind("AtlWindow: list state=0") > t.rfind("AtlWindow: list state=2")
     });
@@ -1152,14 +1169,18 @@ pub fn drive(
     }
     drag.push(press(false));
     inject(&proxy, drag)?;
-    if !wait_until(app_log, LINE_WAIT, |t| {
-        t.get(drag_from..)
-            .is_some_and(|after| after.contains("AtlWindow: list first="))
-    }) {
-        return Err("the list did not scroll after the drag".to_owned());
-    }
+    until(&Wait::log(
+        "list-scroll",
+        "the list did not scroll after the drag",
+        LINE_WAIT,
+        app_log,
+        &|t: &str| {
+            t.get(drag_from..)
+                .is_some_and(|after| after.contains("AtlWindow: list first="))
+        },
+    ))?;
     // two fingers on the touchscreen, once the drag's fling is idle; a miss leaves the touch check to fail alone
-    wait_until(app_log, FLING_WAIT, |t| {
+    wait_until("touch-idle", app_log, FLING_WAIT, |t| {
         t.rfind("AtlWindow: list state=0") > t.rfind("AtlWindow: list state=2")
     });
     let (x2, step) = (x + TOUCH_GAP_PX, DRAG_PX / f64::from(SCROLL_STEPS));
@@ -1176,7 +1197,7 @@ pub fn drive(
     for action in fingers {
         proxy.inject_touch(action).map_err(|e| e.to_string())?;
     }
-    wait_until(app_log, LINE_WAIT, |t| touch_check(t).is_ok());
+    wait_until("touch", app_log, LINE_WAIT, |t| touch_check(t).is_ok());
     wait_line(app_log, FINAL_LINE)?;
     // the final frame's picture, once the scenes stop
     probe.record_settled();
@@ -1194,14 +1215,16 @@ pub fn drive(
             button(BTN_EXTRA, false),
         ],
     )?;
-    wait_until(app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
+    wait_until("buttons", app_log, LINE_WAIT, |t| buttons_check(t).is_ok());
     // Esc twice: the first clears the text field's focus (TextView ESCAPE, handled), the second no view consumes: its fallback (esc-back on) is BACK; the checks judge the whole log at the end, so a late BACK with esc-back off still fails
     let key = |code: u32, pressed: bool| proxy.inject_key(code, pressed).map_err(|e| e.to_string());
     for _ in 0..2 {
         key(KEY_ESC, true)?;
         key(KEY_ESC, false)?;
     }
-    wait_until(app_log, LINE_WAIT, |t| esc_back_check(t, esc_back).is_ok());
+    wait_until("esc-back", app_log, LINE_WAIT, |t| {
+        esc_back_check(t, esc_back).is_ok()
+    });
     // the idle window: nothing is injected, so the app must request no frame (`idle`); the composer's parking is not observed
     std::thread::sleep(IDLE_SETTLE);
     let from = log_len(app_log)?;
@@ -1209,7 +1232,7 @@ pub fn drive(
     let to = log_len(app_log)?;
     tap(centre("button")?)?;
     wait_line(app_log, RESUME_CLICK_LINE)?;
-    wait_until(app_log, LINE_WAIT, |t| t.contains(RESUME_LINE));
+    wait_until("resume", app_log, LINE_WAIT, |t| t.contains(RESUME_LINE));
     Ok(Liveness {
         answered: false,
         silent: false,
@@ -1222,17 +1245,28 @@ pub fn drive(
 
 /// The mouse-touch stage's probe (window.rs `Stage::MouseTouch`): after the first present, one mouse drag on the list (press, DRAG_PX up in SCROLL_STEPS motions, release).
 /// With the desktop adaptation on, the press is a finger ([`mouse_touch_check`] judges the touches); the drive only waits for the list's scroll and for that check, so a miss is the check's to report.
-pub fn drive_mouse_touch(proxy: Proxy, app_log: &Path) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, SOFTWARE_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never logged its software frame")?;
-    wait_for_line(app_log, CONTENT_ORIGIN_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the window never presented")?;
+pub fn drive_mouse_touch(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "software-frame",
+        "the fixture never logged its software frame",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(SOFTWARE_LINE),
+    ))?;
+    until(&Wait::log(
+        "content-origin",
+        "the window never presented",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(CONTENT_ORIGIN_LINE),
+    ))?;
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
     let r = widget(&text, "list")?;
     let (x, y) = content_to_surface(
@@ -1249,11 +1283,13 @@ pub fn drive_mouse_touch(proxy: Proxy, app_log: &Path) -> Result<Liveness, Strin
     }
     drag.push(press(false));
     inject(&proxy, drag)?;
-    wait_until(app_log, LINE_WAIT, |t| {
+    wait_until("mouse-list-scroll", app_log, LINE_WAIT, |t| {
         t.get(drag_from..)
             .is_some_and(|after| after.contains("AtlWindow: list first="))
     });
-    wait_until(app_log, LINE_WAIT, |t| mouse_touch_check(t).is_ok());
+    wait_until("mouse-touch", app_log, LINE_WAIT, |t| {
+        mouse_touch_check(t).is_ok()
+    });
     Ok(Liveness {
         answered: false,
         silent: false,

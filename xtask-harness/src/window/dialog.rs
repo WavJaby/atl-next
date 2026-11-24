@@ -21,11 +21,10 @@ use std::time::Duration;
 use std::sync::Mutex;
 
 use super::capture;
-use super::widgets::{BTN_SIDE, inject, press, wait_until};
-use super::{
-    ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, await_event, content_origin, wait_for_line,
-};
+use super::widgets::{BTN_SIDE, inject, press};
+use super::{ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, content_origin};
 use crate::composer::{fnv1a64, word};
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// The fixture's dir.
@@ -479,10 +478,23 @@ fn back(proxy: &Proxy, x: f64, y: f64) -> Result<(), String> {
 /// The dialog is touch-modal, so no touch reaches the anchor (a click there lands in the dialog); the Back is a mouse button, which goes to the focused window.
 /// Waits only; [`back_check`] judges the lines, so a break fails there, not here.
 fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
-    wait_until(app_log, BACK_WAIT, |t| t.contains(SUB_RESUMED));
+    // not probe stops: back_check judges the lines
+    let _ = until(&Wait::log(
+        "sub-resumed",
+        "Sub never resumed",
+        BACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(SUB_RESUMED),
+    ));
     let (x, y) = anchor_centre(app_log)?;
     back(proxy, x, y)?;
-    wait_until(app_log, BACK_WAIT, |t| t.contains(SUB_DESTROYED));
+    let _ = until(&Wait::log(
+        "sub-destroyed",
+        "Sub was never destroyed",
+        BACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(SUB_DESTROYED),
+    ));
     Ok(())
 }
 
@@ -491,38 +503,66 @@ fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
 fn root_backs(proxy: &Proxy, app_log: &Path) -> Result<bool, String> {
     let (x, y) = anchor_centre(app_log)?;
     back(proxy, x, y)?;
-    wait_until(app_log, BACK_WAIT, |t| t.contains(CONSUMED));
+    // not a probe stop: consumed_check judges the line
+    let _ = until(&Wait::log(
+        "consumed",
+        "Main's first Back was not consumed",
+        BACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(CONSUMED),
+    ));
     back(proxy, x, y)?;
-    Ok(await_event(&proxy.events, BACK_WAIT, |e| *e == ProxyEvent::Minimized).is_some())
+    Ok(until(&Wait::event(
+        "minimized",
+        "the window did not minimize",
+        BACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Minimized,
+    ))
+    .is_ok())
 }
 
 /// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
 /// The back case's Sub Back comes first, before any other input (Sub covers the dialog until it pops); Main's Backs come last, since the window minimizes with the second.
-pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, SHOWN, ACK_WAIT)
-        .then_some(())
-        .ok_or("the dialog never drew")?;
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "shown",
+        "the dialog never drew",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(SHOWN),
+    ))?;
     sub_back(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Pong { serial: 1 }
-    })
-    .is_some();
+    let answered = until(&Wait::event(
+        "pong",
+        "no pong to the first ping",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
+    ))
+    .is_ok();
     drag(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     let (width, height, serial) = RESIZED;
     proxy
         .inject_configure(width, height, serial, &[])
         .map_err(|e| e.to_string())?;
-    await_event(&proxy.events, PONG_WAIT, |e| {
-        *e == ProxyEvent::Acked { serial }
-    })
-    .ok_or("the resize was never acked")?;
+    until(&Wait::event(
+        "resize-ack",
+        "the resize was never acked",
+        PONG_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
+    ))?;
     std::thread::sleep(RESIZE_SETTLE);
     drag(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);

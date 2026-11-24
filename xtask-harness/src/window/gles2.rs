@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use atl_services_types::display_model::DisplayModel;
 
 use super::capture;
-use super::{ACK_WAIT, Liveness, Sub, await_event, opening_size, wait_for_line};
+use super::{ACK_WAIT, Liveness, Sub, opening_size};
 use crate::gles2_fixture::PROBES;
+use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The marker: the fixture's surface line (Main.java onSurfaceChanged), logged once the GL surface exists.
@@ -33,14 +34,21 @@ pub(super) fn composed_row(height: u32, y: u32) -> Option<u32> {
 }
 
 /// The probe: the window is acked, the fixture has read back, and its picture has settled (after the app's last present).
-pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, String> {
-    await_event(&proxy.events, ACK_WAIT, |e| {
-        matches!(e, ProxyEvent::Acked { .. })
-    })
-    .ok_or("the window never acked a configure")?;
-    wait_for_line(app_log, READBACK_LINE, ACK_WAIT)
-        .then_some(())
-        .ok_or("the fixture never read back")?;
+pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
+    until(&Wait::event(
+        "configure-ack",
+        "the window never acked a configure",
+        ACK_WAIT,
+        &proxy.events,
+        &|e: &ProxyEvent| matches!(e, ProxyEvent::Acked { .. }),
+    ))?;
+    until(&Wait::log(
+        "readback",
+        "the fixture never read back",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| t.contains(READBACK_LINE),
+    ))?;
     probe.record_settled();
     Ok(Liveness::default())
 }
