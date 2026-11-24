@@ -1302,15 +1302,22 @@ struct RustToolchain {
     version: String,
 }
 
-/// Resolves rust-toolchain.toml's rustc through rustup in the repo root (ninja runs elsewhere, where rustup would not see the pin).
-fn rust_toolchain(root: &Path) -> Result<RustToolchain> {
+/// rust-toolchain.toml's rustc, through rustup in the repo root (ninja runs elsewhere, where rustup would not see the pin).
+pub(crate) fn rustc(root: &Path) -> Result<std::path::PathBuf> {
     let out = Command::new("rustup")
         .args(["which", "rustc"])
         .current_dir(root)
         .output()
         .context("running rustup which rustc")?;
     ensure!(out.status.success(), "rustup which rustc failed");
-    let rustc = std::path::PathBuf::from(String::from_utf8(out.stdout)?.trim());
+    Ok(std::path::PathBuf::from(
+        String::from_utf8(out.stdout)?.trim(),
+    ))
+}
+
+/// The pinned rustc (`rustc`) and its version.
+fn rust_toolchain(root: &Path) -> Result<RustToolchain> {
+    let rustc = rustc(root)?;
     let out = Command::new(&rustc)
         .arg("--version")
         .output()

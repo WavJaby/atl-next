@@ -3,7 +3,8 @@
 //! It is one edge of build.ninja (bp2ninja -licence-gate), so ninja alone decides when it runs: `xtask licence-gate` (hidden, `run_edge`) reads the edge's inputs from its rspfile, writes the report (`$out`, JSON) and,
 //! as its depfile, every file it read or reached plus its own binary and tables, so a changed artifact, reached file, licence header, licenses.toml row or gate build reruns it and nothing else does.
 //! The edge runs only once every artifact linked, so each is this build's (no stale artifact to tell apart). Findings are the report's, not the edge's status: `native` prints it and fails the run.
-//! - Shipped artifacts: the device-side link outputs (bp2ninja emits the edge over those under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
+//! - Shipped artifacts: the device-side link outputs, cc links and rustc-linked binaries (bp2ninja emits the edge over those under `<out>/device/`), all of class `runtime`. Host outputs are build tools and never ship.
+//!   A rustc-linked binary's trace is lld `--why-extract`'s loaded members (rustc swallows `--trace`); its own codegen units are counted through its depfile record (sources + crates), and the pinned rustc sysroot's std rlibs are the platform's (`Places`).
 //! - Reached files, per artifact: the objects its link loaded, from `<artifact>.trace` (bp2ninja's link rule runs lld with `--trace`: each object on the command line and each archive member loaded -- those symbol resolution pulled in, every member of a `--whole-archive`); a member is mapped back to its object through the archive's ninja edge (`ninja -t query`). Members are named by file name, so where two objects of one archive share one, both count.
 //!   An archive whose members are none of its inputs but which has a depfile record was compiled whole by its own edge (rustc's generated staticlib): the archive is the object, whichever of its codegen units ld loaded.
 //!   Then each object's source and headers, from its deps log record (ninja_deps.rs); a dependency with a record of its own (an rlib, which bp2ninja's rustc rule lists after rustc's dep-info) stands for what it is made of, transitively. So a Rust archive reaches every crate of its closure's sources; the toolchain sysroot's std/core/alloc are rustc's own inputs, in no depfile, and are not reached -- like the C toolchain's crt objects and libc++, the platform's.
@@ -28,7 +29,7 @@ use crate::notice;
 const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64"];
 
 /// Where the gate places a reached file: the checkouts (`roots`), and the platform's dirs (`system`: SYSTEM_DIRS plus every deps.toml sysroot row's root -- Debian packages a cross link
-/// loads crt objects, libgcc and libc_nonshared from, the platform's as the build machine's /usr is; memory M41 F1).
+/// loads crt objects, libgcc and libc_nonshared from, the platform's as the build machine's /usr is; memory M41 F1 -- plus the pinned rustc's sysroot, whose std/core/alloc rlibs a rustc link loads, the toolchain's as libc++ is).
 pub struct Places {
     pub roots: Vec<Root>,
     pub system: Vec<PathBuf>,
@@ -46,6 +47,7 @@ impl Places {
             // an unfetched sysroot holds nothing a link loaded
             system.extend(std::fs::canonicalize(crate::deps::sysroot_dir(root, &row)?).ok());
         }
+        system.push(rust_sysroot(root)?);
         Ok(Self {
             roots: roots(layout, checkouts),
             system,
@@ -265,6 +267,12 @@ pub fn check(
         )?)
     };
     let deps = crate::ninja_deps::read(out)?.deps();
+    // an artifact with a depfile record of its own (a rustc-linked binary: its trace lists only archive members, its own codegen units are its sources + crates)
+    for artifact in &artifacts {
+        if deps.contains_key(artifact) {
+            objects.entry(artifact.clone()).or_insert(artifact);
+        }
+    }
     // archives no edge of this build makes: external build dir -> (archive, member, artifact)
     let mut external: BTreeMap<PathBuf, Vec<(&Path, &str, &Path)>> = BTreeMap::new();
     for (archive, member, artifact) in &members {
@@ -650,6 +658,23 @@ fn judge(
     Ok(())
 }
 
+/// The pinned rustc's sysroot (`rustc --print sysroot`, canonical), where the std rlibs a Rust link loads live.
+fn rust_sysroot(root: &Path) -> Result<PathBuf> {
+    let rustc = crate::native::rustc(root)?;
+    let out = Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .with_context(|| format!("running {} --print sysroot", rustc.display()))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{} --print sysroot failed",
+        rustc.display()
+    );
+    Ok(std::fs::canonicalize(
+        String::from_utf8(out.stdout)?.trim(),
+    )?)
+}
+
 /// The linker trace bp2ninja's link rule writes beside an artifact.
 fn trace_of(artifact: &Path) -> PathBuf {
     let mut name = artifact.as_os_str().to_owned();
@@ -948,6 +973,11 @@ mod tests {
 
     /// Runs ninja in `out`, then the gate with `src` as the one checkout (key `aosp`) and only MIT allowed, over every device link output.
     fn build_and_check(src: &Path, out: &Path) -> (Report, Inputs) {
+        build_and_check_with(src, out, &[])
+    }
+
+    /// build_and_check with `extra` artifacts (relative to `out`) besides the `rule link` outputs: bp2ninja's rspfile names rustc-linked binaries too.
+    fn build_and_check_with(src: &Path, out: &Path, extra: &[&str]) -> (Report, Inputs) {
         let status = Command::new("ninja")
             .arg("-C")
             .arg(out)
@@ -970,10 +1000,15 @@ mod tests {
                 key: "aosp".into(),
                 prefix: PathBuf::new(),
             }],
-            system: SYSTEM_DIRS.iter().map(PathBuf::from).collect(),
+            system: SYSTEM_DIRS
+                .iter()
+                .map(PathBuf::from)
+                .chain([rust_sysroot(&crate::test_root()).unwrap()])
+                .collect(),
         };
         let out = std::fs::canonicalize(out).unwrap();
-        let artifacts = crate::runpath_gate::link_outputs(&out, &[out.join("device")]).unwrap();
+        let mut artifacts = crate::runpath_gate::link_outputs(&out, &[out.join("device")]).unwrap();
+        artifacts.extend(extra.iter().map(|e| out.join(e)));
         let mut inputs = Inputs::new();
         let report = check(
             &out,
@@ -1050,6 +1085,57 @@ mod tests {
         // main.cpp, root.rs, dep.rs, dep_mod.rs
         assert_eq!(report.checked, 4);
         assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+    }
+
+    /// bp2ninja's rustc-linked device binary (rustc rule verbatim, link via clang++ + lld --why-extract -> $out.trace): `device/app/app` from main.rs (MIT) over the rlib `libdep.rlib` from dep.rs (LicenseRef-Bad).
+    /// The trace names the rlib's member and std's (the pinned sysroot: system); the binary's own depfile record reaches main.rs + dep.rs. Break: dropping the artifact's own record leaves main.rs unchecked.
+    #[test]
+    fn gate_checks_rust_binary() {
+        let tmp =
+            std::env::temp_dir().join(format!("xtask-licence-gate-rsbin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, out) = (tmp.join("src"), tmp.join("out"));
+        for d in [&src, &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let write = |p: &Path, s: &str| std::fs::write(p, s).unwrap();
+        write(
+            &src.join("dep.rs"),
+            "// SPDX-License-Identifier: LicenseRef-Bad\npub fn used() -> i32 { 3 }\n",
+        );
+        write(
+            &src.join("main.rs"),
+            "// SPDX-License-Identifier: MIT\nfn main() { std::process::exit(dep::used()) }\n",
+        );
+        let rustc = crate::native::rustc(&crate::test_root()).unwrap();
+        let rlib = out.join("device/libdep/libdep.rlib");
+        let app = out.join("device/app/app");
+        write(
+            &out.join("build.ninja"),
+            &format!(
+                "rule rustc\n  command = {rustc} $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' \"$$line\" $crates > $out.d && {{ [ ! -e $out.why ] || tail -n +2 $out.why | cut -f2 | sort -u > $out.trace; }}\n  depfile = $out.d\n  deps = gcc\n\
+                 build {d}: rustc {ds}\n  flags = --crate-type=rlib --crate-name=dep --edition=2021\n\
+                 build {a}: rustc {ms} | {d}\n  flags = --crate-type=bin --edition=2021 -C linker=clang++-19 -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--why-extract={a}.why\n  libs = --extern dep={d} -L dependency={dd}\n  crates = {d}\n",
+                rustc = rustc.display(),
+                d = rlib.display(),
+                ds = src.join("dep.rs").display(),
+                dd = rlib.parent().unwrap().display(),
+                a = app.display(),
+                ms = src.join("main.rs").display(),
+            ),
+        );
+        let (report, inputs) = build_and_check_with(&src, &out, &["device/app/app"]);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let denied: Vec<(&str, Vec<&str>)> = report
+            .denied
+            .iter()
+            .map(|(e, f)| (e.as_str(), f.keys().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(denied, [("LicenseRef-Bad", vec!["dep.rs"])]);
+        // main.rs, dep.rs
+        assert_eq!(report.checked, 2);
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+        assert!(inputs.iter().any(|p| p.ends_with("app.trace")));
     }
 
     #[test]
@@ -1228,7 +1314,7 @@ mod tests {
         );
     }
 
-    /// Places::of: SYSTEM_DIRS plus the root of every fetched deps.toml sysroot row, canonical. Break: dropping the sysroot rows leaves only SYSTEM_DIRS.
+    /// Places::of: SYSTEM_DIRS plus the root of every fetched deps.toml sysroot row and the rustc sysroot, canonical. Break: dropping the sysroot rows leaves only SYSTEM_DIRS + rustc's.
     #[test]
     fn places_count_fetched_sysroots_as_system() {
         let root = crate::test_root();
@@ -1239,7 +1325,8 @@ mod tests {
             .iter()
             .filter_map(|r| std::fs::canonicalize(crate::deps::sysroot_dir(&root, r).unwrap()).ok())
             .collect();
-        assert_eq!(places.system.len(), SYSTEM_DIRS.len() + fetched.len());
+        assert_eq!(places.system.len(), SYSTEM_DIRS.len() + fetched.len() + 1);
+        assert_eq!(places.system.last(), Some(&rust_sysroot(&root).unwrap()));
         for dir in &fetched {
             assert!(
                 places.is_system(&dir.join("usr/lib/x.o")),

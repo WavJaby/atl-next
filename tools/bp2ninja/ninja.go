@@ -210,6 +210,8 @@ func shellQuote(list []string) string {
 // header: the rules. Every rule that can run Python (genrule: script tools and shebang scripts; javagen logtags) sets PYTHONDONTWRITEBYTECODE=1:
 // Python otherwise writes __pycache__ beside the scripts, into the shared src/ checkouts, which the drift test then refuses.
 // link writes $out.trace, lld's --trace list of the objects and archive members it loaded: the linked set xtask's licence gate checks (like a depfile, a side file, not a ninja output).
+// rustc's linked outputs write the same $out.trace from lld --why-extract=$out.why (emitRust): rustc swallows the linker's stdout, so --trace is lost; column 2 is each loaded archive member as
+// `archive(member)`, the --trace form. Objects on rustc's command line are its temp codegen units, what the output's own depfile (sources + $crates) covers; the gate counts that record too.
 // link has Soong's `restat` (cc/builder.go ld: an output the linker left untouched stops there); the gate stays exact: lld writes $out anew on every link, and every trace is in the gate edge's depfile, rewritten by `>` on every link.
 // Soong's rsp also holds the lib flags; ours keeps $libs on the command line (archives and -l flags, short). ar, no_addrsig, lex: Soong's commands (cc/builder.go ar, noAddrSig; cc/gen.go lex: M4= pins flex's m4 against an ambient $M4).
 // Every depfile rule is `deps = gcc`, as Soong's are: ninja folds the depfile into .ninja_deps after the step. Without it ninja re-parses the depfile at load and refuses one naming an
@@ -287,7 +289,7 @@ rule genrule
   description = genrule $name
   restat = 1
 rule rustc
-  command = $env $rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' "$$line" $crates > $out.d
+  command = $env $rustc $flags --emit link -o $out --emit dep-info=$out.d.raw $in $libs && line=$$(grep ^$out: $out.d.raw) && printf '%s ' "$$line" $crates > $out.d && { [ ! -e $out.why ] || tail -n +2 $out.why | cut -f2 | sort -u > $out.trace; }
   depfile = $out.d
   deps = gcc
   description = rustc $in
@@ -444,9 +446,7 @@ func (g *Graph) emit(tools Tools) string {
 			if nt.CXX != tools.CXX {
 				fmt.Fprintf(&b, "  cxx = %s\n", esc(nt.CXX))
 			}
-			if strings.HasPrefix(linkOut, filepath.Join(g.out, "device")+"/") {
-				g.deviceLinks = append(g.deviceLinks, linkOut)
-			}
+			g.addDeviceLink(linkOut)
 			if len(begin)+len(end) > 0 {
 				fmt.Fprintf(&b, "  crtbegin = %s\n  crtend = %s\n", join(begin), join(end))
 			}

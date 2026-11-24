@@ -15,6 +15,13 @@ import (
 // licenceReport: the gate edge's output, in the out dir.
 const licenceReport = "licence-gate.json"
 
+// addDeviceLink: a linked output (cc link or rustc binary, each writing $out.trace) joins the gate's artifacts if it is a device one.
+func (g *Graph) addDeviceLink(out string) {
+	if strings.HasPrefix(out, filepath.Join(g.out, "device")+"/") {
+		g.deviceLinks = append(g.deviceLinks, out)
+	}
+}
+
 // licenceNinja: the gate rule and edge over g.deviceLinks (call after emit), a default target; "" without a command.
 func (g *Graph) licenceNinja(command string) string {
 	if command == "" {

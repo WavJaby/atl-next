@@ -173,6 +173,26 @@ rust_binary { name: "app", srcs: ["main.rs"], rustlibs: ["libtop"] }
 	}
 }
 
+// A device rust_binary is a shipped artifact like a cc link: an input of the licence gate edge, linked with --why-extract (the rustc rule's $out.trace); its rlibs are not artifacts.
+func TestRustBinaryInLicenceGate(t *testing.T) {
+	g := graphFor(t, map[string]string{"p/Android.bp": `
+rust_library { name: "libtop", crate_name: "top", srcs: ["top.rs"] }
+rust_binary { name: "app", srcs: ["main.rs"], rustlibs: ["libtop"] }
+`})
+	if g.node("app", Device, Binary, "goal") == nil || len(g.problems) > 0 {
+		t.Fatal(g.problems)
+	}
+	ninja := g.emit(Tools{CC: "cc", CXX: "c++", AR: "ar", Rustc: "rustc", RustVersion: "1.2.3"})
+	app := filepath.Join(g.out, "device/app/app")
+	if f := shWords(t, ninjaEdgeVars(ninja, app)["flags"]); !containsSeq(f, []string{"-C", "link-arg=-Wl,--why-extract=" + app + ".why"}) {
+		t.Errorf("app flags %q lack --why-extract", f)
+	}
+	gate := ninjaEdgeVars(g.licenceNinja("gate"), filepath.Join(g.out, licenceReport))
+	if gate == nil || !strings.Contains(gate[""], " "+app) || strings.Contains(gate[""], ".rlib") {
+		t.Errorf("licence gate edge %v: want app, no rlib", gate)
+	}
+}
+
 // rust/builder.go: generated srcs are copied into the module's OUT_DIR, which the crate reads through env!("OUT_DIR"); without any, OUT_DIR=out. The plain source stays the crate root.
 func TestRustGeneratedSources(t *testing.T) {
 	g := graphFor(t, map[string]string{"p/Android.bp": `

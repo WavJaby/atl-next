@@ -608,6 +608,9 @@ func (g *Graph) emitRust(b *strings.Builder, n *Node, tools Tools) {
 		link, linkInputs := g.rustLinkArgs(n, g.cfg.ccTools(n.side, tools).CXX)
 		flags = append(flags, link...)
 		implicit = append(implicit, linkInputs...)
+		// the loaded archive members, the rustc rule's $out.trace (ninja.go header); a device output joins the licence gate's artifacts as a cc link's does
+		flags = append(flags, "-C", "link-arg=-Wl,--why-extract="+n.out+".why")
+		g.addDeviceLink(n.out)
 	}
 	var waits []string
 	genClosure(n, map[*Node]bool{}, &waits)
