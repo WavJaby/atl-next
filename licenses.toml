@@ -514,7 +514,7 @@ reason = "Android's additions (README.android names src/android/android.c; the d
 
 [upstream.aosp.paths."external/selinux/libselinux/rust/selinux.h"]
 licence = "LicenseRef-Public-Domain"
-reason = "no notice; the input of libselinux's rust_bindgen (Android.bp libselinux_bindgen, wrapper_src). libselinux/LICENSE: \"This library (libselinux) is public domain software, i.e. not copyrighted\"; not an Android change: README.android (selinux root) lists Android's changes outside the build files as libselinux/include/selinux/android.h and libselinux/src/android/android.c only. The package's Soong kinds (Apache-2.0, GPL-2.0, legacy_unencumbered) give no default, as for include/ and src/"
+reason = "no notice; the input of libselinux's rust_bindgen (Android.bp libselinux_bindgen, wrapper_src). libselinux/LICENSE: \"This library (libselinux) is public domain software, i.e. not copyrighted\"; not an Android change: README.android (selinux root) lists Android's changes as its build files, the MODULE_LICENSE_* files, libselinux/include/selinux/android.h and libselinux/src/android/android.c; rust/selinux.h is not among them. The package's Soong kinds (Apache-2.0, GPL-2.0, legacy_unencumbered) give no default, as for include/ and src/"
 
 [upstream.aosp.paths."external/speex/include/speex/speexdsp_config_types.h"]
 licence = "BSD-3-Clause"
