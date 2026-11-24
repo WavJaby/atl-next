@@ -60,6 +60,44 @@ fn tail(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// The fixture manifest with every `<provider>` element removed (line-based: the fixture writes one element per line, a nested one closes on its own `</provider>` line).
+fn without_providers(manifest: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if inside {
+            inside = t != "</provider>";
+            continue;
+        }
+        if t.starts_with("<provider") {
+            inside = !t.ends_with("/>");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    ensure!(
+        !inside && !out.contains("<provider") && out.contains("<application"),
+        "provider: break-provider-list: manifest not in the one-element-per-line shape"
+    );
+    Ok(out)
+}
+
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = Layout::of(root)?;
     let rt = Runtime::new(
@@ -72,15 +110,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.verbose,
     )?;
     let work = rt.out.join("provider");
-    let apk = rt
-        .apk
-        .build(&root.join(FIXTURE), &work.join("app"), &[], None, None)?;
+    // the services read providers from the installed APK (atl-installer's PackageInfo), so the break must reach the APK's manifest
+    let fixture = if args.break_provider_list {
+        let to = work.join("fixture-no-providers");
+        if to.exists() {
+            std::fs::remove_dir_all(&to)?;
+        }
+        copy_tree(&root.join(FIXTURE), &to)?;
+        let path = to.join("AndroidManifest.xml");
+        std::fs::write(&path, without_providers(&std::fs::read_to_string(&path)?)?)?;
+        to
+    } else {
+        root.join(FIXTURE)
+    };
+    let apk = rt.apk.build(&fixture, &work.join("app"), &[], None, None)?;
     let read = if args.break_meta_ref {
         manifest::read_unresolved
     } else {
         manifest::read
     };
-    let mut m = read(&rt.apk.aapt2, &apk)?;
+    let m = read(&rt.apk.aapt2, &apk)?;
     // the fixture's res/values/strings.xml `meta_ref`, through aapt2's real dump
     let wanted = (
         "com.example.atlprovider.REF".to_owned(),
@@ -96,9 +145,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         apk.display(),
         m.providers.len()
     );
-    if args.break_provider_list {
-        m.providers.clear();
-    }
+    // the break's own gate: an APK that still declares providers would leave the control green
+    ensure!(
+        !args.break_provider_list || m.providers.is_empty(),
+        "provider: break-provider-list: the built APK still declares {} providers",
+        m.providers.len()
+    );
     let package = m.name.clone();
     let run = Run {
         root: work.join("root"),
@@ -180,4 +232,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     println!("{}", crate::verdict::gate("provider", &whys));
     Ok(ExitCode::FAILURE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_break_strips_every_provider_of_the_fixture_and_keeps_the_rest() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/provider/AndroidManifest.xml");
+        let original = std::fs::read_to_string(path).unwrap();
+        // the fixture declares four providers (High, Low, Off, Elsewhere); Low's nested meta-data goes with it
+        assert_eq!(original.matches("<provider").count(), 4);
+        let broken = without_providers(&original).unwrap();
+        assert!(!broken.contains("<provider") && !broken.contains("</provider>"));
+        assert!(!broken.contains("com.example.atlprovider.KEY"));
+        assert!(broken.contains("com.example.atlprovider.REF") && broken.contains("<activity"));
+    }
 }
