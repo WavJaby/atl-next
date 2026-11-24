@@ -92,3 +92,30 @@ aconfig_declarations { name: "decl", package: "com.x.flags", container: "system"
 		t.Errorf("unsigned apk %v", su)
 	}
 }
+
+// DEVICE_PACKAGE_OVERLAYS (android_resources.go overlayResourceGlob, aar.go buildActions): <overlay>/<module resource dir>'s files are compiled as the module's and linked with -R after it,
+// the later, lower-priority directory first; a file below another module's directory is not this module's.
+func TestResourceOverlays(t *testing.T) {
+	g := javaTestGraph(t, appFixture(map[string]string{
+		"app/Android.bp":          `android_app { name: "framework-res", use_resource_processor: false, sdk_version: "core_platform" }`,
+		"app/AndroidManifest.xml": "", "app/res/values/config.xml": "", "o1/app/res/values/config.xml": "", "o2/app/res/values/config.xml": "", "o1/other/res/values/config.xml": "",
+		"frameworks/base/core/res/Android.bp": "", // this test defines framework-res itself
+	}), map[string]string{"RELEASE_PLATFORM_VERSION": "16"})
+	g.java.tools.ResourceOverlays = []string{"o1", "o2"}
+	if n := g.jnode("framework-res", Device, "test"); n == nil {
+		t.Fatalf("problems %v", g.problems)
+	}
+	d := filepath.Join(g.out, "device", "framework-res")
+	flat := func(dir string) string {
+		return filepath.Join(d, "aapt2", dir, "app", "res", "values_config.arsc.flat")
+	}
+	if got := g.genFiles[filepath.Join(d, "aapt2", "res.list")]; got != flat("") {
+		t.Errorf("res.list %q", got)
+	}
+	if got, want := g.genFiles[filepath.Join(d, "aapt2", "overlay.list")], flat("o2")+" "+flat("o1"); got != want {
+		t.Errorf("overlay.list %q, want %q", got, want)
+	}
+	if cz := ninjaEdgeVars(g.java.b.String(), flat("o1")); cz == nil || !strings.Contains(cz[""], g.abs("o1/app/res/values/config.xml")) {
+		t.Errorf("overlay compile %v", cz)
+	}
+}

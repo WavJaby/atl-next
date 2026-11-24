@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Device configuration over frameworks/base/core/res. A desktop has no cellular modem, so the device is a Wi-Fi-only tablet: all three false -> TelephonyManager.getActiveModemCount 0. -->
+<resources>
+    <bool name="config_voice_capable">false</bool>
+    <bool name="config_sms_capable">false</bool>
+    <bool name="config_mobile_data_capable">false</bool>
+</resources>

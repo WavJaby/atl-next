@@ -140,6 +140,8 @@ const SEPOLICY_AV: &str = "atl-sepolicy-av";
 /// The repo's policy dir (`java/sepolicy`) as the tree shows it through the repo bind (AOSP's `vendor/<name>/sepolicy` place), compiled with the platform policy as a SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS entry;
 /// tree-relative, as product config names one, so the outputs do not depend on the checkout's path.
 const SEPOLICY_DIR: &str = "vendor/atl/sepolicy";
+/// The device's resource overlay (`java/overlay`, laid out as the tree), a DEVICE_PACKAGE_OVERLAYS entry as AOSP products name theirs; tree-relative for [`SEPOLICY_DIR`]'s reason.
+const RESOURCE_OVERLAY_DIR: &str = "vendor/atl/overlay";
 
 /// Goal [`SEPOLICY_GOAL`]'s converter flags: the deps.toml rows m4, checkpolicy and secilc, the table tool (built here for the build machine into `<out>/cargo`, before the conversion names it) and
 /// [`SEPOLICY_DIR`]. Empty without the goal.
@@ -456,6 +458,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             path(&build_tools),
             "-keys".into(),
             path(&keys),
+            "-device-resource-overlays".into(),
+            RESOURCE_OVERLAY_DIR.into(),
             "-out".into(),
             path(&graph_out),
         ];

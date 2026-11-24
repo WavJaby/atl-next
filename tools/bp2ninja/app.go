@@ -22,7 +22,8 @@ import (
 //   - An app's classes are dexed by javaDex (d8; the framework-res apk has none); the apk is merge_zips of the dex jar, the resource package and
 //     the JNI zip, signed by signapk with the key of its `certificate` role (signApk) and copied to its install path (installDir) below
 //     <out>/partitions.
-//   - Not modelled: product characteristics / RRO / overlays, the asset-dir hash comment, uses-library class loader contexts beyond uses_libs
+//   - Resource overlays: DEVICE_PACKAGE_OVERLAYS directories (JavaTools.ResourceOverlays) are compiled after the module's own resources (overlayResourceGlob).
+//   - Not modelled: product characteristics / RRO, the asset-dir hash comment, uses-library class loader contexts beyond uses_libs
 //     and optional_uses_libs, extra_packages, proguard, resource shrinking, split packages, the tradefed test config, test data installs.
 //     `instrumentation_for` and the properties listed in appUnsupported are reported as problems.
 
@@ -401,9 +402,7 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 	}
 	aapt2 := g.jhost("aapt2", n.name)
 	aapt2Deps := []string{aapt2}
-	var compiled [][]string
-	for _, rd := range resDirs {
-		dir := filepath.Join(n.mod.Dir, rd)
+	compileDir := func(dir string) []string {
 		files := g.resourceGlob(dir)
 		var outs []string
 		for i, shard := range shards(files, aapt2ShardSize) {
@@ -418,7 +417,16 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 			})
 		}
 		slices.Sort(outs)
-		compiled = append(compiled, outs)
+		return outs
+	}
+	var compiled, overlays [][]string
+	for _, rd := range resDirs {
+		dir := filepath.Join(n.mod.Dir, rd)
+		compiled = append(compiled, compileDir(dir))
+		// the later, lower-priority overlay directories first on the link line; a directory with no resources adds nothing
+		for _, o := range slices.Backward(j.tools.ResourceOverlays) {
+			overlays = append(overlays, compileDir(filepath.Join(o, dir)))
+		}
 	}
 	for i, z := range p.strs("resource_zips") {
 		files, ok := g.resolveSrc(n.mod.Dir, n.side, z, n.name)
@@ -461,6 +469,9 @@ func (g *Graph) aaptBuild(n *jNode, o aaptOpts) *aaptOut {
 		for _, c := range compiled[1:] {
 			compiledOverlay = append(compiledOverlay, c...)
 		}
+	}
+	for _, c := range overlays {
+		compiledOverlay = append(compiledOverlay, c...)
 	}
 
 	// R.srcjar without busybox: the srcjar's `android` subdir keeps the package filter (PathForModuleGen)

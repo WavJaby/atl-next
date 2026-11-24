@@ -33,6 +33,8 @@ type JavaTools struct {
 	JDK, BuildTools string
 	// Keys: the key set apps are signed with, Soong's DefaultAppCertificateDir layout (<role>.x509.pem + <role>.pk8 per certificate role)
 	Keys string
+	// ResourceOverlays: Soong's DeviceResourceOverlays (DEVICE_PACKAGE_OVERLAYS), tree-relative directories, highest priority first
+	ResourceOverlays []string
 }
 
 type jKey struct {

@@ -230,11 +230,12 @@ const MEDIAPLAYER_START: &str = "MediaPlayerNative: start called in state 1";
 /// are empty and getSessionInfo:1324 null. A service without getPackageInstaller answers null, and PackageInstaller's first call throws NullPointerException.
 /// audiodevices: Main.audioDevices: the app's AudioPolicyService (atl-audioflinger policy.rs) lists one device port, the speaker (AudioPolicyManager::listAudioPorts:5275; AudioDeviceInfo.TYPE_BUILTIN_SPEAKER 2,
 /// a sink), no input; A2DP is not connected (getDeviceConnectionState:523 UNAVAILABLE). Without listAudioPorts, AudioManager.updateAudioPortCache fails and getDevices answers no device: `outputs=[]`.
-/// telephony.registry: Main.telephony with no phone process (no `phone` / `isub` service) on a device whose vendor API level is unset (< 2024Q2), so TelephonyManager.hasCapability reads framework-res's
-/// legacy config_voice/sms/mobile_data_capable (all true: one modem, getActiveModemCount): getSimState SIM_STATE_UNKNOWN (0; no isub -> slot -1, slot 0 asks a null ITelephony,
-/// getSimStateForSlotIndex:19217); getPhoneType PHONE_TYPE_NONE (0; no ITelephony and no ro.telephony.default_network, getPhoneTypeFromNetworkType:2841); getNetworkOperator "" (operator_numeric
-/// unset); getDataState DATA_DISCONNECTED (0; null ITelephony). registerTelephonyCallback reaches the registry, which delivers nothing (validatePhoneId: the service sees no modem) -> calls=0.
-/// Without the registry the register NPEs. A Wi-Fi tablet's SIM_STATE_ABSENT needs the device declared modem-less (zero modems) first: not modelled.
+/// telephony.registry: Main.telephony on a Wi-Fi-only device: no android.hardware.telephony* feature declared, and framework-res's legacy config_voice/sms/mobile_data_capable all false (java/overlay), which
+/// TelephonyManager.hasCapability reads while the vendor API level is unset (< 2024Q2). So isVoiceCapable, isDeviceVoiceCapable, isSmsCapable false; getActiveModemCount 0 (multi-SIM config UNKNOWN, none
+/// capable), getPhoneCount and getSupportedModemCount the same; getSimState SIM_STATE_UNKNOWN (0), not ABSENT, as on an AOSP Wi-Fi tablet: PhoneGlobals.onCreate returns without FEATURE_TELEPHONY
+/// (config_force_phone_globals_creation false), so no ITelephony and no ISub is published: slot -1 = SIM_NOT_INSERTED -> DEFAULT_SIM_SLOT_INDEX (getSlotIndex), not the all-slots loop -> getSimStateForSlotIndex with a null ITelephony;
+/// getPhoneType PHONE_TYPE_NONE (0: neither voice nor data capable); getNetworkOperator "" (operator_numeric unset); getDataState DATA_DISCONNECTED (0; null ITelephony).
+/// registerTelephonyCallback reaches the registry, which delivers nothing (validatePhoneId: the service sees no modem) -> calls=0; without the registry the register NPEs.
 /// batterystats: [`battery_want`] (the sticky ACTION_BATTERY_CHANGED read with a null receiver, isCharging, getIntProperty(CAPACITY)).
 /// netstats: Main.netstats: TrafficStats for the app's uid and the device total read null stats (NetworkStatsService's native-null answer, netstats.rs) -> UNSUPPORTED -1 (TrafficStats.java:1343-1345).
 /// account: Main.accounts on a device with no accounts: getAccountsByType / getAccounts -> AccountManagerService.getAccountsAsUser (:4584) empty; getAuthenticatorTypes (:1685) empty (no
@@ -338,7 +339,9 @@ const SERVICE_LINES: [(&str, &str, Option<&str>); 22] = [
     (
         "telephony.registry",
         "AtlTest: telephony: ",
-        Some("sim=0 phone=0 operator=[] data=0 callback=registered calls=0"),
+        Some(
+            "sim=0 voice=false deviceVoice=false sms=false modems=0/0/0 features=[] phone=0 operator=[] data=0 callback=registered calls=0",
+        ),
     ),
     (
         "appops",

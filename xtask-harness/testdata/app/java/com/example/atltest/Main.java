@@ -1797,7 +1797,7 @@ public class Main extends Activity {
     }
 
     /**
-     * TelephonyManager on a device with no modem: SIM state, phone type, network operator, data state, then registerTelephonyCallback of a ServiceStateListener (through `telephony.registry`) and its
+     * TelephonyManager on a device with no modem: SIM state, voice and SMS capability, modem counts (active/phones/supported), the declared android.hardware.telephony* features, phone type, network operator, data state, then registerTelephonyCallback of a ServiceStateListener (through `telephony.registry`) and its
      * unregister; "absent" when getSystemService returns null; else what it threw (no registry: NullPointerException).
      */
     private String telephony() {
@@ -1809,7 +1809,14 @@ public class Main extends Activity {
             NoModemCallback cb = new NoModemCallback();
             tm.registerTelephonyCallback(getMainExecutor(), cb);
             tm.unregisterTelephonyCallback(cb);
-            return "sim=" + tm.getSimState() + " phone=" + tm.getPhoneType() + " operator=[" + tm.getNetworkOperator() + "] data=" + tm.getDataState()
+            java.util.TreeSet<String> features = new java.util.TreeSet<>();
+            for (android.content.pm.FeatureInfo f : getPackageManager().getSystemAvailableFeatures()) {
+                if (f.name != null && f.name.startsWith(android.content.pm.PackageManager.FEATURE_TELEPHONY)) {
+                    features.add(f.name);
+                }
+            }
+            return "sim=" + tm.getSimState() + " voice=" + tm.isVoiceCapable() + " deviceVoice=" + tm.isDeviceVoiceCapable() + " sms=" + tm.isSmsCapable()
+                    + " modems=" + tm.getActiveModemCount() + "/" + tm.getPhoneCount() + "/" + tm.getSupportedModemCount() + " features=" + features + " phone=" + tm.getPhoneType() + " operator=[" + tm.getNetworkOperator() + "] data=" + tm.getDataState()
                     + " callback=registered calls=" + cb.calls;
         } catch (Throwable t) {
             return "threw " + t;
