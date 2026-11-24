@@ -72,8 +72,8 @@ enum Command {
     Keys(keys::Args),
     /// Gate waits' `need` from the machine's need ledger (`<workspace>/out/pool/gate-need.tsv`, gate_need.rs): per row and wait, over its newest quiet passes (one per check run): samples, passes, the largest sample, the need the harness derives (that sample once 20 passes hold it) or `unset`, and the largest took / bound.
     ///
-    /// Read-only. `--seed <harvest.tsv>` imports a harvest once (refused when the ledger exists).
-    GateNeed(gate_need::Args),
+    /// Read-only.
+    GateNeed,
     /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
@@ -216,7 +216,7 @@ pub fn main() -> Result<ExitCode> {
         Command::Keepset(args) => keepset::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::Keys(args) => keys::run(&root, &args),
-        Command::GateNeed(args) => gate_need::run(&root, &args),
+        Command::GateNeed => gate_need::run(&root),
         Command::Qemu(args) => qemu::run(&root, &args),
         Command::Out { out } => out::run(&root, &out),
         Command::Patch(args) => patch::run(&root, &args),

@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::build_pool;
 use crate::flock::{Flock, Mode};
@@ -28,9 +28,6 @@ pub const WINDOW: usize = MIN_PASSES;
 pub const LEDGER: &str = "gate-need.tsv";
 /// The lock file, beside the pool's slot and dir locks (`build_pool::dir`).
 pub const LOCK: &str = "gate-need.lock";
-/// The name 14 `wait_limited` call sites shared until each named its own (binder.rs): a harvest cannot tell their samples apart, so the seed leaves them out.
-const SHARED_EXIT: &str = "exit-limited";
-const HARVEST_HEADER: &str = "file\tshare_pct\twait\ttook_ms\tbound_ms\tneed";
 
 /// A `wait:` line of a log (wait.rs `record`): `wait: <name> took=<ms> bound=<ms> need=<ms|unset>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +137,8 @@ pub fn append(ws: &Path, samples: &[Sample]) -> Result<()> {
     }
     let _held = lock(ws, Mode::Exclusive)?;
     let mut all = load(ws)?.samples;
+    // retired harvest seed lines (run `seed:*`, row `-`): no row reads them, the first rewrite drops them
+    all.retain(|s| s.row != "-" && !s.run.starts_with("seed:"));
     all.extend_from_slice(samples);
     replace(ws, &windowed(&all))
 }
@@ -282,81 +281,9 @@ pub fn derived(ws: &Path, row: &str) -> Result<BTreeMap<String, u64>> {
     Ok(needs(&read(ws)?.samples, row))
 }
 
-/// What a harvest import wrote, and what it left out.
-#[derive(Debug, Default, PartialEq)]
-pub struct Seeded {
-    pub imported: usize,
-    /// [`SHARED_EXIT`] samples: no call site to name them by
-    pub unattributed: usize,
-    /// took >= bound: not samples
-    pub not_samples: usize,
-}
-
-/// Imports a harvest TSV (header `file share_pct wait took_ms bound_ms need`) as the ledger's first passes, once: refused when the ledger exists.
-/// Each harvest file is one pass (run `seed:<file>`, row `-`: the harvest has no row, so no row's need reads it); its share is the stall. The harvest's own dedupe already ran.
-pub fn import_harvest(ws: &Path, tsv: &str) -> Result<Seeded> {
-    let _held = lock(ws, Mode::Exclusive)?;
-    let path = ledger_path(ws);
-    if path.exists() {
-        bail!(
-            "refused: {} exists; the harvest seeds the ledger once",
-            path.display()
-        );
-    }
-    let mut lines = tsv.lines();
-    if lines.next() != Some(HARVEST_HEADER) {
-        bail!("harvest header is not `{HARVEST_HEADER}`");
-    }
-    let mut seeded = Seeded::default();
-    let mut samples = Vec::new();
-    for line in lines {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let &[file, share, wait, took, bound, _need] = cols.as_slice() else {
-            bail!("harvest line is not 6 columns: {line}");
-        };
-        if wait == SHARED_EXIT {
-            seeded.unattributed += 1;
-            continue;
-        }
-        let (took_ms, bound_ms): (u64, u64) = (took.parse()?, bound.parse()?);
-        if took_ms >= bound_ms {
-            seeded.not_samples += 1;
-            continue;
-        }
-        samples.push(Sample {
-            run: format!("seed:{file}"),
-            commit: "seed".to_owned(),
-            row: "-".to_owned(),
-            wait: wait.to_owned(),
-            took_ms,
-            bound_ms,
-            stall: Some(share.parse()?),
-        });
-    }
-    let kept = windowed(&samples);
-    seeded.imported = kept.len();
-    replace(ws, &kept)?;
-    Ok(seeded)
-}
-
-#[derive(clap::Args)]
-pub struct Args {
-    /// Imports this harvest TSV as the ledger's first passes (once: refused when the ledger exists).
-    #[arg(long, value_name = "TSV")]
-    seed: Option<PathBuf>,
-}
-
-/// `cargo xtask gate-need`: each (row, wait)'s window: its samples, quiet passes, largest sample, need (or unset) and largest took / bound. Read-only unless `--seed`.
-pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+/// `cargo xtask gate-need`: each (row, wait)'s window: its samples, quiet passes, largest sample, need (or unset) and largest took / bound. Read-only.
+pub fn run(root: &Path) -> Result<ExitCode> {
     let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
-    if let Some(tsv) = &args.seed {
-        let text = fs::read_to_string(tsv).with_context(|| tsv.display().to_string())?;
-        let seeded = import_harvest(&ws, &text)?;
-        println!(
-            "gate-need: seeded {} samples; left out {} {SHARED_EXIT} (no call site) and {} timeouts",
-            seeded.imported, seeded.unattributed, seeded.not_samples
-        );
-    }
     let ledger = read(&ws)?;
     println!(
         "gate-need: {} samples, {} in the windows (newest {WINDOW} passes, stall <= {QUIET_STALL_PCT} %), {} malformed lines; {}",
@@ -616,30 +543,25 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
+    /// A retired seed line (run `seed:*`, row `-`) stays until the next append, which drops it; the real rows stay.
     #[test]
-    fn the_harvest_seeds_the_ledger_once_and_leaves_out_the_shared_name() {
-        let ws = scratch("seed");
-        let tsv = format!(
-            "{HARVEST_HEADER}\n\
-             out/a.log\t0.04\tconfigure-ack\t8755\t60000\tunset\n\
-             out/a.log\t0.04\texit-limited\t2116\t5000\tunset\n\
-             out/b.log\t0.00\tline\t5000\t5000\tunset\n\
-             out/b.log\t0.00\tline\t50\t5000\tunset\n"
-        );
-        let seeded = import_harvest(&ws, &tsv).expect("seed");
-        assert_eq!(
-            seeded,
-            Seeded {
-                imported: 2,
-                unattributed: 1,
-                not_samples: 1
-            }
-        );
-        assert!(import_harvest(&ws, &tsv).is_err(), "the seed runs once");
-        let ledger = read(&ws).expect("read");
-        assert_eq!(ledger.samples.len(), 2);
-        assert_eq!(ledger.samples[0].run, "seed:out/a.log");
-        assert_eq!(ledger.samples[0].stall, Some(0.04));
+    fn a_seed_line_is_gone_after_the_next_append() {
+        let ws = scratch("seed-gone");
+        fs::create_dir_all(ledger_path(&ws).parent().expect("pool dir")).expect("pool dir");
+        fs::write(
+            ledger_path(&ws),
+            "seed:out/a.log\tseed\t-\tconfigure-ack\t8755\t60000\t0.04\n",
+        )
+        .expect("seed line");
+        assert_eq!(read(&ws).expect("read").samples.len(), 1);
+        append(&ws, &[sample("r1", "app", "marker", 100, Some(0.1))]).expect("append");
+        let kept: Vec<(String, String)> = read(&ws)
+            .expect("read")
+            .samples
+            .into_iter()
+            .map(|s| (s.run, s.row))
+            .collect();
+        assert_eq!(kept, vec![("r1".to_owned(), "app".to_owned())]);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }
