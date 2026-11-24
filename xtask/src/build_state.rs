@@ -2,8 +2,10 @@
 //! The source state a native out dir was built from, so a runtime gate refuses artifacts from another tree (a rebase without `xtask native` once cost a whole round).
 //!
 //! The state is the checkout's tracked files as they are on disk, hashed through a scratch index: `git add -u` into a copy of the index, `git write-tree`.
-//! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash. `native` deletes the record when it starts and writes it once ninja and the converter
-//! packages succeeded (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
+//! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash.
+//! `native` deletes the record when it starts and writes it after its gates (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
+//! A record of goals means: this graph was built from this state and every native gate passed. A red run leaves [`RED`] and the failed gates' names instead, which no reader takes as built: `check` does not run native's gates and land skips a current build dir, so the record is their only sight of a red one.
+//! Each graph (the host's, each foreign guest's `nb-graph-<arch>`) holds its own verdict; a dir is current when its record and those of the foreign graphs in it are ([`ensure_current`]).
 //! The record also lists the goals built from that state (line 1 state, then one goal per line, nb goals as `nb:<arch>:<module>`): a run from the same state adds its goals to the
 //! previous record's, a run from another state starts over, since the older goals' outputs are stale. A gate refuses a build dir lacking its goals (gate_goals.rs).
 
@@ -13,8 +15,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::verdict::Failure;
+
 /// The record, in the out dir.
 const RECORD: &str = "built-from";
+/// First word of a red run's record: `red <state>`, then one failed gate per line. A reader that does not know it sees another state, so it refuses too.
+const RED: &str = "red ";
 /// Top-level entries native's artifacts do not come from: `xtask/` and `xtask-harness/` are the gate side (gate code and the fixtures each gate builds itself), so editing a gate needs no native run.
 /// `test-apks.toml` feeds only `run-apk`, `fetch --test-apks` and the `tables` check: a row or pin change needs no native run.
 /// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the build dir only through a native run anyway.
@@ -88,22 +94,44 @@ pub fn of_checkout(root: &Path) -> Result<String> {
     )
 }
 
-/// A parsed record: the state, and the goals built from it.
+/// A parsed record: the state, and what the run from it came to.
 struct Record {
     state: String,
-    goals: BTreeSet<String>,
+    run: Run,
+}
+
+enum Run {
+    /// Every native gate passed: the goals built.
+    Passed(BTreeSet<String>),
+    /// The gates (ninja included) that failed.
+    Red(Vec<String>),
+}
+
+impl Record {
+    /// The goals known built and gated: none of a red run.
+    fn goals(self) -> BTreeSet<String> {
+        match self.run {
+            Run::Passed(goals) => goals,
+            Run::Red(_) => BTreeSet::new(),
+        }
+    }
 }
 
 fn read(out: &Path) -> Option<Record> {
     let text = std::fs::read_to_string(out.join(RECORD)).ok()?;
     let mut lines = text.lines();
+    let first = lines.next()?.trim();
+    let rest = lines
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned);
+    let (state, run) = match first.strip_prefix(RED) {
+        Some(state) => (state, Run::Red(rest.collect())),
+        None => (first, Run::Passed(rest.collect())),
+    };
     Some(Record {
-        state: lines.next()?.trim().to_owned(),
-        goals: lines
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect(),
+        state: state.to_owned(),
+        run,
     })
 }
 
@@ -111,7 +139,7 @@ fn read(out: &Path) -> Option<Record> {
 pub fn forget(out: &Path, state: &str) -> Result<BTreeSet<String>> {
     let kept = read(out)
         .filter(|r| r.state == state)
-        .map(|r| r.goals)
+        .map(Record::goals)
         .unwrap_or_default();
     match std::fs::remove_file(out.join(RECORD)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -121,11 +149,19 @@ pub fn forget(out: &Path, state: &str) -> Result<BTreeSet<String>> {
     }
 }
 
-/// `native` built `goals` from `state`.
-pub fn record(out: &Path, state: &str, goals: &BTreeSet<String>) -> Result<()> {
-    let mut text = format!("{state}\n");
-    for g in goals {
-        text.push_str(&format!("{g}\n"));
+/// `native` ran from `state`, every gate done: none failed -> `goals` are built, else the run is red and records the failed gates, no goal.
+pub fn record(out: &Path, state: &str, goals: &BTreeSet<String>, failed: &[Failure]) -> Result<()> {
+    let (mut text, lines): (String, Vec<&str>) = if failed.is_empty() {
+        (
+            format!("{state}\n"),
+            goals.iter().map(String::as_str).collect(),
+        )
+    } else {
+        let gates = failed.iter().map(|f| f.step.as_deref().unwrap_or("native"));
+        (format!("{RED}{state}\n"), gates.collect())
+    };
+    for l in lines {
+        text.push_str(&format!("{l}\n"));
     }
     std::fs::write(out.join(RECORD), text).context("writing the build record")
 }
@@ -135,10 +171,10 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) ->
     let out = crate::native::host_out(root, explicit, host)?;
     ensure_current(root, &out).with_context(|| {
         format!(
-            "gate `{gate}`: the build dir is stale: run `cargo xtask native --host {host} --for {gate}`"
+            "gate `{gate}`: the build dir is not current: run `cargo xtask native --host {host} --for {gate}`"
         )
     })?;
-    let built = read(&out).map(|r| r.goals).unwrap_or_default();
+    let built = read(&out).map(Record::goals).unwrap_or_default();
     crate::gate_goals::ensure_built(root, gate, host, &built)?;
     Ok(out)
 }
@@ -159,7 +195,7 @@ pub fn foreign_out(root: &Path, out: &Path, host: &str, isa: &str, gate: &str) -
     ensure_current(root, &dir).with_context(|| {
         format!("gate `{gate}`: the {isa} native-bridge graph is not current: run `{fix}`")
     })?;
-    let built = read(&dir).map(|r| r.goals).unwrap_or_default();
+    let built = read(&dir).map(Record::goals).unwrap_or_default();
     let missing: Vec<String> = foreign_goals(root, gate, isa)?
         .into_iter()
         .filter(|g| !built.contains(g))
@@ -186,24 +222,39 @@ fn with_overlays(root: &Path, overlays: &[crate::tree::Overlay]) -> Result<Strin
     Ok(s)
 }
 
-/// A gate's guard: `out` was built from the checkout at `root` as it is now.
+/// A gate's guard: `out`, with the foreign graphs in it, was built from the checkout at `root` as it is now and every native gate passed.
 pub fn ensure_current(root: &Path, out: &Path) -> Result<()> {
-    ensure_matches(&of_build(root)?, out)
+    let now = of_build(root)?;
+    ensure_matches(&now, out)?;
+    ensure_graphs(&now, &crate::native::guest_graphs(root, out)?)
+}
+
+fn ensure_graphs(now: &str, graphs: &[(String, PathBuf)]) -> Result<()> {
+    for (arch, dir) in graphs {
+        ensure_matches(now, dir).with_context(|| format!("the {arch} native-bridge graph"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_matches(now: &str, out: &Path) -> Result<()> {
-    let recorded = match read(out) {
-        Some(r) => r.state,
-        None => bail!(
+    let Some(Record { state, run }) = read(out) else {
+        bail!(
             "{} holds no record of the tree it was built from (a native run never finished there): run `cargo xtask native`",
             out.display()
-        ),
+        )
     };
     ensure!(
-        recorded == now,
-        "{} was built from another source state ({recorded}, the checkout is {now}): run `cargo xtask native`",
+        state == now,
+        "{} was built from another source state ({state}, the checkout is {now}): run `cargo xtask native`",
         out.display()
     );
+    if let Run::Red(gates) = run {
+        bail!(
+            "{}: the last native run from this source state FAILED: {}: fix it, then run `cargo xtask native`",
+            out.display(),
+            gates.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -297,13 +348,13 @@ mod tests {
         let state = of_checkout(&d).unwrap();
         assert!(forget(&out, &state).unwrap().is_empty());
         let goals: BTreeSet<String> = ["a".to_owned()].into();
-        record(&out, &state, &goals).unwrap();
+        record(&out, &state, &goals, &[]).unwrap();
         ensure_current(&d, &out).expect("built from this state");
         // a run from the same state keeps the earlier goals; from another, starts over
         assert_eq!(forget(&out, &state).unwrap(), goals);
-        record(&out, &state, &goals).unwrap();
+        record(&out, &state, &goals, &[]).unwrap();
         assert!(forget(&out, "other").unwrap().is_empty());
-        record(&out, &state, &goals).unwrap();
+        record(&out, &state, &goals, &[]).unwrap();
         // the same checkout with a task copy bound: another build
         let copy = repo("guard-copy");
         let bound = [crate::tree::Overlay {
@@ -344,6 +395,55 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A red run is no built state: the same source state is refused by the failed gates' names (not as another state) and keeps no goal; a passing run after it is accepted; a red run of an older state reads as stale.
+    #[test]
+    fn a_red_run_is_not_built() {
+        let out = std::env::temp_dir().join(format!("xtask-build-red-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        let goals: BTreeSet<String> = ["a".to_owned()].into();
+        let failed = [
+            Failure::step("licence gate", "x.rs: not declared"),
+            Failure::step("fronts gate", "y"),
+        ];
+        record(&out, "s", &goals, &[]).unwrap();
+        ensure_matches("s", &out).expect("every gate passed");
+        assert_eq!(read(&out).unwrap().goals(), goals);
+        // the pass does not survive a red run from the same state
+        record(&out, "s", &goals, &failed).unwrap();
+        let e = format!("{}", ensure_matches("s", &out).expect_err("red"));
+        assert!(e.contains("FAILED: licence gate, fronts gate:"), "{e}");
+        assert!(!e.contains("another source state"), "{e}");
+        assert!(forget(&out, "s").unwrap().is_empty(), "a red run's goal");
+        record(&out, "s", &goals, &failed).unwrap();
+        let e = format!("{}", ensure_matches("t", &out).expect_err("other state"));
+        assert!(e.contains("another source state (s,"), "{e}");
+        record(&out, "s", &goals, &[]).unwrap();
+        ensure_matches("s", &out).expect("passed after the red run");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A host dir is current only with its foreign graphs: an unfinished, red or stale one refuses it, naming the arch.
+    #[test]
+    fn a_red_foreign_graph_refuses_its_host() {
+        let dir = std::env::temp_dir().join(format!("xtask-build-fgn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let graphs = [("arm64".to_owned(), dir.clone())];
+        let none = BTreeSet::new();
+        let refusal = || format!("{:#}", ensure_graphs("s", &graphs).expect_err("refused"));
+        let e = refusal();
+        assert!(e.contains("arm64 native-bridge graph: "), "{e}");
+        assert!(e.contains("no record"), "{e}");
+        record(&dir, "s", &none, &[Failure::step("guest abi gate", "x")]).unwrap();
+        let e = refusal();
+        assert!(e.contains("FAILED: guest abi gate:"), "{e}");
+        record(&dir, "r", &none, &[]).unwrap();
+        let e = refusal();
+        assert!(e.contains("another source state"), "{e}");
+        record(&dir, "s", &none, &[]).unwrap();
+        ensure_graphs("s", &graphs).expect("every graph passed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The root manifest counts only where a native build reads it: the release profile (minus xtask's override), members, workspace deps.

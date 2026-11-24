@@ -689,14 +689,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 }
             }
         }
-        // the runtime gates read the converter packages and crates from here (build_state::gate_out); a failed ninja leaves the old packages, so no record
-        build_state::record(&graph_out, &state, &built_goals)?;
-        // a host run takes its foreign graphs to its state too: one source state per out dir, so no foreign gate or app refuses a stale graph (build_state.rs foreign_out)
-        if !foreign {
-            failed.extend(refresh_foreign(root, args, &out)?);
-        }
         if let Some(first) = table_check(&table) {
             failed.push(Failure::step("table check", first));
+        }
+        // after this graph's last gate: check and land read native's verdict only here (build_state::ensure_current)
+        build_state::record(&graph_out, &state, &built_goals, &failed)?;
+        // a host run takes its foreign graphs to its state too: one source state per out dir, so no foreign gate or app refuses a stale graph; each records its own verdict, read with the host's
+        if !foreign {
+            failed.extend(refresh_foreign(root, args, &out)?);
         }
         phases.finish();
         return Ok(verdict(failed));
@@ -743,6 +743,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if let Some(first) = table_check(&table) {
         failed.push(Failure::step("table check", first));
     }
+    build_state::record(&graph_out, &state, &built_goals, &failed)?;
     phases.finish();
     Ok(verdict(failed))
 }
@@ -1043,12 +1044,8 @@ pub fn graph_dir(out: &Path, host: &str, arch: &str) -> PathBuf {
 /// Refreshes each foreign guest graph `out` holds at the host run's state: one inner run per graph. Its goals are the foreign set ([`Args::resolved`]), so it takes none of its own.
 /// Returns a failure per graph that did not build; that run's verdict is printed above.
 fn refresh_foreign(root: &Path, args: &Args, out: &Path) -> Result<Vec<Failure>> {
-    let arches = arches::load(root)?;
     let mut failed = Vec::new();
-    for arch in foreign_graphs(out)? {
-        if arch == args.host || arches.get(arch.as_str()).is_none_or(|r| r.guest.is_none()) {
-            continue;
-        }
+    for (arch, _) in guest_graphs(root, out)? {
         println!("native: foreign graph {arch}: refresh at this run's state");
         let inner = Args {
             native_bridge: Some(arch.clone()),
@@ -1066,6 +1063,19 @@ fn refresh_foreign(root: &Path, args: &Args, out: &Path) -> Result<Vec<Failure>>
         }
     }
     Ok(failed)
+}
+
+/// The foreign graphs of out dir `out` as (guest arch, dir): those a host run refreshes and a reader of `out` judges with it (build_state::ensure_current). A dir of an arch that is no guest any more is neither.
+pub fn guest_graphs(root: &Path, out: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let arches = arches::load(root)?;
+    Ok(foreign_graphs(out)?
+        .into_iter()
+        .filter(|a| arches.get(a.as_str()).is_some_and(|r| r.guest.is_some()))
+        .map(|a| {
+            let dir = out.join(format!("{NB_GRAPH_DIR}{a}"));
+            (a, dir)
+        })
+        .collect())
 }
 
 /// The guest arches whose graph dirs `out` holds (`nb-graph-<arch>`, [`graph_dir`]), sorted.
