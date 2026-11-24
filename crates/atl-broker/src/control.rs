@@ -162,6 +162,10 @@ pub enum Response {
     Staged {
         frames: String,
     },
+    /// The installer refused the package: its parse verdict (installer_end.rs). A scan skips it, as PMS skips a package that fails to parse; any other failed end is `Error`.
+    Refused {
+        message: String,
+    },
     /// The package is in place.
     Committed,
     /// The notification's fate.

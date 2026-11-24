@@ -40,6 +40,8 @@ const LIMIT: Duration = Duration::from_secs(180);
 const TAIL: usize = 30;
 const DONE: &str = "AtlBilling: done";
 const CONNECTED: &str = "AtlBilling: connected ";
+/// The head of a failed installer end (atl-broker installer_end.rs `HEAD`): a run whose installer ended first names it before any symptom.
+const INSTALLER_HEAD: &str = "atl-installer exited";
 
 /// The lines each setting must show. On: one resolved service, a connection to the responder's class, 3 = BillingResponseCode.BILLING_UNAVAILABLE for codes 1 and 10, code 2 unanswered.
 /// Off: AOSP without the package -- queryIntentServices empty, bindService false (bindServiceLocked found nothing).
@@ -55,6 +57,40 @@ const ANSWER: &str = "AtlBilling: connected com.android.vending.billing.InAppBil
 fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The log from its first line naming a failed installer end to its end: no count can cut that line. A log without one keeps its last `n` lines.
+fn tail_from_head(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains(INSTALLER_HEAD))
+        .unwrap_or(lines.len().saturating_sub(n));
+    lines[at..].join("\n")
+}
+
+/// The first line naming a failed installer end, in the first log that has one (services first, the origin; atld's exit chain repeats its text).
+fn installer_head(logs: &[&str]) -> Option<String> {
+    logs.iter().find_map(|log| {
+        log.lines()
+            .find(|l| l.contains(INSTALLER_HEAD))
+            .map(str::to_owned)
+    })
+}
+
+/// The run's failures in error order: the installer's head line, atld's exit, then the failed checks. The checks are symptoms (the app never started); the verdict line quotes only the first failure.
+fn failures(checks: &[(&str, bool)], ended: Option<&str>, head: Option<&str>) -> Vec<String> {
+    let mut whys: Vec<String> = head.map(str::to_owned).into_iter().collect();
+    if let Some(status) = ended {
+        whys.push(format!("atld exited {status}"));
+    }
+    whys.extend(
+        checks
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(what, _)| (*what).to_owned()),
+    );
+    whys
 }
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
@@ -109,6 +145,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         atld.wait()?;
     }
     let text = read(&log);
+    let atld_text = read(&run.atld_log());
+    let services_text = read(&run.log("services"));
     if args.verbose {
         println!("---- app log\n{text}");
     }
@@ -124,20 +162,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             },
         ),
     ];
-    let mut whys = match &outcome {
+    let head = installer_head(&[services_text.as_str(), atld_text.as_str()]);
+    let whys = match &outcome {
         Err(late @ Miss::Late { .. }) => stopped_at("billing", &checks, late),
         _ => {
-            let mut fails = Vec::new();
-            for (what, ok) in checks {
+            for (what, ok) in &checks {
                 println!(
                     "billing: {} {what} (setting {setting})",
-                    if ok { "pass" } else { "FAIL" }
+                    if *ok { "pass" } else { "FAIL" }
                 );
-                if !ok {
-                    fails.push(what.to_owned());
-                }
             }
-            fails
+            failures(&checks, ended.as_deref(), head.as_deref())
         }
     };
     if whys.is_empty() {
@@ -154,22 +189,92 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             Err(late @ Miss::Late { .. }) => vec![late.clone()],
             _ => whys.iter().cloned().map(Miss::Wrong).collect(),
         };
-        let services = read(&run.log("services"));
         if let Some(code) =
-            crate::starvation::judge_row("billing", &faults, &services, &read(&run.atld_log()))
+            crate::starvation::judge_row("billing", &faults, &services_text, &atld_text)
         {
             return Ok(code);
         }
     }
-    if let Some(e) = ended {
-        whys.push(format!("atld exited {e}"));
-    }
-    println!("---- atld log\n{}", tail(&read(&run.atld_log()), TAIL));
+    println!(
+        "---- atld log (from its installer head, else last {TAIL})\n{}",
+        tail_from_head(&atld_text, TAIL)
+    );
     println!("---- app log (last {TAIL})\n{}", tail(&text, TAIL));
     println!(
-        "---- services log (last {TAIL})\n{}",
-        tail(&read(&run.log("services")), TAIL)
+        "---- services log (from its installer head, else last {TAIL})\n{}",
+        tail_from_head(&services_text, TAIL)
     );
     println!("{}", crate::verdict::gate("billing", &whys));
     Ok(ExitCode::FAILURE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed run's head line as installer_end.rs writes it for a SIGSYS end.
+    const SIGSYS_HEAD: &str = "Error: scan /product/app/Killed: atl-installer exited signal: 31 (SIGSYS): seccomp: sandbox killed by its seccomp filter, the denied call is the audit record `type=1326 ... sig=31`";
+
+    /// An atld log: `before` noise lines, the head, then `after` lines of the installer's stderr (the shape a SIGSYS end leaves).
+    fn fake_atld_log(before: usize, after: usize) -> String {
+        let mut lines: Vec<String> = (0..before).map(|i| format!("atld: noise {i}")).collect();
+        lines.push(SIGSYS_HEAD.to_owned());
+        lines.extend((0..after).map(|i| format!("    installer stderr {i}")));
+        lines.join("\n")
+    }
+
+    fn texts(whys: &[String]) -> Vec<&str> {
+        whys.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn the_installer_head_leads_the_failures_before_the_exit_and_the_checks() {
+        let atld = fake_atld_log(40, 3);
+        let head = installer_head(&["no head in the services log", atld.as_str()])
+            .expect("the head is found in atld's log");
+        let checks = [
+            ("query and bind", false),
+            ("the connection's answers", false),
+        ];
+        let whys = failures(&checks, Some("exit status: 1"), Some(head.as_str()));
+        assert_eq!(
+            texts(&whys),
+            [
+                SIGSYS_HEAD,
+                "atld exited exit status: 1",
+                "query and bind",
+                "the connection's answers",
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_head_the_exit_leads_and_passing_checks_add_nothing() {
+        let checks = [
+            ("query and bind", false),
+            ("the connection's answers", true),
+        ];
+        let whys = failures(&checks, Some("exit status: 1"), None);
+        assert_eq!(
+            texts(&whys),
+            ["atld exited exit status: 1", "query and bind"]
+        );
+        let passing = [("query and bind", true), ("the connection's answers", true)];
+        assert!(failures(&passing, None, None).is_empty());
+    }
+
+    #[test]
+    fn the_tail_starts_at_the_head_line_not_at_a_count() {
+        // the head is line 41 of 44: the last 30 lines would cut it
+        let atld = fake_atld_log(40, 3);
+        assert!(atld.lines().count() > TAIL);
+        let shown = tail_from_head(&atld, TAIL);
+        assert_eq!(shown.lines().next(), Some(SIGSYS_HEAD));
+        assert_eq!(shown.lines().count(), 1 + 3);
+    }
+
+    #[test]
+    fn a_log_without_a_head_keeps_its_last_lines() {
+        assert_eq!(tail_from_head("a\nb\nc\nd", 2), "c\nd");
+    }
 }

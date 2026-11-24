@@ -21,6 +21,12 @@ pub trait ProcessControl: Send + Sync {
     fn last_app_ended(&self, pid: i32, finished: bool) -> io::Result<()>;
 }
 
+/// A scan's answer: the frames file's host path, or the installer's parse verdict on the package (`Refused`: PMS skips it). Any other end is an error.
+pub enum ScanReply {
+    Staged(String),
+    Refused(String),
+}
+
 /// The control socket's install half (installd's role): staging + the installer run, then the commit (the services' boot-time install, system_services.rs).
 impl ControlSocket {
     /// Stages session `session` for `uid` and runs the installer: the frames file's host path.
@@ -83,12 +89,13 @@ impl ControlSocket {
         }
     }
 
-    /// Runs the installer over the preinstalled package dir `dir` (an Android path): the frames file's host path.
-    pub fn scan(&self, dir: &str) -> io::Result<String> {
+    /// Runs the installer over the preinstalled package dir `dir` (an Android path): the frames file's host path, or its parse verdict.
+    pub fn scan(&self, dir: &str) -> io::Result<ScanReply> {
         match self.call(&Request::Scan {
             dir: dir.to_owned(),
         })? {
-            Response::Staged { frames } => Ok(frames),
+            Response::Staged { frames } => Ok(ScanReply::Staged(frames)),
+            Response::Refused { message } => Ok(ScanReply::Refused(message)),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("scan answered {other:?}"))),
         }

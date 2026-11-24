@@ -39,9 +39,10 @@ use atl_android_paths::{
     VENDOR,
 };
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
+use atl_broker::installer_end::{self, InstallerEnd};
 use atl_broker::{
-    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Profile, Right, Spawn, gpu,
-    kill_sandbox, seccomp_death, to_log, tree_mounts,
+    BinderPids, Broker, INSTALLER_UID, Link, Mount, Process, Right, Spawn, gpu, kill_sandbox,
+    to_log, tree_mounts,
 };
 use atl_gralloc::node::{self, AllocatorTier, NodeSource, UDMABUF_DEVICE};
 use atl_gralloc::vintf;
@@ -1209,11 +1210,14 @@ impl Host {
                 .with_context(|| format!("starting {}", i.installer.display()))?;
             let status = p.child.wait()?;
             let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
-            ensure!(
-                status.success(),
-                "session {session}: {}",
-                installer_failure(&status, &stderr)
-            );
+            match InstallerEnd::of(&status, &stderr, &i.installer) {
+                InstallerEnd::Parsed => {}
+                InstallerEnd::Refused(verdict) => bail!(
+                    "session {session}: {}: {verdict}",
+                    installer_end::head(&status)
+                ),
+                InstallerEnd::Failed(text) => bail!("session {session}: {text}"),
+            }
             log(format_args!(
                 "install session {session}: installer {} ms",
                 start.elapsed().as_millis()
@@ -1273,8 +1277,8 @@ impl Host {
     }
 
     /// Request `Scan`: runs the installer over the preinstalled package dir `dir` (an Android path), which must be one atl-services-types `system_packages::scan` finds in the root: parse only, in
-    /// place (no staging, no native-library root). The frames file; a failed run's error carries the installer's stderr.
-    fn scan(&self, dir: &str) -> Result<String> {
+    /// place (no staging, no native-library root). The answer is the installer's end ([`InstallerEnd::scan_reply`]): the frames file, the parse verdict (`Refused`), or an error naming the package.
+    fn scan(&self, dir: &str) -> Result<Response> {
         let found = system_packages::scan(&self.root.root)?;
         let index = found
             .dirs
@@ -1314,20 +1318,18 @@ impl Host {
             .with_context(|| format!("starting {}", i.installer.display()))?;
         let status = p.child.wait()?;
         let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
-        ensure!(
-            status.success(),
-            "scan {dir}: {}",
-            installer_failure(&status, &stderr)
-        );
-        log(format_args!(
-            "scan {dir}: installer {} ms",
-            start.elapsed().as_millis()
-        ));
-        i.scanned
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(dir.to_owned());
-        Ok(frames.to_string_lossy().into_owned())
+        let end = InstallerEnd::of(&status, &stderr, &i.installer);
+        if matches!(end, InstallerEnd::Parsed) {
+            log(format_args!(
+                "scan {dir}: installer {} ms",
+                start.elapsed().as_millis()
+            ));
+            i.scanned
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(dir.to_owned());
+        }
+        Ok(end.scan_reply(dir, &frames.to_string_lossy()))
     }
 
     /// Request `ScanCommit`: scanned `dir` is package `package` of `uid`: its data dirs and external dirs (installd createAppData, as for any package); no ES1 fact (no native-library root).
@@ -2254,7 +2256,7 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
             } => host
                 .reinstate(session, &package, uid, version, installed)
                 .map(|frames| Response::Staged { frames }),
-            Request::Scan { dir } => host.scan(&dir).map(|frames| Response::Staged { frames }),
+            Request::Scan { dir } => host.scan(&dir),
             Request::ScanCommit { dir, package, uid } => host
                 .scan_commit(&dir, &package, uid)
                 .map(|()| Response::Committed),
@@ -2295,14 +2297,6 @@ fn gralloc_node(log: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix(GRALLOC_READY_LINE))?;
     let node = rest.trim().strip_prefix('(')?.strip_suffix(')')?;
     Some(node.to_owned())
-}
-
-/// The error text of a failed installer run: its exit, the seccomp line when the filter killed it (atl_broker::seccomp_death, which also counts it), its stderr.
-fn installer_failure(status: &std::process::ExitStatus, stderr: &str) -> String {
-    match seccomp_death(Profile::Installer, status) {
-        Some(sys) => format!("atl-installer exited {status}: {sys}\n{}", stderr.trim()),
-        None => format!("atl-installer exited {status}: {}", stderr.trim()),
-    }
 }
 
 /// Waits until `child`'s `log` holds `line`; fails when it exits first (naming its log, which says why) or after `limit`.

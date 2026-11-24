@@ -18,7 +18,7 @@ use crate::activity::log;
 use crate::app_id::AppIds;
 use crate::installed::Installed;
 use crate::packages::{InstallFields, PackageRecord};
-use crate::process_control::ControlSocket;
+use crate::process_control::{ControlSocket, ScanReply};
 
 /// The diag interface the install's counts go under (PackageManagerService's binder name).
 const DIAG: &str = "IPackageManager";
@@ -157,7 +157,9 @@ pub fn long_version(info: &PackageInfo) -> i64 {
 }
 
 /// PMS's system scan (InitAppsHelper.scanSystemDirs, before the /data packages): every package dir atl-services-types `system_packages::scan` finds under the runtime root `root` (host path), parsed
-/// where it lies; flags by location. A dir that fails to parse, or names a package already scanned, is skipped with a log line and counted (PMS logs and skips per package); the start goes on.
+/// where it lies; flags by location. A dir the installer refuses (its parse verdict) is skipped with a log line and counted: PMS's "Failed to parse" (InstallPackageHelper.installPackagesFromDir).
+/// A dir that names a package already scanned is skipped too (PMS's addForInitLI "Failed to scan"). Any other end fails the scan: a killed or verdict-less installer, output that does not decode.
+/// AOSP's "Unexpected exception occurred while parsing" fails the start in the same way, not the package. The start stops there: `main` returns the error before `services: ready`.
 /// An appId is taken only for an accepted package, so a skipped one moves no id.
 pub fn scan(
     control: &ControlSocket,
@@ -178,24 +180,26 @@ pub fn scan(
     let mut records: Vec<PackageRecord> = Vec::new();
     for d in &found.dirs {
         let dir = d.android_path();
-        let parsed = control
-            .scan(&dir)
-            .map_err(anyhow::Error::from)
-            .and_then(|frames| Parsed::read(&frames));
-        let parsed = match parsed {
-            Ok(p) if records.iter().any(|r| r.name() == p.name) => {
-                Err(anyhow::anyhow!("package {} already scanned", p.name))
-            }
-            other => other,
-        };
-        let parsed = match parsed {
-            Ok(p) => p,
-            Err(e) => {
+        let frames = match control.scan(&dir)? {
+            ScanReply::Staged(frames) => frames,
+            ScanReply::Refused(verdict) => {
                 skipped += 1;
-                log(format_args!("scan {dir}: skipped: {e:#}"));
+                log(format_args!(
+                    "scan {dir}: skipped: failed to parse: {verdict}"
+                ));
                 continue;
             }
         };
+        let parsed =
+            Parsed::read(&frames).with_context(|| format!("scan {dir}: installer output"))?;
+        if records.iter().any(|r| r.name() == parsed.name) {
+            skipped += 1;
+            log(format_args!(
+                "scan {dir}: skipped: package {} already scanned",
+                parsed.name
+            ));
+            continue;
+        }
         // a shared user's package runs under the shared user's id (ScanPackageUtils: the PackageSetting's appId is its SharedUserSetting's)
         let uid = match parsed.info.shared_user_id.as_deref() {
             Some(shared) => ids.shared_user(shared),
@@ -326,6 +330,10 @@ fn staged_names(app: &ApplicationInfo) -> Result<Vec<StagedName>> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test: the installer's end is a real child (sh kills itself or exits with a verdict); no runtime process starts"
+)]
 mod tests {
     use super::*;
 
@@ -489,6 +497,105 @@ mod tests {
             }]
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A partition root with one preinstalled package dir `product/app/<name>` (its base APK empty: the installer is the child under test, not this file).
+    fn partition(tag: &str, name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("atl-scan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("product/app").join(name);
+        std::fs::create_dir_all(&dir).expect("package dir");
+        std::fs::write(dir.join(format!("{name}.apk")), b"").expect("base apk");
+        root
+    }
+
+    /// `scan` of `root` against a fake atld whose installer is a real child running `script` under sh: the child's end goes through InstallerEnd::of and its answer
+    /// (scan_reply) over the real control protocol. A parsed end answers the frames file `frames`.
+    fn scan_with_installer(root: &Path, script: &str, frames: &str) -> Result<Vec<PackageRecord>> {
+        use atl_broker::control::{self, Request, Response};
+        use atl_broker::installer_end::InstallerEnd;
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair");
+        let (script, frames) = (script.to_owned(), frames.to_owned());
+        let server = std::thread::spawn(move || {
+            control::serve(&theirs, |r| match r {
+                Request::Scan { dir } => {
+                    let out = std::process::Command::new("/bin/sh")
+                        .args(["-c", &script])
+                        .output()
+                        .expect("sh");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    InstallerEnd::of(&out.status, &stderr, Path::new("atl-installer"))
+                        .scan_reply(&dir, &frames)
+                }
+                other => Response::Error {
+                    message: format!("unexpected {other:?}"),
+                },
+            })
+            .expect("serve");
+        });
+        let control = ControlSocket::new(ours);
+        let config = Config {
+            abis: vec![SupportedAbi {
+                abi: "x86_64".into(),
+                isa: "x86_64".into(),
+            }],
+        };
+        let result = scan(&control, root, &mut AppIds::new(), &config);
+        drop(control);
+        server.join().expect("server");
+        result
+    }
+
+    #[test]
+    fn a_killed_installer_fails_the_scan_and_names_the_package() {
+        let root = partition("killed", "Killed");
+        // a real SIGSYS end: the signal a seccomp kill leaves
+        let err = match scan_with_installer(&root, "kill -s SYS $$", "") {
+            Err(e) => e,
+            Ok(_) => panic!("a killed installer is not a skipped package"),
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("Killed"), "the package is named: {text}");
+        assert!(text.contains("atl-installer exited"), "{text}");
+        assert!(
+            text.contains("type=1326"),
+            "a SIGSYS end points at its audit record: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_parse_verdict_still_skips_the_package() {
+        let root = partition("refused", "Refused");
+        let records = scan_with_installer(
+            &root,
+            "echo 'atl-installer: parse error -2: not an APK' >&2; exit 1",
+            "",
+        )
+        .expect("a parse failure is skipped and the start goes on");
+        assert!(records.is_empty(), "the refused package is not registered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn output_that_does_not_decode_fails_the_scan() {
+        let root = partition("garbage", "Garbage");
+        let frames = root.join("frames");
+        std::fs::write(&frames, b"not an installer's frames").expect("frames");
+        let err = match scan_with_installer(&root, "exit 0", &frames.to_string_lossy()) {
+            Err(e) => e,
+            Ok(_) => panic!("an undecodable exit-0 output is not a skipped package"),
+        };
+        let text = format!("{err:#}");
+        assert!(text.contains("Garbage"), "the package is named: {text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

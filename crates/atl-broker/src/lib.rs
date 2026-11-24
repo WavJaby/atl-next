@@ -13,6 +13,7 @@ pub mod app_env;
 
 pub mod control;
 pub mod gpu;
+pub mod installer_end;
 mod seccomp;
 pub mod webspawn;
 pub use seccomp::{
