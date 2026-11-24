@@ -464,7 +464,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             match run {
                 Ok(done) => {
                     let n = done.undecided.len();
-                    undecided.extend(done.undecided);
+                    undecided.extend(done.undecided.iter().map(ToString::to_string));
                     let open = if n == 0 {
                         String::new()
                     } else {

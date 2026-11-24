@@ -3,6 +3,7 @@
 //! It links the product crates, whose build scripts read fetched trees (bionic headers, native_bridge.h), so it builds only after `xtask fetch`; this tool must not link it.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -16,6 +17,7 @@ use crate::verdict::Outcome;
 
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
+use serde::{Deserialize, Serialize};
 
 /// The harness package; its binary has the same name.
 const PACKAGE: &str = "xtask-harness";
@@ -83,15 +85,19 @@ pub fn pass_through(root: &Path, name: &str, args: &[OsString]) -> Result<ExitCo
 
 /// The line a harness check step prints for "not checked: <why>"; absent = checked.
 pub const SKIP_PREFIX: &str = "skip: ";
-/// The line a harness check step prints per gate it ran whose outcome was [`crate::verdict::Outcome::Undecided`]: `<gate> <why>`, named on check's verdict line.
+/// The line a harness check step prints per gate it ran whose outcome was [`crate::verdict::Outcome::Undecided`]: an [`Undecided`] as JSON, named on check's verdict line.
 pub const UNDECIDED_PREFIX: &str = "undecided-gate: ";
+/// The line a gate prints per judgement the starvation rule makes (xtask-harness starvation.rs `print_ruling`): a [`Ruling`] as JSON. Read back by [`rulings`].
+pub const RULING_PREFIX: &str = "starvation-ruling: ";
+/// The line an undecided gate prints as its verdict's [`Ruling`] as JSON (starvation.rs `undecided`). Read back by [`undecided_verdict`].
+pub const VERDICT_PREFIX: &str = "starvation-verdict: ";
 
-/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host (`<gate> <why>`), neither pass nor fail.
+/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail.
 /// `log`: the harness run's output (stdout, stderr), kept by [`settle_step`] when the run is undecided.
 #[derive(Debug, Default)]
 pub struct StepDone {
     pub skipped: Option<String>,
-    pub undecided: Vec<String>,
+    pub undecided: Vec<Undecided>,
     pub log: String,
 }
 
@@ -151,8 +157,11 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<StepDone> {
         undecided: stdout
             .lines()
             .filter_map(|l| l.strip_prefix(UNDECIDED_PREFIX))
-            .map(str::to_owned)
-            .collect(),
+            .map(|json| {
+                serde_json::from_str::<Undecided>(json)
+                    .with_context(|| format!("{step}: unreadable undecided line: {json}"))
+            })
+            .collect::<Result<_>>()?,
         log: format!("{stdout}{stderr}"),
     })
 }
@@ -170,19 +179,45 @@ pub fn settle_step(
         return Ok(first);
     }
     let task = red_logs::task_dir(root)?;
-    let run = red_logs::run_id();
+    let commit = crate::git::git(Some(root), &["rev-parse", "HEAD"])?;
+    settle_once(
+        &task,
+        &red_logs::run_id(),
+        commit.trim(),
+        step,
+        out,
+        first,
+        || {
+            let grant = build_pool::acquire_rerun(ws, root, Class::Harness)?;
+            let class = grant.class;
+            let second = check_step(root, step, out);
+            drop(grant);
+            Ok((class, second))
+        },
+    )
+}
+
+/// [`settle_step`] without the grant and the process: `rerun` runs the step once more and returns the grant's class with the result. The first log and the rerun's go under `out`, the ledger line and the ceiling under `task`
+/// (red_logs.rs); `commit` is the checkout's HEAD. A test drives it with a fake `rerun`, the only part that spawns.
+fn settle_once(
+    task: &Path,
+    run: &str,
+    commit: &str,
+    step: &str,
+    out: &Path,
+    first: StepDone,
+    rerun: impl FnOnce() -> Result<(&'static str, Result<StepDone>)>,
+) -> Result<StepDone> {
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
+    let supply = first.undecided.iter().find_map(Undecided::supply);
     let mut starvation = Starvation::default();
-    starvation.record_starved(first.undecided.iter().find_map(|u| Supply::of_why(u)));
-    starvation.record_attempt(judged_late(&first.log), false);
+    starvation.record_starved(supply);
+    starvation.record_attempt(judged_in(&first.log)?, false);
     let first_log = logs.join(format!("{step}.log"));
     std::fs::write(&first_log, &first.log).with_context(|| first_log.display().to_string())?;
-    red_logs::keep(&task, red_logs::UNDECIDED, &run, &first_log)?;
-    let grant = build_pool::acquire_rerun(ws, root, Class::Harness)?;
-    let class = grant.class;
-    let second = check_step(root, step, out);
-    drop(grant);
+    red_logs::keep(task, red_logs::UNDECIDED, run, &first_log)?;
+    let (class, second) = rerun()?;
     let (outcome, rerun) = match second {
         Ok(done) if done.undecided.is_empty() => (Outcome::Pass, done),
         Ok(done) => (Outcome::Undecided, done),
@@ -194,28 +229,28 @@ pub fn settle_step(
             },
         ),
     };
-    starvation.record_attempt(judged_late(&rerun.log), false);
+    starvation.record_attempt(judged_in(&rerun.log)?, false);
     starvation.record_rerun(class, outcome);
     let rerun_log = logs.join(format!("{step}.rerun.log"));
     std::fs::write(&rerun_log, &rerun.log).with_context(|| rerun_log.display().to_string())?;
     let kept = match red_logs::bucket_of(outcome) {
-        Some(bucket) => Some(red_logs::keep(&task, bucket, &run, &rerun_log)?),
+        Some(bucket) => Some(red_logs::keep(task, bucket, run, &rerun_log)?),
         None => None,
     };
-    let commit = crate::git::git(Some(root), &["rev-parse", "HEAD"])?;
     red_logs::ledger_append(
-        &task,
+        task,
         &[red_logs::Entry {
-            run: run.as_str(),
-            commit: commit.trim(),
+            run,
+            commit,
             row: step,
             outcome,
             first: Some(Outcome::Undecided),
             stall: None,
             grant: class,
+            supply,
         }],
     )?;
-    let streak = red_logs::trailing_undecided(&task)?
+    let streak = red_logs::trailing_undecided(task)?
         .remove(step)
         .unwrap_or_default();
     let ceiling = streak.len() >= red_logs::CEILING;
@@ -246,31 +281,145 @@ pub fn settle_step(
     }
 }
 
-/// Starved gates' supply: the host's CPU (`starved cpu:`, xtask-harness starvation.rs) or the GPU (`host GPU starved`). None for a line naming neither.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which supply starved a gate (starvation.rs): the host's CPU over a declared wait, or the window's GPU render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Supply {
     Cpu,
     Gpu,
 }
 
 impl Supply {
-    /// The supply an undecided line, or its `<row> <why>` note, names.
-    pub fn of_why(why: &str) -> Option<Self> {
-        if why.contains("GPU starved") {
-            Some(Self::Gpu)
-        } else if why.contains("starved cpu") {
-            Some(Self::Cpu)
-        } else {
-            None
+    /// The ledger's word for it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
         }
     }
 }
 
-/// Judged late waits in a gate's log: the `starvation: ` lines that refused to excuse a miss (`-> judged:`, starvation.rs `print_cpu`).
-pub fn judged_late(log: &str) -> usize {
+/// The starvation rule's judgement on a miss (starvation.rs): `Starved` = undecided, by the supply that took the margin; `Judged` (a real miss) and `Unknown` (nothing measured) = refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Judgement {
+    Starved(Supply),
+    Judged,
+    Unknown,
+}
+
+impl Judgement {
+    /// The word a `starvation:` line prints for it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Starved(_) => "undecided",
+            Self::Judged => "judged",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A judgement and its measures. `text` is what the rule measured, without the supply's wording; [`fmt::Display`] renders the human form (`starved cpu: <text>`, `host GPU starved (<text>)`, or `<text>` alone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ruling {
+    pub judgement: Judgement,
+    pub text: String,
+}
+
+impl Ruling {
+    pub fn starved(supply: Supply, text: impl Into<String>) -> Self {
+        Self {
+            judgement: Judgement::Starved(supply),
+            text: text.into(),
+        }
+    }
+
+    pub fn judged(text: impl Into<String>) -> Self {
+        Self {
+            judgement: Judgement::Judged,
+            text: text.into(),
+        }
+    }
+
+    pub fn unknown(text: impl Into<String>) -> Self {
+        Self {
+            judgement: Judgement::Unknown,
+            text: text.into(),
+        }
+    }
+
+    /// The supply that starved it; None unless undecided.
+    pub fn supply(&self) -> Option<Supply> {
+        match self.judgement {
+            Judgement::Starved(supply) => Some(supply),
+            Judgement::Judged | Judgement::Unknown => None,
+        }
+    }
+}
+
+impl fmt::Display for Ruling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.judgement {
+            Judgement::Starved(Supply::Cpu) => write!(f, "starved cpu: {}", self.text),
+            Judgement::Starved(Supply::Gpu) => write!(f, "host GPU starved ({})", self.text),
+            Judgement::Judged | Judgement::Unknown => f.write_str(&self.text),
+        }
+    }
+}
+
+/// A gate row that ended undecided: its name and the verdict's ruling. `ruling` None: the run printed no verdict line (a defect; the row still counts as undecided, with no supply).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Undecided {
+    pub row: String,
+    pub ruling: Option<Ruling>,
+}
+
+impl Undecided {
+    /// The supply that starved the row's verdict.
+    pub fn supply(&self) -> Option<Supply> {
+        self.ruling.as_ref().and_then(Ruling::supply)
+    }
+}
+
+/// `<row> <why>`: the note check's verdict line names.
+impl fmt::Display for Undecided {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.ruling {
+            Some(ruling) => write!(f, "{} {ruling}", self.row),
+            None => write!(f, "{} undecided (no verdict line)", self.row),
+        }
+    }
+}
+
+/// The rulings a gate's output printed, in order ([`RULING_PREFIX`] lines). A line that does not parse is an error: the protocol broke, and a guessed judgement would decide a row.
+pub fn rulings(log: &str) -> Result<Vec<Ruling>> {
     log.lines()
-        .filter(|l| l.starts_with("starvation: ") && l.contains(" -> judged: "))
-        .count()
+        .filter_map(|l| l.strip_prefix(RULING_PREFIX))
+        .map(|json| {
+            serde_json::from_str::<Ruling>(json)
+                .with_context(|| format!("unreadable starvation ruling: {json}"))
+        })
+        .collect()
+}
+
+/// The verdict a gate printed (its last [`VERDICT_PREFIX`] line). None when it printed none.
+pub fn undecided_verdict(log: &str) -> Result<Option<Ruling>> {
+    log.lines()
+        .filter_map(|l| l.strip_prefix(VERDICT_PREFIX))
+        .next_back()
+        .map(|json| {
+            serde_json::from_str::<Ruling>(json)
+                .with_context(|| format!("unreadable starvation verdict: {json}"))
+        })
+        .transpose()
+}
+
+/// Judged late waits in a gate's log: the rulings the rule refused to excuse (starvation.rs `print_ruling`).
+pub fn judged_in(log: &str) -> Result<usize> {
+    Ok(rulings(log)?
+        .iter()
+        .filter(|r| r.judgement == Judgement::Judged)
+        .count())
 }
 
 /// One gates step's starvation counters (gate-starved-red-design 2.7), over every attempt of its rows. Starved: first attempts that ended undecided.
@@ -369,29 +518,238 @@ fn show_and_keep(from: impl Read) -> String {
 mod tests {
     use super::*;
 
-    /// Supply reads the wording starvation.rs prints: `starved cpu: ...` (CPU), `host GPU starved (...)` (GPU); a line naming neither is None.
+    /// The human form renders from the typed ruling: the supply's wording is added by `Display`, never matched in text.
     #[test]
-    fn supply_reads_the_undecided_wording() {
-        assert_eq!(
-            Supply::of_why(
-                "window: undecided slow-display: host GPU starved (window render median 300 ms, max 300 ms in the phase > bound 100 ms)"
-            ),
-            Some(Supply::Gpu)
+    fn a_ruling_renders_its_supply_wording_once() {
+        let cpu = Ruling::starved(
+            Supply::Cpu,
+            "event bound 1000 ms need 100 ms stalled 960 ms",
         );
         assert_eq!(
-            Supply::of_why(
-                "window: undecided ime: starved cpu: event bound 1000 ms need 100 ms stalled 960 ms"
-            ),
-            Some(Supply::Cpu)
+            cpu.to_string(),
+            "starved cpu: event bound 1000 ms need 100 ms stalled 960 ms"
         );
-        assert_eq!(Supply::of_why("window: FAILED ime: copy lost"), None);
+        assert_eq!(cpu.supply(), Some(Supply::Cpu));
+        let gpu = Ruling::starved(
+            Supply::Gpu,
+            "window render median 300 ms, max 300 ms in the phase > bound 100 ms",
+        );
+        assert_eq!(
+            gpu.to_string(),
+            "host GPU starved (window render median 300 ms, max 300 ms in the phase > bound 100 ms)"
+        );
+        assert_eq!(gpu.supply(), Some(Supply::Gpu));
+        let judged = Ruling::judged("event bound 10000 ms need 100 ms stalled 5 ms");
+        assert_eq!(judged.supply(), None);
+        assert_eq!(
+            judged.to_string(),
+            "event bound 10000 ms need 100 ms stalled 5 ms"
+        );
+        assert_eq!(
+            Ruling::unknown("x: no gate scope samples").to_string(),
+            "x: no gate scope samples"
+        );
     }
 
-    /// Only `-> judged:` lines count: an `undecided` or `unknown` refusal is not a late wait the rule refused to excuse.
+    /// The wire form: one JSON object per line, the judgement tagged by its supply (`{"starved":"cpu"}`), read back as the same value.
     #[test]
-    fn judged_late_counts_the_refusals() {
-        let log = "starvation: ime IME_WAIT -> judged: event bound 10000 ms need 100 ms stalled 5 ms\nstarvation: ime x -> undecided: starved cpu: event bound 1000 ms need 100 ms stalled 960 ms\nstarvation: ime y -> unknown: no gate scope samples\nwindow: FAILED ime\n";
-        assert_eq!(judged_late(log), 1);
+    fn a_ruling_round_trips_through_its_line() {
+        let ruling = Ruling::starved(
+            Supply::Cpu,
+            "event bound 1000 ms need 100 ms stalled 960 ms",
+        );
+        let json = serde_json::to_string(&ruling).expect("json");
+        assert_eq!(
+            json,
+            r#"{"judgement":{"starved":"cpu"},"text":"event bound 1000 ms need 100 ms stalled 960 ms"}"#
+        );
+        let log = format!("window: undecided ime: {ruling}\n{RULING_PREFIX}{json}\n");
+        assert_eq!(rulings(&log).expect("rulings"), [ruling]);
+    }
+
+    /// Only `Judged` rulings count as judged late: an undecided or unknown one is not a late wait the rule refused to excuse. An indented line (a case's output echoed by host-load) is not the gate's own.
+    #[test]
+    fn judged_counts_only_the_judged_rulings() {
+        let line = |r: &Ruling| {
+            format!(
+                "{RULING_PREFIX}{}\n",
+                serde_json::to_string(r).expect("json")
+            )
+        };
+        let log = [
+            line(&Ruling::judged(
+                "event bound 10000 ms need 100 ms stalled 5 ms",
+            )),
+            line(&Ruling::starved(
+                Supply::Cpu,
+                "event bound 1000 ms need 100 ms stalled 960 ms",
+            )),
+            line(&Ruling::unknown("no gate scope samples")),
+            format!(
+                "  {RULING_PREFIX}{}\n",
+                serde_json::to_string(&Ruling::judged("a case's own")).expect("json")
+            ),
+        ]
+        .concat();
+        assert_eq!(judged_in(&log).expect("count"), 1);
+    }
+
+    /// A ruling line that does not parse is an error: a guessed judgement would decide a row.
+    #[test]
+    fn an_unreadable_ruling_line_is_an_error() {
+        assert!(rulings(&format!("{RULING_PREFIX}{{\"judgement\":\"maybe\"}}\n")).is_err());
+    }
+
+    /// The verdict is the gate's last verdict line; a gate that printed none has no verdict.
+    #[test]
+    fn the_verdict_is_the_last_verdict_line() {
+        let first = Ruling::starved(Supply::Gpu, "render max 205 ms > 100 ms");
+        let last = Ruling::starved(
+            Supply::Cpu,
+            "event bound 1000 ms need 100 ms stalled 960 ms",
+        );
+        let log = format!(
+            "{VERDICT_PREFIX}{}\n{VERDICT_PREFIX}{}\n",
+            serde_json::to_string(&first).expect("json"),
+            serde_json::to_string(&last).expect("json")
+        );
+        assert_eq!(undecided_verdict(&log).expect("verdict"), Some(last));
+        assert_eq!(undecided_verdict("window: pass x\n").expect("none"), None);
+    }
+
+    /// An undecided row names itself and its verdict's wording and supply; a row whose run printed no verdict says so, with no supply. Both survive the JSON line check_step reads.
+    #[test]
+    fn an_undecided_row_names_its_ruling() {
+        let row = Undecided {
+            row: "window-slow-display".to_owned(),
+            ruling: Some(Ruling::starved(Supply::Gpu, "render max 205 ms > 100 ms")),
+        };
+        assert_eq!(
+            row.to_string(),
+            "window-slow-display host GPU starved (render max 205 ms > 100 ms)"
+        );
+        assert_eq!(row.supply(), Some(Supply::Gpu));
+        let json = serde_json::to_string(&row).expect("json");
+        assert_eq!(serde_json::from_str::<Undecided>(&json).expect("back"), row);
+        let bare = Undecided {
+            row: "drive-tap".to_owned(),
+            ruling: None,
+        };
+        assert_eq!(bare.to_string(), "drive-tap undecided (no verdict line)");
+        assert_eq!(bare.supply(), None);
+    }
+
+    /// `out` (the logs) and `task` (kept logs, ledger) under a fresh temp dir named for the test; the test removes `out`'s parent.
+    fn settle_dirs(name: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("xtask-settle-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        (base.join("out"), base.join("task"))
+    }
+
+    /// A drive-tap first attempt that ended undecided on `supply`.
+    fn undecided_step(supply: Supply) -> StepDone {
+        StepDone {
+            undecided: vec![Undecided {
+                row: "drive-tap".to_owned(),
+                ruling: Some(Ruling::starved(
+                    supply,
+                    "drive-tap wait bound 120000 ms need 900 ms stalled 3000 ms",
+                )),
+            }],
+            log: "drive-tap: the first shot was blank\n".to_owned(),
+            ..StepDone::default()
+        }
+    }
+
+    /// The undecided path makes the drive-tap settle fire (the step's rerun is the only part faked): a starved first attempt, a passing rerun, the first log kept beside it, one ledger line with the first attempt's supply.
+    #[test]
+    fn a_starved_step_is_rerun_once_and_settles_on_the_rerun() {
+        let (out, task) = settle_dirs("pass");
+        let settled = settle_once(
+            &task,
+            "run-1",
+            "c0ffee",
+            "drive-tap",
+            &out,
+            undecided_step(Supply::Gpu),
+            || Ok(("quiet", Ok(StepDone::default()))),
+        )
+        .expect("a passing rerun settles the step");
+        assert!(settled.undecided.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(task.join(red_logs::LEDGER)).expect("ledger"),
+            "run-1\tc0ffee\tdrive-tap\tpass\tundecided\t-\tquiet\tgpu\n"
+        );
+        assert!(out.join("check-gates").join("drive-tap.log").is_file());
+        assert!(
+            task.join(red_logs::UNDECIDED)
+                .join("run-1")
+                .join("drive-tap.log")
+                .is_file()
+        );
+        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
+    }
+
+    /// Undecided in two runs is not a failure; the third consecutive undecided run fails the step, naming the three runs (red_logs::CEILING).
+    #[test]
+    fn a_step_undecided_in_three_runs_fails_at_the_ceiling() {
+        let (out, task) = settle_dirs("ceiling");
+        for run in ["r1", "r2"] {
+            let settled = settle_once(
+                &task,
+                run,
+                "c0ffee",
+                "drive-tap",
+                &out,
+                undecided_step(Supply::Cpu),
+                || Ok(("harness", Ok(undecided_step(Supply::Cpu)))),
+            )
+            .expect("undecided twice is not a failure of its run");
+            assert_eq!(settled.undecided.len(), 1);
+        }
+        let err = settle_once(
+            &task,
+            "r3",
+            "c0ffee",
+            "drive-tap",
+            &out,
+            undecided_step(Supply::Cpu),
+            || Ok(("harness", Ok(undecided_step(Supply::Cpu)))),
+        )
+        .expect_err("the third run hits the ceiling");
+        assert_eq!(
+            format!("{err:#}"),
+            "drive-tap undecided in 3 consecutive runs of this checkout (r1, r2, r3): the ceiling fails the step"
+        );
+        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
+    }
+
+    /// A rerun that fails fails the step, and its log is kept in the red bucket.
+    #[test]
+    fn a_failing_rerun_fails_the_step() {
+        let (out, task) = settle_dirs("red");
+        let err = settle_once(
+            &task,
+            "run-1",
+            "c0ffee",
+            "drive-tap",
+            &out,
+            undecided_step(Supply::Gpu),
+            || Ok(("quiet", Err(anyhow::anyhow!("the tap drive failed")))),
+        )
+        .expect_err("a red rerun fails the step");
+        assert!(
+            format!("{err:#}").starts_with("drive-tap: starved, rerun FAILED (log "),
+            "{err:#}"
+        );
+        assert!(
+            task.join(red_logs::RED)
+                .join("run-1")
+                .join("drive-tap.rerun.log")
+                .is_file(),
+            "the rerun's log is kept in the red bucket"
+        );
+        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
     }
 
     /// Each counter sits in its own field of the line; a rerun on the whole pool is `quiet`, any other grant `shared`.

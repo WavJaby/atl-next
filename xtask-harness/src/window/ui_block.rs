@@ -298,7 +298,7 @@ mod tests {
         assert!(judged.is_empty());
         assert!(matches!(undecided.as_slice(), [("commits", _, Err(_))]));
         assert_eq!(
-            undecided[0].1,
+            undecided[0].1.to_string(),
             "host GPU starved (window render median 20 ms, max 20 ms in the phase > steady p95 20.0 ms)"
         );
         for log in [app(Some(20_000)), app(None)] {

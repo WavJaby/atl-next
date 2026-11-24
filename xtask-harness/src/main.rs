@@ -531,7 +531,11 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
             let arches = arches::load(root)?;
             let (arch, _) = arches::build_machine(root, &arches)?;
             for gate in check_gates::run(root, arch, out)? {
-                println!("{}{gate}", xtask::harness::UNDECIDED_PREFIX);
+                println!(
+                    "{}{}",
+                    xtask::harness::UNDECIDED_PREFIX,
+                    serde_json::to_string(&gate)?
+                );
             }
             None
         }

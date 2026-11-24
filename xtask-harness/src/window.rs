@@ -3479,7 +3479,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         }
     };
     if let Some(why) = starved {
-        // check_gates.rs `undecided_line` reads this line; the exit code alone carries the outcome
+        // the verdict's ruling goes out as its `starvation-verdict:` line (starvation.rs `undecided`); the exit code carries the outcome
         return Ok(crate::starvation::undecided(
             "window",
             args.stage.name(),

@@ -16,7 +16,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
 use xtask::build_pool::{self, Class};
-use xtask::harness::{Starvation, Supply, judged_late};
+use xtask::harness::{Ruling, Starvation, Supply, Undecided, judged_in, undecided_verdict};
 use xtask::red_logs;
 
 use crate::gate_build::{self, Group, Moved, Snapshot};
@@ -172,7 +172,7 @@ struct Done {
     took: f64,
     /// the `gates:` line less its lane fields ([`run_lanes`] adds them)
     line: String,
-    /// `<row> (log <path>): <verdict>` when red, `<row> <why>` when undecided
+    /// `<row> (log <path>): <verdict>` when red; empty when undecided (`verdict` names it)
     note: String,
     /// what ended a window row's watch
     end: Option<String>,
@@ -182,8 +182,8 @@ struct Done {
     grant: &'static str,
     /// host stall share of the run's span, percent (`host load:`); None when unknown
     stall: Option<f64>,
-    /// an undecided run's supply
-    supply: Option<Supply>,
+    /// an undecided run's verdict (`undecided_verdict`); None unless undecided
+    verdict: Option<Ruling>,
     /// judged late waits in the run's log
     judged: usize,
     /// the run's host-load record is unknown
@@ -204,7 +204,7 @@ impl Done {
             running: 0,
             grant: "-",
             stall: None,
-            supply: None,
+            verdict: None,
             judged: 0,
             host_unknown: false,
             first: None,
@@ -214,6 +214,14 @@ impl Done {
     /// This run, then the attempt it was rerun after.
     fn attempts(&self) -> impl Iterator<Item = &Done> {
         std::iter::once(self).chain(self.first.as_deref())
+    }
+
+    /// The supply that starved the attempt this run reran (None when the row ran once).
+    fn first_supply(&self) -> Option<Supply> {
+        self.first
+            .as_deref()
+            .and_then(|f| f.verdict.as_ref())
+            .and_then(Ruling::supply)
     }
 }
 
@@ -254,7 +262,7 @@ fn starvation_of(done: &[Done]) -> Starvation {
             counts.record_attempt(a.judged, a.host_unknown);
         }
         if let Some(first) = d.first.as_deref() {
-            counts.record_starved(first.supply);
+            counts.record_starved(first.verdict.as_ref().and_then(Ruling::supply));
             counts.record_rerun(d.grant, d.outcome);
         }
     }
@@ -311,9 +319,9 @@ impl Drop for Entered<'_> {
     }
 }
 
-/// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows (`<row> <why>`), neither pass nor fail ([`Outcome`]).
+/// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows, neither pass nor fail ([`Outcome`]).
 /// Each row takes its own pool grant (memory admission decides how many run at once); no grant is held around the step ([`run_lanes`]).
-pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
+pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     let exe = std::env::current_exe().context("the harness's own path")?;
     let ws = Layout::of(root)?.workspace().to_owned();
     let logs = out.join("check-gates");
@@ -397,6 +405,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
             first: d.first.as_deref().map(|f| f.outcome),
             stall: d.stall,
             grant: d.grant,
+            supply: d.first_supply(),
         })
         .collect();
     red_logs::ledger_append(&task, &entries)?;
@@ -414,7 +423,10 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
                     starvation.ceiling += 1;
                     failed.push(note);
                 }
-                None => undecided.push(d.note.clone()),
+                None => undecided.push(Undecided {
+                    row: name.clone(),
+                    ruling: d.verdict.clone(),
+                }),
             },
         }
     }
@@ -442,7 +454,8 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let open = if undecided.is_empty() {
         String::new()
     } else {
-        format!(" ({} undecided: {})", undecided.len(), undecided.join("; "))
+        let notes: Vec<String> = undecided.iter().map(ToString::to_string).collect();
+        format!(" ({} undecided: {})", undecided.len(), notes.join("; "))
     };
     let summary = format!(
         "{} of {} gates failed{open}: {}",
@@ -607,7 +620,13 @@ impl RowRun<'_> {
                 .map_or("unknown".to_owned(), |p| format!("{p:.0}%")),
         );
         let outcome = Outcome::of_exit(status.code());
+        // the undecided verdict's ruling, typed: the gate printed it as a `starvation-verdict:` line (harness `undecided_verdict`)
         let verdict = match outcome {
+            Outcome::Undecided => undecided_verdict(&text)?,
+            Outcome::Pass | Outcome::Fail => None,
+        };
+        // the gate's own verdict line, shown as printed
+        let shown = match outcome {
             Outcome::Undecided => undecided_line(&text, row.cmd()),
             Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
         }
@@ -635,14 +654,11 @@ impl RowRun<'_> {
                 }
             ),
         };
-        let line = format!(
-            "gates: {} {word} ({group}) {verdict}{kept_note}",
-            row.name()
-        );
+        let line = format!("gates: {} {word} ({group}) {shown}{kept_note}", row.name());
         let note = match outcome {
-            Outcome::Undecided => undecided_note(row, verdict),
+            Outcome::Undecided => String::new(),
             Outcome::Pass | Outcome::Fail => {
-                format!("{} (log {}): {verdict}", row.name(), at.display())
+                format!("{} (log {}): {shown}", row.name(), at.display())
             }
         };
         Ok(Done {
@@ -654,11 +670,8 @@ impl RowRun<'_> {
             running: 0,
             grant: "-",
             stall: seen.stall_pct,
-            supply: match outcome {
-                Outcome::Undecided => Supply::of_why(verdict),
-                Outcome::Pass | Outcome::Fail => None,
-            },
-            judged: judged_late(&text),
+            verdict,
+            judged: judged_in(&text)?,
             host_unknown: seen.stall_pct.is_none(),
             first: None,
         })
@@ -735,19 +748,10 @@ fn runtime_work(text: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// An undecided gate's own line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`).
+/// An undecided gate's own verdict line (`<cmd>: undecided <stage>: <why>`, window.rs `judge`), echoed on the gates line. The typed verdict is `undecided_verdict`.
 fn undecided_line<'a>(text: &'a str, cmd: &str) -> Option<&'a str> {
     let prefix = format!("{cmd}: {UNDECIDED_WORD}");
     text.lines().rev().find(|l| l.starts_with(&prefix))
-}
-
-/// `<row> <why>` for check's verdict line: the gate's undecided line less its `<cmd>: undecided <stage>: ` head.
-fn undecided_note(row: &Row, line: &str) -> String {
-    let why = line
-        .split_once(UNDECIDED_WORD)
-        .map(|(_, rest)| rest.split_once(": ").map_or(rest, |(_, why)| why))
-        .unwrap_or(line);
-    format!("{} {why}", row.name())
 }
 
 /// The gate's verdict among its `<cmd>: ` lines (a gate also prints counters and log tails under its name): its `FAILED` line, else the last pass / ok line.
@@ -915,15 +919,31 @@ mod tests {
         );
     }
 
-    /// An undecided run's note for check's line: the row name and the stage's why, from the line the window judge prints.
+    /// An undecided run's note for check's line is the row name and its verdict's ruling, read from the gate's `starvation-verdict:` line; the verdict line beside it is the echo only.
     #[test]
-    fn undecided_note_names_row_and_why() {
-        let text = "window: held: undecided host GPU starved: x\nwindow: undecided slow-display: host GPU starved (render max 205 ms > 100 ms)\n";
+    fn undecided_names_row_and_its_ruling() {
+        let ruling = Ruling::starved(Supply::Gpu, "render max 205 ms > 100 ms");
+        let text = format!(
+            "window: held: undecided host GPU starved: x\nwindow: undecided slow-display: {ruling}\n{}{}\n",
+            xtask::harness::VERDICT_PREFIX,
+            serde_json::to_string(&ruling).expect("json")
+        );
         let row = Row::new(&["window", "--stage", "slow-display"], true, true);
-        let line = undecided_line(text, "window").expect("line");
+        let note = Undecided {
+            row: row.name(),
+            ruling: undecided_verdict(&text).expect("readable"),
+        };
         assert_eq!(
-            undecided_note(&row, line),
+            note.to_string(),
             "window-slow-display host GPU starved (render max 205 ms > 100 ms)"
+        );
+        assert_eq!(
+            undecided_line(&text, "window"),
+            Some("window: undecided slow-display: host GPU starved (render max 205 ms > 100 ms)")
+        );
+        assert_eq!(
+            undecided_verdict("window: pass x\n").expect("readable"),
+            None
         );
         assert_eq!(undecided_line("window: pass x\n", "window"), None);
     }
@@ -1096,7 +1116,12 @@ mod tests {
             Done {
                 running: entered.count,
                 grant: "harness",
-                supply: (outcome == Outcome::Undecided).then_some(Supply::Cpu),
+                verdict: (outcome == Outcome::Undecided).then(|| {
+                    Ruling::starved(
+                        Supply::Cpu,
+                        "event bound 1000 ms need 100 ms stalled 960 ms",
+                    )
+                }),
                 ..Done::bare(outcome, format!("gates: {} first", row.name()), row.name())
             }
         };
@@ -1154,6 +1179,7 @@ mod tests {
             first: Some(Outcome::Undecided),
             stall: Some(31.0),
             grant: "quiet",
+            supply: Some(Supply::Cpu),
         };
         let row = "window-slow-display";
         let step = |entries: &[red_logs::Entry<'_>]| -> Option<String> {

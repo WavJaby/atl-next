@@ -310,7 +310,7 @@ mod tests {
             assert!(judged.is_empty(), "{l}");
             let names: Vec<&str> = undecided.iter().map(|u| u.0).collect();
             assert_eq!(names, ["held", "replaced"]);
-            undecided[0].1.clone()
+            undecided[0].1.to_string()
         };
         // latches_unpainted +40 with 20 ms paints: judged, red
         assert!(replaced(&log(on, 20_000, 20_000, 135)).is_err());

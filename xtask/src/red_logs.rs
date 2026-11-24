@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use atl_layout::Layout;
 
 use crate::build_pool;
+use crate::harness::Supply;
 use crate::out;
 use crate::verdict::Outcome;
 
@@ -88,6 +89,7 @@ pub const LEDGER: &str = "gate-ledger.tsv";
 pub const CEILING: usize = 3;
 
 /// One row's ledger line. `first`: the attempt before a rerun (`-` when the row ran once). `stall`: the deciding run's host stall share, percent (`-` unknown). `grant`: the grant it held (`quiet`, or the class name).
+/// `supply`: what starved the first attempt (`-` when it was not starved); the deciding run's verdict is in `outcome`.
 pub struct Entry<'a> {
     pub run: &'a str,
     pub commit: &'a str,
@@ -96,6 +98,7 @@ pub struct Entry<'a> {
     pub first: Option<Outcome>,
     pub stall: Option<f64>,
     pub grant: &'a str,
+    pub supply: Option<Supply>,
 }
 
 /// The ledger's word for an outcome.
@@ -107,7 +110,7 @@ fn word(outcome: Outcome) -> &'static str {
     }
 }
 
-/// Appends one line per entry to checkout `task`'s ledger, made on first use. Columns: run, commit, row, outcome, first, stall, grant.
+/// Appends one line per entry to checkout `task`'s ledger, made on first use. Columns: run, commit, row, outcome, first, stall, grant, supply. Lines written before `supply` have seven columns; readers take the first four.
 pub fn ledger_append(task: &Path, entries: &[Entry<'_>]) -> Result<()> {
     fs::create_dir_all(task).with_context(|| format!("creating {}", task.display()))?;
     let path = task.join(LEDGER);
@@ -116,8 +119,9 @@ pub fn ledger_append(task: &Path, entries: &[Entry<'_>]) -> Result<()> {
         .map(|e| {
             let first = e.first.map_or("-", word);
             let stall = e.stall.map_or("-".to_owned(), |s| format!("{s:.1}"));
+            let supply = e.supply.map_or("-", Supply::word);
             format!(
-                "{}\t{}\t{}\t{}\t{first}\t{stall}\t{}\n",
+                "{}\t{}\t{}\t{}\t{first}\t{stall}\t{}\t{supply}\n",
                 e.run,
                 e.commit,
                 e.row,
@@ -342,6 +346,7 @@ mod tests {
             first: (outcome == Outcome::Undecided).then_some(Outcome::Undecided),
             stall: None,
             grant: "harness",
+            supply: (outcome == Outcome::Undecided).then_some(Supply::Gpu),
         };
         ledger_append(&ws, &[entry("r1", "app", Outcome::Undecided)]).expect("r1");
         ledger_append(
@@ -355,7 +360,7 @@ mod tests {
         let text = fs::read_to_string(ws.join(LEDGER)).expect("ledger");
         assert_eq!(
             text.lines().next(),
-            Some("r1\tc0ffee\tapp\tundecided\tundecided\t-\tharness")
+            Some("r1\tc0ffee\tapp\tundecided\tundecided\t-\tharness\tgpu")
         );
         let streaks = trailing_undecided(&ws).expect("streaks");
         assert_eq!(streaks["app"], ["r1", "r2"]);

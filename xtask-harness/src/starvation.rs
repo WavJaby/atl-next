@@ -11,12 +11,14 @@
 //! - Product timers ([`TIMERS`]): a red whose services log holds a fired timer is judged by that timer, as a wait with `bound = period` over `[fire - period, fire]` (the fire's `at=` stamp).
 //!   A timer that did not lose its margin makes the red real; a fired line without `at=` is unknown, so judged.
 //!
-//! Each judged late wait or fired timer prints one `starvation: ` line (stage, what, outcome, measures) so logs count how often the rule fires and how often it refuses.
+//! Each judgement prints one `starvation: ` line (stage, what, outcome, measures) and one `starvation-ruling: ` JSON line (xtask harness.rs `Ruling`); an undecided verdict prints `starvation-verdict: `.
+//! Logs count how often the rule fires and refuses; the parent reads the JSON, never the wording.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use atl_host_load::{Samples, Span};
+use xtask::harness::{RULING_PREFIX, Ruling, Supply, VERDICT_PREFIX};
 
 use crate::composer::word;
 use crate::wait::Miss;
@@ -100,8 +102,8 @@ pub struct Timed {
     pub fakes: Fakes,
 }
 
-/// A timed sub-check the rule left unjudged: name, reason, the result as measured (shown, judging nothing).
-pub type Undecided = (&'static str, String, Result<String, String>);
+/// A timed sub-check the rule left unjudged: name, its starved ruling, the result as measured (shown, judging nothing).
+pub type Undecided = (&'static str, Ruling, Result<String, String>);
 
 /// What the rule reads besides the sub-checks: the stage's name, the app log and the marker's stamp (GPU), and the gate's samples (CPU; None: unknown).
 pub(crate) struct Run<'a> {
@@ -123,40 +125,32 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The GPU form: the reason `t` is unjudged on this run, None when judged. `host`: the run's median render (us), None without paint lines.
-fn gpu_starved(app: &str, host: Option<u64>, t: &Timed, render: &Render) -> Option<String> {
+/// The GPU form: the ruling on `t` when it is starved on this run, None when judged. `host`: the run's median render (us), None without paint lines.
+fn gpu_starved(app: &str, host: Option<u64>, t: &Timed, render: &Render) -> Option<Ruling> {
     let faked = match t.fakes {
         Fakes::Fail => t.sub.1.is_err(),
         Fakes::Both => true,
     };
     let host = host.filter(|&m| faked && m as f64 > render.limit_us)?;
     let reached = render_max_us(app, render.span?).filter(|&r| r as f64 > render.limit_us)?;
-    Some(format!(
-        "host GPU starved (window render median {} ms, max {} ms in the phase > {})",
-        host / 1000,
-        reached / 1000,
-        render.limit
+    Some(Ruling::starved(
+        Supply::Gpu,
+        format!(
+            "window render median {} ms, max {} ms in the phase > {}",
+            host / 1000,
+            reached / 1000,
+            render.limit
+        ),
     ))
 }
 
-/// The CPU form's answer for one budget.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Cpu {
-    /// The host took the margin: the text names wait, bound, need and stall.
-    Starved(String),
-    /// The margin was there (or no need is declared): the miss is real.
-    Judged(String),
-    /// Nothing measured over the span: judged, counted apart.
-    Unknown(String),
-}
-
-/// Rule 2 for an event that never came: starved when `bound - stalled(span) < need`.
-pub(crate) fn cpu(b: &Budget, samples: Option<&Samples>) -> Cpu {
+/// Rule 2 for an event that never came: starved when `bound - stalled(span) < need`. The ruling's text names wait, bound, need and stall; unknown when nothing was measured.
+pub(crate) fn cpu(b: &Budget, samples: Option<&Samples>) -> Ruling {
     let Some(samples) = samples else {
-        return Cpu::Unknown(format!("{}: no gate scope samples", b.wait));
+        return Ruling::unknown(format!("{}: no gate scope samples", b.wait));
     };
     let Some(stalled_us) = samples.stalled(b.span) else {
-        return Cpu::Unknown(format!("{}: the samples do not cover the wait", b.wait));
+        return Ruling::unknown(format!("{}: the samples do not cover the wait", b.wait));
     };
     let stalled = Duration::from_micros(stalled_us);
     let need = b
@@ -169,14 +163,12 @@ pub(crate) fn cpu(b: &Budget, samples: Option<&Samples>) -> Cpu {
         stalled.as_millis()
     );
     match b.need {
-        Some(need) if b.bound.saturating_sub(stalled) < need => {
-            Cpu::Starved(format!("starved cpu: {text}"))
-        }
-        _ => Cpu::Judged(text),
+        Some(need) if b.bound.saturating_sub(stalled) < need => Ruling::starved(Supply::Cpu, text),
+        _ => Ruling::judged(text),
     }
 }
 
-/// Splits a stage's timed sub-checks into judged ones and the ones host starvation left unjudged; prints one `starvation: ` line per unjudged or CPU-judged sub-check.
+/// Splits a stage's timed sub-checks into judged ones and the ones host starvation left unjudged; prints the judgement lines ([`print_ruling`]) of each unjudged or CPU-refused sub-check.
 pub fn apply(run: &Run, timed: Vec<Timed>) -> (Vec<Sub>, Vec<Undecided>) {
     let host = host_render_us(run.app, run.from).map(|(median, _, _)| median);
     let (mut judged, mut undecided) = (Vec::new(), Vec::new());
@@ -188,25 +180,21 @@ pub fn apply(run: &Run, timed: Vec<Timed>) -> (Vec<Sub>, Vec<Undecided>) {
         // a late wait only fails: a pass that ran inside its bound stands
         let cpu = match (&t.cpu, &t.sub.1) {
             (Some(b), Err(_)) if gpu.is_none() => {
-                // a starved one prints below, as every unjudged sub-check does
-                match cpu(b, run.samples) {
-                    Cpu::Starved(why) => Some(why),
-                    answer => {
-                        print_cpu(run.stage, "late", &answer);
-                        None
-                    }
+                let ruling = cpu(b, run.samples);
+                if ruling.supply().is_some() {
+                    Some(ruling)
+                } else {
+                    print_ruling(run.stage, "late", None, &ruling);
+                    None
                 }
             }
             _ => None,
         };
         match gpu.or(cpu) {
-            Some(why) => {
+            Some(ruling) => {
                 let was = if t.sub.1.is_ok() { "pass" } else { "FAIL" };
-                println!(
-                    "starvation: {} {} {was} -> undecided: {why}",
-                    run.stage, t.sub.0
-                );
-                undecided.push((t.sub.0, why, t.sub.1));
+                print_ruling(run.stage, t.sub.0, Some(was), &ruling);
+                undecided.push((t.sub.0, ruling, t.sub.1));
             }
             None => judged.push(t.sub),
         }
@@ -214,13 +202,17 @@ pub fn apply(run: &Run, timed: Vec<Timed>) -> (Vec<Sub>, Vec<Undecided>) {
     (judged, undecided)
 }
 
-fn print_cpu(stage: &str, what: &str, answer: &Cpu) {
-    let (word, text) = match answer {
-        Cpu::Starved(t) => ("undecided", t),
-        Cpu::Judged(t) => ("judged", t),
-        Cpu::Unknown(t) => ("unknown", t),
-    };
-    println!("starvation: {stage} {what} -> {word}: {text}");
+/// One judgement's two lines: the human `starvation:` line (`was`: a starved sub-check's pass/FAIL) and the machine `starvation-ruling:` line the gate's parent reads back (check_gates.rs, harness `rulings`).
+fn print_ruling(stage: &str, what: &str, was: Option<&str>, ruling: &Ruling) {
+    let was = was.map_or_else(String::new, |w| format!(" {w}"));
+    println!(
+        "starvation: {stage} {what}{was} -> {}: {ruling}",
+        ruling.judgement.word()
+    );
+    println!(
+        "{RULING_PREFIX}{}",
+        serde_json::to_string(ruling).expect("a ruling serializes")
+    );
 }
 
 /// A product timer a gate can trip (design 2.4): the services' line when it fires (text after `services: `), its period, and the time it needs on a quiet host.
@@ -283,10 +275,10 @@ fn fired_budget(t: &Timer, line: &str, samples: Option<&Samples>) -> Result<Budg
     })
 }
 
-/// A red run's verdict under the rule: Some(why) when it is undecided, None when the red stands. `faults`: the run's failing checks (not `not reached`). `services`: the services log.
+/// A red run's verdict under the rule: Some(starved ruling) when it is undecided, None when the red stands. `faults`: the run's failing checks (not `not reached`). `services`: the services log.
 /// - A fired product timer decides alone (a death or a late answer it caused follows from it): undecided only when every fired timer lost its margin.
 /// - Else the run is undecided only when its one fault is a late declared wait whose budget the host took (rule 3: no other check failed).
-pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<String> {
+pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<Ruling> {
     let fired: Vec<(&Timer, &str)> = services
         .lines()
         .filter_map(|l| {
@@ -298,30 +290,28 @@ pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<String>
         })
         .collect();
     if !fired.is_empty() {
-        let mut why = None;
+        let mut verdict = None;
         for (t, line) in fired {
             let answer = match fired_budget(t, line, run.samples) {
                 Ok(b) => cpu(&b, run.samples),
-                Err(e) => Cpu::Unknown(e),
+                Err(e) => Ruling::unknown(e),
             };
-            print_cpu(run.stage, "timer", &answer);
-            match answer {
-                Cpu::Starved(w) => {
-                    why.get_or_insert(w);
-                }
-                Cpu::Judged(_) | Cpu::Unknown(_) => return None,
-            }
+            print_ruling(run.stage, "timer", None, &answer);
+            // a judged or unknown timer refuses the excuse: the red stands
+            answer.supply()?;
+            verdict.get_or_insert(answer);
         }
-        return why;
+        return verdict;
     }
     let [Miss::Late { name, why, budget }] = faults else {
         return None;
     };
     let Some(budget) = budget.clone() else {
-        print_cpu(
+        print_ruling(
             run.stage,
             "late",
-            &Cpu::Unknown(format!("{name}: no budget (a remote or undeclared wait)")),
+            None,
+            &Ruling::unknown(format!("{name}: no budget (a remote or undeclared wait)")),
         );
         return None;
     };
@@ -332,7 +322,7 @@ pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<String>
         fakes: Fakes::Fail,
     };
     let (_, undecided) = apply(run, vec![timed]);
-    undecided.into_iter().next().map(|(_, why, _)| why)
+    undecided.into_iter().next().map(|(_, ruling, _)| ruling)
 }
 
 /// The gate's live samples through now: what [`red`] reads in the gate process (atl-host-load `live`).
@@ -340,18 +330,26 @@ pub(crate) fn live() -> Option<Samples> {
     atl_host_load::live(atl_host_load::monotonic_ns())
 }
 
-/// A row's red under the rule (rows judged on CPU only): prints the undecided line and returns exit 4 when [`red`] excuses `faults`; None when the red stands. The caller never passes
+/// A row's red under the rule (rows judged on CPU only): prints the undecided verdict and returns exit 4 when [`red`] excuses `faults`; None when the red stands. The caller never passes
 /// a run whose atld exited (a death is never excused).
 pub(crate) fn judge_row(cmd: &str, faults: &[Miss], services: &str) -> Option<ExitCode> {
     let samples = live();
     let faults: Vec<&Miss> = faults.iter().collect();
-    let why = red(&Run::cpu(cmd, samples.as_ref()), &faults, services)?;
-    Some(undecided(cmd, cmd, &why))
+    let ruling = red(&Run::cpu(cmd, samples.as_ref()), &faults, services)?;
+    Some(undecided(cmd, cmd, &ruling))
 }
 
-/// Prints the undecided verdict line `<cmd>: undecided <stage>: <why>` (check_gates.rs `undecided_line` reads it) and returns its exit code.
-pub(crate) fn undecided(cmd: &str, stage: &str, why: &str) -> ExitCode {
-    println!("{cmd}: {}{stage}: {why}", crate::verdict::UNDECIDED_WORD);
+/// Prints the undecided verdict: the human line `<cmd>: undecided <stage>: <ruling>` and the machine `starvation-verdict:` line the gate's parent reads (check_gates.rs). Returns exit 4.
+/// `starved`: a ruling with a supply, as [`red`] and [`apply`] return.
+pub(crate) fn undecided(cmd: &str, stage: &str, starved: &Ruling) -> ExitCode {
+    println!(
+        "{cmd}: {}{stage}: {starved}",
+        crate::verdict::UNDECIDED_WORD
+    );
+    println!(
+        "{VERDICT_PREFIX}{}",
+        serde_json::to_string(starved).expect("a ruling serializes")
+    );
     ExitCode::from(crate::verdict::UNDECIDED_EXIT)
 }
 
@@ -359,6 +357,7 @@ pub(crate) fn undecided(cmd: &str, stage: &str, why: &str) -> ExitCode {
 mod tests {
     use super::*;
     use atl_host_load::{GateReading, Sample};
+    use xtask::harness::Judgement;
 
     /// A paint line at `at` s covering `ms` with longest render `max_us`.
     fn paint(at: &str, ms: u64, max_us: u64) -> String {
@@ -457,7 +456,10 @@ mod tests {
         assert!(j.is_empty());
         assert_eq!(
             u[0].1,
-            "host GPU starved (window render median 300 ms, max 300 ms in the phase > bound 100 ms)"
+            Ruling::starved(
+                Supply::Gpu,
+                "window render median 300 ms, max 300 ms in the phase > bound 100 ms"
+            )
         );
         for app in [&spike, &slow_elsewhere, &exact] {
             assert_eq!(
@@ -520,30 +522,30 @@ mod tests {
         let starved = cpu(&budget(Some(100)), Some(&load(480, 5, 500)));
         assert_eq!(
             starved,
-            Cpu::Starved("starved cpu: event bound 1000 ms need 100 ms stalled 960 ms".to_owned())
+            Ruling::starved(
+                Supply::Cpu,
+                "event bound 1000 ms need 100 ms stalled 960 ms"
+            )
         );
-        assert!(matches!(
-            cpu(&budget(Some(100)), Some(&load(400, 5, 500))),
-            Cpu::Judged(_)
-        ));
-        assert!(matches!(
-            cpu(&budget(Some(100)), Some(&load(450, 5, 500))),
-            Cpu::Judged(_)
-        ));
-        assert!(matches!(
-            cpu(&budget(None), Some(&load(480, 5, 500))),
-            Cpu::Judged(t) if t.contains("need unset")
-        ));
-        assert!(matches!(
-            cpu(&budget(Some(100)), Some(&load(480, 400, 500))),
-            Cpu::Judged(_)
-        ));
-        assert!(matches!(cpu(&budget(Some(100)), None), Cpu::Unknown(_)));
+        let judged = |b: Budget, s: Option<&Samples>| cpu(&b, s).judgement;
+        assert_eq!(
+            judged(budget(Some(100)), Some(&load(400, 5, 500))),
+            Judgement::Judged
+        );
+        assert_eq!(
+            judged(budget(Some(100)), Some(&load(450, 5, 500))),
+            Judgement::Judged
+        );
+        assert_eq!(
+            judged(budget(Some(100)), Some(&load(480, 400, 500))),
+            Judgement::Judged
+        );
+        let unset = cpu(&budget(None), Some(&load(480, 5, 500)));
+        assert_eq!(unset.judgement, Judgement::Judged);
+        assert!(unset.text.contains("need unset"), "{}", unset.text);
+        assert_eq!(judged(budget(Some(100)), None), Judgement::Unknown);
         let short = Samples(load(480, 5, 500).0[..2].to_vec());
-        assert!(matches!(
-            cpu(&budget(Some(100)), Some(&short)),
-            Cpu::Unknown(_)
-        ));
+        assert_eq!(judged(budget(Some(100)), Some(&short)), Judgement::Unknown);
     }
 
     fn late(budget: Option<Budget>) -> Miss {
@@ -562,7 +564,10 @@ mod tests {
         let starved = late(Some(budget(Some(100))));
         assert_eq!(
             red(&run, &[&starved], ""),
-            Some("starved cpu: event bound 1000 ms need 100 ms stalled 960 ms".to_owned())
+            Some(Ruling::starved(
+                Supply::Cpu,
+                "event bound 1000 ms need 100 ms stalled 960 ms"
+            ))
         );
         let wrong = Miss::Wrong("picture differs".to_owned());
         assert_eq!(red(&run, &[&starved, &wrong], ""), None);
@@ -584,10 +589,10 @@ mod tests {
         let starved = load(490, 5, 500);
         assert_eq!(
             red(&Run::cpu("capture", Some(&starved)), &[&wrong], fired),
-            Some(
-                "starved cpu: removeTask kill 1s bound 1000 ms need 25 ms stalled 980 ms"
-                    .to_owned()
-            )
+            Some(Ruling::starved(
+                Supply::Cpu,
+                "removeTask kill 1s bound 1000 ms need 25 ms stalled 980 ms"
+            ))
         );
         let quiet = load(10, 5, 500);
         assert_eq!(
