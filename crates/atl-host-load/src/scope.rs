@@ -13,11 +13,17 @@ use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The cgroup v2 mount.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// A relaunch names its unit `atl-gate-<pid>`; systemd adds `.scope`.
 const UNIT_PREFIX: &str = "atl-gate-";
+
+/// [`leftovers`]'s poll.
+const LEFTOVER_POLL: Duration = Duration::from_millis(50);
+/// The length of a command line [`leftovers`] shows.
+const COMMAND_CHARS: usize = 100;
 
 /// A gate's scope: its cgroup dir.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +80,33 @@ pub fn peak_bytes(dir: &Path) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// The other processes in the scope at `dir`, as `<pid> <command line>`, once none is left or `settle` has passed. Zombies are not listed (cgroup v2 `cgroup.procs`).
+pub fn leftovers(dir: &Path, settle: Duration) -> Result<Vec<String>, String> {
+    let path = dir.join("cgroup.procs");
+    let own = std::process::id().to_string();
+    let until = Instant::now() + settle;
+    loop {
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("{} unreadable: {e}", path.display()))?;
+        let pids: Vec<&str> = text.lines().filter(|p| *p != own).collect();
+        if pids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if Instant::now() >= until {
+            return Ok(pids.into_iter().map(with_command).collect());
+        }
+        std::thread::sleep(LEFTOVER_POLL);
+    }
+}
+
+/// `<pid> <command line>` on one line, cut to [`COMMAND_CHARS`].
+fn with_command(pid: &str) -> String {
+    let cmd = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let cmd = String::from_utf8_lossy(&cmd).replace(char::is_control, " ");
+    let cmd: String = cmd.trim().chars().take(COMMAND_CHARS).collect();
+    format!("{pid} {cmd}")
 }
 
 /// Whether this process already is the relaunch: its unit is `atl-gate-<pid>.scope`, whether or not the scope has cpu files.

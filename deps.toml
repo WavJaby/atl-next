@@ -681,7 +681,17 @@ arch = "libsecret"
 scope = ["test"]
 used_by = ["optional:xtask:fetch"]
 
-# ChildGuard (nested_wayland.rs): `setpriv --pdeathsig TERM` ends the child when xtask dies
+# `set_default_route` (atld_run.rs): joins a routed run's namespaces for a route step
+[nsenter]
+debian = "util-linux"
+arch = "util-linux"
+binary = "nsenter"
+min = "2.41.5"
+min_reason = "observed 2026-11-24; older is untested"
+scope = ["test"]
+used_by = ["xtask:test"]
+
+# `dying_with_parent` (nested_wayland.rs): `setpriv --pdeathsig` ends a compositor (TERM) or a run's atld (KILL) when xtask dies
 [setpriv]
 debian = "util-linux"
 arch = "util-linux"

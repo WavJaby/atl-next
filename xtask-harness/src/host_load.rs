@@ -11,6 +11,7 @@
 //! (sleeps past the bound, then works) -> FAIL; pass under equal-weight load -> pass. Without `--case` the gate runs every case and passes when each ends as expected.
 //! A FAIL case must end red with its expected cause on its own stdout line ([`CAUSE_PREFIX`]: `late`, `exited`, `wrong`). Any other exit 1 (a burner or the worker that did not start) fails the row.
 //! `--break burner-start` refuses the burners' CPUWeight: every burning case must then fail the gate.
+//! `--break leak` leaves a process running in each case: each case must then end in the leftover verdict (main.rs; tests/gate_leftovers.rs runs one case both ways).
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -54,7 +55,7 @@ pub struct Args {
     /// Run one case in this process (the gate runs each case so, pinned to one CPU); without it every case runs and is compared with its expected outcome.
     #[arg(long, value_enum, hide = true)]
     case: Option<Case>,
-    /// Break the gate on purpose: `burner-start` refuses the burners' CPUWeight, so every case that burns ends with a setup error and the gate goes red.
+    /// Break the gate on purpose: `burner-start` refuses the burners' CPUWeight, so every case that burns ends with a setup error and the gate goes red; `leak` leaves a process running in each case, so each case ends red.
     #[arg(long = "break", value_enum)]
     break_: Option<Break>,
 }
@@ -118,12 +119,15 @@ impl Cause {
 pub(crate) enum Break {
     /// The burners do not start: systemd-run refuses their CPUWeight, so each ends at once.
     BurnerStart,
+    /// A `sleep` outlives the case: the gate's leftover check (main.rs) must turn it red.
+    Leak,
 }
 
 impl Break {
     fn name(self) -> &'static str {
         match self {
             Self::BurnerStart => "burner-start",
+            Self::Leak => "leak",
         }
     }
 }
@@ -434,6 +438,17 @@ fn judge(case: Case, cpus: &[u32], log: &Path, brk: Option<Break>) -> Result<Exi
         .burners()
         .map(|weight| Burners::start(cpus, weight, brk))
         .transpose()?;
+    if brk == Some(Break::Leak) {
+        // ends by itself, well past the leftover check's settle (10 s)
+        let leak = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("sleep")?;
+        std::mem::forget(leak);
+    }
     let exe = std::env::current_exe().context("the harness's own path")?;
     // setpriv: the worker dies with this gate too (PDEATHSIG), so a killed gate leaves no spinner
     let mut worker = Command::new("setpriv")

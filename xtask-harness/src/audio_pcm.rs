@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::nested_wayland::dying_with_parent;
 use crate::platform_ui::Built as Client;
 use crate::verdict::{Failure, Verdict};
 
@@ -396,7 +397,8 @@ impl Routing {
 
     fn null_node(name: &str, class: &str, extra: &str) -> Result<Self> {
         use std::io::Write;
-        let mut holder = Command::new("pw-cli")
+        // pw-cli spins on EOF instead of ending: a killed harness must end it, Drop does not run there
+        let mut holder = dying_with_parent(&Command::new("pw-cli"), "KILL")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -510,7 +512,7 @@ impl PulseServer {
         let _ = fs::remove_file(&socket);
         let log_path = dir.join("pipewire-pulse.log");
         let log = fs::File::create(&log_path)?;
-        let child = Command::new("pipewire-pulse")
+        let child = dying_with_parent(&Command::new("pipewire-pulse"), "KILL")
             .env("PULSE_RUNTIME_PATH", &runtime)
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .stdin(Stdio::null())
@@ -554,7 +556,7 @@ impl Recorder {
         let log = wav.with_extension("log");
         let out = fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
         let err = out.try_clone().context("duplicating the pw-record log")?;
-        let child = Command::new("pw-record")
+        let child = dying_with_parent(&Command::new("pw-record"), "KILL")
             .args(["-P", "stream.capture.sink=true", "--target", sink])
             .args([
                 "--rate",
@@ -620,7 +622,7 @@ pub(crate) struct PrivateServer {
 impl PrivateServer {
     pub(crate) fn start(runtime: &Path, dir: &Path) -> Result<Self> {
         let log = fs::File::create(dir.join("server.log")).context("creating the server log")?;
-        let child = Command::new("pipewire")
+        let child = dying_with_parent(&Command::new("pipewire"), "KILL")
             .env("PIPEWIRE_RUNTIME_DIR", runtime)
             .stdout(Stdio::null())
             .stderr(log)

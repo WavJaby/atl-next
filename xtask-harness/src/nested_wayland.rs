@@ -72,6 +72,26 @@ pub(crate) fn labwc_env(outputs: usize) -> [(&'static str, String); 3] {
     ]
 }
 
+/// `cmd` under `setpriv --pdeathsig <signal>`: the kernel sends it when the spawning thread dies, so spawn it from a thread that outlives it.
+/// exec keeps the pid, and the signal survives `unshare -Ur` (no uid change the kernel sees). Environment and directory carry over; stdio is the caller's to set.
+pub(crate) fn dying_with_parent(cmd: &Command, signal: &str) -> Command {
+    let mut wrapped = Command::new("setpriv");
+    wrapped
+        .args(["--pdeathsig", signal, "--"])
+        .arg(cmd.get_program())
+        .args(cmd.get_args());
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => wrapped.env(k, v),
+            None => wrapped.env_remove(k),
+        };
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        wrapped.current_dir(dir);
+    }
+    wrapped
+}
+
 /// A child process that is always ended: SIGTERM, then SIGKILL after [`STOP_WAIT`], when this guard drops, so on every return path of the gate, an error or a panic included.
 /// Ctrl-C reaches the child directly (same process group), and `setpriv --pdeathsig` ends it should xtask itself be killed.
 pub struct ChildGuard(Child);
@@ -79,21 +99,7 @@ pub struct ChildGuard(Child);
 impl ChildGuard {
     /// Starts `cmd` with SIGTERM as its parent-death signal.
     pub fn spawn(cmd: &mut Command) -> Result<Self> {
-        let mut wrapped = Command::new("setpriv");
-        wrapped
-            .args(["--pdeathsig", "TERM", "--"])
-            .arg(cmd.get_program())
-            .args(cmd.get_args());
-        for (k, v) in cmd.get_envs() {
-            match v {
-                Some(v) => wrapped.env(k, v),
-                None => wrapped.env_remove(k),
-            };
-        }
-        if let Some(dir) = cmd.get_current_dir() {
-            wrapped.current_dir(dir);
-        }
-        let child = wrapped
+        let child = dying_with_parent(cmd, "TERM")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

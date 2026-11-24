@@ -18,6 +18,11 @@ pub use sampler::{
 };
 pub use scope::cgroup_dir;
 
+use std::time::Duration;
+
+/// How long a gate's ended processes may take to go: a SIGKILLed sandbox tree is torn down asynchronously, in milliseconds on a quiet host.
+const LEFTOVER_SETTLE: Duration = Duration::from_secs(10);
+
 /// A test gate's record: [`Gate::begin`] first, [`Gate::finish`] last.
 pub struct Gate {
     tier: Tier,
@@ -53,6 +58,14 @@ impl Gate {
             }
         };
         Self { tier }
+    }
+
+    /// The processes the gate leaves running: everything in its scope but this process, whoever its parent is now. Called once the gate's work is over. Empty without a scope: not measured there.
+    pub fn leftovers(&self) -> Result<Vec<String>, String> {
+        match &self.tier {
+            Tier::Scoped { scope, .. } => scope::leftovers(&scope.dir, LEFTOVER_SETTLE),
+            Tier::Unscoped { .. } => Ok(Vec::new()),
+        }
     }
 
     /// Ends the gate and returns its record.

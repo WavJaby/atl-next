@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use atl_layout::Layout;
 
-use crate::atld_run::{Package, Run, Runtime, counter_lines, route_fifo, set_default_route};
+use crate::atld_run::{Package, Run, Runtime, counter_lines, set_default_route};
 use crate::manifest;
 use crate::wait::{LOOP_POLL, Miss, Wait, settle_for, until, until_child};
 
@@ -589,7 +589,7 @@ fn connectivity_checks(
     let started = rt.start_atld(&run);
     rt.set_routed(false);
     let mut atld = started?;
-    let (fifo, app) = (route_fifo(&run), run.log(&package));
+    let app = run.log(&package);
     let read = atl_diag::logfiles::read;
     // waits up to NET_STEP for the app's log to hold `marker`: one declared wait per step (its record); a late step is false
     let seen = |name: &'static str, marker: &str| -> bool {
@@ -607,10 +607,10 @@ fn connectivity_checks(
     let start_seen = seen("net-start", NET_START);
     let sticky_start = start_seen && seen("net-sticky-start", NET_STICKY_START);
     let lost_seen =
-        start_seen && set_default_route(&fifo, false).is_ok() && seen("net-lost", NET_LOST);
+        start_seen && set_default_route(atld.id(), false).is_ok() && seen("net-lost", NET_LOST);
     let sticky_lost = lost_seen && seen("net-sticky-lost", NET_STICKY_LOST);
     let again_seen =
-        lost_seen && set_default_route(&fifo, true).is_ok() && seen("net-again", NET_AGAIN);
+        lost_seen && set_default_route(atld.id(), true).is_ok() && seen("net-again", NET_AGAIN);
     let sticky_again = again_seen && seen("net-sticky-again", NET_STICKY_AGAIN);
     let _ = atld.kill();
     atld.wait()?;

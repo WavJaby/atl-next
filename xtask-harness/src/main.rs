@@ -340,7 +340,7 @@ fn main() -> Result<ExitCode> {
     // every declared wait made by this process takes its need from the machine's need ledger (gate_need.rs), read once here
     wait::install_needs(&root);
     let name = verdict_name(&cli.command);
-    let result = match cli.command {
+    let mut result = match cli.command {
         Command::RunApk(args) => run_apk::run(&root, &args),
         Command::Remote { remote } => remote::run(&root, &remote),
         Command::Test {
@@ -505,7 +505,17 @@ fn main() -> Result<ExitCode> {
         }
     };
     if let Some(gate) = gate {
+        // a process the gate left running keeps what it inherited (locks included): red whatever the gate judged
+        let left = match gate.leftovers() {
+            Ok(left) if left.is_empty() => None,
+            Ok(left) => Some(format!("left running: {}", left.join("; "))),
+            Err(e) => Some(format!("left running: unknown ({e})")),
+        };
         println!("{}", gate.finish());
+        if let Some(left) = left {
+            println!("{}", verdict::gate(name.unwrap_or("test"), &[left]));
+            result = result.map(|_| ExitCode::FAILURE);
+        }
     }
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {

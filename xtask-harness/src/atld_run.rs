@@ -21,6 +21,7 @@ use crate::gate_goals::{
     ANGLE_FRONTS, EXTRACTOR_PLUGINS, GL_FRONTS, NB_EXE, NB_GUEST_LIBS, NB_LINKER, NDK_PROXIED,
 };
 use crate::host_art::{self, HostArt};
+use crate::nested_wayland::dying_with_parent;
 use crate::{manifest, out, packages, remote, tree};
 
 /// The keystore modules (gate_goals.rs `keystore`), each installed at `<out>/device/<module>/<module>`.
@@ -299,46 +300,40 @@ const OFFLINE_NET: &str = r#"set -eu
 ip link set lo up
 exec "$@""#;
 
-/// A routed run's network setup inside its fresh namespace: loopback up, the dummy link `atl0` with its address and default route; then a loop in the namespace reads route steps
-/// (`up` / `down`) from the FIFO `$1` and logs each step's result to `$2`, and the command runs (pid stays atld's). The steps run inside: `setns` into a namespace needs
-/// CAP_SYS_ADMIN in the caller's own user namespace, which an unprivileged harness does not have (`nsenter` fails with EPERM).
+/// A routed run's network setup inside its fresh namespace: loopback up, the dummy link `atl0` with its address and default route, then exec the command (no fork: the pid stays atld's).
+/// Nothing keeps running beside it: a step comes from outside ([`set_default_route`]). A process started here would be atld's child outside the broker, which no `--die-with-parent` ends.
 const ROUTED_NET: &str = r#"set -eu
 ip link set lo up
 ip link add atl0 type dummy
 ip addr add 192.0.2.10/24 dev atl0
 ip link set atl0 up
 ip route add default via 192.0.2.1 dev atl0
-fifo="$1"
-log="$2"
-shift 2
-( set +e
-  while read -r step < "$fifo"; do
-    case "$step" in
-      down) ip route del default ;;
-      up) ip route add default via 192.0.2.1 dev atl0 ;;
-    esac
-    echo "step $step rc=$?" >> "$log"
-  done ) &
 exec "$@""#;
 
-/// The routed run's step FIFO and step log, under its scratch dir ([`ROUTED_NET`]).
-const ROUTE_LOG: &str = "route.log";
-const ROUTE_FIFO: &str = "route.fifo";
-
-/// The step FIFO of a routed run.
-pub fn route_fifo(run: &Run) -> PathBuf {
-    run.scratch.join(ROUTE_FIFO)
+/// `inner` in a routed namespace ([`ROUTED_NET`]).
+fn routed(inner: &Command) -> Command {
+    let mut cmd = Command::new("unshare");
+    cmd.args(["-Urn", "--", "sh", "-c", ROUTED_NET, "sh"])
+        .arg(inner.get_program())
+        .args(inner.get_args());
+    cmd
 }
 
-/// Removes the routed namespace's default route (`up` = false) or restores it through atl0: the step goes to the namespace's own loop, which answers in the run's `route.log`.
-pub fn set_default_route(fifo: &Path, up: bool) -> Result<()> {
-    let step = if up { "up" } else { "down" };
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(fifo)
-        .with_context(|| format!("opening {}", fifo.display()))?;
-    f.write_all(format!("{step}\n").as_bytes())
-        .with_context(|| format!("writing {step} to {}", fifo.display()))?;
+/// Removes the default route of the routed run whose atld is `atld` (`up` = false) or restores it through atl0.
+/// nsenter joins the run's user namespace too (`-U`): this uid owns it, so the join brings CAP_SYS_ADMIN over the network namespace. `-n` alone is EPERM.
+pub fn set_default_route(atld: u32, up: bool) -> Result<()> {
+    let step: &[&str] = if up {
+        &["add", "default", "via", "192.0.2.1", "dev", "atl0"]
+    } else {
+        &["del", "default"]
+    };
+    let status = Command::new("nsenter")
+        .args(["-t", &atld.to_string(), "-U", "-n"])
+        .args(["--preserve-credentials", "--", "ip", "route"])
+        .args(step)
+        .status()
+        .context("running nsenter")?;
+    ensure!(status.success(), "ip route {}: {status}", step.join(" "));
     Ok(())
 }
 
@@ -1992,10 +1987,13 @@ impl Runtime {
             );
         }
         let log_file = std::fs::File::create(run.atld_log())?;
-        cmd.stdin(Stdio::null())
+        // a killed harness (SIGKILL included) ends atld; atld's own processes end with it (the broker's bwrap --die-with-parent)
+        dying_with_parent(&cmd, "KILL")
+            .stdin(Stdio::null())
             .stdout(log_file.try_clone()?)
-            .stderr(log_file);
-        cmd.spawn().context("starting atld")
+            .stderr(log_file)
+            .spawn()
+            .context("starting atld")
     }
 
     /// How a run's child ended: an error naming the transcript's last line when a remote transfer failed by itself (an exit code). A transfer the caller stopped at its limit has no code: its logs are the judge's to read, as on this host.
@@ -2072,23 +2070,7 @@ impl Runtime {
             }
         };
         if self.routed {
-            // the routed namespace: its step FIFO is made here, the wrapper's loop reads it (ROUTED_NET)
-            let fifo = route_fifo(run);
-            std::fs::create_dir_all(&run.scratch)
-                .with_context(|| format!("creating {}", run.scratch.display()))?;
-            let _ = std::fs::remove_file(&fifo);
-            let made = Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .context("running mkfifo")?;
-            ensure!(made.success(), "mkfifo {} failed", fifo.display());
-            let inner = cmd;
-            cmd = Command::new("unshare");
-            cmd.args(["-Urn", "--", "sh", "-c", ROUTED_NET, "sh"])
-                .arg(&fifo)
-                .arg(run.scratch.join(ROUTE_LOG))
-                .arg(inner.get_program())
-                .args(inner.get_args());
+            cmd = routed(&cmd);
         } else if self.offline {
             // outermost: the fake-kernel namespace (if any) nests inside it. unshare(1) leaves lo down in a new namespace; ns-root raises it (needs iproute2's `ip`), then execs on
             let inner = cmd;
@@ -2655,6 +2637,126 @@ mod tests {
         assert!(last_resumed("services: activity resumed org.x.Main\n").is_none());
         assert!(last_resumed("services: ready at=100.250\n").is_none());
         assert!(last_resumed("nothing\n").is_none());
+    }
+
+    /// The processes of a routed test run: their environment holds the run's mark, which every descendant inherits. A zombie's environment is empty, so it does not count.
+    fn marked(mark: &str) -> Vec<u32> {
+        let want = format!("ATL_ROUTED_MARK={mark}");
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == want.as_bytes()))
+            })
+            .collect()
+    }
+
+    /// Polls `ok` for up to 10 s: a loaded host's namespace setup or signal delivery, milliseconds on a quiet one.
+    fn soon(ok: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !ok() {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    /// A routed run of `sh -c script`, wrapped as start_atld wraps atld, and its mark.
+    fn routed_run(name: &str, script: &str) -> (Command, String) {
+        let mark = format!("{name}-{}", std::process::id());
+        let mut inner = Command::new("sh");
+        inner.args(["-c", script]);
+        let mut cmd = dying_with_parent(&routed(&inner), "KILL");
+        // a leaked process must not hold the test binary's output open (a piped `cargo test` would wait for it)
+        cmd.env("ATL_ROUTED_MARK", &mark)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        (cmd, mark)
+    }
+
+    /// Whether the run reached its command, `sleep`: the namespace is set up.
+    fn up(mark: &str) -> bool {
+        marked(mark).iter().any(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c == "sleep\n")
+        })
+    }
+
+    fn assert_gone(mark: &str) {
+        if soon(|| marked(mark).is_empty()) {
+            return;
+        }
+        let left = marked(mark);
+        for pid in &left {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+        panic!("{mark}: still running {left:?}");
+    }
+
+    #[test]
+    fn a_routed_run_that_ends_leaves_no_process() {
+        for (name, code) in [("pass", 0), ("fail", 3)] {
+            let (mut cmd, mark) = routed_run(name, &format!("exit {code}"));
+            assert_eq!(cmd.status().unwrap().code(), Some(code));
+            assert_gone(&mark);
+        }
+    }
+
+    #[test]
+    fn a_killed_routed_run_leaves_no_process() {
+        let (mut cmd, mark) = routed_run("atld-killed", "exec sleep 300");
+        let mut atld = cmd.spawn().unwrap();
+        assert!(soon(|| up(&mark)), "the run did not start");
+        atld.kill().unwrap();
+        atld.wait().unwrap();
+        assert_gone(&mark);
+    }
+
+    /// The harness here is a `sh` that starts the run and waits.
+    #[test]
+    fn a_routed_run_of_a_killed_harness_leaves_no_process() {
+        let (cmd, mark) = routed_run("harness-killed", "exec sleep 300");
+        let mut harness = Command::new("sh")
+            .args(["-c", r#""$@" & wait"#, "sh"])
+            .arg(cmd.get_program())
+            .args(cmd.get_args())
+            .env("ATL_ROUTED_MARK", &mark)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(soon(|| up(&mark)), "the run did not start");
+        harness.kill().unwrap();
+        harness.wait().unwrap();
+        assert_gone(&mark);
+    }
+
+    /// Each step changes the run's own table (read through its pid); a step on a route already gone is an error.
+    #[test]
+    fn route_steps_reach_the_run() {
+        let (mut cmd, mark) = routed_run("steps", "exec sleep 300");
+        let mut atld = cmd.spawn().unwrap();
+        assert!(soon(|| up(&mark)), "the run did not start");
+        // /proc/<pid>/net/route: interface, then the destination in hex, 00000000 for the default route
+        let default = || {
+            std::fs::read_to_string(format!("/proc/{}/net/route", atld.id()))
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with("atl0\t00000000\t"))
+        };
+        assert!(default());
+        set_default_route(atld.id(), false).unwrap();
+        assert!(!default());
+        assert!(set_default_route(atld.id(), false).is_err());
+        set_default_route(atld.id(), true).unwrap();
+        assert!(default());
+        atld.kill().unwrap();
+        atld.wait().unwrap();
+        assert_gone(&mark);
     }
 
     /// The last settle line decides; a resume line alone is not settled.

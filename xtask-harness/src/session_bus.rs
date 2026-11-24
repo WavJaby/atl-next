@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::nested_wayland::dying_with_parent;
+
 /// The freedesktop notification service's bus name, object path and interface (Desktop Notifications 1.3).
 const NAME: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
@@ -36,7 +38,7 @@ impl PrivateBus {
         let config = dir.join("session.conf");
         std::fs::write(&config, config_text(&socket))
             .with_context(|| format!("writing {}", config.display()))?;
-        let child = Command::new("dbus-daemon")
+        let child = dying_with_parent(&Command::new("dbus-daemon"), "KILL")
             .arg(format!("--config-file={}", config.display()))
             .args(["--nofork", "--nopidfile"])
             .stdin(Stdio::null())
