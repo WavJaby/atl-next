@@ -199,6 +199,8 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
     let from_ns = atl_host_load::monotonic_ns();
     let start = Instant::now();
     let deadline = start + wait.bound;
+    // the budget's span covers the bound only: [from_ns, from_ns + bound]
+    let bound_ns = i64::try_from(wait.bound.as_nanos()).unwrap_or(i64::MAX);
     let ended = match (&wait.until, child) {
         (Until::Event { events, want }, _) => Ok(received(events, want, deadline)),
         (Until::Log { file, want }, child) => polled(
@@ -243,7 +245,8 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
                 need: wait.need,
                 span: Span {
                     from_ns,
-                    to_ns: atl_host_load::monotonic_ns(),
+                    // up to the deadline, not the return: the last poll or sleep may end past it, and that overshoot is the host's, not the wait's
+                    to_ns: from_ns.saturating_add(bound_ns),
                 },
             }),
         }),
@@ -424,7 +427,54 @@ mod tests {
             (b.wait.as_str(), b.bound, b.need),
             ("pong", w.bound, w.need)
         );
-        assert!(b.span.to_ns - b.span.from_ns >= 30_000_000, "{b:?}");
+        assert_eq!(b.span.to_ns - b.span.from_ns, 30_000_000, "{b:?}");
+    }
+
+    /// The budget's span is the bound's own, up to the deadline: load after the deadline (only the last poll's overshoot reached it) is not the wait's stall, so the red stays judged.
+    #[test]
+    fn load_after_the_deadline_does_not_starve_a_late_wait() {
+        use atl_host_load::{GateReading, Sample, Samples};
+        use xtask::harness::Judgement;
+        const MS: i64 = 1_000_000;
+        let never = || false;
+        // a 200 ms poll against a 50 ms bound: the wait ends 150 ms past its deadline
+        let mut w = Wait::logs(
+            "draw",
+            "no draw",
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            &never,
+        );
+        w.need = Some(Duration::from_millis(20));
+        let Err(Miss::Late {
+            budget: Some(b), ..
+        }) = until(&w)
+        else {
+            panic!("late without a budget");
+        };
+        let deadline = b.span.from_ns + 50 * MS;
+        // synthetic host: no gate stall up to the deadline, then the gate is stalled through every later 10 ms step; the gate uses no CPU, so all busy CPU is foreign
+        let base = b.span.from_ns - 50 * MS;
+        let samples = Samples(
+            (0..=45_i64)
+                .map(|k| {
+                    let at = base + k * 10 * MS;
+                    Sample {
+                        at_ns: at,
+                        wall_ns: at,
+                        gate: Some(GateReading {
+                            stall_us: u64::try_from((at - deadline).max(0) / 1_000)
+                                .expect("non-negative"),
+                            usage_us: 0,
+                        }),
+                        busy_us: Some(u64::try_from((at - base) / 1_000).expect("non-negative")),
+                        ..Sample::default()
+                    }
+                })
+                .collect(),
+        );
+        let ruling = crate::starvation::cpu(&b, Some(&samples));
+        assert!(matches!(ruling.judgement, Judgement::Judged), "{ruling}");
     }
 
     #[test]
