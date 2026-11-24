@@ -261,8 +261,13 @@ pub(crate) fn pick_base(root: &Path, ws: &Path) -> Result<Option<String>> {
 
 /// Refuses a ram dir (delta.rs) seen outside its namespace: there it is the empty mount point, and a build would write the pool under the overlay's place.
 fn unmounted_ram(dir: &Path, id: &str) -> Result<()> {
+    unmounted_ram_at(dir, id, crate::delta::stage().is_some())
+}
+
+/// [`unmounted_ram`] with `inside` = this process runs in a delta namespace.
+pub(crate) fn unmounted_ram_at(dir: &Path, id: &str, inside: bool) -> Result<()> {
     ensure!(
-        crate::delta::stage().is_some() || !dir.join(crate::delta::RECORD).exists(),
+        inside || !dir.join(crate::delta::RECORD).exists(),
         "ws/{id} is a ram delta (delta.rs): reachable only inside its namespace, which build commands enter; this command runs outside it"
     );
     Ok(())
@@ -1036,7 +1041,7 @@ fn land_id(land: &Path) -> Result<()> {
 }
 
 /// What `publish` keeps of `ws/land`: all but the gate's target ([`BOOTSTRAP_DIR`]). Cargo reuses a target's outputs as fresh when the checkout's sources are older than them, and the unit key does not include the checkout path: a child would pass its gate on the land's artifacts. [`reset_land`] carries the land's own back.
-fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
+pub(crate) fn copy_base(src: &Path, dst: &Path) -> Result<Tier> {
     copy_tree(src, dst, None, &[BOOTSTRAP_DIR])
 }
 

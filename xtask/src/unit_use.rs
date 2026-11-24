@@ -5,7 +5,7 @@
 //!
 //! `Units::Plain` runs add no flag and record nothing: `cargo metadata`, `fmt`, `deny` and `install --list` take no `--message-format`, and the `cargo xtask` alias would hand it to xtask. The alias's own units (xtask and its dependencies) are compiled before any xtask code runs, so no run records them; `out prune --units` judges them by mtime.
 //!
-//! A unit is named by the 16-hex-digit hash in its paths: `deps/<crate>-<hash>.*`, `examples/<name>-<hash>`, `build/<pkg>-<hash>/`, `.fingerprint/<pkg>-<hash>/`. An uplifted output (`<tree>/<name>`) is a hard link of its hashed file, so its inode names the hash. An output with no hash (a cdylib's `deps/lib<x>.so`) names only its package: every fingerprint dir of that package in the tree is recorded, superseded ones included. That keeps more, never less.
+//! A unit is named by the 16-hex-digit hash in its paths: `deps/<crate>-<hash>.*`, `examples/<name>-<hash>`, `build/<pkg>-<hash>/`, `.fingerprint/<pkg>-<hash>/`. An uplifted output (`<tree>/<name>`) is a hard link of its hashed file, so its inode names the hash. An output with no hash (a cdylib's `deps/lib<x>.so`) names only its package; its unit is the package's lib fingerprint dir (a `lib-*` file) that cargo invoked last at or before the output's mtime (cargo touches `invoked.timestamp` before rustc writes the outputs), among the dirs the same run did not name by hash. Superseded generations are not recorded: a unit is live only by its own use. No such dir: nothing recorded for that output, worst case one rebuild.
 //!
 //! The record `<tree>/.atl-unit-use.json` holds `units` (hash -> last use, unix seconds). A unit without an entry has no recorded use: `out prune --units` judges it by its fingerprint dir's mtime. Updates take `flock` on `<tree>/.atl-unit-use.lock` and replace the file by rename. An unreadable record is an error for prune; the next recorded build replaces it with an empty record.
 
@@ -290,9 +290,9 @@ fn with_units(cmd: &Command, units: Units) -> Result<Command> {
 /// Records the units `messages` name as used at `now`, in each tree they name.
 pub fn record(messages: &[Value], now: u64) -> Result<()> {
     for (tree, uses) in uses_of(messages)? {
-        let mut hashes = uses.hashes;
-        for package in &uses.packages {
-            hashes.extend(fingerprints_of(&tree, package)?);
+        let mut hashes = uses.hashes.clone();
+        for (package, output) in &uses.unhashed {
+            hashes.extend(owner_of_unhashed(&tree, package, output, &uses.hashes)?);
         }
         update(&tree, |record| {
             for hash in hashes {
@@ -356,11 +356,11 @@ fn update(tree: &Path, change: impl FnOnce(&mut Record)) -> Result<()> {
     fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))
 }
 
-/// What one tree's messages used: unit hashes, and packages whose outputs named no hash.
+/// What one tree's messages used: unit hashes, and (package, output) pairs whose output names no hash.
 #[derive(Debug, Default)]
 struct Uses {
     hashes: BTreeSet<String>,
-    packages: BTreeSet<String>,
+    unhashed: BTreeSet<(String, PathBuf)>,
 }
 
 fn uses_of(messages: &[Value]) -> Result<BTreeMap<PathBuf, Uses>> {
@@ -396,7 +396,7 @@ fn uses_of(messages: &[Value]) -> Result<BTreeMap<PathBuf, Uses>> {
                     uses.hashes.insert(hash);
                 }
                 (None, Some(package)) => {
-                    uses.packages.insert(package.clone());
+                    uses.unhashed.insert((package.clone(), PathBuf::from(path)));
                 }
                 (None, None) => {}
             }
@@ -454,9 +454,22 @@ fn package_name(package_id: &str) -> Option<String> {
     }
 }
 
-/// The hashes of `package`'s fingerprint dirs in `tree`, superseded ones included.
-fn fingerprints_of(tree: &Path, package: &str) -> Result<Vec<String>> {
-    let mut hashes = Vec::new();
+/// cargo's mark in a fingerprint dir, touched as it invokes rustc for the unit (before the outputs are written).
+const INVOKED: &str = "invoked.timestamp";
+/// Prefix of the fingerprint file of a lib target's unit (cdylib, staticlib, dylib, rlib); test, bin and build-script units carry other prefixes.
+const LIB_FINGERPRINT: &str = "lib-";
+
+/// The unit of `package` that wrote unhashed `output` in `tree`: of its lib fingerprint dirs not in `named` (this run named them by hash), the one invoked last at or before `output`'s mtime. None when `output` is gone or no dir qualifies.
+fn owner_of_unhashed(
+    tree: &Path,
+    package: &str,
+    output: &Path,
+    named: &BTreeSet<String>,
+) -> Result<Option<String>> {
+    let Some(written) = modified(output)? else {
+        return Ok(None);
+    };
+    let mut best: Option<(SystemTime, String)> = None;
     for dir in dir_entries(&tree.join(FINGERPRINT))? {
         let Some(name) = file_name(&dir) else {
             continue;
@@ -464,11 +477,33 @@ fn fingerprints_of(tree: &Path, package: &str) -> Result<Vec<String>> {
         let Some((pkg, hash)) = split_unit(&name) else {
             continue;
         };
-        if pkg == package {
-            hashes.push(hash.to_owned());
+        if pkg != package || named.contains(hash) {
+            continue;
+        }
+        let is_lib = dir_entries(&dir)?
+            .iter()
+            .filter_map(|f| file_name(f))
+            .any(|f| f.starts_with(LIB_FINGERPRINT));
+        let Some(invoked) = modified(&dir.join(INVOKED))? else {
+            continue;
+        };
+        if is_lib && invoked <= written && best.as_ref().is_none_or(|(t, _)| invoked > *t) {
+            best = Some((invoked, hash.to_owned()));
         }
     }
-    Ok(hashes)
+    Ok(best.map(|(_, hash)| hash))
+}
+
+/// `path`'s mtime; None when it is gone.
+fn modified(path: &Path) -> Result<Option<SystemTime>> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some(
+            meta.modified()
+                .with_context(|| format!("mtime of {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// The hash of a unit name `<pkg>-<hash>`; None for any other name.
@@ -618,7 +653,21 @@ mod tests {
         fs::write(path, text).expect("file");
     }
 
-    /// The outputs of one debug tree: lib `pdep` (hashed deps files), bin `pbin` and example `ex` (uplifted hard links), cdylib `pcdy` (no hash), and two fingerprint dirs of `pcdy`.
+    /// `pcdy`'s units in `fixture`: the lib unit that wrote the `.so` (invoked 10 s before it), an older lib generation (100 s before), a test unit (invoked with the `.so`'s mtime).
+    const CDYLIB_UNIT: &str = "pcdy-98196d3cfe1a415c";
+    const CDYLIB_OLDER: &str = "pcdy-1111111111111111";
+    const CDYLIB_TEST: &str = "pcdy-3333333333333333";
+
+    fn stamp(path: &Path, at: SystemTime) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_times(fs::FileTimes::new().set_modified(at))
+            .expect("set mtime");
+    }
+
+    /// The outputs of one debug tree: lib `pdep` (hashed deps files), bin `pbin` and example `ex` (uplifted hard links), cdylib `pcdy` (no hash, mtime NOW) and its three fingerprint dirs above.
     fn fixture(root: &Path) -> PathBuf {
         let tree = root.join("debug");
         file(&tree.join("deps/libpdep-82c9bf5494a1a958.rlib"), "rlib");
@@ -635,8 +684,19 @@ mod tests {
         file(&tree.join("deps/libpcdy.so"), "cdylib");
         fs::hard_link(tree.join("deps/libpcdy.so"), tree.join("libpcdy.so"))
             .expect("uplift cdylib");
-        fs::create_dir_all(tree.join(FINGERPRINT).join("pcdy-98196d3cfe1a415c")).expect("fp");
-        fs::create_dir_all(tree.join(FINGERPRINT).join("pcdy-1111111111111111")).expect("fp");
+        let so = UNIX_EPOCH + std::time::Duration::from_secs(NOW);
+        stamp(&tree.join("deps/libpcdy.so"), so);
+        let fp = tree.join(FINGERPRINT);
+        for (unit, kind, before) in [
+            (CDYLIB_UNIT, "lib-pcdy", 10),
+            (CDYLIB_OLDER, "lib-pcdy", 100),
+            (CDYLIB_TEST, "test-lib-pcdy", 0),
+        ] {
+            file(&fp.join(unit).join(kind), "hash");
+            let invoked = fp.join(unit).join(INVOKED);
+            file(&invoked, "");
+            stamp(&invoked, so - std::time::Duration::from_secs(before));
+        }
         tree
     }
 
@@ -660,8 +720,7 @@ mod tests {
     }
 
     /// The unit hashes `fixture` + `messages` record, derived by hand from the names above.
-    const FIXTURE_UNITS: [&str; 6] = [
-        "1111111111111111",
+    const FIXTURE_UNITS: [&str; 5] = [
         "4d8b50e752b24547",
         "6478fe1bccb24b75",
         "6870961078c9e1fc",
@@ -678,9 +737,27 @@ mod tests {
         let got: Vec<&str> = record.units.keys().map(String::as_str).collect();
         assert_eq!(
             got, FIXTURE_UNITS,
-            "lib deps files, build-script run dir, uplifted bin and example by inode, cdylib by package (both generations)"
+            "lib deps files, build-script run dir, uplifted bin and example by inode, cdylib by its last invoked lib unit"
         );
         assert!(record.units.values().all(|&at| at == NOW));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A build reporting the cdylib uses only the lib unit invoked last before the `.so`. Break target: the old rule (every fingerprint dir of the package) records the older generation and the test unit.
+    #[test]
+    fn an_older_generation_of_a_cdylib_is_not_recorded() {
+        let root = scratch("cdylib");
+        let tree = fixture(&root);
+        record(&messages(&tree, true), NOW).expect("record");
+        let record = load(&tree).expect("load").expect("record exists");
+        let has = |unit: &str| {
+            record
+                .units
+                .contains_key(unit.rsplit_once('-').expect("hash").1)
+        };
+        assert!(has(CDYLIB_UNIT), "the unit that wrote the .so");
+        assert!(!has(CDYLIB_OLDER), "older generation recorded");
+        assert!(!has(CDYLIB_TEST), "test unit recorded");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

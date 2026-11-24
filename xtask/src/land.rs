@@ -3,7 +3,7 @@
 //! Why this order: `src/<up>` is one checkout shared by every worktree and holds origin/main's pins and patches (`fetch::Main`), so a branch's unlanded patches exist only in its task copies (`src-wt/<branch>/<up>`), which only the branch's worktree resolves (`atl-layout`).
 //! Main has no task copies, so `check` run on main sees `src/` alone. That is why the branch is checked before the push in a checkout on the branch, and why its copies go only after main and `src/` reached the new commit.
 //! That checkout is the land worktree [`LAND_WT`] (build dir `ws/land`), never the branch's own: one fixed path whose build dir holds the last landed tree, so Build compiles only the branch's diff (cargo outputs key on the checkout path too).
-//! It checks the branch out beside the branch's own worktree (`--ignore-other-worktrees`; land changes neither), so the task copies resolve by branch name as there. Green and pushed -> `ws/land` is published as `base/<commit>`, which new build dirs start from (a pool dir copied; a ram dir as lower + upper, out::publish), then laid again over it.
+//! It checks the branch out beside the branch's own worktree (`--ignore-other-worktrees`; land changes neither), so the task copies resolve by branch name as there. Green and pushed -> `ws/land` drops the cargo units no recorded build used for `out_prune::LAND_PRUNE_DAYS` (`--prune-units` child, inside its namespace) and is published as `base/<commit>`, which new build dirs start from (a pool dir copied; a ram dir as lower + upper, out::publish), then laid again over it.
 //! Failed before the push -> the land worktree goes back to origin/main and `ws/land` is laid again from the newest base (out::reset_land): no failed branch's outputs stay in the dir the next base comes from.
 //! Nothing reaches origin before the push. A task copy is a worktree of `src/` on `atl-patches-<branch>`: it leaves every other worktree's checkout alone.
 //! This process is main's xtask, so it never parses the branch's tables: a branch may change their schema. What they say comes from the branch's own xtask in its worktree (`--facts` child, `patch --edit`, `check`).
@@ -53,6 +53,9 @@ pub struct Args {
     /// Internal: the build dir child in the land worktree (`build_dir_child`); prints whether its build dir is current for every gate's goals, read-only.
     #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts"])]
     build_dir: bool,
+    /// Internal: the unit prune child in the land worktree (`prune_units_child`); removes from ws/land the cargo units no recorded build used for `out_prune::LAND_PRUNE_DAYS`, inside its namespace. The branch argument is not read.
+    #[arg(long, hide = true, conflicts_with_all = ["execute", "cleanup", "facts", "build_dir"])]
+    prune_units: bool,
 }
 
 /// What the branch's own tables say, as the branch's xtask reads them (`branch_facts`).
@@ -191,6 +194,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    if args.prune_units {
+        // ws/land on ram shows its trees only inside its namespace (outside: the empty mount point)
+        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small)? {
+            return Ok(code);
+        }
+        let ws = Layout::of(root)?.workspace().to_owned();
+        let inside = crate::delta::stage().is_some();
+        println!(
+            "{}",
+            out_prune::prune_land(&ws, unit_use::now()?, true, inside)?
+        );
+        out::count(&ws, "land-unit-prune");
+        return Ok(ExitCode::SUCCESS);
+    }
     let started = Instant::now();
     verdict::step("land:preflight");
     let plan = match Plan::new(root, &args.branch, args.execute, &facts_child)
@@ -241,7 +258,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         cleanup: &cleanup_execute,
         native: &native_execute,
         stale: &build_dir_child,
-        publish: &out::publish,
+        publish: &publish_execute,
         reset: &out::reset_land,
     };
     let line = plan.execute(&stages, &runner);
@@ -984,6 +1001,44 @@ fn build_dir_child(wt: &Path, branch: &str) -> Result<Option<String>> {
         run.stderr.trim_end()
     );
     parse_build_dir(&run.stdout)
+}
+
+/// Publish: ws/land's unit prune first ([`prune_units_child`]; Publish runs only after a green Verify), then `out::publish`. A failed prune is logged and the publish goes on: what was removed went whole, unit by unit.
+fn publish_execute(land: &Path) -> Result<String> {
+    verdict::step("land:unit-prune");
+    match prune_units_child(land) {
+        Ok(line) => println!("{line}"),
+        Err(e) => println!("{LAND_UNIT_PRUNE}FAILED: {e:#}"),
+    }
+    out::publish(land)
+}
+
+/// Prefix of `out_prune::prune_land`'s summary line.
+const LAND_UNIT_PRUNE: &str = "land unit prune: ";
+
+/// `cargo xtask land HEAD --prune-units` in the land worktree, by its own xtask (the landed commit's): enters ws/land's namespace and prunes it under its exclusive dir lock (`out_prune::prune_land`). Returns its summary line; the tree lines show in the land log.
+fn prune_units_child(land: &Path) -> Result<String> {
+    let mut cmd = crate::cargo_command();
+    cmd.args(["xtask", "land", "HEAD", "--prune-units"])
+        .current_dir(land);
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Stdout).with_context(|| {
+        format!(
+            "running cargo xtask land --prune-units in {}",
+            land.display()
+        )
+    })?;
+    ensure!(
+        run.status.success(),
+        "{}: {}",
+        run.status,
+        run.stderr.trim_end()
+    );
+    run.stdout
+        .lines()
+        .rev()
+        .find(|l| l.starts_with(LAND_UNIT_PRUNE))
+        .map(str::to_owned)
+        .context("the unit prune child printed no summary line")
 }
 
 fn parse_build_dir(stdout: &str) -> Result<Option<String>> {

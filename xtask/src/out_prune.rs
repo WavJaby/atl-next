@@ -7,6 +7,7 @@
 //! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its build dir.
 //! Busy: a build holds the dir lock (`build_pool::hold_dir`); prune takes it exclusive without waiting and skips the dir. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
 //! Symlinks are refused, never followed: a link under a root could point the prune outside it.
+//! Land ([`prune_land`]): before Publish, ws/land with window [`LAND_PRUNE_DAYS`], inside the dir's namespace, so the base it becomes holds what recent builds read; a tree with no use record keeps every unit there. Published bases are never pruned: they are the lowers of live overlays.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -23,6 +24,8 @@ use crate::unit_use::{self, BUILD, DEPS, EXAMPLES, FINGERPRINT};
 
 /// Default `--older-than`, in days: a unit no cargo build used for this long is stale. First guess, not measured. A shorter cutoff frees more but recompiles stable dependencies more often; a rebuilt dependency also recompiles its dependents (2026-11-08: pruning one unit recompiled it and its dependent crate). Re-fit from the rebuild counts after a few lands.
 pub const PRUNE_AFTER_DAYS: u64 = 14;
+/// Land's window, in days: before Publish, ws/land drops the units no recorded build used for this long, so the base holds what main's recent builds read. Basis (base 9689dcda `target/debug`, 3289 units, base-cache-bloat study 2026-11-25): 2 days cuts 1073 units, 1 day 1525, 14 days 0; 2 keeps a unit a land skipped once (a branch that does not build it). A wrong cut costs one rebuild of the unit and its dependents in the next land.
+pub const LAND_PRUNE_DAYS: u64 = 2;
 
 const SECS_PER_DAY: u64 = 86_400;
 const MIB: f64 = 1_048_576.0;
@@ -68,6 +71,8 @@ pub struct TreePlan {
     pub tree: String,
     pub dir: PathBuf,
     pub busy: bool,
+    /// The tree has no use record and its scope needs one: no unit planned.
+    pub no_record: bool,
     /// Fingerprint entries in the tree.
     pub units: usize,
     pub stale: Vec<Unit>,
@@ -192,6 +197,9 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
             println!("{}: busy, skipped: a cargo build holds its lock", plan.tree);
             continue;
         }
+        if plan.no_record {
+            println!("{}: no use record: units not pruned", plan.tree);
+        }
         println!(
             "{}: units {}, stale {} ({}), kept {} (unrecorded {}), unattributed {}, orphan deps {} ({}), sessions stale {} ({}), kept {}",
             plan.tree,
@@ -220,15 +228,61 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
 /// What a prune removes: units and sessions (`out prune --units`), or sessions only (the end of a build, `prune_sessions`).
 #[derive(Clone, Copy, Debug)]
 enum Scope {
-    /// units last used `cutoff` seconds or more ago, and the stale sessions
-    Everything { cutoff: u64 },
+    /// units last used `cutoff` seconds or more ago, and the stale sessions. `need_record`: a tree without a use record plans no unit (land: mtime is no evidence of use there).
+    Everything { cutoff: u64, need_record: bool },
     /// stale sessions only: units keep their `--older-than` rule
     SessionsOnly,
 }
 
 /// Plans build dir `id`'s prune and, with `execute`, removes what it names. Holds the dir's lock for the whole call.
 pub fn prune_dir(ws: &Path, id: &str, cutoff: u64, now: u64, execute: bool) -> Result<Outcome> {
-    prune_dir_in(ws, id, Scope::Everything { cutoff }, now, execute)
+    let scope = Scope::Everything {
+        cutoff,
+        need_record: false,
+    };
+    prune_dir_in(ws, id, scope, now, execute)
+}
+
+/// Land's prune of ws/land before Publish ([`LAND_PRUNE_DAYS`]): run inside the dir's namespace when it is a ram delta (outside, its mount point is empty and every tree would read as absent). A tree with no use record plans nothing; an unreadable one refuses the dir. Prints the tree lines; returns the summary line.
+/// `inside`: this process runs in ws/land's delta namespace (`delta::stage`).
+pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<String> {
+    let id = out::LAND_ID;
+    out::unmounted_ram_at(&out::dir_of(ws, id), id, inside)?;
+    let window = LAND_PRUNE_DAYS;
+    let scope = Scope::Everything {
+        cutoff: window * SECS_PER_DAY,
+        need_record: true,
+    };
+    let plans = match prune_dir_in(ws, id, scope, now, execute)? {
+        Outcome::NotBuilt => {
+            return Ok(format!(
+                "land unit prune: ws/{id}: not built, nothing pruned"
+            ));
+        }
+        Outcome::Busy => {
+            return Ok(format!(
+                "land unit prune: ws/{id}: busy, nothing pruned: a process holds it"
+            ));
+        }
+        Outcome::Done(plans) => plans,
+    };
+    let mut total = Sweep::default();
+    report(&plans, &mut total, &mut BTreeMap::new());
+    let kept: usize = plans.iter().map(|p| p.kept).sum();
+    let no_record = plans.iter().filter(|p| p.no_record).count();
+    let busy = plans.iter().filter(|p| p.busy).count();
+    let verb = if execute {
+        "removed"
+    } else {
+        "dry run, would remove"
+    };
+    Ok(format!(
+        "land unit prune: ws/{id}: {verb} {} units and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned)",
+        total.units,
+        total.sessions,
+        human(total.bytes),
+        plans.len()
+    ))
 }
 
 /// The end of a build in build dir `id` (`out::after_build`): removes its stale incremental sessions, never units. Busy while any process holds the dir, so the caller drops its own shared hold first.
@@ -251,7 +305,11 @@ fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> R
 /// The trees no build dir owns: a real `repo/target` (a main checkout not yet on its build dir). Each is busy-checked by its own `.cargo-lock`.
 pub fn prune_unowned(ws: &Path, cutoff: u64, now: u64, execute: bool) -> Result<Vec<TreePlan>> {
     let found = trees_under(&unowned_roots(ws)?)?;
-    prune_trees(ws, &found, Scope::Everything { cutoff }, now, execute)
+    let scope = Scope::Everything {
+        cutoff,
+        need_record: false,
+    };
+    prune_trees(ws, &found, scope, now, execute)
 }
 
 /// The one line the end of a build prints for `what` (a build dir): sessions removed and kept, their bytes, busy trees.
@@ -428,8 +486,12 @@ fn plan_tree(tree: &Path, root: String, label: String, now: u64, scope: Scope) -
         dir: tree.to_owned(),
         ..TreePlan::default()
     };
-    if let Scope::Everything { cutoff } = scope {
-        plan_units(tree, now, cutoff, &mut plan)?;
+    if let Scope::Everything {
+        cutoff,
+        need_record,
+    } = scope
+    {
+        plan_units(tree, now, cutoff, need_record, &mut plan)?;
     }
     let (sessions, kept) = stale_sessions(tree, now)?;
     plan.sessions = sessions;
@@ -438,8 +500,18 @@ fn plan_tree(tree: &Path, root: String, label: String, now: u64, scope: Scope) -
 }
 
 /// Plans the units of `tree` into `plan`. Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. A unit's last use is its record entry; without one, its fingerprint dir's mtime. Stale when that is older than the cutoff.
-fn plan_units(tree: &Path, now: u64, cutoff: u64, plan: &mut TreePlan) -> Result<()> {
+fn plan_units(
+    tree: &Path,
+    now: u64,
+    cutoff: u64,
+    need_record: bool,
+    plan: &mut TreePlan,
+) -> Result<()> {
     let record = unit_use::load(tree)?;
+    if need_record && record.is_none() {
+        plan.no_record = true;
+        return Ok(());
+    }
     let mut units: Vec<(PathBuf, String)> = Vec::new();
     for dir in children(&tree.join(FINGERPRINT))? {
         plan.units += 1;
@@ -1606,5 +1678,102 @@ mod tests {
             "{line}"
         );
         assert!(line.ends_with("), kept 3"), "{line}");
+    }
+
+    /// Land's window, written out: 2 days.
+    const LAND_WINDOW: u64 = 2 * DAY;
+
+    /// `tree_fixture` as ws/land's `cargo/release`.
+    fn land_fixture(ws: &Path) -> PathBuf {
+        tree_fixture(ws);
+        let pool = ws.join("out/pool/ws");
+        fs::rename(pool.join("a"), pool.join("land")).expect("as ws/land");
+        pool.join("land/cargo/release")
+    }
+
+    /// Land's record: LIVE used an hour ago, EDGE exactly the window ago, NEW a day ago (kept); JUST a day past the window, the rest weeks ago (stale). NEVER (no row, mtime 30 days) stale, FRESH (no row, mtime 1 day) kept.
+    fn land_uses() -> Vec<(&'static str, u64)> {
+        vec![
+            (STALE, NOW - 30 * DAY),
+            (JUST, NOW - LAND_WINDOW - DAY),
+            (EDGE, NOW - LAND_WINDOW),
+            (LIVE, NOW - 3600),
+            (OLD, NOW - 20 * DAY),
+            (NEW, NOW - DAY),
+            (EXAMPLE, NOW - 30 * DAY),
+        ]
+    }
+
+    fn fingerprints(tree: &Path) -> Vec<String> {
+        let mut names: Vec<String> = children(&tree.join(FINGERPRINT))
+            .expect("fingerprints")
+            .iter()
+            .map(|p| file_name(p))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What land keeps of `land_fixture` + `land_uses`, sorted.
+    const LAND_KEPT: [&str; 5] = [EDGE, FRESH, LIVE, NEW, NOHASH];
+
+    /// Break target: a window of 0 days removes LIVE (used an hour ago); the 14-day default keeps JUST.
+    #[test]
+    fn land_keeps_a_unit_used_today_and_drops_the_ones_past_its_window() {
+        let ws = scratch("land-window");
+        let tree = land_fixture(&ws);
+        write_record(&tree, &land_uses());
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert_eq!(fingerprints(&tree), LAND_KEPT);
+        assert!(
+            line.starts_with("land unit prune: ws/land: removed 5 units and 0 sessions, "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "kept 4 units; window 2 d; 1 trees (0 without a use record, 0 busy: not pruned)"
+            ),
+            "{line}"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// No record = no evidence of use: land prunes none of the tree's units and says so, though most are 30 days old by mtime. Break target: judging by mtime there (the manual prune's rule) removes them.
+    #[test]
+    fn land_without_a_use_record_prunes_nothing() {
+        let ws = scratch("land-no-record");
+        let tree = land_fixture(&ws);
+        let before = fingerprints(&tree);
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert_eq!(fingerprints(&tree), before);
+        assert!(line.contains("removed 0 units"), "{line}");
+        assert!(line.contains("(1 without a use record"), "{line}");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A ram ws/land seen outside its namespace is its empty mount point: refused, never reported as "no cargo trees". Break target: without the guard this returns Ok with 0 trees.
+    #[test]
+    fn land_on_ram_outside_its_namespace_is_refused() {
+        let ws = scratch("land-ram");
+        let dir = out::dir_of(&ws, out::LAND_ID);
+        fs::create_dir_all(&dir).expect("mount point");
+        fs::write(dir.join(crate::delta::RECORD), "").expect("delta record");
+        let err = prune_land(&ws, NOW, true, false).expect_err("outside the namespace");
+        assert!(format!("{err:#}").contains("ram delta"), "{err:#}");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The base published after land's prune holds exactly the kept units. Break target: publishing before the prune carries the 5 stale ones.
+    #[test]
+    fn publish_after_land_prune_holds_the_kept_set() {
+        let ws = scratch("land-publish");
+        let tree = land_fixture(&ws);
+        write_record(&tree, &land_uses());
+        prune_land(&ws, NOW, true, false).expect("land prune");
+        let base = ws.join("out/pool/base/c");
+        fs::create_dir_all(base.parent().expect("parent")).expect("bases dir");
+        out::copy_base(&out::dir_of(&ws, out::LAND_ID), &base).expect("publish copy");
+        assert_eq!(fingerprints(&base.join("cargo/release")), LAND_KEPT);
+        fs::remove_dir_all(&ws).expect("cleanup");
     }
 }
