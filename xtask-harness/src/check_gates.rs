@@ -6,6 +6,7 @@
 //! Before the lanes the step builds every cargo product the rows run, once (gate_build.rs `ensure`, the function each gate calls itself); a product whose identity changes while the lanes run fails
 //! the step, naming it and the row whose end first saw it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +16,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
 use xtask::build_pool::{self, Class};
+use xtask::harness::{Starvation, Supply, judged_late};
 use xtask::red_logs;
 
 use crate::gate_build::{self, Group, Moved, Snapshot};
@@ -164,7 +166,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["window", "--stage", "tiled"], true, true),
 ];
 
-/// One row's result, held until every row before it in the table has reported: the `gates:` lines stay in table order whatever ends first.
+/// One row's run: its `gates:` line, its outcome, and the evidence the step's counters and ledger read. The lines stay in table order whatever ends first.
 struct Done {
     outcome: Outcome,
     took: f64,
@@ -176,6 +178,110 @@ struct Done {
     end: Option<String>,
     /// rows holding their grant when this one was admitted, itself included (0: never admitted)
     running: usize,
+    /// the grant class the run held (`quiet` = the whole pool); `-` when it never got one
+    grant: &'static str,
+    /// host stall share of the run's span, percent (`host load:`); None when unknown
+    stall: Option<f64>,
+    /// an undecided run's supply
+    supply: Option<Supply>,
+    /// judged late waits in the run's log
+    judged: usize,
+    /// the run's host-load record is unknown
+    host_unknown: bool,
+    /// the attempt an undecided row was rerun after (gate-starved-red-design 2.7): this run's outcome is the row's, that attempt is the first
+    first: Option<Box<Done>>,
+}
+
+impl Done {
+    /// A run with no measurements: a row whose process could not start, or a test fake.
+    fn bare(outcome: Outcome, line: String, note: String) -> Self {
+        Self {
+            outcome,
+            took: 0.0,
+            line,
+            note,
+            end: None,
+            running: 0,
+            grant: "-",
+            stall: None,
+            supply: None,
+            judged: 0,
+            host_unknown: false,
+            first: None,
+        }
+    }
+
+    /// This run, then the attempt it was rerun after.
+    fn attempts(&self) -> impl Iterator<Item = &Done> {
+        std::iter::once(self).chain(self.first.as_deref())
+    }
+}
+
+/// A row's attempt: its first run, or the rerun after an undecided first (gate-starved-red-design 2.7).
+#[derive(Clone, Copy)]
+enum Attempt {
+    First,
+    Rerun,
+}
+
+impl Attempt {
+    /// The row's log in `check-gates/`: the rerun writes its own file, so a kept first log is never overwritten.
+    fn log_name(self, row: &Row) -> String {
+        match self {
+            Attempt::First => format!("{}.log", row.name()),
+            Attempt::Rerun => format!("{}.rerun.log", row.name()),
+        }
+    }
+}
+
+/// Reruns each undecided row once: `rerun(i)` runs row `i` alone and its outcome is the row's; the first attempt moves into `first`. A red or passing row is never rerun.
+fn settle(done: &mut [Done], rerun: &mut dyn FnMut(usize) -> Done) {
+    for (i, d) in done.iter_mut().enumerate() {
+        if d.outcome != Outcome::Undecided {
+            continue;
+        }
+        let again = rerun(i);
+        let first = std::mem::replace(d, again);
+        d.first = Some(Box::new(first));
+    }
+}
+
+/// The starvation counters over a step's rows: first attempts that ended undecided (by supply), their reruns (by grant and outcome), and every attempt's judged waits and unknown host loads.
+fn starvation_of(done: &[Done]) -> Starvation {
+    let mut counts = Starvation::default();
+    for d in done {
+        for a in d.attempts() {
+            counts.record_attempt(a.judged, a.host_unknown);
+        }
+        if let Some(first) = d.first.as_deref() {
+            counts.record_starved(first.supply);
+            counts.record_rerun(d.grant, d.outcome);
+        }
+    }
+    counts
+}
+
+/// The failure note of a row undecided in [`red_logs::CEILING`] consecutive runs of this checkout, its last runs named. None below the ceiling.
+fn ceiling_note(streaks: &BTreeMap<String, Vec<String>>, row: &str) -> Option<String> {
+    let runs = streaks
+        .get(row)
+        .filter(|runs| runs.len() >= red_logs::CEILING)?;
+    let last = &runs[runs.len() - red_logs::CEILING..];
+    Some(format!(
+        "{row} undecided in {} consecutive runs of this checkout ({}): the ceiling fails the step",
+        red_logs::CEILING,
+        last.join(", ")
+    ))
+}
+
+/// A row whose process could not start (a pool or spawn error): its red verdict, so the other rows still report.
+fn errored(row: &Row, e: &anyhow::Error) -> Done {
+    let line = format!("error: {e:#}");
+    Done::bare(
+        Outcome::Fail,
+        format!("gates: {} FAILED (0.0s) {line}", row.name()),
+        format!("{}: {line}", row.name()),
+    )
 }
 
 /// Rows admitted (grant held) at the moment, and the most at once: a row enters after its grant, so rows queued for the pool are not counted.
@@ -230,6 +336,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
     let moved = Mutex::new(Moved::default());
     let run = red_logs::run_id();
     let task = red_logs::task_dir(root)?;
+    let commit = xtask::git::git(Some(root), &["rev-parse", "HEAD"])?;
     let at = RowRun {
         exe: &exe,
         root,
@@ -239,46 +346,87 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<String>> {
         host,
         out: out_arg,
     };
-    let run_one = |row: &Row, admitted: &Admitted| -> Done {
-        // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
-        let gated = build_pool::acquire_quiet_stdout(&ws, root, row.class).and_then(|grant| {
-            let entered = admitted.enter();
-            let mut done = at.row(row)?;
-            done.running = entered.count;
-            Ok((done, grant))
-        });
-        // after the row's process ended: a product it (or a row beside it) re-linked or re-staged is named now, with this row
+    // after a row's process ended: a product it (or a row beside it) re-linked or re-staged is named now, with this row
+    let note_moved = |row: &Row| {
         moved
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .note(&snapshot, Some(&row.name()));
-        gated.map(|(done, _grant)| done).unwrap_or_else(|e| {
-            let line = format!("error: {e:#}");
-            Done {
-                outcome: Outcome::Fail,
-                took: 0.0,
-                note: format!("{}: {line}", row.name()),
-                line: format!("gates: {} FAILED (0.0s) {line}", row.name()),
-                end: None,
-                running: 0,
-            }
-        })
     };
+    let run_one = |row: &Row, admitted: &Admitted| -> Done {
+        // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
+        let gated = build_pool::acquire_quiet_stdout(&ws, root, row.class).and_then(|grant| {
+            let entered = admitted.enter();
+            let mut done = at.row(row, Attempt::First)?;
+            done.running = entered.count;
+            done.grant = grant.class;
+            Ok((done, grant))
+        });
+        note_moved(row);
+        gated
+            .map(|(done, _grant)| done)
+            .unwrap_or_else(|e| errored(row, &e))
+    };
+    // an undecided row's rerun (gate-starved-red-design 2.7): alone after the lanes, under the pool's quiet grant when it is idle, else the row's class
+    let rerun = |row: &Row| -> Done {
+        let gated = build_pool::acquire_rerun(&ws, root, row.class).and_then(|grant| {
+            let mut done = at.row(row, Attempt::Rerun)?;
+            done.running = 1;
+            done.grant = grant.class;
+            Ok((done, grant))
+        });
+        note_moved(row);
+        let mut done = gated
+            .map(|(done, _grant)| done)
+            .unwrap_or_else(|e| errored(row, &e));
+        done.line = with_lane(&done.line, Lane::Serial, done.running);
+        eprintln!("{}", done.line);
+        done
+    };
+    let (stats, mut done) = run_lanes(ROWS, &run_one, &mut |first| eprintln!("{}", first.line));
+    settle(&mut done, &mut |i| rerun(&ROWS[i]));
+    let names: Vec<String> = ROWS.iter().map(Row::name).collect();
+    let entries: Vec<red_logs::Entry<'_>> = done
+        .iter()
+        .zip(&names)
+        .map(|(d, name)| red_logs::Entry {
+            run: run.as_str(),
+            commit: commit.trim(),
+            row: name.as_str(),
+            outcome: d.outcome,
+            first: d.first.as_deref().map(|f| f.outcome),
+            stall: d.stall,
+            grant: d.grant,
+        })
+        .collect();
+    red_logs::ledger_append(&task, &entries)?;
+    let streaks = red_logs::trailing_undecided(&task)?;
+    let mut starvation = starvation_of(&done);
     let mut failed = Vec::new();
     let mut undecided = Vec::new();
-    let mut ends = WatchTally::default();
-    let stats = run_lanes(ROWS, &run_one, &mut |done| {
-        eprintln!("{}", done.line);
-        ends.count(done.end.as_deref());
-        match done.outcome {
+    for (name, d) in names.iter().zip(&done) {
+        match d.outcome {
             Outcome::Pass => {}
             // the path leads: check quotes its first error at 160 chars (verdict.rs FIRST_ERROR_CHARS), and the verdict line lands in it
-            Outcome::Fail => failed.push(done.note.clone()),
-            Outcome::Undecided => undecided.push(done.note.clone()),
+            Outcome::Fail => failed.push(d.note.clone()),
+            Outcome::Undecided => match ceiling_note(&streaks, name) {
+                Some(note) => {
+                    starvation.ceiling += 1;
+                    failed.push(note);
+                }
+                None => undecided.push(d.note.clone()),
+            },
         }
-    });
+    }
+    let mut ends = WatchTally::default();
+    for d in &done {
+        for a in d.attempts() {
+            ends.count(a.end.as_deref());
+        }
+    }
     eprintln!("gates: watch ends {}", ends.line());
     eprintln!("gates: {}", stats.line());
+    eprintln!("{}", starvation.line("gates"));
     let mut moved = moved.into_inner().unwrap_or_else(|p| p.into_inner());
     moved.note(&snapshot, None);
     let moved = moved.lines();
@@ -339,12 +487,12 @@ fn with_lane(line: &str, lane: Lane, running: usize) -> String {
 }
 
 /// Runs `rows` with `run_one` (which takes the row's grant itself, then enters `Admitted`): parallel rows concurrently, each once its `after` rows ended, then serial rows one at a time, alone.
-/// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` ([`Done::running`]).
+/// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` ([`Done::running`]). Returns the stats and every result, in table order.
 fn run_lanes(
     rows: &[Row],
     run_one: &(dyn Fn(&Row, &Admitted) -> Done + Sync),
     emit: &mut dyn FnMut(&Done),
-) -> LaneStats {
+) -> (LaneStats, Vec<Done>) {
     let started = Instant::now();
     let names: Vec<String> = rows.iter().map(Row::name).collect();
     let ended = Mutex::new(vec![false; rows.len()]);
@@ -401,13 +549,14 @@ fn run_lanes(
             flush(&results, &mut next);
         }
     }
-    LaneStats {
+    let stats = LaneStats {
         wall: started.elapsed().as_secs_f64(),
         sum: results.iter().flatten().map(|d| d.took).sum(),
         parallel: rows.iter().filter(|r| r.lane == Lane::Parallel).count(),
         serial: rows.iter().filter(|r| r.lane == Lane::Serial).count(),
         max_at_once: admitted.max.load(Ordering::SeqCst),
-    }
+    };
+    (stats, results.into_iter().flatten().collect())
 }
 
 /// What every row's run shares: the harness binary, the checkout, the log dir, the red-log task dir and run id, the host and build dir arguments.
@@ -422,10 +571,10 @@ struct RowRun<'a> {
 }
 
 impl RowRun<'_> {
-    /// One row as its own `xtask test` process, its output in `<logs>/<row>.log`; a red or undecided log is kept ([`keep_unless_pass`]).
+    /// One row as its own `xtask test` process, its output in `<logs>/<row>.log` (a rerun's in `<row>.rerun.log`); a red or undecided log is kept ([`keep_unless_pass`]).
     /// Called on the thread holding the row's grant: its job count reaches the gate's cargo runs (xtask `grant_jobs`).
-    fn row(&self, row: &Row) -> Result<Done> {
-        let log = self.logs.join(format!("{}.log", row.name()));
+    fn row(&self, row: &Row, attempt: Attempt) -> Result<Done> {
+        let log = self.logs.join(attempt.log_name(row));
         let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
         let argv = row.argv(self.host, self.out);
         let started = Instant::now();
@@ -469,14 +618,26 @@ impl RowRun<'_> {
             .as_ref()
             .map(|k| format!(" (log {})", k.display()))
             .unwrap_or_default();
+        let word = match outcome {
+            Outcome::Pass => "ok",
+            Outcome::Fail => "FAILED",
+            Outcome::Undecided => "undecided",
+        };
+        // a rerun's line says what the first attempt was and what the rerun ended as (M4: `ok (starved, rerun ok)`)
+        let group = match attempt {
+            Attempt::First => format!("{took:.1}s {measured}"),
+            Attempt::Rerun => format!(
+                "starved, rerun {}; {took:.1}s {measured}",
+                match outcome {
+                    Outcome::Pass => "ok",
+                    Outcome::Fail => "red",
+                    Outcome::Undecided => "undecided",
+                }
+            ),
+        };
         let line = format!(
-            "gates: {} {} ({took:.1}s {measured}) {verdict}{kept_note}",
-            row.name(),
-            match outcome {
-                Outcome::Pass => "ok",
-                Outcome::Fail => "FAILED",
-                Outcome::Undecided => "undecided",
-            }
+            "gates: {} {word} ({group}) {verdict}{kept_note}",
+            row.name()
         );
         let note = match outcome {
             Outcome::Undecided => undecided_note(row, verdict),
@@ -491,6 +652,15 @@ impl RowRun<'_> {
             note,
             end: phases.map(|p| p.end),
             running: 0,
+            grant: "-",
+            stall: seen.stall_pct,
+            supply: match outcome {
+                Outcome::Undecided => Supply::of_why(verdict),
+                Outcome::Pass | Outcome::Fail => None,
+            },
+            judged: judged_late(&text),
+            host_unknown: seen.stall_pct.is_none(),
+            first: None,
         })
     }
 }
@@ -679,16 +849,17 @@ mod tests {
                 Outcome::Pass
             };
             Done {
-                outcome,
                 took: 0.1,
-                line: format!("gates: {} x (0.1s peak=0MiB) v", row.name()),
-                note: row.name(),
-                end: None,
                 running: entered.count,
+                ..Done::bare(
+                    outcome,
+                    format!("gates: {} x (0.1s peak=0MiB) v", row.name()),
+                    row.name(),
+                )
             }
         };
         let mut seen = Vec::new();
-        let stats = run_lanes(FAKE, &run_one, &mut |d| {
+        let (stats, _) = run_lanes(FAKE, &run_one, &mut |d| {
             seen.push((d.line.clone(), d.outcome))
         });
         let names: Vec<String> = seen
@@ -897,5 +1068,115 @@ mod tests {
                 .join("window-ime.log")
         );
         std::fs::remove_dir_all(&out).expect("cleanup");
+    }
+
+    /// The fake-row scheduler test, extended (gate-starved-red-design 2.7): an undecided row reruns once, after the lanes. Starved then pass is ok and counted; starved then red FAILED; starved twice undecided; a red row is never rerun.
+    #[test]
+    fn starved_rows_rerun_once_after_the_lanes() {
+        const FAKE: &[Row] = &[
+            Row::new(&["steady"], false, false),
+            Row::new(&["starved-pass"], false, false),
+            Row::new(&["starved-red"], false, false),
+            Row::new(&["starved-twice"], false, false),
+            Row::new(&["red"], false, false),
+        ];
+        let first_of = |name: &str| match name {
+            "starved-pass" | "starved-red" | "starved-twice" => Outcome::Undecided,
+            "red" => Outcome::Fail,
+            _ => Outcome::Pass,
+        };
+        let again_of = |name: &str| match name {
+            "starved-pass" => Outcome::Pass,
+            "starved-red" => Outcome::Fail,
+            _ => Outcome::Undecided,
+        };
+        let run_one = |row: &Row, admitted: &Admitted| -> Done {
+            let entered = admitted.enter();
+            let outcome = first_of(&row.name());
+            Done {
+                running: entered.count,
+                grant: "harness",
+                supply: (outcome == Outcome::Undecided).then_some(Supply::Cpu),
+                ..Done::bare(outcome, format!("gates: {} first", row.name()), row.name())
+            }
+        };
+        let (_, mut done) = run_lanes(FAKE, &run_one, &mut |_| {});
+        let mut reran = Vec::new();
+        settle(&mut done, &mut |i| {
+            let name = FAKE[i].name();
+            reran.push(name.clone());
+            Done {
+                grant: "quiet",
+                running: 1,
+                ..Done::bare(
+                    again_of(&name),
+                    format!("gates: {name} rerun"),
+                    name.clone(),
+                )
+            }
+        });
+        assert_eq!(reran, ["starved-pass", "starved-red", "starved-twice"]);
+        let outcomes: Vec<Outcome> = done.iter().map(|d| d.outcome).collect();
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Pass,
+                Outcome::Pass,
+                Outcome::Fail,
+                Outcome::Undecided,
+                Outcome::Fail
+            ]
+        );
+        assert!(
+            done[1]
+                .first
+                .as_deref()
+                .is_some_and(|f| f.outcome == Outcome::Undecided),
+            "the starved attempt is kept as the first"
+        );
+        assert!(done[4].first.is_none(), "a red row was rerun");
+        assert_eq!(
+            starvation_of(&done).line("gates"),
+            "gates: starvation starved=3 (cpu=3 gpu=0) rerun quiet=3 shared=0 -> ok=1 failed=1 undecided=1; judged late=0; unknown=0; ceiling=0"
+        );
+    }
+
+    /// The ceiling (gate-starved-red-design 2.7, M1): a row undecided in three consecutive runs of this checkout fails, naming those runs. A deciding run resets the streak; other rows' runs do not count.
+    #[test]
+    fn a_third_consecutive_undecided_run_hits_the_ceiling() {
+        let task = std::env::temp_dir().join(format!("xtask-gates-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&task);
+        let entry = |run: &'static str, row: &'static str, outcome: Outcome| red_logs::Entry {
+            run,
+            commit: "c0ffee",
+            row,
+            outcome,
+            first: Some(Outcome::Undecided),
+            stall: Some(31.0),
+            grant: "quiet",
+        };
+        let row = "window-slow-display";
+        let step = |entries: &[red_logs::Entry<'_>]| -> Option<String> {
+            red_logs::ledger_append(&task, entries).expect("ledger");
+            ceiling_note(&red_logs::trailing_undecided(&task).expect("streaks"), row)
+        };
+        assert_eq!(step(&[entry("r1", row, Outcome::Undecided)]), None);
+        assert_eq!(
+            step(&[
+                entry("r2", row, Outcome::Undecided),
+                entry("r2", "app", Outcome::Pass)
+            ]),
+            None
+        );
+        assert_eq!(step(&[entry("r3", row, Outcome::Pass)]), None);
+        assert_eq!(step(&[entry("r4", row, Outcome::Undecided)]), None);
+        assert_eq!(step(&[entry("r5", row, Outcome::Undecided)]), None);
+        assert_eq!(
+            step(&[entry("r6", row, Outcome::Undecided)]).as_deref(),
+            Some(
+                "window-slow-display undecided in 3 consecutive runs of this checkout (r4, r5, r6): the ceiling fails the step"
+            )
+        );
+        std::fs::remove_dir_all(&task).expect("cleanup");
     }
 }

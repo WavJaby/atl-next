@@ -372,6 +372,17 @@ pub fn try_take_all(ws: &Path, who: &Path) -> Result<std::result::Result<Grant, 
     }))
 }
 
+/// A rerun's grant (gate-starved-red-design 2.7): every slot (`quiet`) when the pool is idle, else `class`'s normal grant, waiting its turn. The refusal (`pool: quiet window refused`) goes to stderr.
+pub fn acquire_rerun(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
+    match try_take_all(ws, who)? {
+        Ok(quiet) => Ok(quiet),
+        Err(held) => {
+            eprintln!("{held}");
+            acquire_quiet_stdout(ws, who, class)
+        }
+    }
+}
+
 /// The pool directory of workspace `ws`.
 pub fn dir(ws: &Path) -> PathBuf {
     ws.join("cache").join("build-pool")

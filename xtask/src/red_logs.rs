@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-//! Kept gate logs. A check gate that ends red keeps its log in `<workspace>/out/<checkout id>/check-gates-red/<run>/<gate>.log`; an undecided one in `check-gates-undecided/`. The next check overwrites `check-gates/<gate>.log` in the build dir but never these. `<run>` is the check run's UTC start (`YYYYMMDD-HHMMSS-mmm`), so the names sort oldest first.
+//! Kept gate logs. A check gate that ends red keeps its log in `<workspace>/out/<checkout id>/check-gates-red/<run>/<gate>.log`; an undecided one in `check-gates-undecided/`. The next check overwrites `check-gates/<gate>.log` in the build dir but never these. `<run>` is the check run's UTC start (`YYYYMMDD-HHMMSS-mmm`), so the names sort oldest first. A rerun's log is `<gate>.rerun.log` (the first attempt's is never overwritten); the outcome ledger `gate-ledger.tsv` sits beside the buckets ([`LEDGER`]).
 //! The logs sit beside the checkout's task logs, not in its build dir: a build dir is regenerable (a ram tier shows it empty outside a build; a land reset, refresh or tier change remakes it), and the evidence must outlive it. A path under `out/<id>/` is readable from any shell.
 //! `prune` (out.rs `prune_dirs`: `out prune`, and land's cleanup) keeps the newest [`KEEP_RUNS`] runs of each bucket of each live checkout and removes the rest. Undecided has its own bucket: it is routine on a GPU-starved host, and one shared count would evict the red runs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,6 +80,84 @@ pub fn keep(task: &Path, bucket: &str, run: &str, log: &Path) -> Result<PathBuf>
     fs::copy(log, &kept)
         .with_context(|| format!("copying {} to {}", log.display(), kept.display()))?;
     Ok(kept)
+}
+
+/// The checkout's outcome ledger: one line per gate row (and per drive-tap step) per check run, in `<task>/` (`task` = [`task_dir`]). The ceiling reads its trailing undecided lines.
+pub const LEDGER: &str = "gate-ledger.tsv";
+/// Consecutive undecided runs of one row that fail its checkout's step (manager M1, 2026-11-23). A row starved in every run gates nothing: it fails visibly, not silently.
+pub const CEILING: usize = 3;
+
+/// One row's ledger line. `first`: the attempt before a rerun (`-` when the row ran once). `stall`: the deciding run's host stall share, percent (`-` unknown). `grant`: the grant it held (`quiet`, or the class name).
+pub struct Entry<'a> {
+    pub run: &'a str,
+    pub commit: &'a str,
+    pub row: &'a str,
+    pub outcome: Outcome,
+    pub first: Option<Outcome>,
+    pub stall: Option<f64>,
+    pub grant: &'a str,
+}
+
+/// The ledger's word for an outcome.
+fn word(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Pass => "pass",
+        Outcome::Fail => "fail",
+        Outcome::Undecided => "undecided",
+    }
+}
+
+/// Appends one line per entry to checkout `task`'s ledger, made on first use. Columns: run, commit, row, outcome, first, stall, grant.
+pub fn ledger_append(task: &Path, entries: &[Entry<'_>]) -> Result<()> {
+    fs::create_dir_all(task).with_context(|| format!("creating {}", task.display()))?;
+    let path = task.join(LEDGER);
+    let text: String = entries
+        .iter()
+        .map(|e| {
+            let first = e.first.map_or("-", word);
+            let stall = e.stall.map_or("-".to_owned(), |s| format!("{s:.1}"));
+            format!(
+                "{}\t{}\t{}\t{}\t{first}\t{stall}\t{}\n",
+                e.run,
+                e.commit,
+                e.row,
+                word(e.outcome),
+                e.grant
+            )
+        })
+        .collect();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| path.display().to_string())?;
+    file.write_all(text.as_bytes())
+        .with_context(|| path.display().to_string())
+}
+
+/// Per row, the run names of its trailing undecided ledger lines, oldest first. A pass or a fail ends the row's streak; other rows' lines do not. No ledger: empty.
+pub fn trailing_undecided(task: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+    let path = task.join(LEDGER);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    let mut streaks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let (run, row, outcome) = (cols[0], cols[2], cols[3]);
+        let streak = streaks.entry(row.to_owned()).or_default();
+        if outcome == word(Outcome::Undecided) {
+            streak.push(run.to_owned());
+        } else {
+            streak.clear();
+        }
+    }
+    Ok(streaks)
 }
 
 /// The run dirs of one bucket, newest first.
@@ -248,6 +327,42 @@ mod tests {
         assert_eq!(bucket_of(Outcome::Pass), None);
         assert_eq!(bucket_of(Outcome::Fail), Some(RED));
         assert_eq!(bucket_of(Outcome::Undecided), Some(UNDECIDED));
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The ledger line's columns, then the streaks: per row, the runs since its last pass or fail; another row's lines do not end it. Expected values are written out, not read back from the code.
+    #[test]
+    fn ledger_streaks_are_per_row_and_a_deciding_run_resets_them() {
+        let ws = scratch("ledger");
+        let entry = |run: &'static str, row: &'static str, outcome: Outcome| Entry {
+            run,
+            commit: "c0ffee",
+            row,
+            outcome,
+            first: (outcome == Outcome::Undecided).then_some(Outcome::Undecided),
+            stall: None,
+            grant: "harness",
+        };
+        ledger_append(&ws, &[entry("r1", "app", Outcome::Undecided)]).expect("r1");
+        ledger_append(
+            &ws,
+            &[
+                entry("r2", "app", Outcome::Undecided),
+                entry("r2", "ime", Outcome::Pass),
+            ],
+        )
+        .expect("r2");
+        let text = fs::read_to_string(ws.join(LEDGER)).expect("ledger");
+        assert_eq!(
+            text.lines().next(),
+            Some("r1\tc0ffee\tapp\tundecided\tundecided\t-\tharness")
+        );
+        let streaks = trailing_undecided(&ws).expect("streaks");
+        assert_eq!(streaks["app"], ["r1", "r2"]);
+        assert!(streaks["ime"].is_empty());
+        ledger_append(&ws, &[entry("r3", "app", Outcome::Pass)]).expect("r3");
+        ledger_append(&ws, &[entry("r4", "app", Outcome::Undecided)]).expect("r4");
+        assert_eq!(trailing_undecided(&ws).expect("streaks")["app"], ["r4"]);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

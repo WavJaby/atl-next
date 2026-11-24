@@ -454,6 +454,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     step.run(root, &out)
                 }),
             };
+            // drive-tap's undecided run is rerun here, after its grant ended: harness::settle_step takes its own (a nested grant is refused)
+            let run = match (step, run) {
+                (Step::DriveTap, Ok(done)) => {
+                    crate::harness::settle_step(root, &ws, step.name(), &out, done)
+                }
+                (_, run) => run,
+            };
             match run {
                 Ok(done) => {
                     let n = done.undecided.len();
