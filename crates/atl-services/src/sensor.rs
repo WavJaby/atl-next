@@ -12,7 +12,7 @@
 //! - set at start, as AOSP's `dumpsys sensorservice hal_bypass_replay_data_injection <package>` sets it (changeOperatingMode :2430): global, one allow-listed package matched by `contains` (isAllowListedPackage :2538)
 //! - requested = on, also while the platform lists a real accelerometer (a laptop on a desk cannot be tilted): bypass mode's poll() reads only the injected queue, so the real ones are neither listed nor polled (logged + [`OVERRIDE_COUNTER`]). Scope: every app of this services instance (one per atld session), for its lifetime; host programs reading IIO are untouched. Not requested: NORMAL, the real sensors as AOSP
 //! - the "HAL" here lists no sensor without a device, so the mode lists one accelerometer of its own ([`INJECTED_NAME`], the only one) for injected events to land on; it has no source thread
-//! - not AOSP: an event is accepted only from the process owning the focused window ([`FocusedProcess`]), checked per event; the name check alone lets any process that claims the allow-listed name (the op package is the caller's own string) steer every app's accelerometer
+//! - ours, not AOSP (AOSP checks only the name): an event is accepted only from the process owning the focused window ([`FocusedProcess`]: the last caller of either input method focus-gain call, the report-only one AOSP drops included), checked per event; the name check alone lets any process that claims the allow-listed name (the op package is the caller's own string) steer every app's accelerometer
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::OwnedFd;

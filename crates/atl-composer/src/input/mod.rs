@@ -72,8 +72,9 @@ impl Frame {
 /// The app's input windows, bottom to top, each by its channel key `K` with its channel `C`, its LayoutParams flags and its frame (None until the first relayout), and the open pointer gesture's window:
 /// the part of AOSP's InputDispatcher that picks a window. Z-order = add order: windows of the one Task stack as they are added (a new activity's or a dialog's window comes on top).
 /// Touched window = topmost without FLAG_NOT_TOUCHABLE that is touch-modal or holds the point: a modal window's touchable region is the Task, any other's its frame (WindowState.getEffectiveTouchableRegion,
-/// InputDispatcher windowAcceptsTouchAt). A window with no frame yet counts as covering. The topmost without FLAG_NOT_FOCUSABLE is the focused one.
-/// Focus (InputDispatcher's focused window, delivered as InputChannel focus events -> ViewRootImpl windowFocusChanged): the top window while the desktop toplevel is active, none otherwise.
+/// InputDispatcher windowAcceptsTouchAt). A window with no frame yet counts as covering.
+/// Focus (InputDispatcher's focused window, delivered as InputChannel focus events -> ViewRootImpl windowFocusChanged): while the desktop toplevel is active, the topmost window without FLAG_NOT_FOCUSABLE that has its frame; none otherwise.
+/// No focus before the first relayout (WindowState.canReceiveKeys wants mViewVisibility VISIBLE, which relayout sets): told earlier, ViewRootImpl may handle it before its first traversal attaches the decor, and InputMethodManager then serves no view and starts no input.
 pub struct Windows<K, C> {
     list: Vec<(K, C, i32, Option<Frame>)>,
     gesture: Option<K>,
@@ -120,14 +121,14 @@ impl<K: PartialEq + Clone, C> Windows<K, C> {
         self.active = active;
     }
 
-    /// The focus events owed since the last call, in order: the old window loses focus, then the new one gains it. Called after every add, remove and [`Windows::set_active`], so a window added later gets the current state replayed.
+    /// The focus events owed since the last call, in order: the old window loses focus, then the new one gains it. Called after every add, frame, remove and [`Windows::set_active`], so a window added later gets the current state replayed.
     /// An event for a window whose channel is gone is still listed; [`Windows::channel`] then finds none.
     pub fn focus_changes(&mut self) -> Vec<(K, bool)> {
         let want = if self.active {
             self.list
                 .iter()
                 .rev()
-                .find(|(_, _, f, _)| f & FLAG_NOT_FOCUSABLE == 0)
+                .find(|(_, _, f, frame)| f & FLAG_NOT_FOCUSABLE == 0 && frame.is_some())
                 .map(|(k, ..)| k.clone())
         } else {
             None
@@ -814,6 +815,7 @@ mod publish {
                     }
                     Message::WindowFrame { token, frame } => {
                         state.windows.borrow_mut().set_frame(&token, frame);
+                        publish_focus(&state);
                     }
                     Message::Event(event) => source.inject(event),
                     // once: the script's events come back as Message::Event from its own thread, so a wait never holds up the channels a later window brings
@@ -1060,16 +1062,44 @@ mod tests {
         );
     }
 
-    /// Focus goes to the top window only while the desktop window is active: replayed to a window added later, moved when the top changes, taken (false) on deactivation.
+    /// A window's frame after its first relayout; focus needs one, its size does not matter.
+    const LAID_OUT: Frame = Frame {
+        left: 0,
+        top: 0,
+        right: 480,
+        bottom: 300,
+    };
+
+    /// Focus waits for the window's first relayout (canReceiveKeys: mViewVisibility VISIBLE); until then the window below keeps it.
+    #[test]
+    fn focus_waits_for_the_first_frame() {
+        let mut w = Windows::<u32, &str>::default();
+        w.set_active(true);
+        w.add(1, "main", 0);
+        assert!(w.focus_changes().is_empty());
+        w.set_frame(&1, LAID_OUT);
+        assert_eq!(w.focus_changes(), [(1, true)]);
+        w.add(2, "second", 0);
+        assert!(w.focus_changes().is_empty());
+        w.set_frame(&2, LAID_OUT);
+        assert_eq!(w.focus_changes(), [(1, false), (2, true)]);
+        // a later relayout changes nothing
+        w.set_frame(&2, LAID_OUT);
+        assert!(w.focus_changes().is_empty());
+    }
+
+    /// Focus goes to the top laid-out window only while the desktop window is active: replayed to a window added later, moved when the top changes, taken (false) on deactivation.
     #[test]
     fn focus_follows_the_top_window_while_active() {
         let mut w = Windows::<u32, &str>::default();
         w.add(1, "main", 0);
+        w.set_frame(&1, LAID_OUT);
         assert!(w.focus_changes().is_empty());
         w.set_active(true);
         assert_eq!(w.focus_changes(), [(1, true)]);
         assert!(w.focus_changes().is_empty());
         w.add(2, "second", 0);
+        w.set_frame(&2, LAID_OUT);
         assert_eq!(w.focus_changes(), [(1, false), (2, true)]);
         w.remove(&2);
         assert_eq!(w.focus_changes(), [(2, false), (1, true)]);
@@ -1079,6 +1109,7 @@ mod tests {
         w.set_active(true);
         assert!(w.focus_changes().is_empty());
         w.add(3, "late", 0);
+        w.set_frame(&3, LAID_OUT);
         assert_eq!(w.focus_changes(), [(3, true)]);
     }
 
@@ -1088,8 +1119,10 @@ mod tests {
         let mut w = Windows::<u32, &str>::default();
         w.set_active(true);
         w.add(1, "main", 0);
+        w.set_frame(&1, LAID_OUT);
         assert_eq!(w.focus_changes(), [(1, true)]);
         w.add(2, "toast", FLAG_NOT_TOUCHABLE | FLAG_NOT_FOCUSABLE);
+        w.set_frame(&2, LAID_OUT);
         assert!(w.focus_changes().is_empty());
         assert_eq!(
             w.pointer_target(false, (0.0, 0.0)).map(|(k, ..)| *k),

@@ -92,15 +92,21 @@ impl IUiAgent for UiAgent {
         token: SpIBinder,
         [left, top, right, bottom]: [i32; 4],
     ) -> Result<(), StatusCode> {
-        // break `input-frames` (Cargo.toml): the windows' frames never reach the input thread, so pointer events stay in Task coordinates
-        if cfg!(feature = "break-input-frames") {
-            return Ok(());
-        }
-        let frame = crate::input::Frame {
-            left,
-            top,
-            right,
-            bottom,
+        // break `input-frames` (Cargo.toml): every window's frame is an endless one at the Task's origin, so pointer events stay in Task coordinates (the frame still comes: it is what lets the window take focus)
+        let frame = if cfg!(feature = "break-input-frames") {
+            crate::input::Frame {
+                left: 0,
+                top: 0,
+                right: i32::MAX,
+                bottom: i32::MAX,
+            }
+        } else {
+            crate::input::Frame {
+                left,
+                top,
+                right,
+                bottom,
+            }
         };
         self.input
             .send(Message::WindowFrame { token, frame })

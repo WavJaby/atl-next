@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The process whose window has input focus, as the services learn it: every focus gain of a window reaches InputMethodManager as startInputOrWindowGainedFocus from that window's process (ViewRootImpl.handleWindowFocusChanged -> InputMethodManager.startInputInner),
-//! so its calling pid names the focus owner (InputMethodManagerService keeps mCurFocusedWindow from the same call). No call reports a loss: the last owner stays until another process gains focus, including while the desktop's focus is outside every app window.
+//! The process whose window has input focus, as the services learn it.
+//! AOSP: a focus gain of a window that may use an input method reaches the input method service from that window's process (ViewRootImpl.handleWindowFocusChanged -> InputMethodManager onPostWindowGainedFocus): startInputOrWindowGainedFocusAsync when it starts input, else the synchronous startInputOrWindowGainedFocus (WINDOW_FOCUS_GAIN_REPORT_ONLY), which ZeroJankProxy answers null and drops.
+//! Ours, not AOSP (its focus owner is WMS's and InputDispatcher's): every focus gain of a window reaches here by one of those two calls, whose calling pid names the owner; the report-only one counts too. No call reports a loss: the last owner stays until another process gains focus, including while the desktop's focus is outside every app window.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 

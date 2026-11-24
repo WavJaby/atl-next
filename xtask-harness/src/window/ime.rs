@@ -10,7 +10,9 @@
 //! sub-gate must fail.
 //! Then death: the probe SIGKILLs the app mid-session; the services must count one client death and drop the uid's entry (IMMS-lite's death link). `--break-ime-death` runs the services without
 //! the link (`--no-ime-death-link`): the death sub-gate must fail. Then relaunch: the probe starts the fixture again through atld's control `start` (startActivity with no caller app,
-//! a process started anew); the relaunch sub-gate wants a fresh addClient and bind after the death.
+//! a process started anew); the relaunch sub-gate wants a fresh addClient and bind after the death. Untapped that bind is AOSP's: in touch mode no view takes default focus, the decor is served with no
+//! connection, and IMMS binds for its EditorInfo all the same (config_preventImeStartupUnlessTextEditor false). Then the probe taps the relaunched EditText: the refocus sub-gate wants that untapped focus
+//! gain (decor attached, touch mode, no focused view, a start without a connection), then the tap's focus and a start with the editor's connection.
 //! The run ends when this probe is done (window.rs `probe_ends_run`), and the composer sub-checks judge the first process's part of the shared app log ([`first_process`]): the relaunched one
 //! is stopped wherever its start has got to.
 
@@ -35,6 +37,19 @@ const COMMIT: &str = "仮名";
 const TEXT_LINE: &str = "AtlWindow: text input=";
 /// The app log's input-method lines (atl-ime), which a red dump prints beside the fixture's edits ([`TEXT_LINE`]).
 const IME_LINE_MARK: &str = "atl-ime:";
+/// The fixture's line on a window focus change (Main.java logFocusState), and on the EditText's focus.
+const FOCUS_STATE_LINE: &str = "AtlWindow: focus-state ";
+const INPUT_FOCUS_LINE: &str = "AtlWindow: focus input=";
+/// The focus lines a red dump prints too: which window and view had focus, and when the composer told it.
+const FOCUS_LINE_MARKS: [&str; 4] = [
+    FOCUS_STATE_LINE,
+    INPUT_FOCUS_LINE,
+    "AtlWindow: window second",
+    "input: focus ",
+];
+/// atl-ime's lines for a start of the decor (no connection) and of an editor.
+const START_NO_CONNECTION: &str = "atl-ime: start without a connection";
+const START_EDITOR: &str = "atl-ime: start input_type=";
 /// Most such lines a red dump prints, the newest when the log holds more. A break run stopped at the commit logged 17 (2026-11-23, `--break-ime-commit`); the cap bounds a runaway log (a line per frame), not a normal one.
 const IME_DUMP_LINES: usize = 400;
 /// How long the desktop input method may take to activate after the focus, and each edit to reach the fixture.
@@ -84,6 +99,16 @@ fn first_part(app: &str, end: Option<usize>) -> &str {
             .map_or("", |at| &app[..=at]),
         None => app,
     }
+}
+
+/// The app log after [`first_part`]: the relaunched process's. Empty for `None`.
+fn relaunched_part(app: &str, end: Option<usize>) -> &str {
+    &app[first_part(app, end).len()..]
+}
+
+/// [`relaunched_part`] at the recorded end; empty when the probe never got to the kill.
+fn relaunched(app: &str) -> &str {
+    relaunched_part(app, *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The composer has logged what the post-draw and release sub-checks judge: a post-draw received, and a shown buffer retired for a paint whose release went out with its read fence (or a fence
@@ -291,20 +316,7 @@ fn steps(
         waited.elapsed().as_millis()
     );
     let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
-    let (ox, oy) = content_origin(&text)?;
-    let r = widgets::widget(&text, "input")?;
-    let (x, y) = (
-        (r.left + r.width / 2) as f64 + f64::from(ox),
-        (r.top + r.height / 2) as f64 + f64::from(oy),
-    );
-    widgets::inject(
-        proxy,
-        vec![
-            PointerAction::Enter { x, y },
-            widgets::press(true),
-            widgets::press(false),
-        ],
-    )?;
+    tap_input(proxy, &text)?;
     widgets::wait_line(app_log, "AtlWindow: focus input=true")?;
     widgets::wait_line(app_log, widgets::SECOND_CLOSED)?;
     let deadline = Instant::now() + IME_WAIT;
@@ -382,13 +394,16 @@ fn steps(
         return Err(Miss::Wrong(format!("relaunch refused: {reply}")));
     }
     // not a probe stop: a missing rebind is judged by the relaunch sub-gate (services log)
-    let _ = until(&Wait::log(
+    let rebound = until(&Wait::log(
         "rebound",
         "the services never bound the relaunch",
         RELAUNCH_WAIT,
         services_log,
         &|t: &str| t.contains(REBOUND_LINE),
     ));
+    if rebound.is_ok() {
+        tap_relaunched(proxy, app_log)?;
+    }
     Ok(Liveness {
         answered: true,
         silent: true,
@@ -397,6 +412,54 @@ fn steps(
         idle: None,
         minimized: false,
     })
+}
+
+/// Taps the EditText's centre, its window's origin and layout read from `app`.
+fn tap_input(proxy: &Proxy, app: &str) -> Result<(), Miss> {
+    let (ox, oy) = content_origin(app)?;
+    let r = widgets::widget(app, "input")?;
+    let (x, y) = (
+        (r.left + r.width / 2) as f64 + f64::from(ox),
+        (r.top + r.height / 2) as f64 + f64::from(oy),
+    );
+    widgets::inject(
+        proxy,
+        vec![
+            PointerAction::Enter { x, y },
+            widgets::press(true),
+            widgets::press(false),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Taps the relaunched EditText once its window is shown and its untapped start is logged. What came of either is the refocus sub-gate's to judge; only a tap that could not be made stops the probe.
+fn tap_relaunched(proxy: &Proxy, app_log: &Path) -> Result<(), Miss> {
+    until(&Wait::log(
+        "relaunched-shown",
+        "the relaunched window never presented and laid out",
+        ACK_WAIT,
+        app_log,
+        &|t: &str| {
+            let t = relaunched(t);
+            t.contains(CONTENT_ORIGIN_LINE)
+                && t.contains(LAYOUT_INPUT_LINE)
+                && t.contains(START_NO_CONNECTION)
+        },
+    ))?;
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    tap_input(proxy, relaunched(&text))?;
+    let _ = until(&Wait::log(
+        "refocus",
+        "the tap on the relaunched EditText started no input",
+        IME_WAIT,
+        app_log,
+        &|t: &str| {
+            let t = relaunched(t);
+            t.contains(widgets::SECOND_CLOSED) && t.contains(START_EDITOR)
+        },
+    ));
+    Ok(())
 }
 
 /// The stage's sub-gates over the fixture log. `activate` takes the probe's error when it stopped before its edits (the desktop input method never activated, or a setup step failed); a fail-fast edit stop goes to that edit's sub-gate ([`route_stop`]). `app_uid` is the fixture's (Runtime::first_app_uid).
@@ -450,6 +513,7 @@ pub fn checks(
         ),
         ("death", death_verdict(probe_killed(), services, app_uid)),
         ("relaunch", relaunch_check(services)),
+        ("refocus", refocus_check(relaunched(app))),
         // the relaunch reports too; judge the process the stage drove, as the composer sub-checks do
         ("outbox", outbox_check(first_process(app))),
         ("copy", copy_check(first_process(app))),
@@ -552,6 +616,31 @@ fn relaunch_check(services: &str) -> Result<String, String> {
     }
 }
 
+/// The relaunched process's focus: its window gained focus with the decor attached, in touch mode (the first process's tap set the display's) and with no focused view, and that start had no connection; the tap then focused the EditText, whose start has one.
+/// `attached=false` = the composer told the focus before the window's first relayout, and the gain started no input.
+fn refocus_check(app: &str) -> Result<String, String> {
+    const GAIN: &str = "main=true attached=true touch=true view=none";
+    let gain = app
+        .lines()
+        .filter_map(|l| l.split_once(FOCUS_STATE_LINE).map(|(_, rest)| rest.trim()))
+        .find(|rest| rest.starts_with("main=true"));
+    if gain != Some(GAIN) {
+        return Err(format!(
+            "the relaunched window's focus gain: {gain:?}, want `{GAIN}`"
+        ));
+    }
+    let focused = format!("{INPUT_FOCUS_LINE}true");
+    match [START_NO_CONNECTION, focused.as_str(), START_EDITOR]
+        .into_iter()
+        .find(|want| !app.contains(want))
+    {
+        None => Ok(format!(
+            "untapped `{GAIN}` and a start without a connection; tapped: the EditText's focus and start"
+        )),
+        Some(missing) => Err(format!("the relaunched process logged no `{missing}`")),
+    }
+}
+
 /// After the kill, before the relaunch's client is added: the services counted exactly one client death, and its line names the app's uid with its entry removed and no client left
 /// (the fixture is the only app). Lines after the relaunch are not this death: the run's stop kills the relaunched app too.
 fn death_check(services: &str, app_uid: u32) -> Result<String, String> {
@@ -630,7 +719,7 @@ pub fn red_dump(app: &str) {
     let lines = ime_lines(app);
     let shown = newest(&lines, IME_DUMP_LINES);
     println!(
-        "---- app log: atl-ime and text input lines (last {} of {})",
+        "---- app log: atl-ime, text input and focus lines (last {} of {})",
         shown.len(),
         lines.len()
     );
@@ -639,10 +728,14 @@ pub fn red_dump(app: &str) {
     }
 }
 
-/// The app log's input-method lines, in log order: the `atl-ime:` ones and the fixture's edits.
+/// The app log's input-method lines, in log order: the `atl-ime:` ones, the fixture's edits and the focus lines.
 fn ime_lines(app: &str) -> Vec<&str> {
     app.lines()
-        .filter(|l| l.contains(IME_LINE_MARK) || l.contains(TEXT_LINE))
+        .filter(|l| {
+            l.contains(IME_LINE_MARK)
+                || l.contains(TEXT_LINE)
+                || FOCUS_LINE_MARKS.iter().any(|m| l.contains(m))
+        })
         .collect()
 }
 
@@ -764,6 +857,38 @@ mod tests {
         assert_eq!(first_process(app), "a\nかな\n");
         *FIRST_END.lock().unwrap_or_else(|e| e.into_inner()) = None;
         assert_eq!(first_process(app), app);
+    }
+
+    /// The lines as the fixture and atl-ime write them; the early focus (`attached=false`), a default-focused EditText and each missing line are red.
+    #[test]
+    fn the_relaunched_window_gains_focus_attached_and_the_tap_starts_input() {
+        let gain = "I liblog/AtlWindow: focus-state main=true attached=true touch=true view=none\n";
+        let none = "WARN atl-ime: start without a connection\n";
+        let tap = "I liblog/AtlWindow: focus input=true\n";
+        let editor = "INFO atl-ime: start input_type=0x20001 session=0\n";
+        assert!(refocus_check(&format!("{gain}{none}{tap}{editor}")).is_ok());
+        for red in [
+            format!("{none}{tap}{editor}"),
+            format!("{gain}{tap}{editor}"),
+            format!("{gain}{none}{editor}"),
+            format!("{gain}{none}{tap}"),
+            format!(
+                "{}{none}{tap}{editor}",
+                gain.replace("attached=true", "attached=false")
+            ),
+            format!("{}{none}{tap}{editor}", gain.replace("none", "EditText")),
+        ] {
+            assert!(refocus_check(&red).is_err(), "{red}");
+        }
+    }
+
+    /// The two processes' parts make up the whole log; without a kill there is no relaunched one.
+    #[test]
+    fn the_relaunched_part_starts_where_the_first_ends() {
+        let app = "a\nb\nc\n";
+        assert_eq!(first_part(app, Some(4)), "a\nb\n");
+        assert_eq!(relaunched_part(app, Some(4)), "c\n");
+        assert_eq!(relaunched_part(app, None), "");
     }
 
     /// Settled only once a retired shown buffer's release went out (or a fence rode none), with a post-draw received.
@@ -908,6 +1033,7 @@ mod tests {
                 "delete: not reached",
                 "death: not reached",
                 "relaunch: not reached",
+                "refocus: not reached",
                 "outbox: not reached",
                 "copy: not reached",
             ]

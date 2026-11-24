@@ -3,7 +3,8 @@
 //! Each app process serves its own input method (atl-ime, IME plan route R1), found through the app's UI agent (INPUT_METHOD); IMMS-lite binds it as IMMS binds an IME, by the state machine in ime_bind.rs:
 //! - addClient (InputMethodManager.java:1652, the startup call; InputMethodManagerService.java:1791-1805): the client is kept per app process (ui_agents.rs AppProcess: uid + binder calling pid), as
 //!   AOSP keeps one ClientState per client binder with its uid and pid; its input method is that process's UI agent's.
-//! - startInputOrWindowGainedFocusAsync (every window focus gain, ViewRootImpl.handleWindowFocusChanged -> InputMethodManager.startInputInner:3560): ime_bind.rs; every call gets its onStartInputResult (ZeroJankProxy.java:466-476).
+//! - startInputOrWindowGainedFocusAsync (every start of input, a window focus gain's included, ViewRootImpl.handleWindowFocusChanged -> InputMethodManager.startInputInner:3560): ime_bind.rs; every call gets its onStartInputResult (ZeroJankProxy.java:466-476).
+//! - startInputOrWindowGainedFocus (a window focus gain that starts no input, WINDOW_FOCUS_GAIN_REPORT_ONLY): null, as ZeroJankProxy; only our focus owner moves (focus.rs).
 //! - showSoftInput / hideSoftInput (ImeTracker.Token decoded): false (the desktop input method shows its own UI; no soft keyboard window). getImeTrackerService: null (the client's no-tracker path).
 //!   getInputMethodList / getEnabledInputMethodList: the empty InputMethodInfoSafeList (the in-app method is no installed InputMethodInfo).
 //!
@@ -76,7 +77,7 @@ struct State {
     clients: Mutex<HashMap<AppProcess, Client>>,
     /// Clients get a death link (false only for the ime gate's deliberate break, services `--no-ime-death-link`).
     death_link: bool,
-    /// Every startInputOrWindowGainedFocus names its caller the focus owner (focus.rs).
+    /// Every startInputOrWindowGainedFocus and ...Async names its caller the focus owner (focus.rs).
     focus: Arc<FocusedProcess>,
 }
 
@@ -104,6 +105,12 @@ impl State {
 }
 
 impl State {
+    /// A focus gain of a window of `pid` that started no input: the pid owns the focus, the answer is null and no client's state changes.
+    fn report_only_focus(&self, pid: i32) -> Option<InputBindResult> {
+        self.focus.gained(pid);
+        None
+    }
+
     fn clients(&self) -> MutexGuard<'_, HashMap<AppProcess, Client>> {
         // a poisoned table still holds the clients
         self.clients.lock().unwrap_or_else(|e| e.into_inner())
@@ -417,6 +424,34 @@ impl IInputMethodManager for InputMethodManager {
         Ok(())
     }
 
+    /// startInputOrWindowGainedFocus: AOSP answers null and changes no state (ZeroJankProxy.java:263-275, use_zero_jank_proxy on in the pinned release configs); the client still calls it for a report-only focus gain (InputMethodManager.java:958-977, result ignored).
+    /// Ours, not AOSP: the caller becomes the focus owner (focus.rs). Counted.
+    #[allow(clippy::too_many_arguments)]
+    fn r#startInputOrWindowGainedFocus(
+        &self,
+        _start_input_reason: i32,
+        _client: Option<&Strong<dyn IInputMethodClient>>,
+        _window_token: Option<&SpIBinder>,
+        _start_input_flags: i32,
+        _soft_input_mode: i32,
+        _window_flags: i32,
+        _editor_info: Option<&EditorInfo>,
+        _input_connection: Option<&Strong<dyn IRemoteInputConnection>>,
+        _remote_accessibility_input_connection: Option<
+            &Strong<dyn atl_aidl::mangled::_3_com_7_android_8_internal_11_inputmethod_35_IRemoteAccessibilityInputConnection>,
+        >,
+        _unverified_target_sdk_version: i32,
+        _user_id: i32,
+        _ime_dispatcher: Option<&ImeOnBackInvokedDispatcher>,
+        _ime_requested_visible: bool,
+    ) -> binder::Result<Option<InputBindResult>> {
+        atl_diag::answered(
+            INTERFACE,
+            "startInputOrWindowGainedFocus (null: ZeroJankProxy)",
+        );
+        Ok(self.state.report_only_focus(ThreadState::get_calling_pid()))
+    }
+
     /// showSoftInput: no IME window to show -> false (IMMS answers false when there is no current method).
     #[allow(clippy::too_many_arguments)]
     fn r#showSoftInput(
@@ -500,4 +535,25 @@ pub fn new_binder(
         BinderFeatures::default(),
     )
     .as_binder()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report-only focus gain: null (ZeroJankProxy.java:263-275), the caller is the focus owner, no client is added. The calling pid is a parameter: reading it opens the binder driver, which a unit test has not.
+    #[test]
+    fn a_report_only_focus_gain_is_null_and_names_the_owner() {
+        let focus = Arc::new(FocusedProcess::default());
+        let state = State {
+            agents: Arc::new(UiAgents::default()),
+            clients: Mutex::new(HashMap::new()),
+            death_link: true,
+            focus: Arc::clone(&focus),
+        };
+        assert!(!focus.is(7));
+        assert!(state.report_only_focus(7).is_none());
+        assert!(focus.is(7));
+        assert!(state.clients().is_empty());
+    }
 }

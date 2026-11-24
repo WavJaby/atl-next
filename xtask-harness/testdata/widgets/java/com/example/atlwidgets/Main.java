@@ -265,6 +265,15 @@ public class Main extends Activity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         Log.i(TAG, "window focus=" + hasFocus);
+        logFocusState("main", this, hasFocus);
+    }
+
+    /** What decides whether a window focus gain starts input (the ime stage's relaunch): the decor attached (its first traversal ran), the window's touch mode, the focused view. `focus-state` lines, Main's and Second's. */
+    static void logFocusState(String window, Activity activity, boolean hasFocus) {
+        View decor = activity.getWindow().getDecorView();
+        View focused = decor.findFocus();
+        Log.i(TAG, "focus-state " + window + "=" + hasFocus + " attached=" + decor.isAttachedToWindow() + " touch=" + decor.isInTouchMode()
+                + " view=" + (focused == null ? "none" : focused.getClass().getSimpleName()));
     }
 
     /** Once: the geometry. */

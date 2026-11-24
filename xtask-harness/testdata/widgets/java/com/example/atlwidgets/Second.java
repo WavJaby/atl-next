@@ -29,6 +29,12 @@ public class Second extends Activity {
         post();
     }
 
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        Main.logFocusState("second", this, hasFocus);
+    }
+
     private void post() {
         Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
             @Override
