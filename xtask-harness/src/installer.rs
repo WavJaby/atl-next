@@ -636,7 +636,7 @@ impl Gate<'_> {
             .context("starting the installer in its profile")?;
         // the broker's share of the wall time: mounts, the ELF closure of the runtime, bwrap's set-up, before the installer runs
         println!("{stem}: profile spawn {} ms", start.elapsed().as_millis());
-        let status = binder::wait_limited(&mut p.child, RUN_LIMIT)?;
+        let status = binder::wait_limited("exit-installer-run", &mut p.child, RUN_LIMIT)?;
         let wall = start.elapsed().as_millis();
         let run = ArtRun {
             ok: status.is_some_and(|s| s.success()),
@@ -770,7 +770,7 @@ impl Gate<'_> {
             .broker
             .spawn_installer(spawn)
             .context("starting the probe in the installer profile")?;
-        let status = binder::wait_limited(&mut p.child, RUN_LIMIT)?;
+        let status = binder::wait_limited("exit-installer-probe", &mut p.child, RUN_LIMIT)?;
         let refused = new_records(before, seccomp_records());
         match status {
             Some(s) if killed_by(s) == Some(SIGSYS) => {
@@ -1378,7 +1378,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ok = gate.fails.is_empty();
     drop(gate);
     drop(broker);
-    binder::wait_limited(&mut binderd.child, RUN_LIMIT)?;
+    binder::wait_limited("exit-installer-binderd", &mut binderd.child, RUN_LIMIT)?;
     Ok(if ok {
         ExitCode::SUCCESS
     } else {

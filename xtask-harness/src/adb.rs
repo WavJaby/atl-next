@@ -142,7 +142,7 @@ fn client(adb: &Path, home: &Path, server_port: u16, args: &[&str]) -> Result<(S
         .stderr(std::fs::File::options().append(true).open(&log)?)
         .spawn()
         .with_context(|| format!("running {}", adb.display()))?;
-    let status = wait_limited(&mut child, RUN_LIMIT)?;
+    let status = wait_limited("exit-adb-run", &mut child, RUN_LIMIT)?;
     let text = std::fs::read_to_string(&log)?;
     Ok((text, status.is_some_and(|s| s.success())))
 }
@@ -372,13 +372,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if let Some(secs) = args.serve {
         println!("adb: serving on {serial} for {secs} s");
-        let _ = wait_limited(&mut p.child, Duration::from_secs(secs))?;
+        let _ = wait_limited("exit-adb-serve", &mut p.child, Duration::from_secs(secs))?;
     }
     let _ = client(&adb_client, &home, server_port, &["kill-server"]);
     let _ = atl_broker::kill_sandbox(p.host_pid);
     let _ = p.child.wait();
     drop(b);
-    let _ = wait_limited(&mut binderd.child, RUN_LIMIT)?;
+    let _ = wait_limited("exit-adb-binderd", &mut binderd.child, RUN_LIMIT)?;
     Ok(if pass {
         ExitCode::SUCCESS
     } else {

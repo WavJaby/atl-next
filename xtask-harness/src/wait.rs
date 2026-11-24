@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: MIT
 //! Declared waits (gate-starved-red-design section 2.2, 2.6): one function runs a wait, bounds it and prints its record.
 //!
-//! H2a/H2b judge nothing: `bound` is the limit each call site already had, and `need` stays unset until quiet passes measure it.
+//! H2a/H2b judge nothing: `bound` is the limit each call site already had. `need` is derived from the machine's need ledger (gate_need.rs): unset until a wait has 20 quiet passes.
 //! `until()` returns `Miss::Late` when the bound passes and the caller decides what that means: a probe `?`s it (its first late wait ends the probe), an absence wait takes it as the answer.
 //! `until_child()` also ends a wait when the child it watches exits (`Miss::Exited`: a death, never a late wait).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
+use std::sync::OnceLock;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use atl_host_load::Span;
+use xtask::gate_need;
 
 use crate::starvation::Budget;
 use crate::wayland_proxy::Event as ProxyEvent;
@@ -40,7 +43,7 @@ pub(crate) enum Until<'a> {
     },
 }
 
-/// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time (None: not measured yet).
+/// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time, derived from the need ledger when the wait is made (None below [`gate_need::MIN_PASSES`] quiet passes).
 /// `every`: the poll interval of a polled kind (the sleep of the loop the wait replaced); an event wait receives and ignores it.
 pub(crate) struct Wait<'a> {
     pub(crate) name: &'static str,
@@ -64,7 +67,7 @@ impl<'a> Wait<'a> {
             name,
             why: why.into(),
             bound,
-            need: None,
+            need: derived_need(name),
             every: POLL,
             until: Until::Log { file, want },
         }
@@ -82,7 +85,7 @@ impl<'a> Wait<'a> {
             name,
             why: why.into(),
             bound,
-            need: None,
+            need: derived_need(name),
             every: POLL,
             until: Until::Event { events, want },
         }
@@ -99,7 +102,7 @@ impl<'a> Wait<'a> {
             name,
             why: why.into(),
             bound,
-            need: None,
+            need: derived_need(name),
             every,
             until: Until::Exit,
         }
@@ -117,7 +120,7 @@ impl<'a> Wait<'a> {
             name,
             why: why.into(),
             bound,
-            need: None,
+            need: derived_need(name),
             every,
             until: Until::Logs { held },
         }
@@ -176,6 +179,28 @@ impl From<String> for Miss {
     fn from(s: String) -> Self {
         Self::Wrong(s)
     }
+}
+
+/// Each wait's derived `need` (ms) from the machine's need ledger, read once per process by [`install_needs`]. Empty until installed: no wait has a need.
+static NEEDS: OnceLock<BTreeMap<String, u64>> = OnceLock::new();
+
+/// Reads the need ledger of the checkout at `root` (gate_need.rs `derived`): each wait made after this takes its derived need. An unreadable ledger leaves every need unset, named on stderr.
+pub(crate) fn install_needs(root: &Path) {
+    let needs = load_needs(root).unwrap_or_else(|e| {
+        eprintln!("need ledger unreadable, every need unset: {e:#}");
+        BTreeMap::new()
+    });
+    let _ = NEEDS.set(needs);
+}
+
+fn load_needs(root: &Path) -> anyhow::Result<BTreeMap<String, u64>> {
+    let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
+    gate_need::derived(&ws)
+}
+
+/// A wait's derived need: unset below [`gate_need::MIN_PASSES`] quiet passes, and with no ledger installed.
+fn derived_need(name: &str) -> Option<Duration> {
+    NEEDS.get()?.get(name).map(|ms| Duration::from_millis(*ms))
 }
 
 /// Runs `wait` until its condition holds (Ok: the instant it did) or its bound passes (Late). Prints the record once, on either outcome.
@@ -302,9 +327,12 @@ fn polled(
     }
 }
 
-/// The record line of a declared wait: `wait: <name> took=<ms> bound=<ms> need=<ms|unset>`.
+/// The record line of a declared wait: `wait: <name> took=<ms> bound=<ms> need=<ms|unset>`. `need`: the wait's own (a `Wait`'s, already derived); None, as a hand-recorded wait passes it, takes the derived need.
 pub(crate) fn record(name: &str, took: Duration, bound: Duration, need: Option<Duration>) {
-    println!("{}", line(name, took, bound, need));
+    println!(
+        "{}",
+        line(name, took, bound, need.or_else(|| derived_need(name)))
+    );
 }
 
 fn line(name: &str, took: Duration, bound: Duration, need: Option<Duration>) -> String {

@@ -215,7 +215,7 @@ fn service_limited(
     let mut cmd = Command::new(service);
     cmd.args(args).envs(env.iter().cloned());
     let mut p = spawn_logged(b, &cmd, AID_SHELL, domains::SHELL, log)?;
-    let status = wait_limited(&mut p.child, limit)?;
+    let status = wait_limited("exit-binder-service", &mut p.child, limit)?;
     let text = std::fs::read_to_string(log)?;
     Ok(match status {
         Some(s) => (s.success(), text),
@@ -226,13 +226,14 @@ fn service_limited(
 /// How long one `service` run may take: a lookup is one binder round trip (well under 100 ms); a hang means a lost reply.
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 
-/// `child`'s exit status, or None after killing it at `limit`. One record name for every caller (adb, binder, installer, sandbox, gralloc): `wait: exit-limited`.
+/// `child`'s exit status, or None after killing it at `limit`. `name` is the wait's record and its need-ledger key (gate_need.rs): one per call site, so a site's samples never mix with another's.
 pub(crate) fn wait_limited(
+    name: &'static str,
     child: &mut Child,
     limit: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
     let exit = Wait::exit(
-        "exit-limited",
+        name,
         "the process outlived its limit",
         limit,
         EXIT_LIMITED_POLL,
@@ -423,7 +424,7 @@ fn sweep_stage(
     )?;
     let log = test_root.join("sweep-client.log");
     let mut cli = spawn_logged(b, &client, AID_APP, domains::UNTRUSTED_APP, &log)?;
-    let status = wait_limited(&mut cli.child, SWEEP_LIMIT)?;
+    let status = wait_limited("exit-binder-sweep", &mut cli.child, SWEEP_LIMIT)?;
     let _ = srv.child.kill();
     let _ = srv.child.wait();
     let text = std::fs::read_to_string(&log)?;
@@ -507,7 +508,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let _ = sm.child.kill();
     sm.child.wait()?;
     drop(b);
-    let bstatus = wait_limited(&mut binderd.child, RUN_LIMIT)?;
+    let bstatus = wait_limited("exit-binder-binderd", &mut binderd.child, RUN_LIMIT)?;
     let counters = std::fs::read_to_string(test_root.join("binderd.log"))?;
     let sm_log = std::fs::read_to_string(&sm_log_path)?;
     print!("{counters}");
@@ -539,6 +540,39 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each `wait_limited` call site names its own wait (`wait: exit-<site>`), so one site's samples never mix with another's. Scans the call sites of the modules that use it: 14, all literal and distinct.
+    #[test]
+    fn every_wait_limited_call_site_names_its_own_wait() {
+        let needle = concat!("wait_", "limited(");
+        let sources = [
+            include_str!("adb.rs"),
+            include_str!("binder.rs"),
+            include_str!("gralloc.rs"),
+            include_str!("installer.rs"),
+            include_str!("sandbox.rs"),
+        ];
+        let mut names = Vec::new();
+        for src in sources {
+            for (at, _) in src.match_indices(needle) {
+                if src[..at].ends_with("fn ") {
+                    continue;
+                }
+                let literal = src[at + needle.len()..]
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next());
+                names.push(
+                    literal
+                        .expect("a call site with no literal name")
+                        .to_owned(),
+                );
+            }
+        }
+        assert_eq!(names.len(), 14, "{names:?}");
+        let distinct: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("exit-")), "{names:?}");
+    }
 
     /// R7-10: a servicemanager that exited is reported as exited at once, with its status, while its check still waits (`None`) and also past STARTUP (was `killed after 60s`, 60 s late).
     /// Raw wait status 0x100 = exit code 1 (wait(2) WEXITSTATUS: the code in bits 8-15).

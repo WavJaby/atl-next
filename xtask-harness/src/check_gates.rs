@@ -16,6 +16,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
 use xtask::build_pool::{self, Class};
+use xtask::gate_need;
 use xtask::harness::{Ruling, Starvation, Supply, Undecided, judged_in, undecided_verdict};
 use xtask::red_logs;
 
@@ -48,6 +49,8 @@ pub struct Row {
     pub lane: Lane,
     pub after: &'static [&'static str],
     pub class: Class,
+    /// its waits feed the need ledger (gate_need.rs); off for the sampler's self-test, whose waits starve on purpose
+    samples: bool,
 }
 
 impl Row {
@@ -59,6 +62,14 @@ impl Row {
             lane: Lane::Parallel,
             after: &[],
             class: Class::Harness,
+            samples: true,
+        }
+    }
+
+    const fn self_test(self) -> Self {
+        Self {
+            samples: false,
+            ..self
         }
     }
 
@@ -108,7 +119,7 @@ impl Row {
 pub const ROWS: &[Row] = &[
     Row::new(&["task-bind"], false, false),
     // the starvation rule's own gate: a starved wait undecided, every real red still red (about 10 s on one CPU)
-    Row::new(&["host-load"], false, false),
+    Row::new(&["host-load"], false, false).self_test(),
     Row::new(&["sandbox"], true, true),
     Row::new(&["signing"], true, true),
     Row::new(&["sepolicy"], true, true),
@@ -190,6 +201,8 @@ struct Done {
     host_unknown: bool,
     /// the attempt an undecided row was rerun after (gate-starved-red-design 2.7): this run's outcome is the row's, that attempt is the first
     first: Option<Box<Done>>,
+    /// this run's wait samples (gate_need.rs); kept in the need ledger when the row passes
+    waits: Vec<gate_need::WaitLine>,
 }
 
 impl Done {
@@ -208,6 +221,7 @@ impl Done {
             judged: 0,
             host_unknown: false,
             first: None,
+            waits: Vec::new(),
         }
     }
 
@@ -267,6 +281,24 @@ fn starvation_of(done: &[Done]) -> Starvation {
         }
     }
     counts
+}
+
+/// The need-ledger samples of one step: each passing row's wait samples from its deciding run (the rerun, when there was one). A pass is `(run, row)`; the self-test row's waits are not gate waits.
+fn need_samples(run: &str, commit: &str, rows: &[(&Row, &Done)]) -> Vec<gate_need::Sample> {
+    rows.iter()
+        .filter(|(row, d)| row.samples && d.outcome == Outcome::Pass)
+        .flat_map(|(row, d)| {
+            d.waits.iter().map(move |w| gate_need::Sample {
+                run: run.to_owned(),
+                commit: commit.to_owned(),
+                row: row.name(),
+                wait: w.name.clone(),
+                took_ms: w.took_ms,
+                bound_ms: w.bound_ms,
+                stall: d.stall,
+            })
+        })
+        .collect()
 }
 
 /// The failure note of a row undecided in [`red_logs::CEILING`] consecutive runs of this checkout, its last runs named. None below the ceiling.
@@ -409,6 +441,11 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         })
         .collect();
     red_logs::ledger_append(&task, &entries)?;
+    // the need ledger (gate_need.rs): every passing row's wait samples, machine-wide, after the step's rows ended
+    let pairs: Vec<(&Row, &Done)> = ROWS.iter().zip(&done).collect();
+    let samples = need_samples(&run, commit.trim(), &pairs);
+    gate_need::append(&ws, &samples)?;
+    eprintln!("gates: need ledger +{} samples", samples.len());
     let streaks = red_logs::trailing_undecided(&task)?;
     let mut starvation = starvation_of(&done);
     let mut failed = Vec::new();
@@ -674,6 +711,7 @@ impl RowRun<'_> {
             judged: judged_in(&text)?,
             host_unknown: seen.stall_pct.is_none(),
             first: None,
+            waits: gate_need::wait_samples(&text),
         })
     }
 }
@@ -774,6 +812,62 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::time::Duration;
+
+    /// A step's need samples: each passing row's own waits, from its deciding run; a red row and the self-test row add none. Expected values written out.
+    #[test]
+    fn need_samples_are_the_passing_rows_waits_and_the_self_test_is_not_one() {
+        let wait = |name: &str, took_ms: u64| gate_need::WaitLine {
+            name: name.to_owned(),
+            took_ms,
+            bound_ms: 60_000,
+        };
+        let step = |outcome: Outcome, stall: Option<f64>, waits: Vec<gate_need::WaitLine>| Done {
+            stall,
+            waits,
+            ..Done::bare(outcome, String::new(), String::new())
+        };
+        let app = Row::new(&["app"], true, true);
+        let ime = Row::new(&["ime"], true, true);
+        let self_test = Row::new(&["host-load"], false, false).self_test();
+        let passed = step(
+            Outcome::Pass,
+            Some(0.04),
+            vec![wait("app-progress", 521), wait("marker", 11_773)],
+        );
+        let red = step(Outcome::Fail, Some(0.0), vec![wait("marker", 900)]);
+        let quiet_self_test = step(Outcome::Pass, Some(0.0), vec![wait("draw", 3_100)]);
+        let pairs = [
+            (&app, &passed),
+            (&ime, &red),
+            (&self_test, &quiet_self_test),
+        ];
+        let samples = need_samples("20261124-120000-000", "c0ffee", &pairs);
+        let got: Vec<(&str, &str, &str, u64, Option<f64>)> = samples
+            .iter()
+            .map(|s| {
+                (
+                    s.run.as_str(),
+                    s.row.as_str(),
+                    s.wait.as_str(),
+                    s.took_ms,
+                    s.stall,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "20261124-120000-000",
+                    "app",
+                    "app-progress",
+                    521,
+                    Some(0.04)
+                ),
+                ("20261124-120000-000", "app", "marker", 11_773, Some(0.04)),
+            ]
+        );
+    }
 
     /// Lines as the window and composer gates printed them (job rgm-done1).
     #[test]

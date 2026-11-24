@@ -337,6 +337,8 @@ fn main() -> Result<ExitCode> {
     // a test gate runs in its own scope when the host can make one (atl-host-load): begun here, its `host load:` line printed after its verdict
     let gate = matches!(cli.command, Command::Test { .. }).then(atl_host_load::Gate::begin);
     let root = checkout_root()?;
+    // every declared wait made by this process takes its need from the machine's need ledger (gate_need.rs), read once here
+    wait::install_needs(&root);
     let name = verdict_name(&cli.command);
     let result = match cli.command {
         Command::RunApk(args) => run_apk::run(&root, &args),

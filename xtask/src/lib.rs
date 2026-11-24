@@ -36,6 +36,7 @@ pub mod env_reads;
 pub mod fetch;
 pub mod flock;
 pub mod gate_goals;
+pub mod gate_need;
 pub mod git;
 pub mod git_dirs;
 pub mod gtk_baseline;

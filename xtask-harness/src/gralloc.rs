@@ -344,8 +344,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let reader_log = test_root.join("reader.log");
         let mut writer = spawn_probe(&broker, &probe, "writer", a, &env, &writer_log)?;
         let mut reader = spawn_probe(&broker, &probe, "reader", b, &env, &reader_log)?;
-        let reader_status = binder::wait_limited(&mut reader.child, PROBE_LIMIT)?;
-        let writer_status = binder::wait_limited(&mut writer.child, PROBE_LIMIT)?;
+        let reader_status =
+            binder::wait_limited("exit-gralloc-reader", &mut reader.child, PROBE_LIMIT)?;
+        let writer_status =
+            binder::wait_limited("exit-gralloc-writer", &mut writer.child, PROBE_LIMIT)?;
         let _ = alloc.kill();
         let _ = alloc.wait();
 

@@ -283,7 +283,7 @@ fn probe_once(
     });
     (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
     let mut p = broker.spawn(spawn).context("starting the probe")?;
-    let status = binder::wait_limited(&mut p.child, LIMIT)?;
+    let status = binder::wait_limited("exit-sandbox-probe", &mut p.child, LIMIT)?;
     let text = fs::read_to_string(&log)?;
     let line = text
         .lines()
@@ -538,7 +538,7 @@ fn wayland_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(String, V
     let log = work.join("probe-wayland.log");
     (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
     let mut p = broker.spawn(spawn).context("starting the wayland probe")?;
-    let status = binder::wait_limited(&mut p.child, LIMIT)?;
+    let status = binder::wait_limited("exit-sandbox-wayland", &mut p.child, LIMIT)?;
     let line = fs::read_to_string(&log)?
         .lines()
         .find(|l| l.starts_with("probe: wayland "))
@@ -632,7 +632,7 @@ fn pipewire_rows(broker: &Broker, probe: &Path, work: &Path) -> Result<(Vec<Stri
         let log = work.join(format!("probe-{}.log", tag.replace(' ', "-")));
         (spawn.stdout, spawn.stderr) = to_log(File::create(&log)?)?;
         let mut child = broker.spawn(spawn).context("starting the pipewire probe")?;
-        let status = binder::wait_limited(&mut child.child, LIMIT)?;
+        let status = binder::wait_limited("exit-sandbox-pipewire", &mut child.child, LIMIT)?;
         drop(ctx);
         let line = fs::read_to_string(&log)?
             .lines()

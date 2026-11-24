@@ -70,6 +70,10 @@ enum Command {
     /// Default dir: the workspace's dev set <workspace>/keys, shared by every build dir; `native` signs with it unless given `--keys`. Never AOSP's published keys, never committed.
     /// Dry run by default: lists the roles present and missing. `--execute` makes the missing ones with openssl as AOSP's make_key does.
     Keys(keys::Args),
+    /// Gate waits' `need` from the machine's need ledger (`<workspace>/out/pool/gate-need.tsv`, gate_need.rs): per wait, its samples, quiet samples, quiet passes, the need the harness derives (the largest quiet sample once 20 passes hold it) or `unset`, and the largest took / bound.
+    ///
+    /// Read-only. `--seed <harvest.tsv>` imports a harvest once (refused when the ledger exists).
+    GateNeed(gate_need::Args),
     /// The pinned QEMU's user-mode executable for a guest arch (`qemu-<target>`), built with no patch.
     ///
     /// Dry run unless `--execute`: then QEMU's own `configure` and ninja build `qemu-<target>` into `<out>/qemu/<target>-linux-user`, and its `--version` must name the sources.toml pin.
@@ -212,6 +216,7 @@ pub fn main() -> Result<ExitCode> {
         Command::Keepset(args) => keepset::run(&root, &args),
         Command::Native(args) => native::run(&root, &args),
         Command::Keys(args) => keys::run(&root, &args),
+        Command::GateNeed(args) => gate_need::run(&root, &args),
         Command::Qemu(args) => qemu::run(&root, &args),
         Command::Out { out } => out::run(&root, &out),
         Command::Patch(args) => patch::run(&root, &args),
