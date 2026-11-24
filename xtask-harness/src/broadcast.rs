@@ -31,7 +31,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, counter_lines, route_fifo, set_default_route};
 use crate::manifest;
-use crate::wait::{Miss, Wait, settle_for, until, until_child};
+use crate::wait::{LOOP_POLL, Miss, Wait, settle_for, until, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -228,6 +228,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "broadcast-run-end",
             "no done, headless end or alarm line",
             LIMIT,
+            LOOP_POLL,
             &run_end,
         ),
         &mut atld,
@@ -283,14 +284,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let start2 = Instant::now();
     // the receiver's MY_PACKAGE_REPLACED, then the sender's silence is read after REINSTALL_SETTLE (what is left of LIMIT at most): a late delivery lands before it.
     // The settle stays a timed wait (see REINSTALL_SETTLE): no fence on the sender's queue exists in this run
-    let replaced = |t: &str| t.contains(BOOT_MY_REPLACED);
+    let replaced = || read(&r2_log).contains(BOOT_MY_REPLACED);
     let mut atld2_ended = false;
     match until_child(
-        &Wait::log(
+        &Wait::logs(
             "reinstall-replaced",
             "no MY_PACKAGE_REPLACED line",
             LIMIT,
-            &r2_log,
+            LOOP_POLL,
             &replaced,
         ),
         &mut atld2,
@@ -517,12 +518,12 @@ fn connectivity_checks(
     let read = atl_diag::logfiles::read;
     // waits up to NET_STEP for the app's log to hold `marker`: one declared wait per step (its record); a late step is false
     let seen = |name: &'static str, marker: &str| -> bool {
-        let held = |t: &str| t.contains(marker);
-        until(&Wait::log(
+        let held = || read(&app).contains(marker);
+        until(&Wait::logs(
             name,
             format!("no {marker} line"),
             NET_STEP,
-            &app,
+            LOOP_POLL,
             &held,
         ))
         .is_ok()

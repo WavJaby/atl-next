@@ -16,6 +16,10 @@ use crate::wayland_proxy::Event as ProxyEvent;
 pub(crate) const POLL: Duration = Duration::from_millis(50);
 /// How often an exit-only wait polls its child (`try_wait` is cheap; the 10 ms that binder's `wait_limited` polled before, so `took=` keeps its precision).
 const EXIT_POLL: Duration = Duration::from_millis(10);
+/// The poll of a converted loop wait: the sleep of the loop it replaced on main (broadcast's run loops, app's marker loop, the connectivity steps: 200 ms). H2 moves no poll interval.
+pub(crate) const LOOP_POLL: Duration = Duration::from_millis(200);
+/// The poll of the app's post-marker watch: its sleep on main (app.rs, 100 ms).
+pub(crate) const WATCH_POLL: Duration = Duration::from_millis(100);
 
 /// What a wait ends on: a log's text (polled), a proxy event (received; its arrival time is the answer), the child's exit (`until_child` only: the exit is the answer),
 /// or a condition the caller reads from any number of logs (`Logs`, polled like a log). `Log` and `Logs` run through `until_child` also end on that child's exit (`Miss::Exited`).
@@ -30,8 +34,10 @@ pub(crate) enum Until<'a> {
     },
     Exit,
     /// `held` is the whole judgement: the caller reads each log it needs. Multi-log fences (broadcast's run end, app's marker or app end) are this kind.
+    /// `every` is the poll interval: the sleep of the loop the wait replaced.
     Logs {
         held: &'a dyn Fn() -> bool,
+        every: Duration,
     },
 }
 
@@ -90,11 +96,12 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// A condition `held` reads from any number of logs, polled for `bound`. Holds only while `held` does: a conjunction of logs is one `held`.
+    /// A condition `held` reads from any number of logs, polled every `every` for `bound`. Holds only while `held` does: a conjunction of logs is one `held`.
     pub(crate) fn logs(
         name: &'static str,
         why: impl Into<String>,
         bound: Duration,
+        every: Duration,
         held: &'a dyn Fn() -> bool,
     ) -> Self {
         Self {
@@ -102,7 +109,7 @@ impl<'a> Wait<'a> {
             why: why.into(),
             bound,
             need: None,
-            until: Until::Logs { held },
+            until: Until::Logs { held, every },
         }
     }
 }
@@ -174,7 +181,7 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
             false,
             POLL,
         ),
-        (Until::Logs { held }, child) => polled(deadline, child, *held, false, POLL),
+        (Until::Logs { held, every }, child) => polled(deadline, child, *held, false, *every),
         (Until::Exit, Some(child)) => polled(deadline, Some(child), &|| false, true, EXIT_POLL),
         (Until::Exit, None) => {
             return Err(Miss::Wrong(format!(
@@ -330,7 +337,7 @@ pub(crate) fn settle_for(
     child: &mut Child,
 ) -> Result<(), Miss> {
     let never = || false;
-    let w = Wait::logs(name, "", bound, &never);
+    let w = Wait::logs(name, "", bound, LOOP_POLL, &never);
     match until_child(&w, child) {
         Err(Miss::Late { .. }) => Ok(()),
         Err(miss) => Err(miss),
@@ -540,6 +547,7 @@ mod tests {
             "run-end",
             "no alarm line",
             Duration::from_millis(150),
+            LOOP_POLL,
             &held,
         );
         assert_eq!(until(&w).unwrap_err(), late("run-end", "no alarm line"));
@@ -547,7 +555,13 @@ mod tests {
         assert!(until(&w).is_ok());
         // the same condition with the child's exit: a death, not a late wait (bound long enough for the exit to land)
         std::fs::write(&receiver, "").unwrap();
-        let w = Wait::logs("run-end", "no alarm line", Duration::from_secs(5), &held);
+        let w = Wait::logs(
+            "run-end",
+            "no alarm line",
+            Duration::from_secs(5),
+            LOOP_POLL,
+            &held,
+        );
         let mut dead = sh("exit 5");
         assert_eq!(
             until_child(&w, &mut dead).unwrap_err(),

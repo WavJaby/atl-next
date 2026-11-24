@@ -21,7 +21,7 @@ use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_li
 use crate::gl_scene::{Judged, Scene};
 use crate::native_load::PLAYER_STEPS;
 use crate::test_fonts;
-use crate::wait::{Miss, Wait, until_child};
+use crate::wait::{LOOP_POLL, Miss, WATCH_POLL, Wait, until_child};
 use crate::window::{self, WINDOW_MS};
 use crate::{gl_probe, jni_fixture, manifest};
 
@@ -2500,6 +2500,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "app-marker",
             format!("no marker after {LIMIT:?}"),
             LIMIT,
+            LOOP_POLL,
             &marker_or_end,
         ),
         &mut atld_child,
@@ -2550,7 +2551,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             run.app_ended()
         };
         match until_child(
-            &Wait::logs("app-window", "", Duration::from_millis(WINDOW_MS), &window),
+            &Wait::logs(
+                "app-window",
+                "",
+                Duration::from_millis(WINDOW_MS),
+                WATCH_POLL,
+                &window,
+            ),
             &mut atld_child,
         ) {
             Ok(_) | Err(Miss::Exited { .. }) => ended = Some(run.stop(&mut atld_child)?),
@@ -2574,7 +2581,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 RESULT_STALL.saturating_sub(since_progress)
             };
             match until_child(
-                &Wait::logs("app-progress", "", bound, &next),
+                &Wait::logs("app-progress", "", bound, WATCH_POLL, &next),
                 &mut atld_child,
             ) {
                 Err(Miss::Exited { .. }) => ended = Some(run.stop(&mut atld_child)?),
