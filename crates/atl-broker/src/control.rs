@@ -62,6 +62,16 @@ pub enum Request {
         uid: u32,
         names: Vec<StagedName>,
     },
+    /// The services refused staged session `session` (staged for `uid`) as INSTALL_FAILED_VERSION_DOWNGRADE (`version` below the installed `installed`): its staging dir goes and the installer
+    /// parses `package`'s installed `/data/app/<package>` in place (as an unchanged session, `--installed`) under the same session, so the session's `Commit` registers the installed package as it
+    /// is (PMS refuses that install only; the installed package stays and runs). atld says so in one line naming both versionCodes. Answered [`Response::Staged`]; a failed run answers its stderr.
+    Reinstate {
+        session: u32,
+        package: String,
+        uid: u32,
+        version: i64,
+        installed: i64,
+    },
     /// PMS's system scan of one preinstalled package dir (`dir`: its Android path, one of atl-services-types `system_packages::scan`'s dirs, e.g. `/product/app/Fixture`): the installer parses it
     /// where it lies (read-only partition, no staging, no native-library copy). No uid yet: PMS assigns the appId only to a package the scan accepts. Answered [`Response::Staged`]; a failed run
     /// answers its stderr.

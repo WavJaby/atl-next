@@ -19,7 +19,7 @@
 //!   The receiver's boot receiver exists in its version 2 only, so the first run's restricted-start rows see no boot grant.
 //! - reinstall (plan S9): a second atld run over the same data root installs version 2 of the receiver: the services classify it `Updated { from: 1 }` and MY_PACKAGE_REPLACED reaches it alone;
 //!   the sender, unchanged, gets none.
-//! - downgrade (S9b): a third run installs version 1 again: refused INSTALL_FAILED_VERSION_DOWNGRADE, and the start fails.
+//! - downgrade (S9b): a third run installs version 1 again: refused INSTALL_FAILED_VERSION_DOWNGRADE (atld says so), yet the installed version 2 stays, its activity runs and atld exits 0.
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
@@ -117,6 +117,10 @@ const LAUNCH_RELEASED: &str = "launch released after first-start boot broadcasts
 /// install.rs change_of's refusal text (PackageManagerServiceUtils.checkDowngrade :1427-1429), version 1 over the recorded 2.
 const DOWNGRADE_REFUSED: &str =
     "INSTALL_FAILED_VERSION_DOWNGRADE: Update version code 1 is older than current 2";
+/// atld's user line for that refusal (main.rs Host::reinstate): both versionCodes, and that the installed one runs.
+const DOWNGRADE_USER_LINE: &str = "atld: install com.example.atlbcastrecv: refused INSTALL_FAILED_VERSION_DOWNGRADE: versionCode 1 is older than the installed 2; the installed versionCode 2 runs";
+/// The receiver's Show activity in the downgrade run: the installed version 2's code runs.
+const KEPT_V2_RUNS: &str = "AtlBcast: activity onCreate versionCode=2";
 
 /// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed).
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -335,11 +339,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     for l in counter_lines(&services2) {
         println!("broadcast: reinstall counter {l}");
     }
-    // the downgrade row: version 1 of the receiver again over the same data root, recorded at 2. The install refuses it (INSTALL_FAILED_VERSION_DOWNGRADE) and, all or nothing, the start fails
+    // the downgrade row: version 1 of the receiver again over the same data root, recorded at 2. The install refuses that session (INSTALL_FAILED_VERSION_DOWNGRADE) and the installed version 2
+    // stays and runs: the receiver is launched, logs its versionCode and finishes, and atld ends with its last app
     let run3 = Run {
         root: work.join("root3"),
         scratch: work.join("scratch3"),
-        launch: None,
+        launch: Some(receiver.clone()),
         packages: vec![
             Package::base(apk_paths[0].clone()),
             Package::base(apk_paths[1].clone()),
@@ -349,7 +354,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         log_tags: "*:i".into(),
     };
     let start3 = Instant::now();
-    let mut atld3 = kept_runtime(&[])?.start_atld(&run3)?;
+    let mut atld3 = kept_runtime(&[])?
+        .with_exit_with_last_app()
+        .start_atld(&run3)?;
     let ended3 = loop {
         if let Some(s) = atld3.try_wait()? {
             break Some(s);
@@ -366,10 +373,15 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         start3.elapsed()
     );
     let services3 = read(&run3.log("services"));
-    let refused3 = services3.contains(DOWNGRADE_REFUSED);
-    if !refused3 {
+    let atld3_log = read(&run3.atld_log());
+    let r3 = read(&run3.log(&receiver));
+    let refused3 = services3.contains(DOWNGRADE_REFUSED) && atld3_log.contains(DOWNGRADE_USER_LINE);
+    let kept3 = services3.contains(&format!("services: install {receiver} version 2 Unchanged"))
+        && r3.contains(KEPT_V2_RUNS);
+    if !(refused3 && kept3) {
         println!(
-            "---- downgrade run services log (last {TAIL})\n{}",
+            "---- downgrade run atld log (last {TAIL})\n{}\n---- services log (last {TAIL})\n{}",
+            tail(&atld3_log, TAIL),
             tail(&services3, TAIL)
         );
     }
@@ -506,8 +518,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             !s2.contains(BOOT_MY_REPLACED),
         ),
         (
-            "a lower versionCode over the recorded one was refused INSTALL_FAILED_VERSION_DOWNGRADE and the start failed (all or nothing)",
-            refused3 && ended3.is_some_and(|s| !s.success()),
+            "a lower versionCode over the recorded one was refused INSTALL_FAILED_VERSION_DOWNGRADE, said in atld's one line naming both versionCodes",
+            refused3,
+        ),
+        (
+            "after the refusal the installed version 2 stayed (Unchanged), ran (its activity's onCreate) and atld exited 0 with its last app",
+            kept3 && ended3.is_some_and(|s| s.success()),
         ),
     ];
     checks.extend(connectivity_checks(root, &mut rt, &work)?);

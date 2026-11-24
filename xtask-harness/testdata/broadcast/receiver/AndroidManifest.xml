@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: MIT -->
-<!-- `xtask test broadcast`: the app with manifest receivers and one service, no activity; it does not request BROADCAST_STICKY. -->
+<!-- `xtask test broadcast`: the app with manifest receivers, services and one activity launched only by the downgrade row (Show); it does not request BROADCAST_STICKY. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.atlbcastrecv"
     android:versionCode="1"
@@ -36,5 +36,14 @@
 
         <!-- started by BootRecv inside the BOOT_COMPLETED temp allowlist -->
         <service android:name=".BootSvc" android:exported="false" />
+        <!-- the downgrade row's launch: logs the running versionCode, then finishes. No window, no hardware rendering, as the sender's Main (HWUI's EGL preload aborts without this run's GPU setup) -->
+        <activity android:name=".Show" android:exported="true"
+            android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

@@ -61,6 +61,28 @@ impl ControlSocket {
         }
     }
 
+    /// Session `session` was refused as a downgrade (`version` below `installed`): the installer parses `package`'s installed code in place under it instead; the frames file's host path.
+    pub fn reinstate(
+        &self,
+        session: u32,
+        package: &str,
+        uid: u32,
+        version: i64,
+        installed: i64,
+    ) -> io::Result<String> {
+        match self.call(&Request::Reinstate {
+            session,
+            package: package.to_owned(),
+            uid,
+            version,
+            installed,
+        })? {
+            Response::Staged { frames } => Ok(frames),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("reinstate answered {other:?}"))),
+        }
+    }
+
     /// Runs the installer over the preinstalled package dir `dir` (an Android path): the frames file's host path.
     pub fn scan(&self, dir: &str) -> io::Result<String> {
         match self.call(&Request::Scan {
@@ -130,8 +152,9 @@ impl ControlSocket {
         })
     }
 
+    /// A socket to a test's fake atld.
     #[cfg(test)]
-    fn new(fd: OwnedFd) -> Self {
+    pub(crate) fn new(fd: OwnedFd) -> Self {
         ControlSocket { fd: Mutex::new(fd) }
     }
 

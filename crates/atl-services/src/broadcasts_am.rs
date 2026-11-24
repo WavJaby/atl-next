@@ -955,7 +955,7 @@ impl ActivityManager {
 
     /// The start-time package broadcasts of the install's reports (BroadcastHelper.sendPostInstallBroadcasts :600-720), before the boot ones: a new package gets PACKAGE_ADDED; an updated
     /// one PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED to every receiver, and MY_PACKAGE_REPLACED to its own receivers alone with the REASON_PACKAGE_REPLACED temp allowlist.
-    /// Unchanged packages send nothing; a downgrade never gets here (install.rs change_of refuses it).
+    /// Unchanged packages send nothing; a refused downgrade comes as Unchanged (install.rs install keeps the installed package).
     pub fn package_broadcasts(&self, reports: &[install::Reported]) {
         for r in reports {
             match r.change {

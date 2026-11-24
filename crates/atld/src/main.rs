@@ -1078,7 +1078,83 @@ impl Host {
                     stage_file(&f.path, &host_dir.join(f.session_name()?))?;
                 }
             }
-            let lib = LIB_DIR_NAME;
+            self.run_session_installer(session, &host_dir, &at, in_place.is_some())
+        })();
+        match staged {
+            Ok(frames) => {
+                i.staged
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session, Staged { uid, in_place });
+                Ok(frames)
+            }
+            Err(e) => {
+                // an installed package's code stays: only a staging dir is this session's own
+                if in_place.is_none() {
+                    let _ = std::fs::remove_dir_all(&host_dir);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Request `Reinstate`: session `session`, staged for `uid` in its staging dir, was refused as a downgrade (`version` below `installed`). The staging dir goes; the installer parses `package`'s
+    /// installed code in place (as [`Host::install`]'s unchanged session) and the session is staged in place, so its commit registers the installed package unchanged. Logs the one user line.
+    fn reinstate(
+        &self,
+        session: u32,
+        package: &str,
+        uid: u32,
+        version: i64,
+        installed: i64,
+    ) -> Result<String> {
+        ensure!(
+            valid_package_name(package),
+            "{package:?}: not a package name"
+        );
+        let i = &self.installd;
+        {
+            let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
+            match staged.get(&session) {
+                Some(s) if s.uid == uid && s.in_place.is_none() => {}
+                _ => bail!("session {session}: not staged for uid {uid} in a staging dir"),
+            }
+            staged.remove(&session);
+        }
+        let _ = std::fs::remove_dir_all(self.root.data().join("app").join(staging_name(session)));
+        let host_dir = self.root.package(package, host_layout::Item::Apk);
+        ensure!(host_dir.is_dir(), "{package}: no installed code to keep");
+        let frames = self.run_session_installer(
+            session,
+            &host_dir,
+            &Path::new(DATA_APP).join(package),
+            true,
+        )?;
+        i.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            session,
+            Staged {
+                uid,
+                in_place: Some(package.to_owned()),
+            },
+        );
+        log(format_args!(
+            "install {package}: refused INSTALL_FAILED_VERSION_DOWNGRADE: versionCode {version} is older than the installed {installed}; the installed versionCode {installed} runs"
+        ));
+        Ok(frames)
+    }
+
+    /// The installer over session `session`'s code at `host_dir` (Android path `at`), its native-library root `<at>/lib` writable; `installed`: the boot-scan mode (`--installed`, no library copied).
+    /// The frames file; a failed run's error carries the installer's stderr.
+    fn run_session_installer(
+        &self,
+        session: u32,
+        host_dir: &Path,
+        at: &Path,
+        installed: bool,
+    ) -> Result<String> {
+        let i = &self.installd;
+        let lib = LIB_DIR_NAME;
+        {
             std::fs::create_dir_all(host_dir.join(lib))?;
             let install_dir = self.root.root.join("install");
             let frames = install_dir.join(format!("{session}.frames"));
@@ -1095,8 +1171,8 @@ impl Host {
                     .cloned()
                     .chain([
                         Mount {
-                            host: host_dir.clone(),
-                            at: at.clone(),
+                            host: host_dir.to_owned(),
+                            at: at.to_owned(),
                             writable: false,
                         },
                         // the native-library root, the one writable path (NativeLibraryHelper copies into it)
@@ -1114,12 +1190,11 @@ impl Host {
                 app_id: None,
                 program: i.installer.clone(),
                 // in place: the installer's boot-scan mode, no library copied
-                args: in_place
-                    .as_ref()
-                    .map(|_| OsString::from("--installed"))
+                args: installed
+                    .then(|| OsString::from("--installed"))
                     .into_iter()
                     .chain(i.vm.iter().cloned())
-                    .chain([at.clone().into_os_string(), at.join(lib).into_os_string()])
+                    .chain([at.as_os_str().to_owned(), at.join(lib).into_os_string()])
                     .collect(),
                 env: i.env.clone(),
                 cwd: None,
@@ -1144,22 +1219,6 @@ impl Host {
                 start.elapsed().as_millis()
             ));
             Ok(frames.to_string_lossy().into_owned())
-        })();
-        match staged {
-            Ok(frames) => {
-                i.staged
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(session, Staged { uid, in_place });
-                Ok(frames)
-            }
-            Err(e) => {
-                // an installed package's code stays: only a staging dir is this session's own
-                if in_place.is_none() {
-                    let _ = std::fs::remove_dir_all(&host_dir);
-                }
-                Err(e)
-            }
         }
     }
 
@@ -2186,6 +2245,15 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
             } => host
                 .commit(session, &package, uid, &names)
                 .map(|()| Response::Committed),
+            Request::Reinstate {
+                session,
+                package,
+                uid,
+                version,
+                installed,
+            } => host
+                .reinstate(session, &package, uid, version, installed)
+                .map(|frames| Response::Staged { frames }),
             Request::Scan { dir } => host.scan(&dir).map(|frames| Response::Staged { frames }),
             Request::ScanCommit { dir, package, uid } => host
                 .scan_commit(&dir, &package, uid)
