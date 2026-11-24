@@ -90,10 +90,12 @@ const SYS_RISCV_FLUSH_ICACHE: i64 = 244 + 15;
 /// 2. Kill-mode gate runs: alto's native copy makes calls no census reached: unlink (87), chmod (90), fsync (74), utimensat (280), fallocate (285), rename (82). Each run ended at the first unlisted call (SIGSYS, the call named by dmesg `type=1326`).
 /// 3. The sandbox's own start-up (bwrap's pid 1 and atl-sandbox-stub run under this filter too): execve (59), wait4 (61), the Landlock calls (444-446), from binderd's measured list.
 /// 4. Kill-mode app-gate run after the install path gained certificate collection (ParsingPackageUtils.getSigningDetails -> ApkSignatureVerifier.verify): getsockopt (55), named by dmesg `type=1326`.
+/// 5. Billing gate run (2026-11-24, same kernel) killed by its own filter: clock_nanosleep (230), named by dmesg's audit record (SIGSYS, sig=31). Caller: ART's 16-byte dex-cache pair seqlock (AOSP art/runtime/base/atomic_pair.h) spins 10 000 times, then NanoSleep(5000) -> glibc nanosleep = clock_nanosleep(CLOCK_REALTIME, 0, ...); nanosleep (35) is not listed.
+///    Rare (inferred): the reader spins its 10 000 only while the slot's writer is descheduled mid-update; CPU contention makes that likelier. The census and the kill-mode gate runs never reached it. No cfg: libc gives the number per arch (riscv64 not measured).
 ///
-/// The measurement gave 68 numbers; four of them (clone3, set_robust_list, rseq, membarrier) are newer.rs rows, which add statx and faccessat2 as Allow. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
+/// The measurement gave 68 numbers (items 1-4), 69 with item 5; four of them (clone3, set_robust_list, rseq, membarrier) are newer.rs rows, which add statx and faccessat2 as Allow. socket(2) is absent from it: seccomp.rs allows it for AF_UNIX only. setpriority(2) is measured (ART's thread priorities); no EACCES from it reached the gate's stderr.
 ///
-/// Final evidence: the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
+/// Final evidence (items 1-4): the installer gate green in kill mode with 0 denials in dmesg on three runs. Re-measure after installer, ART or glibc start-up code changes: a new call ends the run with SIGSYS, and dmesg names it.
 pub const INSTALLER_SYSCALLS: &[i64] = &[
     // file and socket I/O (socket itself: AF_UNIX only, binderd-style rule in seccomp.rs); riscv64: open -> the openat already listed
     libc::SYS_read,
@@ -180,6 +182,8 @@ pub const INSTALLER_SYSCALLS: &[i64] = &[
     libc::SYS_prlimit64,
     libc::SYS_getrandom,
     libc::SYS_clock_gettime,
+    // ART's seqlock sleep (derivation item 5); no cfg
+    libc::SYS_clock_nanosleep,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     libc::SYS_prctl,
