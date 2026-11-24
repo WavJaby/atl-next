@@ -20,6 +20,18 @@ pub(crate) fn link_outputs(out: &Path, under: &[PathBuf]) -> Result<Vec<PathBuf>
     .collect())
 }
 
+/// The device link outputs the licence edge lists (`deviceLinks`, bp2ninja licence.go: cc links and rustc binaries), as its explicit inputs: the list the licence gate reads.
+/// `link_outputs` (`rule link`) misses rustc's binaries. No licence edge: ninja errors (no silent empty list).
+pub(crate) fn device_links(out: &Path) -> Result<Vec<PathBuf>> {
+    let report = out.join(crate::native::LICENCE_REPORT);
+    let query = crate::licence_gate::ninja(out, &["-t", "query", &report.display().to_string()])?;
+    Ok(crate::licence_gate::parse_query(&query)
+        .into_values()
+        .flatten()
+        .filter(|p| p.is_file())
+        .collect())
+}
+
 /// `artifacts` split into (fresh, stale): stale = a failed build left an earlier link's output (`relinked`).
 pub(crate) fn fresh(out: &Path, artifacts: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let stale = relinked(out, &artifacts);
@@ -130,5 +142,52 @@ mod tests {
         let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         assert!(runpaths(&exe).unwrap().is_some());
         assert!(runpaths(b"#!/bin/sh\n").unwrap().is_none());
+    }
+
+    /// A rustc-linked device binary with a build-tree runpath is red. `device_links` lists it (the licence edge's inputs); `link_outputs` (`rule link`) does not, rustc's rule not being `link`.
+    #[test]
+    fn rust_binary_runpath_is_red() {
+        let tmp = std::env::temp_dir().join(format!("xtask-runpath-rs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (src, out) = (tmp.join("src"), tmp.join("out"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(out.join("device/app")).unwrap();
+        std::fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+        let rustc = crate::native::rustc(&crate::test_root()).unwrap();
+        let (app, report) = (
+            out.join("device/app/app"),
+            out.join(crate::native::LICENCE_REPORT),
+        );
+        std::fs::write(
+            out.join("build.ninja"),
+            format!(
+                "rule rustc\n  command = {} --crate-type=bin --edition=2021 -C linker=clang++-19 -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-rpath,/nonexistent/build/lib -o $out $in\nrule licence_gate\n  command = true\nbuild {}: rustc {}\nbuild {}: licence_gate {}\n",
+                rustc.display(),
+                app.display(),
+                src.join("main.rs").display(),
+                report.display(),
+                app.display(),
+            ),
+        )
+        .unwrap();
+        let built = std::process::Command::new("ninja")
+            .arg("-C")
+            .arg(&out)
+            .arg(&app)
+            .status()
+            .unwrap();
+        assert!(built.success());
+        let listed = device_links(&out).unwrap();
+        let by_rule = link_outputs(&out, &[out.join("device")]).unwrap();
+        let (read, violations) = check(&out, &listed).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(listed, [app]);
+        assert!(by_rule.is_empty(), "{by_rule:?}");
+        assert_eq!(read, 1);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("/nonexistent/build/lib"),
+            "{violations:?}"
+        );
     }
 }

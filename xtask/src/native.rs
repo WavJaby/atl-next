@@ -1724,9 +1724,10 @@ fn gate<'a>(out: &Path, libs: impl Iterator<Item = &'a Path>) -> Result<Option<S
     Ok(report.violations.first().map(ToString::to_string))
 }
 
-/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs under `<out>/device` and `<out>/nb/` (a stale one's failed link is ninja's to report), plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
+/// The runpath gate (runpath_gate.rs) over this graph's fresh link outputs: the device ones from the licence edge's list (`device_links`, rustc binaries too) and `<out>/nb/` by rule link (not in that list); a stale one's failed link is ninja's to report. Plus the converter-built Rust packages' libraries (`<out>/crates/*/lib`, packages.rs: cargo links them, not ninja); its first violation, None when it passes.
 fn runpath_gate(out: &Path) -> Result<Option<String>> {
-    let all = crate::runpath_gate::link_outputs(out, &[out.join("device"), out.join(NB_DIR)])?;
+    let mut all = crate::runpath_gate::device_links(out)?;
+    all.extend(crate::runpath_gate::link_outputs(out, &[out.join(NB_DIR)])?);
     let (mut artifacts, _) = crate::runpath_gate::fresh(out, all);
     artifacts.extend(crate::runpath_gate::package_libs(&out.join("crates"))?);
     let (read, violations) = crate::runpath_gate::check(out, &artifacts)?;
@@ -1751,7 +1752,7 @@ fn selfbind_gate(out: &Path, graph: &triage::Graph) -> Result<Option<String>> {
         );
         return Ok(None);
     }
-    let all = crate::runpath_gate::link_outputs(out, &[out.join("device")])?;
+    let all = crate::runpath_gate::device_links(out)?;
     let (artifacts, stale) = crate::runpath_gate::fresh(out, all);
     let (read, violations) = crate::selfbind_gate::check(out, &artifacts)?;
     let unread = crate::selfbind_gate::unread(&expected, &read, &stale);

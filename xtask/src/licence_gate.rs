@@ -767,7 +767,7 @@ fn parse_trace(text: &str) -> Loaded {
 }
 
 /// `ninja -t query <archive>...`: archive -> the explicit inputs of its edge (`input: <rule>` section; implicit `| x` and order-only `|| x` entries skipped).
-fn parse_query(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+pub(crate) fn parse_query(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     let mut out: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     let (mut target, mut inputs) = (None::<PathBuf>, false);
     for line in text.lines() {
