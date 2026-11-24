@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! `ro.hw_timeout_multiplier`: AOSP's scale of the framework's timeouts on hardware slower than a phone (Build.HW_TIMEOUT_MULTIPLIER, Build.java:1744-1745).
 //! Plumbing: atld reads the property from its props (the bundled build.prop, then the host's /etc/atl/vendor.prop, atld's host_props: the later set wins) and passes the multiplier to atl-system-services as `--hw-timeout-multiplier`; each timer is `scale(BASE)`.
-//! Scaled, as the pin scales them: process start, broadcast FG/BG, the cold-start abandon. Not scaled: the FGS timers (ActivityManagerConstants.java:245, :318, :320).
+//! Scaled, as the pin scales them: process start, broadcast FG/BG, the cold-start abandon. Not scaled: the FGS timers (ActivityManagerConstants.java:245, :318, :320), removeTask's kill.
 //! Not scaled because ATL has no such timer: BIND_APPLICATION (ActivityManagerService.java:571) and SERVICE_TIMEOUT (ActivityManagerConstants.java:327).
+
+use std::time::Duration;
 
 /// ActivityManagerService.java:568 PROC_START_TIMEOUT: a started process must attach within it, else it failed to start.
 pub const PROC_START_TIMEOUT_BASE_MS: u64 = 10 * 1000;
@@ -12,6 +14,9 @@ pub const BROADCAST_FG_TIMEOUT_BASE_MS: u64 = 10 * 1000;
 pub const BROADCAST_BG_TIMEOUT_BASE_MS: u64 = 60 * 1000;
 /// BroadcastConstants.java:294-299 PENDING_COLD_START_ABANDON_TIMEOUT_MILLIS: a cold start not attached within it releases the broadcast queue's slot.
 pub const PENDING_COLD_START_ABANDON_BASE_MS: u64 = 5 * 60 * 1000;
+
+/// ActivityTaskSupervisor.java:207 KILL_TASK_PROCESSES_TIMEOUT_MS: how long a removed Task's processes wait for its shown top's activityDestroyed. Not scaled (:1868-1869 posts it as is).
+pub const KILL_TASK_PROCESSES_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// AOSP's value when the property is unset: `SystemProperties.getInt("ro.hw_timeout_multiplier", 1)`, Build.java:1745.
 const UNSET: u32 = 1;

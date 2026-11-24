@@ -234,7 +234,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             && read(&sender_log).contains(DONE_RECEIVED)
             && read(&receiver_log).contains(ALARM_SERVICE_STARTED)
     };
-    // a run end that runs out is judged later, as before: the checks read the logs as they are. atld's death is a verdict line
+    // a run end that runs out is not judged here: the checks below read the logs as they are. atld's death is a verdict line
     let ended = match until_child(
         &Wait::logs(
             "broadcast-run-end",

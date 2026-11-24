@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! Declared waits (gate-starved-red-design section 2.2, 2.6): one function runs a wait, bounds it and prints its record.
+//! Declared waits: one function runs a wait, bounds it and prints its record.
 //!
-//! H2a/H2b judge nothing: `bound` is the limit each call site already had. `need` is derived from the machine's need ledger (gate_need.rs): unset until a wait has 20 quiet passes.
+//! The record judges nothing. `bound` is the limit the call site gives. `need` is derived from the machine's need ledger (gate_need.rs): unset until a wait has 20 quiet passes.
 //! `until()` returns `Miss::Late` when the bound passes and the caller decides what that means: a probe `?`s it (its first late wait ends the probe), an absence wait takes it as the answer.
 //! `until_child()` also ends a wait when the child it watches exits (`Miss::Exited`: a death, never a late wait).
 
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, ExitStatus};
 use std::sync::OnceLock;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use atl_host_load::Span;
@@ -18,11 +18,11 @@ use xtask::gate_need;
 use crate::starvation::Budget;
 use crate::wayland_proxy::Event as ProxyEvent;
 
-/// How often a log is read while a wait polls it (the app's log is written by another process): the window waits' interval. A row wait polls at the sleep of the loop it replaced ([`Wait::every`]): H2 moves no poll interval.
+/// How often a window wait reads the log it polls (the app's log is written by another process). A poll is the resolution of a wait's `took`, and so of the `need` derived from it: an event is seen up to one poll late, at the cost of one read per poll.
 pub(crate) const POLL: Duration = Duration::from_millis(50);
-/// The poll of a converted loop wait: the sleep of the loop it replaced on main (broadcast's run loops, app's marker loop, the connectivity steps: 200 ms). H2 moves no poll interval.
+/// The poll of a row wait (bounds of seconds to minutes): each poll may read several whole logs, so it is coarser than [`POLL`]; `took` is up to this much late.
 pub(crate) const LOOP_POLL: Duration = Duration::from_millis(200);
-/// The poll of the app's post-marker watch: its sleep on main (app.rs, 100 ms).
+/// The poll of the app's post-marker watch. Each poll is a step of the sticky and foreground cases too (app.rs), so it bounds how late they see an event and act on it.
 pub(crate) const WATCH_POLL: Duration = Duration::from_millis(100);
 
 /// What a wait ends on: a log's text (polled), a proxy event (received; its arrival time is the answer), the child's exit (`until_child` only: the exit is the answer),
@@ -44,7 +44,7 @@ pub(crate) enum Until<'a> {
 }
 
 /// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time, derived from the need ledger when the wait is made (None below [`gate_need::MIN_PASSES`] quiet passes).
-/// `every`: the poll interval of a polled kind (the sleep of the loop the wait replaced); an event wait receives and ignores it.
+/// `every`: the poll interval of a polled kind; an event wait receives and ignores it.
 pub(crate) struct Wait<'a> {
     pub(crate) name: &'static str,
     pub(crate) why: String,
@@ -133,7 +133,7 @@ impl<'a> Wait<'a> {
 }
 
 /// Why a check did not pass. `Wrong`: its own judgement, or a probe's proxy/spawn error (never a wait). `Late`: a declared wait ran out its bound. `NotReached`: an earlier late wait ended the probe, so this check did not run.
-/// `Exited`: the child a wait watched ended before the wait's condition held. A death, not a late wait: section 2.3 never excuses it, so it is never `Late`.
+/// `Exited`: the child a wait watched ended before the wait's condition held. A death, not a late wait: the starvation rule never excuses it, so it is never `Late`.
 /// Owned strings: the probe's miss travels in `live.json` (LiveRecord) to the judge of a remote run. A late wait's `budget` (its span on this host's clock) does not travel: a remote miss is judged.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Miss {
@@ -208,6 +208,15 @@ pub(crate) fn until(wait: &Wait) -> Result<Instant, Miss> {
     run(wait, None)
 }
 
+/// [`until`] for a caller whose answer includes "not within the bound": None then. Any other miss stays an error: an event that cannot come any more (a dead proxy) is not its absence.
+pub(crate) fn within(wait: &Wait) -> Result<Option<Instant>, Miss> {
+    match until(wait) {
+        Ok(at) => Ok(Some(at)),
+        Err(Miss::Late { .. }) => Ok(None),
+        Err(miss) => Err(miss),
+    }
+}
+
 /// [`until`], also ended by `child`'s exit (`Miss::Exited`). An [`Until::Exit`] wait is that exit (Ok). An event wait does not watch its child.
 pub(crate) fn until_child(wait: &Wait, child: &mut Child) -> Result<Instant, Miss> {
     run(wait, Some(child))
@@ -227,7 +236,7 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
     // the budget's span covers the bound only: [from_ns, from_ns + bound]
     let bound_ns = i64::try_from(wait.bound.as_nanos()).unwrap_or(i64::MAX);
     let ended = match (&wait.until, child) {
-        (Until::Event { events, want }, _) => Ok(received(events, want, deadline)),
+        (Until::Event { events, want }, _) => received(events, want, deadline),
         (Until::Log { file, want }, child) => polled(
             deadline,
             child,
@@ -278,20 +287,26 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
     }
 }
 
-/// Receives events until `want` accepts one (Held at its arrival) or `deadline` passes. Other events are skipped.
+/// Receives events until `want` accepts one (Held at its arrival) or `deadline` passes. Other events are skipped. Err: every sender is gone (the proxy died), so no event can come.
 fn received(
     events: &Receiver<(Instant, ProxyEvent)>,
     want: &dyn Fn(&ProxyEvent) -> bool,
     deadline: Instant,
-) -> Ended {
+) -> std::io::Result<Ended> {
     loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-            return Ended::Late;
+            return Ok(Ended::Late);
         };
         match events.recv_timeout(left) {
-            Ok((at, event)) if want(&event) => return Ended::Held(at),
+            Ok((at, event)) if want(&event) => return Ok(Ended::Held(at)),
             Ok(_) => {}
-            Err(_) => return Ended::Late,
+            Err(RecvTimeoutError::Timeout) => return Ok(Ended::Late),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the proxy ended: its event channel closed",
+                ));
+            }
         }
     }
 }
@@ -524,6 +539,25 @@ mod tests {
         let want = |e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 };
         let w = Wait::event("pong", "no pong", Duration::from_millis(20), &rx, &want);
         assert_eq!(bare(until(&w).unwrap_err()), late("pong", "no pong"));
+    }
+
+    /// A dead proxy (no sender left) is a wrong miss at once, never a late wait, and never an event's absence.
+    #[test]
+    fn a_dead_proxy_is_no_late_wait() {
+        let (tx, rx) = channel::<(Instant, ProxyEvent)>();
+        let want = |_: &ProxyEvent| true;
+        let quiet = Wait::event("pong", "no pong", Duration::from_millis(20), &rx, &want);
+        assert_eq!(within(&quiet), Ok(None));
+        drop(tx);
+        let dead = Err(Miss::Wrong(
+            "pong: the proxy ended: its event channel closed".to_owned(),
+        ));
+        assert_eq!(within(&quiet), dead);
+        // far under the bound: the closed channel ends the wait
+        let w = Wait::event("pong", "no pong", Duration::from_secs(60), &rx, &want);
+        let start = Instant::now();
+        assert!(matches!(until(&w), Err(Miss::Wrong(_))));
+        assert!(start.elapsed() < w.bound);
     }
 
     #[test]

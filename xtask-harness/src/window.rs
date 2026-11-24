@@ -33,7 +33,7 @@ use crate::gles2_fixture;
 use crate::manifest;
 use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 pub(crate) use crate::wait::POLL;
-use crate::wait::{Miss, Wait, settle, until};
+use crate::wait::{Miss, Wait, settle, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 mod aux_process;
@@ -177,7 +177,7 @@ pub struct Args {
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
-    /// Stage capture only, a manual run of the starvation rule (gate-starved-red-design H4): from the first close until its sub-gates read the logs, one burner at CPUWeight 10000 holds the
+    /// Stage capture only, a manual run of the starvation rule: from the first close until its sub-gates read the logs, one burner at CPUWeight 10000 holds the
     /// gate's last CPU (host_load.rs `Burners`) and the gate's tree is pinned to it, so the fixture's destroy misses the 1 s removeTask kill timer. Expected: `undecided` naming the timer.
     #[arg(long)]
     starve_close: bool,
@@ -1448,14 +1448,14 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
     ))?;
     std::thread::sleep(INPUT_SETTLE);
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = until(&Wait::event(
+    let answered = within(&Wait::event(
         "pong",
         "no pong to the first ping",
         PONG_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
-    ))
-    .is_ok();
+    ))?
+    .is_some();
     let press = |pressed| PointerAction::Button {
         button: BTN_LEFT,
         pressed,
@@ -1479,22 +1479,21 @@ fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
     let sent = Instant::now();
     proxy.inject_ping(2).map_err(|e| e.to_string())?;
     // absence: the pong's timeout is the answer (the UI thread sleeps), so a Late miss is `silent`
-    let silent = until(&Wait::event(
+    let silent = within(&Wait::event(
         "silent",
         "a pong came while the UI thread slept",
         SILENT_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 2 },
-    ))
-    .is_err();
-    let resumed_ms = until(&Wait::event(
+    ))?
+    .is_none();
+    let resumed_ms = within(&Wait::event(
         "resumed",
         "no pong after the sleep",
         RESUME_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 2 },
-    ))
-    .ok()
+    ))?
     .map(|at| at.duration_since(sent).as_millis());
     Ok(Liveness {
         answered,
@@ -1589,14 +1588,14 @@ fn drive_resize(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<
             .inject_configure(width, height, serial, &[])
             .map_err(|e| e.to_string())?;
         // a configure's ack that does not come is a judged answer (configure_check), not a probe stop
-        let acked = until(&Wait::event(
+        let acked = within(&Wait::event(
             "configure-acked",
             "no ack of the configure",
             PONG_WAIT,
             &proxy.events,
             &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
-        ))
-        .is_ok();
+        ))?
+        .is_some();
         std::thread::sleep(RESIZE_SETTLE);
         Ok(acked)
     };
@@ -3471,7 +3470,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 .filter_map(|(_, r)| r.as_ref().err())
                 .filter(|m| !matches!(m, Miss::NotReached { .. }))
                 .collect();
-            // design 2.4: sub-gate (d) times its own kill timer (its subject): that line is no timer of this run, and a failed (d) is never excused
+            // sub-gate (d) times its own kill timer (its subject): that line is no timer of this run, and a failed (d) is never excused
             let subject = captured.lock().ok().and_then(|s| s.timeout_subject.clone());
             let subject_failed = sub.iter().any(|(name, r)| *name == "timeout" && r.is_err());
             let run = crate::starvation::Run {

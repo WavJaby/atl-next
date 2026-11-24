@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use super::{ACK_WAIT, DRAW_LINE, INPUT_SETTLE, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub};
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy, XDG_STATE_MAXIMIZED, XDG_STATE_SUSPENDED};
 
 /// The configures in order, each with its serial: maximized, cleared, suspended, cleared. A configure carries no size (0 x 0: the client keeps its own).
@@ -47,14 +47,14 @@ pub fn drive(proxy: Proxy, app_log: &Path, skip_suspended: bool) -> Result<Liven
             .inject_configure(0, 0, serial, states)
             .map_err(|e| e.to_string())?;
         // a configure's ack that does not come is the step's answer, not a probe stop
-        let acked = until(&Wait::event(
+        let acked = within(&Wait::event(
             "configure-acked",
             "no ack of the configure",
             PONG_WAIT,
             &proxy.events,
             &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
-        ))
-        .is_ok();
+        ))?
+        .is_some();
         std::thread::sleep(RESIZE_SETTLE);
         configured.push(acked);
     }

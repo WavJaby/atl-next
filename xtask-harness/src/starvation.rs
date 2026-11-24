@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! The gates' one starvation rule (gate-starved-red-design 2.2-2.4): a miss is `undecided` (exit 4, neither pass nor fail) only when the host provably took the margin its bound assumed.
+//! The gates' one starvation rule: a miss is `undecided` (exit 4, neither pass nor fail) only when the host provably took the margin its bound assumed.
 //! Every other miss is judged: the default is red. Two supplies, one outcome:
 //! - CPU ([`Budget`]): a declared wait that ran out its bound (`Miss::Late`). Starved when `bound - stalled(span) < need`: what the host left was less than a quiet run needs. `stalled` is the gate's own
 //!   cgroup stall, counted only where foreign CPU covers its own (atl-host-load `Samples::stalled`), so a sleeping deadlock (no stall) or a runaway inside the gate (own CPU) stays red.
 //!   `need` unset (not measured on a quiet host) = judged; no samples (no scope, a remote run's miss) = unknown = judged.
 //! - GPU ([`Render`]): a sub-check whose bound assumes the window renders within an interval (slow-display held / replaced, ui-block commits). Starved when the median of the paint lines' longest
 //!   renders after the marker exceeds the interval and a render covering the sub-check's span does too, both from the window's own `render_us` (GSK render + swap, measured by the window itself,
-//!   so no defect under test lengthens it without the GPU being slow; measured 2026-11-22: median p99 53 ms over 521 runs with the GPU free, p10 210 ms over 54 runs with it held at 94-100 %).
+//!   so no defect under test lengthens it without the GPU being slow).
 //!   Only the outcomes starvation can produce are unjudged ([`Fakes`]).
 //! - Product timers ([`TIMERS`]): a red whose services log holds a fired timer is judged by that timer, as a wait with `bound = period` over `[fire - period, fire]` (the fire's `at=` stamp).
 //!   A timer that did not lose its margin makes the red real; a fired line without `at=` is unknown, so judged.
@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use atl_host_load::{Samples, Span};
 use atl_services_types::hw_timeouts::{
-    HwTimeouts, PENDING_COLD_START_ABANDON_BASE_MS, PROC_START_TIMEOUT_BASE_MS,
+    HwTimeouts, KILL_TASK_PROCESSES_TIMEOUT, PENDING_COLD_START_ABANDON_BASE_MS,
+    PROC_START_TIMEOUT_BASE_MS,
 };
 use xtask::harness::{RULING_PREFIX, Ruling, Supply, VERDICT_PREFIX};
 
@@ -88,7 +89,7 @@ pub struct Render {
     pub span: Option<(u64, u64)>,
 }
 
-/// A declared wait's CPU budget (design 2.2): the wait `wait` had `bound`, a quiet host needs `need` (None: not measured yet, so judged), and it ran over `span` (CLOCK_MONOTONIC ns).
+/// A declared wait's CPU budget: the wait `wait` had `bound`, a quiet host needs `need` (None: not measured yet, so judged), and it ran over `span` (CLOCK_MONOTONIC ns).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Budget {
     pub(crate) wait: String,
@@ -109,7 +110,7 @@ pub struct Timed {
 pub type Undecided = (&'static str, Ruling, Result<String, String>);
 
 /// What the rule reads besides the sub-checks: the stage's name, the app log and the marker's stamp (GPU), and the gate's samples (CPU; None: unknown).
-/// `hw`: the run's multiplier for the scaled product timers (None: atld logged none). `subject`: the gate's own timer line (design 2.4): a services line containing it is no fired timer of this run.
+/// `hw`: the run's multiplier for the scaled product timers (None: atld logged none). `subject`: the gate's own timer line: a services line containing it is no fired timer of this run.
 pub(crate) struct Run<'a> {
     pub(crate) stage: &'a str,
     pub(crate) app: &'a str,
@@ -152,7 +153,7 @@ fn gpu_starved(app: &str, host: Option<u64>, t: &Timed, render: &Render) -> Opti
     ))
 }
 
-/// Rule 2 for an event that never came: starved when `bound - stalled(span) < need`. The ruling's text names wait, bound, need and stall; unknown when nothing was measured.
+/// The CPU rule for an event that never came: starved when `bound - stalled(span) < need`. The ruling's text names wait, bound, need and stall; unknown when nothing was measured.
 pub(crate) fn cpu(b: &Budget, samples: Option<&Samples>) -> Ruling {
     let Some(samples) = samples else {
         return Ruling::unknown(format!("{}: no gate scope samples", b.wait));
@@ -230,7 +231,7 @@ pub(crate) enum Period {
     Scaled(u64),
 }
 
-/// A product timer a gate can trip (design 2.4): the services' line when it fires (text after `services: `), its period, and the time it needs on a quiet host.
+/// A product timer a gate can trip: the services' line when it fires (text after `services: `), its period, and the time it needs on a quiet host.
 pub(crate) struct Timer {
     pub(crate) name: &'static str,
     pub(crate) fired: &'static str,
@@ -238,14 +239,14 @@ pub(crate) struct Timer {
     pub(crate) need: Option<Duration>,
 }
 
-/// The product's timers whose firing the services log names (atl-services). Periods: AOSP's constants, `Scaled` ones x the run's `hw timeouts` multiplier; `need` only where kept runs measured it.
+/// The product's timers whose firing the services log names (atl-services). Periods are the product's own constants (hw_timeouts.rs), `Scaled` where the product scales them by the run's multiplier; `need` only where kept runs measured it.
 pub(crate) const TIMERS: &[Timer] = &[
-    // activity.rs KILL_TASK_PROCESSES_TIMEOUT, `remove task N: no destroy within 1s`. need: remove -> kill 7-25 ms over 9 kept logs (gate-starved-red-design 2.4 table; n < 20, those runs' load
-    // not recorded): the largest seen, until 20 quiet passes measure it
+    // activity.rs `remove task N: no destroy within 1s`. Fixed: neither AOSP nor the product scales it, so 1 s on a x2 host too. need: the largest remove -> kill of 9 kept runs (load not recorded);
+    // fewer than the 20 quiet passes a derived need takes (gate_need.rs), and the timer is no declared wait, so the need ledger has no sample of it
     Timer {
         name: "removeTask kill 1s",
         fired: ": no destroy within ",
-        period: Period::Fixed(Duration::from_millis(1000)),
+        period: Period::Fixed(KILL_TASK_PROCESSES_TIMEOUT),
         need: Some(Duration::from_millis(25)),
     },
     // activity.rs PROC_START_TIMEOUT_MS / active_services.rs process_start_timed_out
@@ -321,7 +322,7 @@ fn fired_budget(
 
 /// A red run's verdict under the rule: Some(starved ruling) when it is undecided, None when the red stands. `faults`: the run's failing checks (not `not reached`). `services`: the services log.
 /// - A fired product timer decides alone (a death or a late answer it caused follows from it): undecided only when every fired timer lost its margin.
-/// - Else the run is undecided only when its one fault is a late declared wait whose budget the host took (rule 3: no other check failed).
+/// - Else the run is undecided only when its one fault is a late declared wait whose budget the host took: a second failing check is no consequence of that wait, so the red stands.
 pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<Ruling> {
     let fired: Vec<(&Timer, &str)> = services
         .lines()
@@ -612,7 +613,7 @@ mod tests {
         }
     }
 
-    /// One fault, a late wait whose budget the host took: undecided. A second fault (rule 3), a death, a late wait without a budget (remote): the red stands.
+    /// One fault, a late wait whose budget the host took: undecided. A second fault, a death, a late wait without a budget (remote): the red stands.
     #[test]
     fn a_red_is_undecided_only_when_its_one_fault_is_a_starved_late_wait() {
         let samples = load(480, 5, 500);
@@ -637,7 +638,7 @@ mod tests {
     }
 
     /// A fired timer decides the red alone. The 1 s kill timer fired at wall 1001.5 s = mono 1.5 s, over 0.5..1.5 s: stalled 980 ms of its 1 s, 20 ms left < need 25 ms: undecided, naming the timer, even with a
-    /// wrong check beside it (the kill caused it). On a quiet host (stall 10 ms per interval) it is judged and the red stands. Without `at=` (product lines before H6): unknown, the red stands.
+    /// wrong check beside it (the kill caused it). On a quiet host (stall 10 ms per interval) it is judged and the red stands. Without `at=`: unknown, the red stands.
     #[test]
     fn a_fired_timer_is_judged_over_its_own_period() {
         let fired = "1001.600 I services: remove task 7: no destroy within 1s at=1001.500\n";
@@ -705,7 +706,7 @@ mod tests {
         assert_eq!(b.bound, Duration::from_secs(1));
     }
 
-    /// design 2.4: the gate's own timer line is no fired timer of its run. The other task's line lies outside the samples (unknown, judged), so only the exclusion lets the starved line decide.
+    /// The gate's own timer line is no fired timer of its run. The other task's line lies outside the samples (unknown, judged), so only the exclusion lets the starved line decide.
     #[test]
     fn the_gates_own_timer_line_is_no_fired_timer_of_its_run() {
         let starved = load(490, 5, 500);
@@ -728,8 +729,33 @@ mod tests {
         );
     }
 
-    /// The table's text against lines the product printed (testdata/timers/services.log, copied from runs): the kill line of the H6 `--starve-close` run (stamped), the start-timeout line of a kept run (before H6, no `at=`).
-    /// No run has printed the cold-start abandon line, so that row is not checked here.
+    /// Every row's text is in the product's own log call, so a reworded line fails here instead of never matching.
+    #[test]
+    fn table_texts_are_the_products() {
+        let sources = [
+            include_str!("../../crates/atl-services/src/activity.rs"),
+            include_str!("../../crates/atl-services/src/active_services.rs"),
+            include_str!("../../crates/atl-services/src/broadcasts_am.rs"),
+        ];
+        // comments and the sources' own tests are no log call
+        let logs = |text: &str| {
+            sources
+                .iter()
+                .filter_map(|s| s.split("\n#[cfg(test)]\nmod ").next())
+                .flat_map(str::lines)
+                .any(|l| !l.trim_start().starts_with("//") && l.contains(text))
+        };
+        for t in TIMERS {
+            assert!(
+                logs(t.fired),
+                "{}: no product source logs `{}`",
+                t.name,
+                t.fired
+            );
+        }
+    }
+
+    /// The table's text against lines the product printed (testdata/timers/services.log, copied from runs): a stamped kill line and an unstamped start-timeout line. No run has printed the cold-start abandon line.
     #[test]
     fn table_texts_match_lines_the_product_printed() {
         let log = include_str!("../testdata/timers/services.log");

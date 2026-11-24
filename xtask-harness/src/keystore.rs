@@ -31,7 +31,7 @@ use crate::atld_run::{Package, Run, Runtime, Shell};
 use crate::tree;
 use crate::wait::{Miss, Wait, until_child};
 
-/// The probe and launch waits' poll: the 100 ms of the loops they replaced.
+/// The probe and launch waits' poll: their end is seen up to this late.
 const POLL: Duration = Duration::from_millis(100);
 
 #[derive(clap::Args)]
@@ -300,7 +300,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     match until_child(&exit, &mut child) {
         Ok(_) => {}
-        // a late atld is killed; its end is judged below (check_end), as before
+        // a late atld is killed; its end is judged below (check_end)
         Err(Miss::Late { .. }) => {
             let _ = child.kill();
         }

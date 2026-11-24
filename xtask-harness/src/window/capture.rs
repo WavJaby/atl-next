@@ -26,7 +26,7 @@ use super::{
 };
 use crate::atld_run::capture_at;
 use crate::composer::{fnv1a64, word};
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 
 /// The fixture's log line for its GET_COMPOSER (xtask-harness/testdata/window Main.java): `composer GET_COMPOSER status=<ok|SECURITY|error> uid=<uid>`.
 const COMPOSER_LINE: &str = "composer GET_COMPOSER status=";
@@ -94,7 +94,7 @@ pub(super) struct Seen {
     pub(super) ended: Option<Result<String, String>>,
     /// Capture (d), when it runs: the second Task's timer ended its process before the delayed destroy.
     pub(super) timeout: Option<Result<String, String>>,
-    /// Sub-gate (d)'s own timer line (`remove task <n>: no destroy within `, its Task): its subject, so no fired timer of the run (design 2.4)
+    /// Sub-gate (d)'s own timer line (`remove task <n>: no destroy within `, its Task): its subject, so no fired timer of the run
     pub(super) timeout_subject: Option<String>,
     /// Every process under atld just before the close (services, binderd, gralloc, the app, sandbox helpers): none may outlive the run's end (atld-end).
     pub(super) ran: Vec<u32>,
@@ -285,14 +285,14 @@ pub(super) fn drive(
         seen.refusal = Some(refusal);
     }
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = until(&Wait::event(
+    let answered = within(&Wait::event(
         "pong",
         "no pong to the first ping",
         PONG_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
-    ))
-    .is_ok();
+    ))?
+    .is_some();
     // the foreign probe's trigger (Main.java onKeyUp): only this stage presses F12; its refusal is counted before the close
     for pressed in [true, false] {
         proxy
@@ -940,7 +940,7 @@ mod tests {
             "services: task 2 removed: killing com.example.atlwindow pids [4242] at=12.000\n";
         let services = format!("{timer}{kill}");
         assert!(timeout_judged(app, &services, Some(vec![])).is_ok());
-        // the product's stamped line (H6): `at=` follows the duration, which is still read
+        // the product's stamped line: `at=` follows the duration, which is still read
         let stamped = "services: remove task 2: no destroy within 1s at=12.000\n";
         assert!(timeout_judged(app, &format!("{stamped}{kill}"), Some(vec![])).is_ok());
         assert!(timeout_judged(app, &services, Some(vec![4242])).is_err());

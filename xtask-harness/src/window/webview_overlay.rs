@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::{ACK_WAIT, Liveness, Sub, widgets};
 use crate::composer::word;
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
 
 /// What the page tap is (`--tap-origin`): the physical input decides whether it focuses the WebView ([`tap_focus_check`]).
@@ -420,13 +420,13 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
         proxy
             .inject_configure(w, h, serial, &[])
             .map_err(|e| e.to_string())?;
-        let _ = until(&Wait::event(
+        within(&Wait::event(
             "resize-ack",
             "no ack of the resize",
             ACK_WAIT,
             &proxy.events,
             &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
-        ));
+        ))?;
         let _ = widgets::wait_until("resize-answered", app_log, ACK_WAIT, |t| {
             resize_answered(t, layouts)
         });

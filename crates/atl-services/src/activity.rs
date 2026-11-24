@@ -48,7 +48,9 @@ use atl_parcelables::parts::{
     ActivityConfigurationChangeItem, ActivityRelaunchItem, ActivityWindowInfo,
     ConfigurationChangeItem, LaunchActivityItem, ResumeActivityItem,
 };
-use atl_services_types::hw_timeouts::{HwTimeouts, PROC_START_TIMEOUT_BASE_MS};
+use atl_services_types::hw_timeouts::{
+    HwTimeouts, KILL_TASK_PROCESSES_TIMEOUT, PROC_START_TIMEOUT_BASE_MS,
+};
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
     ThreadState,
@@ -1189,9 +1191,6 @@ impl ActivityManager {
         }
     }
 }
-
-/// ActivityTaskSupervisor.KILL_TASK_PROCESSES_TIMEOUT_MS: how long a removed Task's processes wait for its shown top's activityDestroyed (AOSP constant, not tuned).
-const KILL_TASK_PROCESSES_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// ApplicationInfo.FLAG_SYSTEM | FLAG_PERSISTENT (ApplicationInfo.java:189, :213; ActivityManagerService.PERSISTENT_MASK): the processes the empty rule never ends, and the callers' persistent check.
 const PERSISTENT_MASK: i32 = crate::packages::FLAG_SYSTEM | 1 << 3;

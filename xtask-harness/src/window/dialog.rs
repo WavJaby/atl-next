@@ -24,7 +24,7 @@ use super::capture;
 use super::widgets::{BTN_SIDE, inject, press};
 use super::{ACK_WAIT, Liveness, PONG_WAIT, RESIZE_SETTLE, Sub, content_origin};
 use crate::composer::{fnv1a64, word};
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// The fixture's dir.
@@ -500,7 +500,7 @@ fn sub_back(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
 
 /// The back case, last steps: Main's first Back (its callback consumes it, [`consumed_check`]), then its second, unhandled one. Returns whether the window then sent `set_minimized`
 /// ([`minimize_check`] judges it with the lines).
-fn root_backs(proxy: &Proxy, app_log: &Path) -> Result<bool, String> {
+fn root_backs(proxy: &Proxy, app_log: &Path) -> Result<bool, Miss> {
     let (x, y) = anchor_centre(app_log)?;
     back(proxy, x, y)?;
     // not a probe stop: consumed_check judges the line
@@ -512,14 +512,14 @@ fn root_backs(proxy: &Proxy, app_log: &Path) -> Result<bool, String> {
         &|t: &str| t.contains(CONSUMED),
     ));
     back(proxy, x, y)?;
-    Ok(until(&Wait::event(
+    Ok(within(&Wait::event(
         "minimized",
         "the window did not minimize",
         BACK_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Minimized,
-    ))
-    .is_ok())
+    ))?
+    .is_some())
 }
 
 /// The probe: the window's configure is acked, the dialog drew, one ping, a drag on the dialog; the window is resized with it open, and a second drag.
@@ -542,14 +542,14 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     sub_back(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = until(&Wait::event(
+    let answered = within(&Wait::event(
         "pong",
         "no pong to the first ping",
         PONG_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
-    ))
-    .is_ok();
+    ))?
+    .is_some();
     drag(&proxy, app_log)?;
     std::thread::sleep(RESIZE_SETTLE);
     let (width, height, serial) = RESIZED;

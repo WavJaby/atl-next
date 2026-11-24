@@ -549,7 +549,7 @@ mod tests {
         uids.on_task_added(APP_UID, 0);
         assert_eq!(uids.on_task_removed(APP_UID, 10_000), Some(70_000));
         // back at 30 000: the background clock is cleared (OomAdjuster :1626)
-        uids.on_task_added(APP_UID, 0);
+        uids.on_task_added(APP_UID, 30_000);
         assert_eq!(uids.settle(APP_UID, 70_000), Settle::Unchanged);
         assert!(!uids.is_idle(APP_UID));
         // the next background period gets its own clock: 80 000 + 60 000

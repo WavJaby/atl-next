@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test host-load`: the starvation rule (starvation.rs) on a process tree the gate controls, no atld (gate-starved-red-design H4). Each case is its own gate process
+//! `xtask test host-load`: the starvation rule (starvation.rs) on a process tree the gate controls, no atld. Each case is its own gate process
 //! (`test host-load --case <c>`, so its own `atl-gate-<pid>.scope` and sampler), pinned to one CPU with `taskset`: its sampler's CPU set is that CPU, so foreign load is what shares it.
 //! The case starts a worker (`host-load-child`, in its scope) and waits `host-load-event` for the worker's event line: bound [`BOUND`], need [`NEED`].
 //! Burners are `host-load-child --role burn` loops pinned to the same CPU, each in its own sibling scope (`systemd-run --user --scope -p CPUWeight=`): at [`STARVE_WEIGHT`] against the
@@ -12,7 +12,7 @@
 //! A FAIL case must end red with its expected cause on its own stdout line ([`CAUSE_PREFIX`]: `late`, `exited`, `wrong`). Any other exit 1 (a burner or the worker that did not start) fails the row.
 //! `--break burner-start` refuses the burners' CPUWeight: every burning case must then fail the gate.
 
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -23,20 +23,21 @@ use rustix::time::{ClockId, clock_gettime};
 use crate::starvation;
 use crate::wait::{Miss, Wait, until_child};
 
-/// The case's wait: 1 s, against a quiet need of 100 ms (the worker's 50 ms of CPU work, doubled for spawn and the log write). Design H4's values.
-const BOUND: Duration = Duration::from_millis(1000);
-const NEED: Duration = Duration::from_millis(100);
-/// The worker's CPU work before its event: half the need.
+/// The worker's CPU work before its event: five USER_HZ ticks, one sampler period.
 const WORK: Duration = Duration::from_millis(50);
+/// The quiet time the case's wait needs: the work, doubled for the spawn and the log write.
+const NEED: Duration = WORK.saturating_mul(2);
+/// The case's wait: between the worker's time at an equal share (2 x WORK = 0.1 s, ends well inside) and at the starved share (1 % of the CPU: 5 s, ends well past).
+const BOUND: Duration = Duration::from_millis(1000);
 /// A burner scope's CPUWeight when it starves the case: cgroup v2's maximum, against the case scope's default 100, so the case gets 100 / 10100 = 1 % of the shared CPU.
 pub(crate) const STARVE_WEIGHT: u32 = 10_000;
 /// The default CPUWeight (systemd): an equal share.
 const EQUAL_WEIGHT: u32 = 100;
-/// Time for a burner to start spinning (a systemd-run scope start and an exec) before the worker starts: an unstarted burner leaves the worker its CPU.
-const BURN_SETTLE: Duration = Duration::from_millis(300);
+/// The line a burner writes on its stdout (a pipe) as it starts to spin, after its scope and exec: the worker starts only then, since an unstarted burner leaves the worker its CPU.
+const BURNING: &str = "burning";
 /// The late case's worker sleeps past the bound by half of it before it works.
-const LATE_SLEEP: Duration = Duration::from_millis(1500);
-/// Spinner threads in the self-inflicted case (design H4).
+const LATE_SLEEP: Duration = BOUND.saturating_add(BOUND.checked_div(2).expect("2 is not 0"));
+/// Spinner threads in the self-inflicted case. The worker shares one CPU with them, so its work ends after (64 + 1) x WORK = 3.25 s, past the bound; 20 is the least that reaches it.
 const SPINNERS: usize = 64;
 /// The worker's event and the value it carries; the wrong case logs another value.
 const EVENT: &str = "host-load: event value=";
@@ -170,7 +171,7 @@ impl Case {
         match self {
             Self::Starved => Some(STARVE_WEIGHT),
             // equal weight, not starving: at 1 % the worker's own start (exec, abort, a write) and the case's 50 ms log poll wait for the CPU long enough to run out the 1 s bound,
-            // so the run is starved by the rule's own measure (asleep: 805 ms stalled of 1000, 2026-11-24) and no longer tests a death, a wrong value or a sleeper
+            // so the run is starved by the rule's own measure and does not test a death, a wrong value or a sleeper
             Self::AsleepUnderLoad
             | Self::CrashUnderLoad
             | Self::WrongUnderLoad
@@ -253,6 +254,7 @@ pub fn child(args: &ChildArgs) -> Result<ExitCode> {
             std::thread::sleep(Duration::from_secs(3600));
         },
         Role::Burn => {
+            println!("{BURNING}");
             spin_for(SPIN_LIMIT);
             Ok(ExitCode::SUCCESS)
         }
@@ -309,14 +311,18 @@ impl Burners {
                 ])
                 .arg(&exe)
                 .args(["host-load-child", "--role", "burn"])
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .spawn()
                 .context("systemd-run burner")?;
             burners.0.push(child);
         }
-        std::thread::sleep(BURN_SETTLE);
         for b in &mut burners.0 {
-            if let Some(status) = b.try_wait()? {
+            // a burner that could not start closes the pipe without the line; systemd-run's own D-Bus timeout ends a start the manager never answers
+            let out = b.stdout.take().context("the burner's stdout pipe")?;
+            let mut line = String::new();
+            BufReader::new(out).read_line(&mut line)?;
+            if line.trim_end() != BURNING {
+                let status = b.wait()?;
                 anyhow::bail!("a burner ended at once ({status}): no scope with CPUWeight here");
             }
         }

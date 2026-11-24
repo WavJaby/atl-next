@@ -199,7 +199,7 @@ struct Done {
     judged: usize,
     /// the run's host-load record is unknown
     host_unknown: bool,
-    /// the attempt an undecided row was rerun after (gate-starved-red-design 2.7): this run's outcome is the row's, that attempt is the first
+    /// the attempt an undecided row was rerun after: this run's outcome is the row's, that attempt is the first
     first: Option<Box<Done>>,
     /// this run's wait samples (gate_need.rs); kept in the need ledger when the row passes
     waits: Vec<gate_need::WaitLine>,
@@ -230,20 +230,17 @@ impl Done {
         std::iter::once(self).chain(self.first.as_deref())
     }
 
-    /// The supply that starved the attempt this run reran (None when the row ran once).
-    fn first_supply(&self) -> Option<Supply> {
-        self.first
-            .as_deref()
-            .and_then(|f| f.verdict.as_ref())
-            .and_then(Ruling::supply)
+    /// The supply this run's verdict names as starved (None: no verdict, or one that names none).
+    fn supply(&self) -> Option<Supply> {
+        self.verdict.as_ref().and_then(Ruling::supply)
     }
 }
 
-/// A row's attempt: its first run, or the rerun after an undecided first (gate-starved-red-design 2.7).
+/// A row's attempt: its first run, or the rerun after an undecided first (`starved`: the supply that first verdict named).
 #[derive(Clone, Copy)]
 enum Attempt {
     First,
-    Rerun,
+    Rerun { starved: Option<Supply> },
 }
 
 impl Attempt {
@@ -251,18 +248,35 @@ impl Attempt {
     fn log_name(self, row: &Row) -> String {
         match self {
             Attempt::First => format!("{}.log", row.name()),
-            Attempt::Rerun => format!("{}.rerun.log", row.name()),
+            Attempt::Rerun { .. } => format!("{}.rerun.log", row.name()),
         }
+    }
+
+    /// The lead of the row line's field group: empty for a first run; a rerun's says what the first attempt was and what the rerun ended as (`starved, rerun ok; `, `undecided, rerun ok; ` when the first verdict named no supply).
+    fn lead(self, outcome: Outcome) -> String {
+        let Attempt::Rerun { starved } = self else {
+            return String::new();
+        };
+        let first = starved.map_or(UNDECIDED, |_| "starved");
+        let ended = match outcome {
+            Outcome::Pass => "ok",
+            Outcome::Fail => "red",
+            Outcome::Undecided => UNDECIDED,
+        };
+        format!("{first}, rerun {ended}; ")
     }
 }
 
-/// Reruns each undecided row once: `rerun(i)` runs row `i` alone and its outcome is the row's; the first attempt moves into `first`. A red or passing row is never rerun.
-fn settle(done: &mut [Done], rerun: &mut dyn FnMut(usize) -> Done) {
+/// An undecided outcome's word in a row line.
+const UNDECIDED: &str = "undecided";
+
+/// Reruns each undecided row once: `rerun(i, first)` runs row `i` alone and its outcome is the row's; the first attempt moves into `first`. A red or passing row is never rerun.
+fn settle(done: &mut [Done], rerun: &mut dyn FnMut(usize, &Done) -> Done) {
     for (i, d) in done.iter_mut().enumerate() {
         if d.outcome != Outcome::Undecided {
             continue;
         }
-        let again = rerun(i);
+        let again = rerun(i, d);
         let first = std::mem::replace(d, again);
         d.first = Some(Box::new(first));
     }
@@ -276,7 +290,7 @@ fn starvation_of(done: &[Done]) -> Starvation {
             counts.record_attempt(a.judged, a.host_unknown);
         }
         if let Some(first) = d.first.as_deref() {
-            counts.record_starved(first.verdict.as_ref().and_then(Ruling::supply));
+            counts.record_starved(first.supply());
             counts.record_rerun(d.grant, d.outcome);
         }
     }
@@ -312,6 +326,69 @@ fn ceiling_note(streaks: &BTreeMap<String, Vec<String>>, row: &str) -> Option<St
         red_logs::CEILING,
         last.join(", ")
     ))
+}
+
+/// What a gates step's rows ended as: the failure notes (red rows, rows at the ceiling, a ledger that could not be kept), the rows left undecided, the starvation counters.
+struct Judged {
+    failed: Vec<String>,
+    undecided: Vec<Undecided>,
+    starvation: Starvation,
+}
+
+/// Ledgers the rows' outcomes (`task`, red_logs.rs), then judges them with the ledger's streaks. A ledger error fails the step after its rows' notes, never in their place.
+fn judge_rows(task: &Path, run: &str, commit: &str, names: &[String], done: &[Done]) -> Judged {
+    let entries: Vec<red_logs::Entry<'_>> = done
+        .iter()
+        .zip(names)
+        .map(|(d, name)| red_logs::Entry {
+            run,
+            commit,
+            row: name.as_str(),
+            outcome: d.outcome,
+            first: d.first.as_deref().map(|f| f.outcome),
+            stall: d.stall,
+            grant: d.grant,
+            supply: d.first.as_deref().and_then(Done::supply),
+        })
+        .collect();
+    let ledger =
+        red_logs::ledger_append(task, &entries).and_then(|()| red_logs::trailing_undecided(task));
+    let (trailing, broken) = match ledger {
+        Ok(trailing) => (trailing, None),
+        Err(e) => (
+            red_logs::Trailing::default(),
+            Some(format!("outcome ledger: {e:#}")),
+        ),
+    };
+    eprintln!(
+        "gates: outcome ledger malformed lines {}",
+        trailing.malformed
+    );
+    let mut starvation = starvation_of(done);
+    let (mut failed, mut undecided) = (Vec::new(), Vec::new());
+    for (name, d) in names.iter().zip(done) {
+        match d.outcome {
+            Outcome::Pass => {}
+            // the path leads: check quotes its first error at 160 chars (verdict.rs FIRST_ERROR_CHARS), and the verdict line lands in it
+            Outcome::Fail => failed.push(d.note.clone()),
+            Outcome::Undecided => match ceiling_note(&trailing.streaks, name) {
+                Some(note) => {
+                    starvation.ceiling += 1;
+                    failed.push(note);
+                }
+                None => undecided.push(Undecided {
+                    row: name.clone(),
+                    ruling: d.verdict.clone(),
+                }),
+            },
+        }
+    }
+    failed.extend(broken);
+    Judged {
+        failed,
+        undecided,
+        starvation,
+    }
 }
 
 /// A row whose process could not start (a pool or spawn error): its red verdict, so the other rows still report.
@@ -407,10 +484,11 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
             .map(|(done, _grant)| done)
             .unwrap_or_else(|e| errored(row, &e))
     };
-    // an undecided row's rerun (gate-starved-red-design 2.7): alone after the lanes, under the pool's quiet grant when it is idle, else the row's class
-    let rerun = |row: &Row| -> Done {
+    // an undecided row's rerun: alone after the lanes, under the pool's quiet grant when it is idle, else the row's class
+    let rerun = |row: &Row, first: &Done| -> Done {
         let gated = build_pool::acquire_rerun(&ws, root, row.class).and_then(|grant| {
-            let mut done = at.row(row, Attempt::Rerun)?;
+            let starved = first.supply();
+            let mut done = at.row(row, Attempt::Rerun { starved })?;
             done.running = 1;
             done.grant = grant.class;
             Ok((done, grant))
@@ -424,48 +502,19 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         done
     };
     let (stats, mut done) = run_lanes(ROWS, &run_one, &mut |first| eprintln!("{}", first.line));
-    settle(&mut done, &mut |i| rerun(&ROWS[i]));
+    settle(&mut done, &mut |i, first| rerun(&ROWS[i], first));
     let names: Vec<String> = ROWS.iter().map(Row::name).collect();
-    let entries: Vec<red_logs::Entry<'_>> = done
-        .iter()
-        .zip(&names)
-        .map(|(d, name)| red_logs::Entry {
-            run: run.as_str(),
-            commit: commit.trim(),
-            row: name.as_str(),
-            outcome: d.outcome,
-            first: d.first.as_deref().map(|f| f.outcome),
-            stall: d.stall,
-            grant: d.grant,
-            supply: d.first_supply(),
-        })
-        .collect();
-    red_logs::ledger_append(&task, &entries)?;
+    let Judged {
+        mut failed,
+        undecided,
+        starvation,
+    } = judge_rows(&task, &run, commit.trim(), &names, &done);
     // the need ledger (gate_need.rs): every passing row's wait samples, machine-wide, after the step's rows ended
     let pairs: Vec<(&Row, &Done)> = ROWS.iter().zip(&done).collect();
     let samples = need_samples(&run, commit.trim(), &pairs);
-    gate_need::append(&ws, &samples)?;
-    eprintln!("gates: need ledger +{} samples", samples.len());
-    let streaks = red_logs::trailing_undecided(&task)?;
-    let mut starvation = starvation_of(&done);
-    let mut failed = Vec::new();
-    let mut undecided = Vec::new();
-    for (name, d) in names.iter().zip(&done) {
-        match d.outcome {
-            Outcome::Pass => {}
-            // the path leads: check quotes its first error at 160 chars (verdict.rs FIRST_ERROR_CHARS), and the verdict line lands in it
-            Outcome::Fail => failed.push(d.note.clone()),
-            Outcome::Undecided => match ceiling_note(&streaks, name) {
-                Some(note) => {
-                    starvation.ceiling += 1;
-                    failed.push(note);
-                }
-                None => undecided.push(Undecided {
-                    row: name.clone(),
-                    ruling: d.verdict.clone(),
-                }),
-            },
-        }
+    match gate_need::append(&ws, &samples) {
+        Ok(()) => eprintln!("gates: need ledger +{} samples", samples.len()),
+        Err(e) => failed.push(format!("need ledger: {e:#}")),
     }
     let mut ends = WatchTally::default();
     for d in &done {
@@ -677,21 +726,13 @@ impl RowRun<'_> {
         let word = match outcome {
             Outcome::Pass => "ok",
             Outcome::Fail => "FAILED",
-            Outcome::Undecided => "undecided",
+            Outcome::Undecided => UNDECIDED,
         };
-        // a rerun's line says what the first attempt was and what the rerun ended as (M4: `ok (starved, rerun ok)`)
-        let group = match attempt {
-            Attempt::First => format!("{took:.1}s {measured}"),
-            Attempt::Rerun => format!(
-                "starved, rerun {}; {took:.1}s {measured}",
-                match outcome {
-                    Outcome::Pass => "ok",
-                    Outcome::Fail => "red",
-                    Outcome::Undecided => "undecided",
-                }
-            ),
-        };
-        let line = format!("gates: {} {word} ({group}) {shown}{kept_note}", row.name());
+        let lead = attempt.lead(outcome);
+        let line = format!(
+            "gates: {} {word} ({lead}{took:.1}s {measured}) {shown}{kept_note}",
+            row.name()
+        );
         let note = match outcome {
             Outcome::Undecided => String::new(),
             Outcome::Pass | Outcome::Fail => {
@@ -1184,7 +1225,45 @@ mod tests {
         std::fs::remove_dir_all(&out).expect("cleanup");
     }
 
-    /// The fake-row scheduler test, extended (gate-starved-red-design 2.7): an undecided row reruns once, after the lanes. Starved then pass is ok and counted; starved then red FAILED; starved twice undecided; a red row is never rerun.
+    /// A rerun's line calls its first attempt starved only when that verdict named a starved supply.
+    #[test]
+    fn a_rerun_line_names_starvation_only_when_ruled() {
+        let starved = Some(Supply::Cpu);
+        assert_eq!(
+            Attempt::Rerun { starved }.lead(Outcome::Pass),
+            "starved, rerun ok; "
+        );
+        assert_eq!(
+            Attempt::Rerun { starved: None }.lead(Outcome::Fail),
+            "undecided, rerun red; "
+        );
+        assert_eq!(Attempt::First.lead(Outcome::Pass), "");
+    }
+
+    /// A ledger that cannot be written (its dir's path is a file) fails the step beside the red row's note, not in its place.
+    #[test]
+    fn an_unwritable_ledger_keeps_the_red_rows_notes() {
+        let task =
+            std::env::temp_dir().join(format!("xtask-gates-noledger-{}", std::process::id()));
+        std::fs::write(&task, "a file, not a dir").expect("the blocking file");
+        let names = ["app".to_owned(), "ime".to_owned()];
+        let done = [
+            Done::bare(Outcome::Fail, String::new(), "app: FAILED".to_owned()),
+            Done::bare(Outcome::Undecided, String::new(), String::new()),
+        ];
+        let judged = judge_rows(&task, "r1", "c0ffee", &names, &done);
+        std::fs::remove_file(&task).expect("cleanup");
+        assert_eq!(judged.failed.len(), 2, "{:?}", judged.failed);
+        assert_eq!(judged.failed[0], "app: FAILED");
+        assert!(
+            judged.failed[1].starts_with("outcome ledger: "),
+            "{:?}",
+            judged.failed
+        );
+        assert_eq!(judged.undecided.len(), 1);
+    }
+
+    /// The fake-row scheduler test, extended: an undecided row reruns once, after the lanes. Starved then pass is ok and counted; starved then red FAILED; starved twice undecided; a red row is never rerun.
     #[test]
     fn starved_rows_rerun_once_after_the_lanes() {
         const FAKE: &[Row] = &[
@@ -1221,7 +1300,7 @@ mod tests {
         };
         let (_, mut done) = run_lanes(FAKE, &run_one, &mut |_| {});
         let mut reran = Vec::new();
-        settle(&mut done, &mut |i| {
+        settle(&mut done, &mut |i, _| {
             let name = FAKE[i].name();
             reran.push(name.clone());
             Done {
@@ -1260,7 +1339,7 @@ mod tests {
         );
     }
 
-    /// The ceiling (gate-starved-red-design 2.7, M1): a row undecided in three consecutive runs of this checkout fails, naming those runs. A deciding run resets the streak; other rows' runs do not count.
+    /// The ceiling: a row undecided in three consecutive runs of this checkout fails, naming those runs. A deciding run resets the streak; other rows' runs do not count.
     #[test]
     fn a_third_consecutive_undecided_run_hits_the_ceiling() {
         let task = std::env::temp_dir().join(format!("xtask-gates-ceiling-{}", std::process::id()));
@@ -1278,7 +1357,8 @@ mod tests {
         let row = "window-slow-display";
         let step = |entries: &[red_logs::Entry<'_>]| -> Option<String> {
             red_logs::ledger_append(&task, entries).expect("ledger");
-            ceiling_note(&red_logs::trailing_undecided(&task).expect("streaks"), row)
+            let trailing = red_logs::trailing_undecided(&task).expect("streaks");
+            ceiling_note(&trailing.streaks, row)
         };
         assert_eq!(step(&[entry("r1", row, Outcome::Undecided)]), None);
         assert_eq!(

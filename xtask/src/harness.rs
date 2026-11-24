@@ -302,7 +302,7 @@ pub fn judged_in(log: &str) -> Result<usize> {
         .count())
 }
 
-/// One gates step's starvation counters (gate-starved-red-design 2.7), over every attempt of its rows. Starved: first attempts that ended undecided.
+/// One gates step's starvation counters, over every attempt of its rows. Starved: first attempts that ended undecided.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Starvation {
     pub starved: usize,

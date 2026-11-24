@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 const BURNER: &str = "host-load: burner pid ";
 /// The gate's line once every burner is up (host_load.rs `Burners::start`).
 const UP: &str = "burner(s) at CPUWeight=";
-/// The gate prints its burners within this: a scope per CPU, then one settle.
+/// The gate prints its burners within this: a scope per CPU, each burner's start line.
 const START: Duration = Duration::from_secs(30);
 /// A burner is gone this long after its gate is killed: PDEATHSIG is delivered at once.
 const DIE: Duration = Duration::from_secs(5);

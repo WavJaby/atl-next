@@ -2528,14 +2528,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     // the watch after the marker, as declared waits: the window (WINDOW_MS, every row polled; the app's or atld's end ends it early), then while a row is missing or
     // timed ([`watch_on`]) one wait per progress step, bounded by what is left of the run's stall ([`result_stall`]). A step: an awaited line, the sticky restart, the not-sticky death
-    // (the fence in StickyCase::finished), a foreground step. A late wait ends the watch and is judged later, as before
+    // (the fence in StickyCase::finished), a foreground step. A late wait ends the watch; the checks below judge what it left missing
     let mut ended = ended;
     let sticky = RefCell::new(StickyCase::default());
     let foreground = RefCell::new(ForegroundCase::default());
     if passed && ended.is_none() {
         let watch = Instant::now();
         let (seen, progress) = (Cell::new(0), Cell::new(watch));
-        // one watch step (the old tick): both rows poll, the awaited lines count. Returns (missing, timed)
+        // one watch step: both rows poll, the awaited lines count. Returns (missing, timed)
         let step = || {
             let now = sticky_wall_ms();
             sticky.borrow_mut().poll(&run, &m.name);
@@ -2655,7 +2655,7 @@ const SERVICE_RESTART_DURATION_MS: u64 = 1_000;
 const STICKY_SLACK_MS: u64 = 1_000;
 /// The not-sticky fence (services log): atld's line for the not-sticky process's death, logged after that death's restart decisions (activity.rs app_died).
 /// A restart starts only from a decision (active_services.rs services_died: `restart of <pkg>/<class> scheduled`), so none logged before this line means none.
-/// No time bound: the former 11 s window (1 s + 10 s) ended before the sticky rule's bound (12 s at x1, 22 s at x2), so a restart started in between passed.
+/// No time bound: a window shorter than the sticky rule's bound (12 s at x1, 22 s at x2) passes a restart started after it.
 const NOT_STICKY_CLASS: &str = "AtlNotSticky";
 const STICKY_CLASS: &str = "AtlSticky";
 const RESTART_DECIDED: &str = "restart of ";

@@ -16,7 +16,7 @@ use super::capture;
 use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub};
 use crate::composer::{fnv1a64, word};
 use crate::nested_wayland::{GATE_OUTPUT, Output};
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 
 /// The fixture's dir.
@@ -317,14 +317,14 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
         &|t: &str| t.contains(LAYOUT),
     ))?;
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = until(&Wait::event(
+    let answered = within(&Wait::event(
         "pong",
         "no pong to the first ping",
         PONG_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
-    ))
-    .is_ok();
+    ))?
+    .is_some();
     probe.record_settled();
     // the settled picture shows A's first frame, so the window holds it: the key's frame replaces a shown buffer
     proxy

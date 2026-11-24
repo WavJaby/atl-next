@@ -83,9 +83,9 @@ pub fn keep(task: &Path, bucket: &str, run: &str, log: &Path) -> Result<PathBuf>
     Ok(kept)
 }
 
-/// The checkout's outcome ledger: one line per gate row (and per drive-tap step) per check run, in `<task>/` (`task` = [`task_dir`]). The ceiling reads its trailing undecided lines.
+/// The checkout's outcome ledger: one line per gate row per check run, in `<task>/` (`task` = [`task_dir`]). The ceiling reads its trailing undecided lines.
 pub const LEDGER: &str = "gate-ledger.tsv";
-/// Consecutive undecided runs of one row that fail its checkout's step (manager M1, 2026-11-23). A row starved in every run gates nothing: it fails visibly, not silently.
+/// Consecutive undecided runs of one row that fail its checkout's step (a maintainer's choice, not a measurement). A row starved in every run gates nothing: it fails visibly, not silently.
 pub const CEILING: usize = 3;
 
 /// One row's ledger line. `first`: the attempt before a rerun (`-` when the row ran once). `stall`: the deciding run's host stall share, percent (`-` unknown). `grant`: the grant it held (`quiet`, or the class name).
@@ -110,7 +110,7 @@ fn word(outcome: Outcome) -> &'static str {
     }
 }
 
-/// Appends one line per entry to checkout `task`'s ledger, made on first use. Columns: run, commit, row, outcome, first, stall, grant, supply. Lines written before `supply` have seven columns; readers take the first four.
+/// Appends one line per entry to checkout `task`'s ledger, made on first use. Columns: run, commit, row, outcome, first, stall, grant, supply ([`COLUMNS`]).
 pub fn ledger_append(task: &Path, entries: &[Entry<'_>]) -> Result<()> {
     fs::create_dir_all(task).with_context(|| format!("creating {}", task.display()))?;
     let path = task.join(LEDGER);
@@ -139,29 +139,43 @@ pub fn ledger_append(task: &Path, entries: &[Entry<'_>]) -> Result<()> {
         .with_context(|| path.display().to_string())
 }
 
-/// Per row, the run names of its trailing undecided ledger lines, oldest first. A pass or a fail ends the row's streak; other rows' lines do not. No ledger: empty.
-pub fn trailing_undecided(task: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+/// A ledger line's columns, as [`ledger_append`] writes them.
+const COLUMNS: usize = 8;
+
+/// What [`trailing_undecided`] read.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Trailing {
+    /// Per row, the run names of its trailing undecided lines, oldest first.
+    pub streaks: BTreeMap<String, Vec<String>>,
+    /// Lines that are no ledger line (column count or outcome word): not read, so the caller reports them.
+    pub malformed: usize,
+}
+
+/// The ledger's streaks. A pass or a fail ends the row's streak; other rows' lines do not. No ledger: empty.
+pub fn trailing_undecided(task: &Path) -> Result<Trailing> {
     let path = task.join(LEDGER);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Trailing::default()),
         Err(e) => return Err(e).with_context(|| path.display().to_string()),
     };
-    let mut streaks: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let decided = [Outcome::Pass, Outcome::Fail].map(word);
+    let mut trailing = Trailing::default();
     for line in text.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 4 {
+        let undecided = cols.get(3) == Some(&word(Outcome::Undecided));
+        if cols.len() != COLUMNS || !(undecided || decided.contains(&cols[3])) {
+            trailing.malformed += 1;
             continue;
         }
-        let (run, row, outcome) = (cols[0], cols[2], cols[3]);
-        let streak = streaks.entry(row.to_owned()).or_default();
-        if outcome == word(Outcome::Undecided) {
-            streak.push(run.to_owned());
+        let streak = trailing.streaks.entry(cols[2].to_owned()).or_default();
+        if undecided {
+            streak.push(cols[0].to_owned());
         } else {
             streak.clear();
         }
     }
-    Ok(streaks)
+    Ok(trailing)
 }
 
 /// The run dirs of one bucket, newest first.
@@ -362,12 +376,21 @@ mod tests {
             text.lines().next(),
             Some("r1\tc0ffee\tapp\tundecided\tundecided\t-\tharness\tgpu")
         );
-        let streaks = trailing_undecided(&ws).expect("streaks");
+        let streaks = trailing_undecided(&ws).expect("streaks").streaks;
         assert_eq!(streaks["app"], ["r1", "r2"]);
         assert!(streaks["ime"].is_empty());
         ledger_append(&ws, &[entry("r3", "app", Outcome::Pass)]).expect("r3");
         ledger_append(&ws, &[entry("r4", "app", Outcome::Undecided)]).expect("r4");
-        assert_eq!(trailing_undecided(&ws).expect("streaks")["app"], ["r4"]);
+        let path = ws.join(LEDGER);
+        let trailing = trailing_undecided(&ws).expect("streaks");
+        assert_eq!(trailing.streaks["app"], ["r4"]);
+        assert_eq!(trailing.malformed, 0);
+        // a truncated line, a seven-column line and an unknown outcome are counted, and end or extend no streak
+        let bad = "r5\tc0ffee\tapp\nr6\tc0ffee\tapp\tpass\t-\t-\tharness\nr7\tc0ffee\tapp\tred\t-\t-\tharness\t-\n";
+        fs::write(&path, fs::read_to_string(&path).expect("ledger") + bad).expect("bad lines");
+        let trailing = trailing_undecided(&ws).expect("streaks");
+        assert_eq!(trailing.streaks["app"], ["r4"]);
+        assert_eq!(trailing.malformed, 3);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

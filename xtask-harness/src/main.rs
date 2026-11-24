@@ -317,7 +317,7 @@ enum Test {
     EglBridge(egl_bridge::Args),
     /// A CJK and an emoji code point each resolve to a real font file through the product's font list over the desktop's own fontconfig (host_fonts.rs); prints family + file per code point. A host without such a face is its own verdict (`host lacks a CJK font`), not a failure. `--break empty-dir` / `no-fallback` must leave the ok verdict.
     HostFonts(host_fonts::Args),
-    /// The starvation rule on a process tree it controls, no atld (gate-starved-red-design H4): each case runs as its own gate pinned to one CPU, with burners in sibling scopes.
+    /// The starvation rule on a process tree it controls, no atld: each case runs as its own gate pinned to one CPU, with burners in sibling scopes.
     /// A starved wait (burners at CPUWeight 10000) must be `undecided`; a silent, asleep, crashed, wrong, self-starved or late worker must FAIL with its own cause; equal-weight load inside the bound must pass.
     /// `--break burner-start` (burners refused) must turn the gate red. Needs a user systemd that makes scopes with CPUWeight (`systemd-run --user --scope`), and `taskset`.
     HostLoad(host_load::Args),

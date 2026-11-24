@@ -22,7 +22,8 @@ const PROC_STAT: &str = "/proc/stat";
 const PROC_SELF_STATUS: &str = "/proc/self/status";
 /// This thread's scheduler stats, `run_time run_delay timeslices` in ns (CONFIG_SCHED_INFO).
 const THREAD_SCHEDSTAT: &str = "/proc/thread-self/schedstat";
-/// How often the sampler reads. A tenth of the shortest judged window (31 callbacks at 60 Hz = 500 ms) keeps the bracketing samples within 20% of the window's span.
+/// How often the sampler reads. A span's two edge intervals are pro-rated as if their stall were even, so the period bounds what they misplace: up to one period per edge, 100 ms over the shortest judged span (1 s, the removeTask kill timer and host-load's wait).
+/// Five `/proc/stat` ticks (USER_HZ 100), so an interval's busy CPU resolves to a fifth of it.
 pub const SAMPLE_PERIOD: Duration = Duration::from_millis(50);
 const PERIOD_NS: i64 = SAMPLE_PERIOD.as_nanos() as i64;
 
@@ -158,11 +159,14 @@ impl Samples {
 /// The samples of the running gate's sampler ([`Sampler::publish`]): one gate per process.
 static LIVE: OnceLock<Arc<Mutex<Vec<Sample>>>> = OnceLock::new();
 
-/// The running gate's samples once one is at or after `through_ns` (CLOCK_MONOTONIC): what a judge reads over a span that just ended. Waits at most four periods for that sample.
+/// How many periods [`live`] waits for a sample past its span. An on-time sampler needs one; the rest is for one that wakes late on a loaded host. Past it the span is not covered: unknown, so judged.
+const LIVE_PERIODS: u32 = 4;
+
+/// The running gate's samples once one is at or after `through_ns` (CLOCK_MONOTONIC): what a judge reads over a span that just ended. Waits at most [`LIVE_PERIODS`] for that sample.
 /// None without a published sampler (no scope: unknown, so judged).
 pub fn live(through_ns: i64) -> Option<Samples> {
     let shared = LIVE.get()?;
-    for _ in 0..4 {
+    for _ in 0..LIVE_PERIODS {
         let covered = shared
             .lock()
             .expect("sampler lock")
@@ -226,7 +230,7 @@ impl Sampler {
         }
     }
 
-    /// [`Self::start_for`] on this process's own scope and allowed CPUs: what the window and g4 gates judge with.
+    /// [`Self::start_for`] on the gate scope this process runs in and its allowed CPUs: the stall g4's band failure names. Outside a gate scope no stall is counted (unknown): a job's scope holds more than the gate.
     pub fn start() -> Self {
         let gate = scope::own().ok().map(|s| s.dir);
         Self::start_for(gate.as_deref(), allowed_cpus().as_deref())
@@ -439,7 +443,7 @@ mod tests {
         assert_eq!(s.foreign(span), Some(400_000));
     }
 
-    /// Only intervals wholly inside the span count: 1..2 s of a 0..2 s run is the second interval alone (own 0.1 s, foreign 0.0, not counted).
+    /// An interval that only touches the span's edge has no part inside it: 1..2 s of a 0..2 s run is the second interval alone (own 0.1 s, foreign 0.0, not counted).
     #[test]
     fn span_takes_only_its_own_intervals() {
         let s = Samples(vec![

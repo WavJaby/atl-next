@@ -41,9 +41,21 @@ impl Scope {
     }
 }
 
-/// This process's scope, when it has the cpu files.
+/// The gate scope this process runs in (its own, or the gate's that started it), when it has the cpu files. Any other scope is the job's: Err.
 pub fn own() -> Result<Scope, String> {
-    Scope::at(cgroup_dir(std::process::id())?)
+    gate_scope(cgroup_dir(std::process::id())?)
+}
+
+/// `dir` as a gate's scope: an `atl-gate-<pid>.scope` with the cpu files.
+fn gate_scope(dir: PathBuf) -> Result<Scope, String> {
+    let is_gate = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(UNIT_PREFIX) && n.ends_with(".scope"));
+    if !is_gate {
+        return Err(format!("{}: not a gate's scope", dir.display()));
+    }
+    Scope::at(dir)
 }
 
 /// `pid`'s cgroup v2 dir: the `0::` line of `/proc/<pid>/cgroup`, under the cgroup mount.
@@ -129,6 +141,27 @@ mod tests {
         let text = "1:name=systemd:/init\n0::/user.slice/app.slice/a.scope\n";
         assert_eq!(parse_v2_path(text), Some("/user.slice/app.slice/a.scope"));
         assert_eq!(parse_v2_path("1:cpu,cpuacct:/x\n"), None);
+    }
+
+    /// A job's scope with the same cpu files is not measured as the gate's.
+    #[test]
+    fn only_a_gate_unit_is_a_gates_scope() {
+        let root = std::env::temp_dir().join(format!("atl-host-load-scope-{}", std::process::id()));
+        for unit in ["atl-gate-7.scope", "job-7.scope"] {
+            let dir = root.join(unit);
+            fs::create_dir_all(&dir).expect("unit dir");
+            for file in ["cpu.pressure", "cpu.stat"] {
+                fs::write(dir.join(file), "").expect("cpu file");
+            }
+        }
+        let gate = gate_scope(root.join("atl-gate-7.scope"));
+        let job = gate_scope(root.join("job-7.scope"));
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(
+            gate.map(|s| s.unit().to_owned()),
+            Ok("atl-gate-7.scope".to_owned())
+        );
+        assert!(job.is_err());
     }
 
     #[test]

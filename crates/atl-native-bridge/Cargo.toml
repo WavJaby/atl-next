@@ -139,7 +139,7 @@ atl-bridgegen = { path = "../atl-bridgegen" }
 atl-sigaction-hook = { path = "../atl-sigaction-hook" }
 
 [dev-dependencies]
-# g4's starvation share over its run: the measure xtask's cadence window is judged with (atl-host-load)
+# the gate's CPU stall over the run, which g4's band failure names; it judges nothing
 atl-host-load = { path = "../atl-host-load" }
 
 [lints]

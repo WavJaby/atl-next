@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The sampler responds. A spinner pinned to one CPU in its own scope, with three burners pinned to that CPU, each in a scope of its own: four equal groups, so the spinner gets a quarter of the CPU and waits three quarters (stall share near 0.75). Alone it waits for nothing.
 //! The burners need their own scopes: the kernel schedules cgroups, and three burners in one group leave the spinner most of the CPU.
-//! Needs the user manager (`systemd-run --user --scope`) and `taskset`. Without them the test prints that it skipped and returns: the record is unknown on such a host, never green.
+//! Needs the user manager (`systemd-run --user --scope`) and `taskset`. Without them the test fails: a return would be a green for what it never measured.
 #![expect(
     clippy::disallowed_types,
     clippy::print_stderr,
@@ -24,6 +24,10 @@ const RUN: Duration = Duration::from_secs(2);
 const ENTER: Duration = Duration::from_secs(5);
 /// Poll step while waiting for the scope.
 const POLL: Duration = Duration::from_millis(10);
+/// Stall share of a spinner against one equal burner (1 of 2 groups). Three burners (expected 0.75) must exceed it: a sampler that misses two of them does not.
+const ONE_BURNER: f64 = 0.5;
+/// Alone bound: the host's other work on the CPU is the only stall, so it varies with the host. Below half the one-burner share, a lone spinner is not read as a loaded one.
+const ALONE_MAX: f64 = ONE_BURNER / 2.0;
 /// Unique unit names across the measurements of one run.
 static UNITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -32,10 +36,10 @@ fn spinner_responds_to_foreign_load() {
     let probe = Command::new("systemd-run")
         .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
         .status();
-    if !probe.is_ok_and(|s| s.success()) {
-        eprintln!("skipped: no user manager scope here (systemd-run --user --scope)");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|s| s.success()),
+        "no user manager scope here (systemd-run --user --scope): nothing can be measured"
+    );
     let cpu = *allowed_cpus()
         .expect("Cpus_allowed_list")
         .last()
@@ -44,11 +48,11 @@ fn spinner_responds_to_foreign_load() {
     let burdened = stall_share(cpu, 3);
     eprintln!("spinner on cpu {cpu}: alone stall {alone:.3}, with 3 burners {burdened:.3}");
     assert!(
-        alone < 0.1,
+        alone < ALONE_MAX,
         "alone the spinner stalls {alone:.3}, expected near 0"
     );
     assert!(
-        burdened >= 0.5,
+        burdened >= ONE_BURNER,
         "with 3 burners the stall share is {burdened:.3}, expected near 0.75"
     );
 }

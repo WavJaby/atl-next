@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use super::{ACK_WAIT, Liveness, PONG_WAIT, Sub};
 use super::{capture, widgets};
 use crate::composer::{fnv1a64, word};
-use crate::wait::{Miss, Wait, until};
+use crate::wait::{Miss, Wait, until, within};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
 
 /// A page title (Main.java onReceivedTitle): every click the page gets sets `tap<n>`.
@@ -699,14 +699,14 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     }
     probe.record_settled();
     proxy.inject_ping(1).map_err(|e| e.to_string())?;
-    let answered = until(&Wait::event(
+    let answered = within(&Wait::event(
         "pong",
         "no pong to the first ping",
         PONG_WAIT,
         &proxy.events,
         &|e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 },
-    ))
-    .is_ok();
+    ))?
+    .is_some();
     if !no_webview {
         drive_input(&proxy, app_log)?;
     }
