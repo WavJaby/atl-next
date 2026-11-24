@@ -348,7 +348,7 @@ pub fn check(
 
 /// What of an external ninja build reaches a shipped artifact.
 enum Reach<'a> {
-    /// Archive members a converter link loaded (`--trace`): (archive, member, artifact). Mapped to objects by archive file name (an install copies the archive under the same name).
+    /// Archive members a converter link loaded (`--trace`): (archive, member, artifact). Mapped to objects by the archive's own path, else by file name (an install copies the archive under the same name).
     Members(&'a [(&'a Path, &'a str, &'a Path)]),
     /// Every object the build compiled (its depfile records), each its own artifact: for a build whose archives later links load (the runtimes), a superset, so a pass holds for any link.
     All,
@@ -433,15 +433,25 @@ fn member_objects<'a>(
     loaded: &[(&Path, &str, &'a Path)],
     report: &mut Report,
 ) -> Result<BTreeMap<PathBuf, &'a Path>> {
-    let targets: Vec<PathBuf> = lines(&ninja(build, &["-t", "targets", "all"])?)
-        .filter_map(|l| l.rsplit_once(": ").map(|(t, _)| build.join(t)))
+    // (path, name as declared): ninja -t query takes the declared name; the absolute path is unknown to it
+    let targets: Vec<(PathBuf, String)> = lines(&ninja(build, &["-t", "targets", "all"])?)
+        .filter_map(|l| {
+            l.rsplit_once(": ")
+                .map(|(t, _)| (build.join(t), t.to_owned()))
+        })
         .collect();
     let mut objects = BTreeMap::new();
     for (archive, member, artifact) in loaded {
-        let named: Vec<&PathBuf> = targets
-            .iter()
-            .filter(|t| t.file_name() == archive.file_name())
-            .collect();
+        // the archive's own path names its edge: a file name also names CMake's phony alias (`librust_wrapper.a: phony <path>`) and other edges of that name; an install's copy has no target and is found by name
+        let own: Vec<&(PathBuf, String)> = targets.iter().filter(|(p, _)| p == *archive).collect();
+        let named: Vec<&(PathBuf, String)> = if own.is_empty() {
+            targets
+                .iter()
+                .filter(|(p, _)| p.file_name() == archive.file_name())
+                .collect()
+        } else {
+            own
+        };
         let [made] = named[..] else {
             report.unresolved.push(format!(
                 "{}: {} edges of {} make an archive of this name (in {})",
@@ -452,7 +462,7 @@ fn member_objects<'a>(
             ));
             continue;
         };
-        let query = ninja(build, &["-t", "query", &made.display().to_string()])?;
+        let query = ninja(build, &["-t", "query", &made.1])?;
         let objs: Vec<PathBuf> = parse_query(&query).into_values().flatten().collect();
         let Some(object) = objs
             .into_iter()
@@ -1233,6 +1243,32 @@ mod tests {
         );
         assert_eq!(external_build(&out.join("device/liba.a"), &out), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// CMake's static library shape (boringssl's bssl-sys): the edge `rust/a/librust_wrapper.a` and a phony alias `librust_wrapper.a` of the same file name. The archive named by its own path maps to its object; by file name alone it is two targets (red before the path rule).
+    #[test]
+    fn member_mapped_by_archive_path() {
+        let tmp = std::env::temp_dir().join(format!("xtask-licence-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let build = tmp.join("build");
+        std::fs::create_dir_all(build.join("rust/a")).unwrap();
+        std::fs::write(
+            build.join("build.ninja"),
+            "rule ar\n  command = ar crs $out $in\nbuild obj/w.o: ar\nbuild rust/a/librust_wrapper.a: ar obj/w.o\nbuild librust_wrapper.a: phony rust/a/librust_wrapper.a\n",
+        )
+        .unwrap();
+        let (archive, artifact) = (build.join("rust/a/librust_wrapper.a"), tmp.join("app"));
+        let mut report = Report::default();
+        let objects = member_objects(
+            &build,
+            &[(archive.as_path(), "w.o", artifact.as_path())],
+            &mut report,
+        );
+        std::fs::remove_dir_all(&tmp).unwrap();
+        let objects = objects.unwrap();
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+        assert_eq!(objects.len(), 1);
+        assert!(objects.keys().all(|o| o.ends_with("obj/w.o")));
     }
 
     #[test]

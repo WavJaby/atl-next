@@ -512,6 +512,10 @@ reason = "Android's addition, not upstream SELinux (README.android: \"This fork 
 licence = "Apache-2.0"
 reason = "Android's additions (README.android names src/android/android.c; the directory is absent upstream); no notices, so Apache-2.0 as include/selinux/android.h"
 
+[upstream.aosp.paths."external/selinux/libselinux/rust/selinux.h"]
+licence = "LicenseRef-Public-Domain"
+reason = "no notice; the input of libselinux's rust_bindgen (Android.bp libselinux_bindgen, wrapper_src). libselinux/LICENSE: \"This library (libselinux) is public domain software, i.e. not copyrighted\"; not an Android change: README.android (selinux root) lists Android's changes outside the build files as libselinux/include/selinux/android.h and libselinux/src/android/android.c only. The package's Soong kinds (Apache-2.0, GPL-2.0, legacy_unencumbered) give no default, as for include/ and src/"
+
 [upstream.aosp.paths."external/speex/include/speex/speexdsp_config_types.h"]
 licence = "BSD-3-Clause"
 reason = "the configured copy of speexdsp_config_types.h.in; speex/COPYING is Xiph's BSD-3-Clause"
@@ -523,6 +527,14 @@ reason = "no file carries a notice; cxx/Cargo.toml and each sub-crate's: license
 [upstream.aosp.paths."external/rust/android-crates-io/crates/memmap2/"]
 licence = "Apache-2.0 OR MIT"
 reason = "no file carries a notice (lib.rs's docs only name LICENSE files in examples); memmap2/Cargo.toml: license = \"MIT OR Apache-2.0\"; its Android.bp lists both kinds, which reads as several, not as the choice"
+
+[upstream.aosp.paths."external/rust/android-crates-io/crates/chrono/src/"]
+licence = "MIT OR Apache-2.0"
+reason = "src/ files' notice \"See README.md and LICENSE.txt for details.\" (the phrase rules do not read it); LICENSE.txt: \"dual-licensed under The MIT License [1] and Apache 2.0 License [2]\"; Cargo.toml: license = \"MIT OR Apache-2.0\". Three src files (time_delta.rs, offset/local/unix.rs, offset/local/windows.rs) state the same pair as \"Licensed under the Apache License, Version 2.0 ... or the MIT license ..., at your option\", so the prefix's label is exact for them too"
+
+[upstream.aosp.paths."external/rust/android-crates-io/crates/der/src/datetime.rs"]
+licence = "MIT OR Apache-2.0"
+reason = "the file's own notice: \"Copyright (c) 2016 The humantime Developers\", \"Released under the MIT OR Apache 2.0 licenses\" (adapted from humantime; the phrase rules do not read it); der/Cargo.toml: license = \"Apache-2.0 OR MIT\""
 
 # Eigen: Android.bp kinds Apache-2.0 + BSD + MPL-2.0, so no package default. Its comments: Apache-2.0 only in Eigen/src/Core/arch/Default/BFloat16.h, BSD only in CMake scripts and MINPACK-derived code; COPYING.README: "Eigen is primarily MPL2 licensed", third-party code under BSD or LGPL noted per file (none of the reached files names LGPL)
 [upstream.aosp.paths."external/eigen/Eigen/src/Core/arch/Default/Half.h"]
