@@ -67,6 +67,23 @@ pub fn process_state(holdings: &Holdings) -> ProcessState {
     }
 }
 
+/// What a service outside the activity manager reads of a uid at one instant: AMInternal.getUidProcessState plus the uid observer events ShortcutService and AppOpsService keep.
+/// The activity manager answers it (ActivityManager::uid_view); shortcut.rs and appops.rs read it through [`UidViews`], so no second tracker exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UidView {
+    /// The uid's state: the best of its attached processes' (UidRecord.curProcState = min over its processes). None = no attached process (PROCESS_STATE_NONEXISTENT).
+    pub state: Option<ProcessState>,
+    /// Uids::top_since.
+    pub top_since: Option<u64>,
+    /// Uids::restricted_since.
+    pub restricted_since: Option<u64>,
+    /// Elapsed ms on the same clock as the two times above.
+    pub now: u64,
+}
+
+/// The uid view source a service is given at registration.
+pub type UidViews = std::sync::Arc<dyn Fn(u32) -> UidView + Send + Sync>;
+
 /// Headless end rule (plan "Linux conventions", no cached processes): ends once nothing holds the process, its uid is idle, and it has been empty for `grace_ms` since `empty_since`.
 /// Times are elapsed ms; the caller sets `empty_since` when the process becomes empty.
 pub fn ends(
@@ -183,6 +200,10 @@ struct Uid {
     temp_until: Option<u64>,
     /// Expiry of the FGS-typed grants (AMS mFgsStartTempAllowList, :15762-15765). Valid while now < until.
     fgs_until: Option<u64>,
+    /// When the uid last turned TOP (its first Task appeared): the uid observer's foreground event ShortcutService records (UidView::top_since).
+    top_since: Option<u64>,
+    /// When the uid's last Task and FGS ended, while neither holds again (UidView::restricted_since).
+    restricted_since: Option<u64>,
 }
 
 impl Uid {
@@ -195,6 +216,20 @@ impl Uid {
             settle_at: None,
             temp_until: None,
             fgs_until: None,
+            top_since: None,
+            restricted_since: None,
+        }
+    }
+
+    /// Task or FGS: the process states at or above FOREGROUND_SERVICE this uid can reach.
+    fn unrestricted(&self) -> bool {
+        self.tasks > 0 || self.fgs > 0
+    }
+
+    /// After a Task or FGS ended at `now`: the restricted clock starts when neither is left.
+    fn restriction_observed(&mut self, now: u64) {
+        if !self.unrestricted() && self.restricted_since.is_none() {
+            self.restricted_since = Some(now);
         }
     }
 
@@ -214,10 +249,14 @@ impl Uids {
         self.uids.get(&uid).is_none_or(|u| u.idle)
     }
 
-    /// A Task of `uid` appears (its process is TOP): the uid is active and its background clock stops (OomAdjuster :1620-1627).
-    pub fn on_task_added(&mut self, uid: u32) {
+    /// A Task of `uid` appears at `now` (its process is TOP): the uid is active and its background clock stops (OomAdjuster :1620-1627). The first Task marks the uid's turn to TOP.
+    pub fn on_task_added(&mut self, uid: u32, now: u64) {
         let u = self.uid_mut(uid);
+        if u.tasks == 0 {
+            u.top_since = Some(now);
+        }
         u.tasks += 1;
+        u.restricted_since = None;
         set_active(u);
     }
 
@@ -225,6 +264,7 @@ impl Uids {
     pub fn on_task_removed(&mut self, uid: u32, now: u64) -> Option<u64> {
         let u = self.uid_mut(uid);
         u.tasks = u.tasks.saturating_sub(1);
+        u.restriction_observed(now);
         background_observed(u, now)
     }
 
@@ -232,6 +272,7 @@ impl Uids {
     pub fn on_fgs_started(&mut self, uid: u32) {
         let u = self.uid_mut(uid);
         u.fgs += 1;
+        u.restricted_since = None;
         set_active(u);
     }
 
@@ -239,7 +280,18 @@ impl Uids {
     pub fn on_fgs_stopped(&mut self, uid: u32, now: u64) -> Option<u64> {
         let u = self.uid_mut(uid);
         u.fgs = u.fgs.saturating_sub(1);
+        u.restriction_observed(now);
         background_observed(u, now)
+    }
+
+    /// When `uid` last turned TOP (None: never in this atld run).
+    pub fn top_since(&self, uid: u32) -> Option<u64> {
+        self.uids.get(&uid).and_then(|u| u.top_since)
+    }
+
+    /// When `uid` lost its last Task and FGS; None while one holds or before either ever did.
+    pub fn restricted_since(&self, uid: u32) -> Option<u64> {
+        self.uids.get(&uid).and_then(|u| u.restricted_since)
     }
 
     /// A temp allowlist grant (AMS tempAllowlistUidLocked :15746-15767; `fgs` for the FGS-allowed type). Returns the expiry to arm for `on_temp_expired`.
@@ -470,7 +522,7 @@ mod tests {
     #[test]
     fn active_uid_stays_normal_until_the_settle_sweep() {
         let mut uids = Uids::default();
-        uids.on_task_added(APP_UID);
+        uids.on_task_added(APP_UID, 0);
         assert!(!uids.is_idle(APP_UID));
         assert_eq!(uids.start_mode(APP_UID, 26, false, 0), StartMode::Normal);
         // the last Task goes at 10 000: sweep due at 10 000 + 60 000
@@ -494,10 +546,10 @@ mod tests {
     #[test]
     fn a_new_reason_cancels_the_pending_sweep() {
         let mut uids = Uids::default();
-        uids.on_task_added(APP_UID);
+        uids.on_task_added(APP_UID, 0);
         assert_eq!(uids.on_task_removed(APP_UID, 10_000), Some(70_000));
         // back at 30 000: the background clock is cleared (OomAdjuster :1626)
-        uids.on_task_added(APP_UID);
+        uids.on_task_added(APP_UID, 0);
         assert_eq!(uids.settle(APP_UID, 70_000), Settle::Unchanged);
         assert!(!uids.is_idle(APP_UID));
         // the next background period gets its own clock: 80 000 + 60 000
@@ -584,7 +636,7 @@ mod tests {
     #[test]
     fn a_visible_task_allows_fgs_start_from_background() {
         let mut uids = Uids::default();
-        uids.on_task_added(APP_UID);
+        uids.on_task_added(APP_UID, 0);
         assert!(uids.fgs_start_allowed(APP_UID, 0));
     }
 
@@ -730,7 +782,7 @@ mod tests {
     #[test]
     fn active_uid_passes_until_it_settles() {
         let mut uids = Uids::default();
-        uids.on_task_added(APP_UID);
+        uids.on_task_added(APP_UID, 0);
         assert!(!background_start_refused(
             &uids, APP_UID, 36, false, false, false, 0
         ));
@@ -749,5 +801,24 @@ mod tests {
         assert!(background_start_refused(
             &uids, APP_UID, 36, false, false, false, at
         ));
+    }
+
+    /// top_since marks the first Task only; restricted_since starts when the last Task and FGS are gone (not on Task -> FGS) and clears when either returns.
+    #[test]
+    fn top_and_restricted_times() {
+        let mut uids = Uids::default();
+        assert_eq!(uids.top_since(APP_UID), None);
+        uids.on_task_added(APP_UID, 100);
+        uids.on_task_added(APP_UID, 200);
+        assert_eq!(uids.top_since(APP_UID), Some(100));
+        uids.on_fgs_started(APP_UID);
+        uids.on_task_removed(APP_UID, 300);
+        uids.on_task_removed(APP_UID, 400);
+        assert_eq!(uids.restricted_since(APP_UID), None);
+        uids.on_fgs_stopped(APP_UID, 500);
+        assert_eq!(uids.restricted_since(APP_UID), Some(500));
+        uids.on_task_added(APP_UID, 600);
+        assert_eq!(uids.restricted_since(APP_UID), None);
+        assert_eq!(uids.top_since(APP_UID), Some(600));
     }
 }

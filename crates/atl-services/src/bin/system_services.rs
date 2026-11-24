@@ -557,6 +557,11 @@ fn main() -> Result<()> {
         binder::add_service(NETSTATS, atl_services::netstats::new_binder())
             .context("addService netstats")?;
     }
+    // the uid state shortcut and appops read (AMInternal.getUidProcessState + uid observer history): the activity manager's, one source
+    let uid_views: atl_services::uid_state::UidViews = {
+        let activity = activity.clone();
+        Arc::new(move |uid| activity.uid_view(uid))
+    };
     if !a.omit_service.iter().any(|s| s == SHORTCUT) {
         binder::add_service(
             SHORTCUT,
@@ -564,6 +569,7 @@ fn main() -> Result<()> {
                 Arc::clone(&packages),
                 Arc::clone(&permissions),
                 Arc::clone(&tasks),
+                Arc::clone(&uid_views),
                 a.system_dir.clone(),
             ),
         )
@@ -599,7 +605,11 @@ fn main() -> Result<()> {
     if !a.omit_service.iter().any(|s| s == APP_OPS) {
         binder::add_service(
             APP_OPS,
-            atl_services::appops::new_binder(Arc::clone(&permissions), Arc::clone(&packages)),
+            atl_services::appops::new_binder(
+                Arc::clone(&permissions),
+                Arc::clone(&packages),
+                uid_views,
+            ),
         )
         .context("addService appops")?;
     }

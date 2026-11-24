@@ -5,8 +5,10 @@
 //! shortcuts: nothing is ever FLAG_PINNED or FLAG_CACHED_*, so every removal or disable deletes the shortcut outright (ShortcutPackage.deleteOrDisableWithId :590-627) and getShortcuts' PINNED / CACHED
 //! matches are empty; isRequestPinItemSupported false, requestPinShortcut false (ShortcutRequestPinProcessor without a supporting launcher).
 //! - Limits = ShortcutService's defaults (:176-197; no device config override here): 15 per activity, 10 calls per 24 h interval, icon 96 dp (not a low-RAM device) in px at the display density.
-//! - Rate limit (ShortcutPackage.getApiCallCount :695-728): reset whenever the uid is foreground (procState <= BOUND_FOREGROUND_SERVICE, isUidForegroundLocked :632). ATL reports every app process
-//!   foreground: no process state is read here (PROCESS_STATE_TOP, running_processes.rs), so its count is reset before each check and it is never limited, as an app in front is on a device. A background caller's real state is not read: a known gap, outside S11.
+//! - Foreground (isUidForegroundLocked :632-645): SYSTEM_UID, or the uid's process state (uid_state::UidView, the activity manager's) <= BOUND_FOREGROUND_SERVICE; of the states derived here only TOP is,
+//!   so a uid with only an FGS, a service or a receiver is background. requestPinShortcut from a background uid throws IllegalStateException (requestPinItem :2367).
+//! - Rate limit (ShortcutPackage.getApiCallCount :695-728): reset when the uid is foreground, holds UNLIMITED_SHORTCUTS_API_CALLS, or turned TOP since the package's last reset
+//!   (mLastKnownForegroundElapsedTime < mUidLastForegroundElapsedTime; the latter is UidView::top_since). A background caller is limited to 10 calls per interval.
 //! - Order: ShortcutPackage keeps an ArrayMap by id, so lists come out by the ids' String.hashCode ascending, equal hashes in insertion order; ranks per activity by adjustRanks (:1558).
 //! - Icons (saveIconAndFixUpShortcutLocked :1536): resource -> iconResId + FLAG_HAS_ICON_RES (own package only), uri -> iconUri + FLAG_HAS_ICON_URI, bitmap -> FLAG_HAS_ICON_FILE; the Icon is dropped.
 //!   AOSP writes the bitmap to a file only a launcher reads (LauncherApps.getShortcutIconFd); there is none, so the pixels are not kept.
@@ -33,8 +35,8 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 use serde::{Deserialize, Serialize};
 
 use crate::packages::{Packages, Permissions};
-use crate::running_processes::PROCESS_STATE_TOP;
 use crate::tasks::Tasks;
+use crate::uid_state::{UidView, UidViews};
 
 /// The name the answers are counted under (`atl_diag::answered`, the app gate's SERVICE_CALLS).
 const SHORTCUT: &str = "IShortcutService";
@@ -142,6 +144,27 @@ struct PackageShortcuts {
     shortcuts: Vec<Entry>,
     api_calls: i32,
     last_reset: i64,
+    /// mLastKnownForegroundElapsedTime: elapsed ms (UidView clock) of the last foreground reset; not kept across atld runs (an elapsed time, like AOSP's across boots).
+    last_known_foreground: Option<u64>,
+}
+
+/// getApiCallCount's reset inputs for one call.
+#[derive(Debug, Clone, Copy)]
+struct Foreground {
+    /// isUidForegroundLocked, or UNLIMITED_SHORTCUTS_API_CALLS held
+    now: bool,
+    /// UidView::top_since
+    top_since: Option<u64>,
+    /// UidView::now
+    elapsed: u64,
+}
+
+/// isUidForegroundLocked (:632-645): SYSTEM_UID, or a known state at or below PROCESS_STATE_FOREGROUND_THRESHOLD (:451); no process = MAX_PROCESS_STATE, background.
+fn uid_foreground(system: bool, view: &UidView) -> bool {
+    system
+        || view
+            .state
+            .is_some_and(|s| s as i32 <= PROCESS_STATE_BOUND_FOREGROUND_SERVICE)
 }
 
 impl PackageShortcuts {
@@ -206,9 +229,14 @@ impl PackageShortcuts {
             }
         }
     }
-    /// getApiCallCount (:695-728): a foreground (or unlimited) caller resets the count; a service-wide reset after this package's last one zeroes it.
-    fn api_call_count(&mut self, foreground: bool, service_last_reset: i64, now: i64) -> i32 {
-        if foreground {
+    /// getApiCallCount (:695-728): a foreground (or unlimited) caller, or one whose uid turned TOP since this package's last foreground reset, resets the count; a service-wide reset after
+    /// this package's last one zeroes it.
+    fn api_call_count(&mut self, fg: Foreground, service_last_reset: i64, now: i64) -> i32 {
+        let was_foreground = fg
+            .top_since
+            .is_some_and(|t| self.last_known_foreground.is_none_or(|k| k < t));
+        if fg.now || was_foreground {
+            self.last_known_foreground = Some(fg.elapsed);
             self.api_calls = 0;
         }
         if self.last_reset > now {
@@ -308,6 +336,7 @@ impl Store {
                     shortcuts,
                     api_calls: s.call_count,
                     last_reset: s.last_reset,
+                    last_known_foreground: None,
                 },
             );
         }
@@ -389,6 +418,8 @@ struct ShortcutService {
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
+    /// the caller uid's state (the activity manager's)
+    uids: UidViews,
     store: Mutex<Store>,
 }
 
@@ -441,9 +472,19 @@ impl ShortcutService {
         Ok(())
     }
 
-    /// isUidForegroundLocked: SYSTEM_UID, or a procState at or below the threshold; no state is read here, so an app caller counts as TOP (module doc).
-    fn foreground(uid: u32) -> bool {
-        Self::is_system(uid) || PROCESS_STATE_TOP <= PROCESS_STATE_BOUND_FOREGROUND_SERVICE
+    /// isUidForegroundLocked for `uid` now.
+    fn is_foreground(&self, uid: u32) -> bool {
+        uid_foreground(Self::is_system(uid), &(self.uids)(uid))
+    }
+
+    /// getApiCallCount's reset inputs for `uid` now (foreground or unlimited, and when the uid last turned TOP).
+    fn foreground(&self, uid: u32) -> Foreground {
+        let view = (self.uids)(uid);
+        Foreground {
+            now: uid_foreground(Self::is_system(uid), &view) || self.unlimited(uid),
+            top_since: view.top_since,
+            elapsed: view.now,
+        }
     }
 
     fn unlimited(&self, uid: u32) -> bool {
@@ -610,7 +651,7 @@ impl ShortcutService {
         op: Operation,
     ) -> binder::Result<bool> {
         let (package, uid) = self.verify_caller(package, user_id)?;
-        let reset = Self::foreground(uid) || self.unlimited(uid);
+        let reset = self.foreground(uid);
         let mut list = Self::list_of(list)?;
         list.iter()
             .try_for_each(|si| Self::verify_shortcut_package(&package, uid, si))?;
@@ -669,8 +710,12 @@ impl ShortcutService {
     }
 
     /// tryApiCall (ShortcutPackage :744-752).
-    /// `reset`: the caller is foreground or holds UNLIMITED_SHORTCUTS_API_CALLS.
-    fn try_api_call(ps: &mut PackageShortcuts, reset: bool, service_reset: i64, now: i64) -> bool {
+    fn try_api_call(
+        ps: &mut PackageShortcuts,
+        reset: Foreground,
+        service_reset: i64,
+        now: i64,
+    ) -> bool {
         if ps.api_call_count(reset, service_reset, now) >= MAX_UPDATES_PER_INTERVAL {
             return false;
         }
@@ -808,7 +853,7 @@ impl IShortcutService for ShortcutService {
         user_id: i32,
     ) -> binder::Result<bool> {
         let (package, uid) = self.verify_caller(package, user_id)?;
-        let reset = Self::foreground(uid) || self.unlimited(uid);
+        let reset = self.foreground(uid);
         let list = Self::list_of(list)?;
         list.iter()
             .try_for_each(|si| Self::verify_shortcut_package(&package, uid, si))?;
@@ -1030,7 +1075,7 @@ impl IShortcutService for ShortcutService {
 
     fn r#getRemainingCallCount(&self, package: Option<&str>, user_id: i32) -> binder::Result<i32> {
         let (package, uid) = self.verify_caller(package, user_id)?;
-        let reset = Self::foreground(uid) || self.unlimited(uid);
+        let reset = self.foreground(uid);
         let now = now_ms();
         let mut store = self.store();
         let service_reset = store.update_times(now);
@@ -1103,6 +1148,12 @@ impl IShortcutService for ShortcutService {
         }
         let (package, uid) = self.verify_caller(package, user_id)?;
         Self::verify_shortcut_package(&package, uid, si)?;
+        if !self.is_foreground(uid) {
+            atl_diag::refused(SHORTCUT, "requestPinShortcut from a background uid");
+            return Err(illegal_state(
+                "Calling application must have a foreground activity or a foreground service",
+            ));
+        }
         atl_diag::answered(SHORTCUT, "requestPinShortcut (no launcher: false)");
         Ok(false)
     }
@@ -1130,6 +1181,7 @@ pub fn new_binder(
     packages: Arc<Packages>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
+    uids: UidViews,
     state_dir: Option<PathBuf>,
 ) -> SpIBinder {
     let store = Store::load(state_dir, |p| packages.by_name(p).is_some());
@@ -1147,6 +1199,7 @@ pub fn new_binder(
             packages,
             permissions,
             tasks,
+            uids,
             store: Mutex::new(store),
         },
         BinderFeatures::default(),
@@ -1157,6 +1210,7 @@ pub fn new_binder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uid_state::ProcessState;
 
     fn entry(id: &str, rank: i32, implicit: i32) -> Entry {
         let info = ShortcutInfo {
@@ -1226,8 +1280,57 @@ mod tests {
             last_reset: 100,
             ..Default::default()
         };
-        assert_eq!(ps.api_call_count(false, 100, 200), 9);
-        assert_eq!(ps.api_call_count(true, 100, 200), 0);
+        assert_eq!(ps.api_call_count(fg(false, None, 50), 100, 200), 9);
+        assert_eq!(ps.api_call_count(fg(true, None, 50), 100, 200), 0);
+    }
+
+    fn fg(now: bool, top_since: Option<u64>, elapsed: u64) -> Foreground {
+        Foreground {
+            now,
+            top_since,
+            elapsed,
+        }
+    }
+
+    fn view(state: Option<ProcessState>) -> UidView {
+        UidView {
+            state,
+            top_since: None,
+            restricted_since: None,
+            now: 0,
+        }
+    }
+
+    /// isUidForegroundLocked per state: threshold BOUND_FOREGROUND_SERVICE (3) -> only TOP (2) of the derived states; FGS (4) and below are background; no process = background; SYSTEM_UID always.
+    #[test]
+    fn foreground_by_uid_state() {
+        assert!(uid_foreground(false, &view(Some(ProcessState::Top))));
+        for s in [
+            ProcessState::ForegroundService,
+            ProcessState::Service,
+            ProcessState::Receiver,
+            ProcessState::CachedEmpty,
+        ] {
+            assert!(!uid_foreground(false, &view(Some(s))), "{s:?}");
+        }
+        assert!(!uid_foreground(false, &view(None)));
+        assert!(uid_foreground(true, &view(None)));
+    }
+
+    /// getApiCallCount's "was foreground since": a background call resets once after the uid turned TOP (top_since 300 > last known None), then counts; a later TOP turn resets again.
+    #[test]
+    fn rate_limit_resets_once_after_turning_top() {
+        let mut ps = PackageShortcuts {
+            api_calls: 10,
+            last_reset: 100,
+            ..Default::default()
+        };
+        assert_eq!(ps.api_call_count(fg(false, None, 400), 100, 200), 10);
+        assert_eq!(ps.api_call_count(fg(false, Some(300), 400), 100, 200), 0);
+        assert_eq!(ps.last_known_foreground, Some(400));
+        ps.api_calls = 10;
+        assert_eq!(ps.api_call_count(fg(false, Some(300), 500), 100, 200), 10);
+        assert_eq!(ps.api_call_count(fg(false, Some(450), 500), 100, 200), 0);
     }
 
     #[test]

@@ -10,8 +10,6 @@ use atl_services_types::permission;
 
 use crate::uid_state::ProcessState;
 
-/// ActivityManager.PROCESS_STATE_TOP. shortcut.rs asks whether a caller is foreground by it (its state is not read there).
-pub const PROCESS_STATE_TOP: i32 = 2;
 /// RunningAppProcessInfo.IMPORTANCE_FOREGROUND (ActivityManager.java:3820) = procStateToImportance below FOREGROUND_SERVICE (:3962-3966).
 pub const IMPORTANCE_FOREGROUND: i32 = 100;
 /// IMPORTANCE_FOREGROUND_SERVICE (ActivityManager.java:3828): procStateToImportance for FOREGROUND_SERVICE (4) below IMPORTANT_FOREGROUND (6) (:3962-3963).

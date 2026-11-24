@@ -76,7 +76,7 @@ use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
 use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
 use crate::ui_agents::{AppProcess, UiAgents};
-use crate::uid_state::{self, ProcessState, Settle};
+use crate::uid_state::{self, ProcessState, Settle, UidView};
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
@@ -1092,6 +1092,23 @@ impl ActivityManager {
             .collect()
     }
 
+    /// AMInternal.getUidProcessState and the uid observer history, for the shortcut and appops services (uid_state::UidView): the best state of `uid`'s attached processes, read at one instant.
+    pub fn uid_view(&self, uid: u32) -> UidView {
+        let st = self.inner.state();
+        let state = st
+            .processes
+            .iter()
+            .filter(|r| r.uid == uid && r.attached.is_some())
+            .map(|r| uid_state::process_state(&self.inner.holdings_locked(&st, r)))
+            .min();
+        UidView {
+            state,
+            top_since: st.uids.top_since(uid),
+            restricted_since: st.uids.restricted_since(uid),
+            now: self.inner.now_ms(),
+        }
+    }
+
     /// The display changed (registry SET_DISPLAY): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
     /// (each WindowProcessController's onConfigurationChanged -> dispatchConfiguration): the new global one, or its Task's on the new display ([`process_configuration`]). Needed: a Task's
     /// override leaves density to the global configuration (task_override), so without it an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
@@ -1654,7 +1671,7 @@ impl Inner {
         let now = self.now_ms();
         if let Some(task) = task {
             st.open_tasks.insert(task, p.uid);
-            st.uids.on_task_added(p.uid);
+            st.uids.on_task_added(p.uid, now);
         }
         let settle = st.uids.on_process_started(p.uid, now);
         st.processes.push(ProcessRecord {
