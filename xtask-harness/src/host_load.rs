@@ -4,6 +4,7 @@
 //! The case starts a worker (`host-load-child`, in its scope) and waits `host-load-event` for the worker's event line: bound [`BOUND`], need [`NEED`].
 //! Burners are `host-load-child --role burn` loops pinned to the same CPU, each in its own sibling scope (`systemd-run --user --scope -p CPUWeight=`): at [`STARVE_WEIGHT`] against the
 //! case scope's default 100 the worker gets about 1 % of the CPU, so its 50 ms of work takes about 5 s; at the default weight ("under load") it gets about half.
+//! The burners and the worker run under `setpriv --pdeathsig KILL`: they die with this gate, SIGKILL included. Burners and spinners also stop on their own after [`SPIN_LIMIT`] of wall time.
 //!
 //! Cases and their expected outcomes ([`Case::expect`]): starved -> undecided (exit 4); no event, no load -> FAIL; worker asleep under load -> FAIL (a sleeper adds no stall);
 //! crash under load -> FAIL (a death); wrong value under load -> FAIL; self-inflicted (64 spinners in the case's own scope, no burners) -> FAIL (own CPU, not foreign); late on a quiet host
@@ -14,7 +15,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rustix::time::{ClockId, clock_gettime};
@@ -42,6 +43,10 @@ const EVENT: &str = "host-load: event value=";
 const VALUE: u32 = 42;
 /// The stdout line a red case prints with the typed cause of its judged red (`late`, `exited`, `wrong`); the gate compares it with the case's expected cause.
 const CAUSE_PREFIX: &str = "host-load-cause: ";
+/// The stdout line per burner: its pid (systemd-run execs the burner in its scope, so the pid is the burner's). tests/host_load_orphans.rs reads it.
+const BURNER_PREFIX: &str = "host-load: burner pid ";
+/// The longest a burner or spinner spins of its own accord. The gate ends them (Burners drop; PDEATHSIG when it dies); this bounds a leak when neither runs. A case lasts about 2 s, so 30 s is far past any case.
+const SPIN_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -237,7 +242,7 @@ pub fn child(args: &ChildArgs) -> Result<ExitCode> {
         }
         Role::Spin => {
             for _ in 0..SPINNERS {
-                std::thread::spawn(|| spend(Duration::MAX));
+                std::thread::spawn(|| spin_for(SPIN_LIMIT));
             }
             spend(WORK);
             event(VALUE)
@@ -248,7 +253,7 @@ pub fn child(args: &ChildArgs) -> Result<ExitCode> {
             std::thread::sleep(Duration::from_secs(3600));
         },
         Role::Burn => {
-            spend(Duration::MAX);
+            spin_for(SPIN_LIMIT);
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -262,6 +267,14 @@ fn spend(cpu: Duration) {
     };
     let start = ran();
     while ran().saturating_sub(start) < cpu {
+        std::hint::spin_loop();
+    }
+}
+
+/// Busy for `limit` of wall time: a spinner's own bound (see [`SPIN_LIMIT`]).
+fn spin_for(limit: Duration) {
+    let until = Instant::now() + limit;
+    while Instant::now() < until {
         std::hint::spin_loop();
     }
 }
@@ -280,10 +293,20 @@ impl Burners {
         let exe = std::env::current_exe().context("the harness's own path")?;
         let mut burners = Self(Vec::new());
         for cpu in cpus {
+            // setpriv: the burner dies with this gate (PDEATHSIG, SIGKILL included); exec keeps the pid, so the burner is the pid the scope reports
             let child = Command::new("systemd-run")
                 .args(["--user", "--scope", "--quiet", "--collect"])
                 .arg(format!("--property=CPUWeight={weight}"))
-                .args(["--", "taskset", "-c", &cpu.to_string()])
+                .args([
+                    "--",
+                    "setpriv",
+                    "--pdeathsig",
+                    "KILL",
+                    "--",
+                    "taskset",
+                    "-c",
+                    &cpu.to_string(),
+                ])
                 .arg(&exe)
                 .args(["host-load-child", "--role", "burn"])
                 .stdout(Stdio::null())
@@ -296,6 +319,9 @@ impl Burners {
             if let Some(status) = b.try_wait()? {
                 anyhow::bail!("a burner ended at once ({status}): no scope with CPUWeight here");
             }
+        }
+        for b in &burners.0 {
+            println!("{BURNER_PREFIX}{}", b.id());
         }
         println!(
             "host-load: {} burner(s) at CPUWeight={weight} on cpu {cpus:?}",
@@ -403,7 +429,10 @@ fn judge(case: Case, cpus: &[u32], log: &Path, brk: Option<Break>) -> Result<Exi
         .map(|weight| Burners::start(cpus, weight, brk))
         .transpose()?;
     let exe = std::env::current_exe().context("the harness's own path")?;
-    let mut worker = Command::new(exe)
+    // setpriv: the worker dies with this gate too (PDEATHSIG), so a killed gate leaves no spinner
+    let mut worker = Command::new("setpriv")
+        .args(["--pdeathsig", "KILL", "--"])
+        .arg(exe)
         .arg("host-load-child")
         .args(["--role", role_name(case.role())])
         .arg("--log")

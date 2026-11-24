@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use atl_host_load::{Sampler, Span, allowed_cpus, cgroup_dir};
 
-/// A busy loop with no syscalls: the shell's `:` builtin.
-const SPIN: &str = "while :; do :; done";
+/// A busy loop with no syscalls: the shell's `:` builtin. `ulimit -t` ends it after 60 s of CPU (the kernel's SIGKILL at the hard limit), so a leaked spinner stops on its own.
+const SPIN: &str = "ulimit -t 60; while :; do :; done";
 /// How long one measurement samples: 40 readings at 50 ms.
 const RUN: Duration = Duration::from_secs(2);
 /// How long a spinner may take to enter its scope before the test fails.
@@ -73,7 +73,7 @@ fn stall_share(cpu: u32, burners: usize) -> f64 {
     stalled_us as f64 / wall_us
 }
 
-/// A spinner pinned to `cpu` in a new scope `atl-host-load-<role>-<pid>-<n>`, and that unit's name.
+/// A spinner pinned to `cpu` in a new scope `atl-host-load-<role>-<pid>-<n>`, and that unit's name. `setpriv --pdeathsig KILL` ends it with the test thread that spawned it, so a failed assertion leaves none.
 fn spawn_scoped(cpu: u32, role: &str) -> (Child, String) {
     let unit = format!(
         "atl-host-load-{role}-{}-{}",
@@ -84,7 +84,19 @@ fn spawn_scoped(cpu: u32, role: &str) -> (Child, String) {
     let child = Command::new("systemd-run")
         .args(["--user", "--scope", "--quiet", "--collect"])
         .arg(format!("--unit={unit}"))
-        .args(["--", "taskset", "-c", cpu.as_str(), "sh", "-c", SPIN])
+        .args([
+            "--",
+            "setpriv",
+            "--pdeathsig",
+            "KILL",
+            "--",
+            "taskset",
+            "-c",
+            cpu.as_str(),
+            "sh",
+            "-c",
+            SPIN,
+        ])
         .stdin(Stdio::null())
         .spawn()
         .expect("systemd-run spawns");
