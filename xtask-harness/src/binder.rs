@@ -38,6 +38,8 @@ const AID_SHELL: u32 = 2000;
 /// AID_APP_START (android_filesystem_config.h): the first application uid; the sweep client runs as one.
 const AID_APP: u32 = 10000;
 /// Longest the sweep client may take: each direction's grid, a bisection of about 20 probes of up to 1 MiB each, and the rows around each limit.
+/// `wait_limited`'s poll: the 10 ms of the loop it replaced.
+const EXIT_LIMITED_POLL: Duration = Duration::from_millis(10);
 const SWEEP_LIMIT: Duration = Duration::from_secs(300);
 /// The name servicemanager registers itself under (cmds/servicemanager/main.cpp `addService("manager", ...)`).
 const MANAGER: &str = "manager";
@@ -229,7 +231,12 @@ pub(crate) fn wait_limited(
     child: &mut Child,
     limit: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
-    let exit = Wait::exit("exit-limited", "the process outlived its limit", limit);
+    let exit = Wait::exit(
+        "exit-limited",
+        "the process outlived its limit",
+        limit,
+        EXIT_LIMITED_POLL,
+    );
     match until_child(&exit, child) {
         Ok(_) => Ok(Some(child.wait()?)),
         Err(Miss::Late { .. }) => {

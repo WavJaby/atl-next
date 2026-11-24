@@ -12,10 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::wayland_proxy::Event as ProxyEvent;
 
-/// How often a log is read while a wait polls it (the app's log is written by another process).
+/// How often a log is read while a wait polls it (the app's log is written by another process): the window waits' interval. A row wait polls at the sleep of the loop it replaced ([`Wait::every`]): H2 moves no poll interval.
 pub(crate) const POLL: Duration = Duration::from_millis(50);
-/// How often an exit-only wait polls its child (`try_wait` is cheap; the 10 ms that binder's `wait_limited` polled before, so `took=` keeps its precision).
-const EXIT_POLL: Duration = Duration::from_millis(10);
 /// The poll of a converted loop wait: the sleep of the loop it replaced on main (broadcast's run loops, app's marker loop, the connectivity steps: 200 ms). H2 moves no poll interval.
 pub(crate) const LOOP_POLL: Duration = Duration::from_millis(200);
 /// The poll of the app's post-marker watch: its sleep on main (app.rs, 100 ms).
@@ -34,19 +32,19 @@ pub(crate) enum Until<'a> {
     },
     Exit,
     /// `held` is the whole judgement: the caller reads each log it needs. Multi-log fences (broadcast's run end, app's marker or app end) are this kind.
-    /// `every` is the poll interval: the sleep of the loop the wait replaced.
     Logs {
         held: &'a dyn Fn() -> bool,
-        every: Duration,
     },
 }
 
 /// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time (None: not measured yet).
+/// `every`: the poll interval of a polled kind (the sleep of the loop the wait replaced); an event wait receives and ignores it.
 pub(crate) struct Wait<'a> {
     pub(crate) name: &'static str,
     pub(crate) why: String,
     pub(crate) bound: Duration,
     pub(crate) need: Option<Duration>,
+    pub(crate) every: Duration,
     pub(crate) until: Until<'a>,
 }
 
@@ -64,6 +62,7 @@ impl<'a> Wait<'a> {
             why: why.into(),
             bound,
             need: None,
+            every: POLL,
             until: Until::Log { file, want },
         }
     }
@@ -81,17 +80,24 @@ impl<'a> Wait<'a> {
             why: why.into(),
             bound,
             need: None,
+            every: POLL,
             until: Until::Event { events, want },
         }
     }
 
-    /// The child's exit within `bound`, for `until_child`: the exit is the answer, its status the caller reads.
-    pub(crate) fn exit(name: &'static str, why: impl Into<String>, bound: Duration) -> Self {
+    /// The child's exit within `bound`, polled every `every`, for `until_child`: the exit is the answer, its status the caller reads.
+    pub(crate) fn exit(
+        name: &'static str,
+        why: impl Into<String>,
+        bound: Duration,
+        every: Duration,
+    ) -> Self {
         Self {
             name,
             why: why.into(),
             bound,
             need: None,
+            every,
             until: Until::Exit,
         }
     }
@@ -109,8 +115,14 @@ impl<'a> Wait<'a> {
             why: why.into(),
             bound,
             need: None,
-            until: Until::Logs { held, every },
+            every,
+            until: Until::Logs { held },
         }
+    }
+
+    /// The same wait polled every `every`.
+    pub(crate) fn every(self, every: Duration) -> Self {
+        Self { every, ..self }
     }
 }
 
@@ -179,10 +191,10 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
             child,
             &|| want(&atl_diag::logfiles::read(file)),
             false,
-            POLL,
+            wait.every,
         ),
-        (Until::Logs { held, every }, child) => polled(deadline, child, *held, false, *every),
-        (Until::Exit, Some(child)) => polled(deadline, Some(child), &|| false, true, EXIT_POLL),
+        (Until::Logs { held }, child) => polled(deadline, child, *held, false, wait.every),
+        (Until::Exit, Some(child)) => polled(deadline, Some(child), &|| false, true, wait.every),
         (Until::Exit, None) => {
             return Err(Miss::Wrong(format!(
                 "{}: an exit wait needs its child (until_child)",
@@ -461,11 +473,11 @@ mod tests {
     #[test]
     fn exit_wait_is_the_childs_exit_or_late_on_the_bound() {
         let mut quick = sh("exit 3");
-        let w = Wait::exit("quick", "never exited", Duration::from_secs(5));
+        let w = Wait::exit("quick", "never exited", Duration::from_secs(5), POLL);
         assert!(until_child(&w, &mut quick).is_ok());
         assert_eq!(quick.wait().expect("status").code(), Some(3));
         let mut slow = sh("sleep 30");
-        let w = Wait::exit("slow", "still running", Duration::from_millis(100));
+        let w = Wait::exit("slow", "still running", Duration::from_millis(100), POLL);
         assert_eq!(
             until_child(&w, &mut slow).unwrap_err(),
             late("slow", "still running")
@@ -476,7 +488,7 @@ mod tests {
 
     #[test]
     fn exit_wait_without_its_child_is_a_wrong_miss_not_a_late_one() {
-        let w = Wait::exit("orphan", "no child", Duration::from_millis(10));
+        let w = Wait::exit("orphan", "no child", Duration::from_millis(10), POLL);
         assert!(matches!(until(&w), Err(Miss::Wrong(_))));
     }
 

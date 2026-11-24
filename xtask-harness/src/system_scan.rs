@@ -15,7 +15,7 @@ use anyhow::Result;
 use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime};
-use crate::wait::{Miss, Wait, judge_checks, stopped_at, until_child};
+use crate::wait::{LOOP_POLL, Miss, Wait, judge_checks, stopped_at, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -99,7 +99,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         LIMIT,
         &log,
         &done_line,
-    );
+    )
+    .every(LOOP_POLL);
     let outcome = until_child(&done, &mut atld);
     let ended = match &outcome {
         Err(Miss::Exited { status, .. }) => Some(status.clone()),

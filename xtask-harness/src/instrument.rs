@@ -24,7 +24,7 @@ use atl_services_types::packages::Library;
 use crate::atld_run::{Package, Run, Runtime, Shell, counter_lines};
 use crate::manifest;
 use crate::verdict::{Failure, Verdict};
-use crate::wait::{Miss, Wait, until_child};
+use crate::wait::{LOOP_POLL, Miss, Wait, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -396,7 +396,12 @@ pub fn am_instrument(rt: &Runtime, run: &Run, limit: Duration, verbose: bool) ->
     let start = Instant::now();
     // the late run is the caller's judgement (`timed_out`), not a probe stop: cts classifies it, this row's checks read its log
     let timed_out = match until_child(
-        &Wait::exit("am-instrument", "the run outlived its limit", limit),
+        &Wait::exit(
+            "am-instrument",
+            "the run outlived its limit",
+            limit,
+            LOOP_POLL,
+        ),
         &mut atld,
     ) {
         Ok(_) => false,

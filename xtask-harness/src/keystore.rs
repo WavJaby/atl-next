@@ -31,6 +31,9 @@ use crate::atld_run::{Package, Run, Runtime, Shell};
 use crate::tree;
 use crate::wait::{Miss, Wait, until_child};
 
+/// The probe and launch waits' poll: the 100 ms of the loops they replaced.
+const POLL: Duration = Duration::from_millis(100);
+
 #[derive(clap::Args)]
 pub struct Args {
     /// The host arch (an arches.toml row with `[host]`): the default --out.
@@ -293,6 +296,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         "keystore-probe-exit",
         format!("atld outlived {LIMIT:?}"),
         LIMIT,
+        POLL,
     );
     match until_child(&exit, &mut child) {
         Ok(_) => {}
@@ -416,7 +420,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             LIMIT,
             &log,
             &done_line,
-        );
+        )
+        .every(POLL);
         let outcome = until_child(&done, &mut child);
         let end = run.stop(&mut child)?;
         let ended = rt.check_end(end, &run);
