@@ -12,7 +12,7 @@ import android.util.Log;
 
 /**
  * Main.foregroundStarts' dataSync foreground service (app.rs FGS row `fgs`), in its own process `:fgs`: its log is `log/<pkg>:fgs.log`, which the gate reads.
- * Calls startForeground with the type its manifest declares (dataSync) and logs the result; the gate then kills the process, and the foreground state must end with it.
+ * Calls startForeground with the type its manifest declares (dataSync) and logs the result; the gate kills the process once the services have the start's result, and the foreground state must end with it.
  * START_NOT_STICKY: the death drops the record (ActiveServices.killServicesLocked, canStopIfKilled), so the foreground state ends there, not in a restart.
  */
 public class AtlFgs extends Service {

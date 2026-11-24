@@ -161,7 +161,7 @@ pub struct Foreground {
     pub ty: i32,
 }
 
-/// setServiceForegroundInnerLocked with an id: `first` starts the uid's FGS reason (the record was not foreground); `cancel` is the notification
+/// setServiceForegroundInnerLocked with an id: `first` starts the uid's FGS reason (the record was not foreground, and a process hosts it); `cancel` is the notification
 /// the record owned under another id, to cancel now (cancelForegroundNotificationLocked, not shared).
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetForeground {
@@ -169,7 +169,7 @@ pub struct SetForeground {
     pub cancel: Option<i32>,
 }
 
-/// A foreground state that ended with its record: the uid's FGS reason ends when `was_foreground`; `cancel_notice` is the notification to cancel.
+/// A foreground state that ended: the uid's FGS reason ends when `was_foreground` (foreground in a live process: a record waiting for its restart holds no reason); `cancel_notice` is the notification to cancel.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForegroundEnd {
     pub component: (String, String),
@@ -178,11 +178,14 @@ pub struct ForegroundEnd {
     pub cancel_notice: Option<i32>,
 }
 
-/// What the rules want the activity service to do after a change: the fgRequired timers to arm (by component, now + the start timeout), the ended foreground states.
+/// What the rules want the activity service to do after a change: the fgRequired timers to arm (by component, now + the start timeout), the ended foreground states,
+/// and the uids (one entry per record) whose FGS reason drops with the process of a record kept for its restart (`paused`) or returns with its new process (`resumed`).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Foregrounds {
     pub arms: Vec<(String, String)>,
     pub ends: Vec<ForegroundEnd>,
+    pub paused: Vec<u32>,
+    pub resumed: Vec<u32>,
 }
 
 /// ServiceRecord, reduced.
@@ -219,7 +222,8 @@ struct Record<K: Kinds> {
     fg_required: bool,
     /// fgWaiting: the startForeground timeout is armed and has not fired (AS :7735, :7610-7627)
     fg_waiting: bool,
-    /// isForeground with foregroundId and foregroundServiceType
+    /// isForeground with foregroundId and foregroundServiceType. It survives a death with a restart (killServicesLocked :7202 leaves it); the uid's FGS reason does not:
+    /// that holds while `foreground` and `app` both do (updateServiceForegroundLocked :3547 counts a process's running services only).
     foreground: Option<Foreground>,
     /// the fgRequired timer is due: set by the delivery that armed it, read once by take_foreground
     fg_arm: bool,
@@ -428,6 +432,9 @@ pub struct Services<K: Kinds> {
     restarting: Vec<(String, String)>,
     /// foreground states ended by a bring-down or a death, until take_foreground
     fg_ends: Vec<ForegroundEnd>,
+    /// uids of foreground records whose process died with a restart scheduled, and of those brought up again, until take_foreground
+    fg_paused: Vec<u32>,
+    fg_resumed: Vec<u32>,
 }
 
 impl<K: Kinds> Default for Services<K> {
@@ -437,6 +444,8 @@ impl<K: Kinds> Default for Services<K> {
             bind_seq: 0,
             restarting: Vec::new(),
             fg_ends: Vec::new(),
+            fg_paused: Vec::new(),
+            fg_resumed: Vec::new(),
         }
     }
 }
@@ -508,6 +517,9 @@ impl<K: Kinds> Services<K> {
         match host {
             Some((pid, thread)) => {
                 Self::real_start(seq, r, pid, thread, now, out);
+                if r.foreground.is_some() {
+                    self.fg_resumed.push(r.uid);
+                }
                 Host::Ready
             }
             None => {
@@ -666,6 +678,9 @@ impl<K: Kinds> Services<K> {
             let r = &mut self.records[ri];
             self.restarting.retain(|k| k != &r.component);
             Self::real_start(seq, r, pid, thread.clone(), now, out);
+            if r.foreground.is_some() {
+                self.fg_resumed.push(r.uid);
+            }
         }
         for &ri in waiting.iter().rev() {
             if !self.records[ri].needed() {
@@ -873,7 +888,7 @@ impl<K: Kinds> Services<K> {
     /// bringDownServiceLocked: the remaining connections hear the service is gone (connected(name, null, true)), bound bindings are unbound, a running service is stopped (scheduleStopService). A restart pending for it is cancelled (unscheduleServiceRestartLocked, force).
     fn bring_down(&mut self, mut r: Record<K>, out: &mut Vec<Call<K>>) {
         self.restarting.retain(|k| k != &r.component);
-        self.queue_end(&r);
+        self.queue_end(&r, r.app.is_some());
         for b in &r.bindings {
             for c in &b.conns {
                 out.push(Call::Connected {
@@ -979,8 +994,8 @@ impl<K: Kinds> Services<K> {
     }
 
     /// The foreground state a record takes down with it (bringDownServiceLocked :6427-6431): queued for take_foreground when it is foreground or still owns a notification.
-    /// Called with the record already out of `records`, so the sharing test sees the others only.
-    fn queue_end(&mut self, r: &Record<K>) {
+    /// Called with the record already out of `records`, so the sharing test sees the others only. `hosted`: its process ran until now.
+    fn queue_end(&mut self, r: &Record<K>, hosted: bool) {
         if r.foreground.is_none() && r.notice.is_none() {
             return;
         }
@@ -988,7 +1003,7 @@ impl<K: Kinds> Services<K> {
         self.fg_ends.push(ForegroundEnd {
             component: r.component.clone(),
             uid: r.uid,
-            was_foreground: r.foreground.is_some(),
+            was_foreground: hosted && r.foreground.is_some(),
             cancel_notice,
         });
     }
@@ -1015,7 +1030,7 @@ impl<K: Kinds> Services<K> {
         r.fg_required = false;
         r.fg_waiting = false;
         r.notice = Some(fg.id);
-        let first = r.foreground.replace(fg).is_none();
+        let first = r.foreground.replace(fg).is_none() && r.app.is_some();
         Some(SetForeground { first, cancel })
     }
 
@@ -1036,6 +1051,7 @@ impl<K: Kinds> Services<K> {
         };
         let r = &mut self.records[ri];
         let uid = r.uid;
+        let was_foreground = r.app.is_some();
         r.foreground = None;
         if remove || detach {
             r.notice = None;
@@ -1043,7 +1059,7 @@ impl<K: Kinds> Services<K> {
         self.fg_ends.push(ForegroundEnd {
             component,
             uid,
-            was_foreground: true,
+            was_foreground,
             cancel_notice,
         });
         true
@@ -1077,6 +1093,8 @@ impl<K: Kinds> Services<K> {
         Foregrounds {
             arms,
             ends: std::mem::take(&mut self.fg_ends),
+            paused: std::mem::take(&mut self.fg_paused),
+            resumed: std::mem::take(&mut self.fg_resumed),
         }
     }
 
@@ -1188,6 +1206,9 @@ impl<K: Kinds> Services<K> {
             }
             if allow_restart && self.records[i].needed() && self.schedule_restart(i, now) {
                 let r = &self.records[i];
+                if r.foreground.is_some() {
+                    self.fg_paused.push(r.uid);
+                }
                 restarts.push(Restart {
                     component: r.component.clone(),
                     at: r.next_restart_time,
@@ -1196,7 +1217,7 @@ impl<K: Kinds> Services<K> {
             } else {
                 let r = self.records.remove(i);
                 self.restarting.retain(|k| k != &r.component);
-                self.queue_end(&r);
+                self.queue_end(&r, true);
             }
         }
         restarts
@@ -1904,7 +1925,7 @@ mod tests {
     }
 
     /// The trap of S7: a foreground record dropped by a stop or a death without restart queues its end (uid FGS reason, notification) for the caller; a restart keeps the
-    /// foreground state (AS killServicesLocked has no foreground branch: the notification stays while the restart is pending).
+    /// foreground state and notification (AS killServicesLocked has no foreground branch), but the uid's FGS reason goes with the process and returns at realStartServiceLocked :6060.
     #[test]
     fn a_dropped_foreground_record_queues_its_end() {
         let mut s = Services::<T>::default();
@@ -1913,11 +1934,21 @@ mod tests {
         s.set_foreground(&9, Foreground { id: 1, ty: 1 });
         let restarts = s.process_died(60, true, 1_000, &mut out);
         assert_eq!(restarts.len(), 1);
-        assert!(
-            s.take_foreground().ends.is_empty(),
-            "a restart keeps the foreground state"
-        );
+        let fx = s.take_foreground();
+        assert!(fx.ends.is_empty(), "a restart keeps the foreground state");
+        assert_eq!((fx.paused, fx.resumed), (vec![10_001], vec![]));
+        assert_eq!(s.foreground_type(&9), 1);
         s.restart(&component("S"), Some((61, "t2")), 2_000, &mut out);
+        let fx = s.take_foreground();
+        assert_eq!((fx.paused, fx.resumed), (vec![], vec![10_001]));
+        assert_eq!(
+            s.set_foreground(&9, Foreground { id: 1, ty: 1 }),
+            Some(SetForeground {
+                first: false,
+                cancel: None
+            }),
+            "the restarted service's startForeground does not count the reason again"
+        );
         s.stop_service(&component("S"), &mut out);
         assert_eq!(
             s.take_foreground().ends,
@@ -1938,6 +1969,53 @@ mod tests {
                 uid: 10_001,
                 was_foreground: true,
                 cancel_notice: Some(2),
+            }]
+        );
+    }
+
+    /// A NOT_STICKY foreground service killed before its onStartCommand result arrives is restarted (stopIfKilled is set by serviceDoneExecutingLocked :6737 only);
+    /// killed after the result it ends. Either way the uid's FGS reason drops at the death.
+    #[test]
+    fn a_not_sticky_foreground_kill_restarts_only_before_the_start_result() {
+        let killed = |done: bool| {
+            let mut s = Services::<T>::default();
+            let mut out = Vec::new();
+            s.start(start_req("S", "a"), Some((60, "t")), || 9, 0, &mut out);
+            s.set_foreground(&9, Foreground { id: 1, ty: 1 });
+            if done {
+                assert_eq!(s.done_executing_start(&9, 1, START_NOT_STICKY), Ok(()));
+            }
+            let restarts = s.process_died(60, true, 100, &mut out).len();
+            (restarts, s.take_foreground())
+        };
+        let (restarts, fx) = killed(false);
+        assert_eq!((restarts, fx.ends.len(), fx.paused), (1, 0, vec![10_001]));
+        let (restarts, fx) = killed(true);
+        assert_eq!((restarts, fx.paused), (0, vec![]));
+        assert!(fx.ends[0].was_foreground);
+    }
+
+    /// A restart that comes up by a process attach returns the reason too; a stop while the restart is pending cancels the notification and drops no second reason.
+    #[test]
+    fn a_pending_restart_holds_no_fgs_reason() {
+        let mut s = Services::<T>::default();
+        let mut out = Vec::new();
+        s.start(start_req("S", "a"), Some((60, "t")), || 9, 0, &mut out);
+        s.set_foreground(&9, Foreground { id: 1, ty: 1 });
+        s.process_died(60, true, 100, &mut out);
+        assert_eq!(s.take_foreground().paused, [10_001]);
+        s.attach(61, "p", 10_001, &"t", 200, &mut out);
+        assert_eq!(s.take_foreground().resumed, [10_001]);
+        s.process_died(61, true, 300, &mut out);
+        assert_eq!(s.take_foreground().paused, [10_001]);
+        s.stop_service(&component("S"), &mut out);
+        assert_eq!(
+            s.take_foreground().ends,
+            [ForegroundEnd {
+                component: component("S"),
+                uid: 10_001,
+                was_foreground: false,
+                cancel_notice: Some(1),
             }]
         );
     }

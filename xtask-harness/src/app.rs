@@ -2657,11 +2657,19 @@ const STICKY_SLACK_MS: u64 = 1_000;
 /// A restart starts only from a decision (active_services.rs services_died: `restart of <pkg>/<class> scheduled`), so none logged before this line means none.
 /// No time bound: the former 11 s window (1 s + 10 s) ended before the sticky rule's bound (12 s at x1, 22 s at x2), so a restart started in between passed.
 const NOT_STICKY_CLASS: &str = "AtlNotSticky";
+const STICKY_CLASS: &str = "AtlSticky";
 const RESTART_DECIDED: &str = "restart of ";
 
-/// The services log's death line of the not-sticky process: the fence's end.
-fn not_sticky_died_line(package: &str) -> String {
-    format!("process {package}{NOT_STICKY_PROC} (pid ")
+/// The services log's death line of `package`'s process `proc`, logged after what the death decided.
+fn died_line(package: &str, proc: &str) -> String {
+    format!("process {package}{proc} (pid ")
+}
+
+/// Whether the services have applied the result of `class`'s first start (active_services.rs service_done_executing_locked): the fence before a kill.
+/// The app's own line is logged inside onStartCommand and serviceDoneExecuting is oneway: a kill before it arrives restarts even a START_NOT_STICKY service, its start redelivered
+/// (ActiveServices.java:6737 sets stopIfKilled, scheduleServiceRestartLocked :5306-5317 puts an unfinished start back).
+fn first_start_done(services: &str, package: &str, class: &str) -> bool {
+    services.contains(&format!("start 1 of {package}/{package}.{class} done: "))
 }
 
 /// The STICKY case's state: [`StickyCase::poll`] in the watch after the marker, [`StickyCase::verdict`] in the judge.
@@ -2690,12 +2698,19 @@ impl StickyCase {
         self.killed.is_some() && self.restart_ms.is_some() && self.not_sticky_died
     }
 
-    /// One watch step: once both first starts are logged, kills both processes; then looks for the sticky restart line and the not-sticky death (the fence).
+    /// One watch step: once both first starts are logged and their results applied ([`first_start_done`]), kills both processes; then looks for the sticky restart line and the not-sticky death (the fence).
     fn poll(&mut self, run: &Run, package: &str) {
         let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
         if self.killed.is_none() {
             let sticky = log(STICKY_PROC);
             if !(sticky.contains(STICKY_FIRST) && log(NOT_STICKY_PROC).contains(NOT_STICKY_FIRST)) {
+                return;
+            }
+            let services = atl_diag::logfiles::read(&run.log("services"));
+            if ![STICKY_CLASS, NOT_STICKY_CLASS]
+                .iter()
+                .all(|class| first_start_done(&services, package, class))
+            {
                 return;
             }
             // the importance line precedes STICKY_FIRST in AtlSticky's onStartCommand: once that line is in the log, so is this one
@@ -2725,7 +2740,7 @@ impl StickyCase {
         }
         if !self.not_sticky_died {
             let services = atl_diag::logfiles::read(&run.log("services"));
-            self.not_sticky_died = services.contains(&not_sticky_died_line(package));
+            self.not_sticky_died = services.contains(&died_line(package, NOT_STICKY_PROC));
         }
     }
 
@@ -2793,7 +2808,7 @@ fn result_stall(atld: &str) -> Result<Duration, String> {
 
 /// The not-sticky fence on the services log: a restart decided for AtlNotSticky before its process's death line is one it must not have. No death line: not judged.
 fn not_sticky_fence(services: &str, package: &str) -> Result<(), String> {
-    let died = not_sticky_died_line(package);
+    let died = died_line(package, NOT_STICKY_PROC);
     let end = services
         .find(&died)
         .ok_or_else(|| format!("notsticky: no `{died}` line in the services log"))?;
@@ -3129,6 +3144,7 @@ mod sticky_case_tests {
 /// so its log is `log/<pkg><proc>.log`.
 const FGS_PROC: &str = ":fgs";
 const FGS_TIMEOUT_PROC: &str = ":fgstimeout";
+const FGS_CLASS: &str = "AtlFgs";
 /// AtlFgs's startForeground returned (logged after the call).
 const FGS_STARTED: &str = "AtlTest: fgs: startForeground ok";
 /// AtlFgsSilent's onStartCommand (the delivered start arms the timer, ActiveServices :6199-6204) and onDestroy (the timeout's stop, ActiveServices :7628).
@@ -3147,12 +3163,14 @@ const FGS_SLACK_MS: u64 = 1_000;
 /// Sampled this long after the stop, well before the ANR: alive here shows the ANR, not something earlier, is what ends the process.
 const FGS_ALIVE_AFTER_STOP_MS: u64 = 5_000;
 
-/// The FGS rows' state: [`ForegroundCase::poll`] in the watch after the marker, [`ForegroundCase::verdicts`] in the judge. `fgs`: the gate kills `:fgs` once its startForeground is logged,
+/// The FGS rows' state: [`ForegroundCase::poll`] in the watch after the marker, [`ForegroundCase::verdicts`] in the judge. `fgs`: the gate kills `:fgs` once its startForeground is logged and its start's result applied,
 /// and the foreground state must end with the process. `fgstimeout`: AtlFgsSilent is left alone; it is stopped 30 s after its start and the headless process ends 10 s after that.
 #[derive(Default)]
 struct ForegroundCase {
-    /// the `:fgs` kill: wall ms when it was sent
-    fgs_killed: Option<u64>,
+    /// the `:fgs` kill was sent
+    fgs_killed: bool,
+    /// `:fgs`'s death line is in the services log (the fence): its counter is written before that line
+    fgs_died: bool,
     /// the first kill that failed (no pid, or the signal), as the reason
     kill_failed: Option<String>,
     /// `:fgstimeout`: onStartCommand's stamp, its host pid (atld's newest `started` line), onDestroy's stamp (wall ms)
@@ -3165,10 +3183,11 @@ struct ForegroundCase {
 }
 
 impl ForegroundCase {
-    /// Progress steps for the watch: the kill, each stamp, each sample.
+    /// Progress steps for the watch: the kill, the death, each stamp, each sample.
     fn steps(&self) -> usize {
         [
-            self.fgs_killed.is_some(),
+            self.fgs_killed,
+            self.fgs_died,
             self.timeout_start.is_some(),
             self.timeout_stop.is_some(),
             self.alive_after_stop.is_some(),
@@ -3197,19 +3216,24 @@ impl ForegroundCase {
         self.timeout_start.is_some() && !self.timeout_done(now)
     }
 
-    /// Whether both rows have run their course at `now`: the `fgs` kill has settled (its counter is written at the death), and `fgstimeout` is done.
+    /// Whether both rows have run their course at `now`: the `:fgs` death is logged, and `fgstimeout` is done.
     fn finished(&self, now: u64) -> bool {
-        self.fgs_killed.is_some_and(|at| now >= at + FGS_SLACK_MS) && self.timeout_done(now)
+        self.fgs_died && self.timeout_done(now)
     }
 
-    /// One watch step: kills `:fgs` once its startForeground is logged; records `:fgstimeout`'s stamps, then the process's state at the two marks (`now`: wall ms).
+    /// One watch step: kills `:fgs` once its startForeground is logged and its start's result applied ([`first_start_done`]), then looks for its death; records `:fgstimeout`'s stamps, then the process's state at the two marks (`now`: wall ms).
     fn poll(&mut self, run: &Run, package: &str, now: u64) {
         let log = |proc: &str| atl_diag::logfiles::read(&run.log(&format!("{package}{proc}")));
         let pid_of = |proc: &str| {
             last_started_pid(&atl_diag::logfiles::read(&run.atld_log()), package, proc)
         };
-        if self.fgs_killed.is_none() && log(FGS_PROC).contains(FGS_STARTED) {
-            self.fgs_killed = Some(now);
+        let services = || atl_diag::logfiles::read(&run.log("services"));
+        if self.fgs_killed {
+            self.fgs_died = self.fgs_died || services().contains(&died_line(package, FGS_PROC));
+        } else if log(FGS_PROC).contains(FGS_STARTED)
+            && first_start_done(&services(), package, FGS_CLASS)
+        {
+            self.fgs_killed = true;
             let end = pid_of(FGS_PROC)
                 .ok_or_else(|| format!("no `started` line for {package}{FGS_PROC} in atld's log"))
                 .and_then(|pid| {
@@ -3255,9 +3279,14 @@ impl ForegroundCase {
         if let Some(e) = &self.kill_failed {
             return Err(format!("fgs: {e}"));
         }
-        if self.fgs_killed.is_none() {
+        if !self.fgs_killed {
             return Err(format!(
-                "fgs: no {FGS_STARTED:?} line in log/<pkg>{FGS_PROC}.log (AtlFgs)"
+                "fgs: not killed: no {FGS_STARTED:?} line in log/<pkg>{FGS_PROC}.log, or no `start 1 of <pkg>/<pkg>.{FGS_CLASS} done` line in the services log"
+            ));
+        }
+        if !self.fgs_died {
+            return Err(format!(
+                "fgs: no death line `process <pkg>{FGS_PROC} (pid ` in the services log after the kill"
             ));
         }
         let ended = answered_count(services, FGS_ENDED);
@@ -3346,10 +3375,11 @@ mod foreground_case_tests {
         )
     }
 
-    /// The case as the rows log it: `:fgs` killed at 5 000 ms; `:fgstimeout` started at 10 000 ms, stopped 30 s later (AMC :318), alive 5 s after that and gone at the ANR's end.
+    /// The case as the rows log it: `:fgs` killed and its death logged; `:fgstimeout` started at 10 000 ms, stopped 30 s later (AMC :318), alive 5 s after that and gone at the ANR's end.
     fn passing() -> ForegroundCase {
         ForegroundCase {
-            fgs_killed: Some(5_000),
+            fgs_killed: true,
+            fgs_died: true,
             kill_failed: None,
             timeout_start: Some(10_000),
             timeout_pid: Some(77),
@@ -3419,6 +3449,37 @@ mod foreground_case_tests {
                 .contains("foreground state ended")
         );
         assert!(passing().fgs_verdict(&services(1, 0)).is_ok());
+    }
+
+    /// A kill waits for its own service's first start result: a longer class name's and a later start's are not it.
+    #[test]
+    fn the_kill_waits_for_the_first_start_result() {
+        let done = |start: &str| {
+            let log = format!("services: start {start} done: result 2\n");
+            first_start_done(&log, "com.example.atltest", FGS_CLASS)
+        };
+        assert!(!done(
+            "1 of com.example.atltest/com.example.atltest.AtlFgsSilent"
+        ));
+        assert!(!done("2 of com.example.atltest/com.example.atltest.AtlFgs"));
+        assert!(done("1 of com.example.atltest/com.example.atltest.AtlFgs"));
+    }
+
+    /// The `fgs` row finishes at its fence, the death line, not at a wall time; without it the row fails by that name.
+    #[test]
+    fn the_fgs_row_waits_for_the_death() {
+        let not_yet = ForegroundCase {
+            fgs_died: false,
+            ..passing()
+        };
+        assert!(!not_yet.finished(u64::MAX));
+        assert!(
+            not_yet
+                .fgs_verdict(&services(1, 1))
+                .unwrap_err()
+                .contains("death line")
+        );
+        assert!(passing().finished(u64::MAX));
     }
 
     /// The timer runs from the start to the window's end (30 s + 1 s, the ANR's 10 s, two 1 s slacks = 43 s), and the watch waits it out.

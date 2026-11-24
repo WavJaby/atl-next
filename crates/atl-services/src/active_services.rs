@@ -666,7 +666,14 @@ impl Inner {
             .map_err(|e| {
                 atl_diag::refused(AM, "serviceDoneExecuting: unknown start result");
                 super::illegal_argument(&format!("Unknown service start result: {}", e.0))
-            })
+            })?;
+        // the harness's kills wait for this line: a process killed before its result is applied is restarted, whatever onStartCommand returned (stopIfKilled)
+        if let Some((package, class)) = st.services.component_of(token) {
+            log(format_args!(
+                "start {start_id} of {package}/{class} done: result {res}"
+            ));
+        }
+        Ok(())
     }
 
     /// unbindServiceLocked under the state lock.
@@ -838,6 +845,7 @@ impl Inner {
 
     /// The foreground changes the rules made under the lock. The fgRequired timers are armed for SERVICE_START_FOREGROUND_TIMEOUT_MS from now (AS :7731-7737, at the delivery).
     /// An ended foreground state drops its uid's FGS reason (uid_state; the settle sweep arms if the uid is now idle) and cancels its notification.
+    /// A foreground service waiting for its restart holds no FGS reason: it drops with the process and returns with the new one (realStartServiceLocked :6060).
     fn foreground_effects_locked(&self, st: &mut State) {
         let fx = st.services.take_foreground();
         let now = self.now_ms();
@@ -846,6 +854,18 @@ impl Inner {
                 Timer::FgsStart(component),
                 now + SERVICE_START_FOREGROUND_TIMEOUT_MS,
             );
+        }
+        for uid in fx.paused {
+            atl_diag::answered(
+                AM,
+                "foreground service's process died: uid FGS reason waits for its restart",
+            );
+            let at = st.uids.on_fgs_stopped(uid, now);
+            self.arm_settle(uid, at);
+        }
+        for uid in fx.resumed {
+            atl_diag::answered(AM, "foreground service restarted: uid FGS reason returns");
+            st.uids.on_fgs_started(uid);
         }
         for end in fx.ends {
             if end.was_foreground {
