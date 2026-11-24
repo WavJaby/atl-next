@@ -1,2 +1,4 @@
+# SPDX-License-Identifier: MIT
+# verbatim product lines copied from runs; read by starvation.rs table_texts_match_lines_the_product_printed (comment lines skipped)
 services: remove task 1: no destroy within 1s at=1795510078.459
 services: process com.example.atltest (pid 17699) failed to attach: start timeout
