@@ -295,7 +295,7 @@ pub enum Verdict {
     Refuse(String),
     /// The class can never fit this store: pool tier.
     NeverFits(String),
-    /// Fits only without land's hold ([`Hold`]): a standing reservation, so waiting is pointless.
+    /// Fits only without land's hold ([`Hold`], counted while land is queued or running): refused at once, never waited for.
     Held(String),
 }
 
@@ -332,12 +332,19 @@ impl Need {
     }
 }
 
-/// Land first (plan ram-delta S3): room for land's next native build that every other admission leaves free. Zero for land itself, while land's own reservation is live (it stands in), and when land's native class never fits the store (land is pool then).
+/// Land's state as an admission sees it. `active`: land's queue holds `out/land.lock` (land-seq.sh takes it for the whole queue), so a land runs or waits behind one. `reserved`: land's own build reservation is live; it is in the others' bytes already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct LandState {
+    pub active: bool,
+    pub reserved: bool,
+}
+
+/// Room for land's next native build that every other admission leaves free: the land hold. Counted only while land is active and holds no reservation (a reservation counts once, in the others' bytes); zero for land itself, and when native never fits the store.
 pub type Hold = Need;
 
-/// The hold an admission by `id` counts on `s`; `land_live` = a live reservation of land exists.
-pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land_live: bool) -> Hold {
-    if id == out::LAND_ID || land_live {
+/// The hold an admission by `id` counts on `s`, given land's state.
+pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land: LandState) -> Hold {
+    if id == out::LAND_ID || !land.active || land.reserved {
         return Hold::default();
     }
     let native = Need::of(Class::Native, cfg, s);
@@ -499,6 +506,30 @@ fn reserved(ws: &Path) -> Result<(u64, bool)> {
     Ok((sum, land))
 }
 
+/// Bytes other builds reserve, and land's state, as an admission sees them now.
+fn land_now(ws: &Path) -> Result<(u64, LandState)> {
+    let (others, land_reserved) = reserved(ws)?;
+    let active = land_active(ws)?;
+    Ok((
+        others,
+        LandState {
+            active,
+            reserved: land_reserved,
+        },
+    ))
+}
+
+/// Whether land's queue is active: land-seq.sh holds `out/land.lock` exclusively from its start to its exit (one land at a time), and a queued land waits behind that holder, so a held lock means a land running or queued. Read by probing the lock (released at once), not from a flag file; no file = no land yet.
+fn land_active(ws: &Path) -> Result<bool> {
+    let p = ws.join("out").join("land.lock");
+    let file = match std::fs::File::open(&p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", p.display())),
+    };
+    Ok(Flock::try_take(file, Mode::Shared)?.is_none())
+}
+
 /// The verdict for `class` by `id` on `stats` against the live reservations and land's hold; the caller holds the admit gate. Counts `delta-land-hold` on a [`Verdict::Held`].
 fn judge_now(
     ws: &Path,
@@ -507,8 +538,8 @@ fn judge_now(
     class: Class,
     stats: &Stats,
 ) -> Result<Verdict> {
-    let (others, land_live) = reserved(ws)?;
-    let hold = hold_for(id, cfg, stats, land_live);
+    let (others, land) = land_now(ws)?;
+    let hold = hold_for(id, cfg, stats, land);
     let v = judge(
         stats,
         Need::of(class, cfg, stats),
@@ -524,8 +555,8 @@ fn judge_now(
 
 /// Land's hold on `stats` as a non-land admission sees it now (`out show`).
 pub fn hold_now(ws: &Path, cfg: &DeltaConfig, stats: &Stats) -> Result<Hold> {
-    let (_, land_live) = reserved(ws)?;
-    Ok(hold_for("", cfg, stats, land_live))
+    let (_, land) = land_now(ws)?;
+    Ok(hold_for("", cfg, stats, land))
 }
 
 fn reserve(ws: &Path, id: &str, need_ram: u64) -> Result<Reservation> {
@@ -1190,7 +1221,7 @@ mod tests {
     /// Land first, hand arithmetic: zram limit 10 GiB, used 3, margin 1 -> RAM free 7 GiB = 7_516_192_768 B; ratio 1.95.
     /// native 9216 MiB = 9_663_676_416 B -> ram ceil(9_663_676_416_000 / 1950) = 4_955_731_496 B (4.62 GiB, plan S3 "land hold 4.62"); check 2_642_949_252 B (admission_arithmetic).
     #[test]
-    fn land_hold_keeps_room_for_land() {
+    fn land_hold_counts_while_land_is_active() {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .expect("cfg")
             .delta;
@@ -1199,13 +1230,17 @@ mod tests {
             raw: 9 * GIB,
             ram: 4_955_731_496,
         };
-        assert_eq!(hold_for("child", &cfg, &s, false), native);
+        let active = LandState {
+            active: true,
+            reserved: false,
+        };
+        assert_eq!(hold_for("child", &cfg, &s, active), native);
         let check = Need::of(Class::Check, &cfg, &s);
         assert_eq!(check.ram, 2_642_949_252);
         // with the hold: 2.46 + 4.62 + 1 = 8.07 GiB > 7 free -> held (a new dir takes the pool)
         assert!(matches!(judge(&s, check, 0, native, GIB), Verdict::Held(_)));
         // land's own admission ignores the hold: 4.62 + 1 = 5.62 <= 7
-        assert_eq!(hold_for(out::LAND_ID, &cfg, &s, false), Hold::default());
+        assert_eq!(hold_for(out::LAND_ID, &cfg, &s, active), Hold::default());
         let land = Need::of(Class::Native, &cfg, &s);
         assert_eq!(
             judge(&s, land, 0, Hold::default(), GIB),
@@ -1225,9 +1260,13 @@ mod tests {
             Verdict::Wait(_)
         ));
         // land's live reservation stands in for the hold; a store native never fits (limit 4 < 4.62 + 1) holds nothing
-        assert_eq!(hold_for("child", &cfg, &s, true), Hold::default());
+        let land_reserved = LandState {
+            active: true,
+            reserved: true,
+        };
+        assert_eq!(hold_for("child", &cfg, &s, land_reserved), Hold::default());
         assert_eq!(
-            hold_for("child", &cfg, &stats(4.0, 0.0, 1950), false),
+            hold_for("child", &cfg, &stats(4.0, 0.0, 1950), active),
             Hold::default()
         );
         // the hold on fs raw: fs free 14, check 4.8 + native 9 = 13.8 fits; with fs free 13 it is held though RAM has room
@@ -1240,11 +1279,162 @@ mod tests {
                 &roomy,
                 check,
                 0,
-                hold_for("child", &cfg, &roomy, false),
+                hold_for("child", &cfg, &roomy, active),
                 GIB
             ),
             Verdict::Held(_)
         ));
+    }
+
+    /// Idle land holds nothing: the hold counts only while land's lock is held. On the store above the check fits without the hold; a land reservation counts once, in the others' bytes.
+    #[test]
+    fn land_hold_is_off_while_land_is_idle() {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .expect("cfg")
+            .delta;
+        let roomy = Stats {
+            fs_free: 13 * GIB,
+            ..stats(64.0, 0.0, 1950)
+        };
+        let check = Need::of(Class::Check, &cfg, &roomy);
+        let idle = LandState::default();
+        assert_eq!(hold_for("child", &cfg, &roomy, idle), Hold::default());
+        assert_eq!(
+            judge(&roomy, check, 0, hold_for("child", &cfg, &roomy, idle), GIB),
+            Verdict::Admit {
+                need_ram: 2_642_949_252
+            }
+        );
+    }
+
+    /// Land's state is the kernel's view of `out/land.lock`: no file or a free lock = idle; a lock held by another process (land-seq.sh's exclusive flock) = active, until that process exits.
+    #[test]
+    fn land_queue_lock_is_read_as_held() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-land-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("out")).unwrap();
+        let lock = ws.join("out").join("land.lock");
+        assert!(!land_active(&ws).unwrap(), "no lock file: no land yet");
+        drop(open_lock(&lock).unwrap());
+        assert!(!land_active(&ws).unwrap(), "a free lock: idle");
+        // land-seq.sh's shape: an fd on the file, flocked exclusive by another process
+        let mut land_seq = sleeper_on(&lock, true);
+        assert!(
+            land_active(&ws).unwrap(),
+            "held by another process: a land runs or queues"
+        );
+        let _ = land_seq.kill();
+        let _ = land_seq.wait();
+        assert!(!land_active(&ws).unwrap(), "released when the holder exits");
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// The hold follows land's lock on one store: a worker's check (room for it, not for land's native build beside it) is Held while land is active and admitted when idle; land's own reservation counts once, as others' bytes (Wait, not Held).
+    #[test]
+    fn land_hold_follows_the_land_lock() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-land-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let s = stats(10.0, 3.0, 1950);
+        let check = || {
+            admit_once(&ws, "c", &cfg, Class::Check, Ok(s.clone()))
+                .unwrap()
+                .map(|_| ())
+        };
+        assert_eq!(check(), Ok(()), "land idle: no hold");
+        let queued = hold_land_lock(&ws);
+        assert!(
+            matches!(check(), Err(Verdict::Held(_))),
+            "land active: held"
+        );
+        assert_eq!(count_of(&ws, "delta-land-hold"), 1);
+        drop(queued);
+        assert_eq!(check(), Ok(()), "land idle again: admitted");
+        // land's reservation (4.62 GiB) + the check (2.46) + margin 1 > 7 free: Wait on the reservation; the hold is not counted again
+        let land = reserve(&ws, out::LAND_ID, 4_955_731_496).unwrap();
+        let queued = hold_land_lock(&ws);
+        assert!(
+            matches!(check(), Err(Verdict::Wait(_))),
+            "land reserved: counted once"
+        );
+        assert_eq!(count_of(&ws, "delta-land-hold"), 1);
+        drop((land, queued));
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A land arriving while workers' reservations fill the store waits: its verdict is Wait naming them, the wait is counted `delta-wait` and it is admitted when they end. The hold never applies to land.
+    #[test]
+    fn land_waits_while_workers_reserve_the_store() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-land-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let s = stats(10.0, 3.0, 1950);
+        let queued = hold_land_lock(&ws);
+        let mut worker = Some(reserve(&ws, "worker", 3 * GIB).unwrap());
+        // land 4.62 + worker 3 + margin 1 > 7 free: Wait, and the reason names the reservations
+        let waiting = judge_now(&ws, out::LAND_ID, &cfg, Class::Native, &s).unwrap();
+        assert!(
+            matches!(&waiting, Verdict::Wait(why) if why.contains("reserved by running builds")),
+            "{waiting:?}"
+        );
+        let mut probes = 0;
+        let (land, _, need_ram) = admit(&ws, out::LAND_ID, &cfg, Class::Native, || {
+            probes += 1;
+            if probes == 2 {
+                worker.take();
+            }
+            Ok(Ok(s.clone()))
+        })
+        .unwrap()
+        .expect("land admitted once the worker's reservation ends");
+        assert_eq!((probes, need_ram), (2, 4_955_731_496));
+        assert_eq!(count_of(&ws, "delta-wait"), 1);
+        assert_eq!(count_of(&ws, "delta-land-hold"), 0, "land is never held");
+        drop((land, queued));
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A land's new dir on a store full by its own accounting (8 GiB limit, 7.5 used: no reservation ends) takes the pool, counted `delta-pool`; land holds nothing.
+    #[test]
+    fn land_takes_the_pool_when_the_store_is_full() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-land-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let queued = hold_land_lock(&ws);
+        let Err(v) = admit(&ws, out::LAND_ID, &cfg, Class::Native, || {
+            Ok(Ok(stats(8.0, 7.5, 1950)))
+        })
+        .unwrap() else {
+            panic!("land admitted on a full store");
+        };
+        assert!(matches!(v, Verdict::Refuse(_)), "{v:?}");
+        assert!(
+            fall_to_pool(&ws, out::LAND_ID, Class::Native, None, v)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count_of(&ws, "delta-pool"), 1);
+        assert_eq!(count_of(&ws, "delta-land-hold"), 0);
+        drop(queued);
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Land queued or running on `ws`: this process holds `out/land.lock` exclusively, as land-seq.sh does, until the guard drops.
+    fn hold_land_lock(ws: &Path) -> Flock {
+        Flock::take(
+            open_lock(&ws.join("out").join("land.lock")).unwrap(),
+            Mode::Exclusive,
+        )
+        .unwrap()
     }
 
     /// Class run takes min(device ratio, delta.ratio_run 1.37): 797 MiB = 835_715_072 B -> ceil(835_715_072_000 / 1370) = 610_011_002 B at device 1.95 (not 428_571_833 at 1.95); tmpfs 1.0 stays 1.0.
@@ -1556,9 +1746,10 @@ mod tests {
         rec
     }
 
-    /// Admission refuses an existing ram dir: its upper holds the outputs of the checkout's last build (and the `built-from` record), its `.delta` record sits in the mount point. Both must survive the refusal; nothing falls to the pool (a fall dropped them, and the next check said "built from another source state"). `want` names the verdict the case must produce.
+    /// Admission refuses an existing ram dir: its upper holds the outputs of the checkout's last build (and the `built-from` record), its `.delta` record sits in the mount point. Both must survive the refusal; nothing falls to the pool (a fall dropped them, and the next check said "built from another source state"). `want` names the verdict the case must produce; `queued`: land's lock is held (its hold applies).
     fn refusal_keeps_outputs(
         tag: &str,
+        queued: bool,
         probe: impl FnMut() -> Result<std::result::Result<Stats, String>>,
         want: fn(&Verdict) -> bool,
     ) {
@@ -1569,6 +1760,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(out::pool(&ws)).unwrap();
         let rec = ram_dir_fixture(&ws, &store);
+        let _queued = queued.then(|| hold_land_lock(&ws));
         let built = rec.dir("c").join("upper/target/app.bin");
         std::fs::create_dir_all(built.parent().unwrap()).unwrap();
         std::fs::write(&built, "built").unwrap();
@@ -1594,11 +1786,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
-    /// Held (the land hold of `land_hold_keeps_room_for_land`: 10 GiB limit, 3 used) keeps the dir.
+    /// Held (the land hold of `land_hold_counts_while_land_is_active`: 10 GiB limit, 3 used, land queued) keeps the dir.
     #[test]
     fn held_ram_delta_keeps_its_outputs() {
         refusal_keeps_outputs(
             "held",
+            true,
             || Ok(Ok(stats(10.0, 3.0, 1950))),
             |v| matches!(v, Verdict::Held(_)),
         );
@@ -1609,6 +1802,7 @@ mod tests {
     fn refused_ram_delta_keeps_its_outputs() {
         refusal_keeps_outputs(
             "refused",
+            false,
             || Ok(Ok(stats(8.0, 7.5, 1950))),
             |v| matches!(v, Verdict::Refuse(_)),
         );
@@ -1619,6 +1813,7 @@ mod tests {
     fn unprobed_store_keeps_its_ram_delta() {
         refusal_keeps_outputs(
             "unprobed",
+            false,
             || Ok(Err("store not mounted".to_owned())),
             |v| matches!(v, Verdict::NeverFits(_)),
         );
@@ -1634,11 +1829,12 @@ mod tests {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
+        let _queued = hold_land_lock(&ws);
         let Err(v) = admit(&ws, "c", &cfg, Class::Check, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         })
         .unwrap() else {
-            panic!("the check was admitted: no hold, so no fall to test");
+            panic!("the check was admitted: no land hold while land is queued, so no fall to test");
         };
         assert!(matches!(v, Verdict::Held(_)), "{v:?}");
         assert!(
@@ -1665,6 +1861,7 @@ mod tests {
             .unwrap()
             .delta;
         let (mut holder, mut bystander) = lingering_holder(&ws, "c");
+        let _queued = hold_land_lock(&ws);
         let verdict = admit(&ws, "c", &cfg, Class::Check, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         })

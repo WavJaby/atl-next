@@ -1675,7 +1675,7 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                     println!("delta store {shown}: {}", s.line());
                     let h = crate::delta::hold_now(&ws, &cfg.delta, &s)?;
                     println!(
-                        "land hold: {:.2} GiB RAM / {:.2} GiB raw (class native peak at the store ratio; 0 = land's reservation stands in or native never fits)",
+                        "land hold: {:.2} GiB RAM / {:.2} GiB raw (class native peak at the store ratio; 0 = no land queued or running, or land's reservation stands in, or native never fits)",
                         h.ram as f64 / (1u64 << 30) as f64,
                         h.raw as f64 / (1u64 << 30) as f64
                     );
