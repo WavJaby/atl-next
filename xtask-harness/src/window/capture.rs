@@ -314,7 +314,7 @@ pub(super) fn drive(
         let cpus =
             atl_host_load::allowed_cpus().ok_or_else(|| "--starve-close: no CPU set".to_owned())?;
         Some(
-            crate::host_load::Burners::start(&cpus, crate::host_load::STARVE_WEIGHT)
+            crate::host_load::Burners::start(&cpus, crate::host_load::STARVE_WEIGHT, None)
                 .map_err(|e| format!("--starve-close: {e:#}"))?,
         )
     } else {

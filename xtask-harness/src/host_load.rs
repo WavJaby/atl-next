@@ -8,6 +8,8 @@
 //! Cases and their expected outcomes ([`Case::expect`]): starved -> undecided (exit 4); no event, no load -> FAIL; worker asleep under load -> FAIL (a sleeper adds no stall);
 //! crash under load -> FAIL (a death); wrong value under load -> FAIL; self-inflicted (64 spinners in the case's own scope, no burners) -> FAIL (own CPU, not foreign); late on a quiet host
 //! (sleeps past the bound, then works) -> FAIL; pass under equal-weight load -> pass. Without `--case` the gate runs every case and passes when each ends as expected.
+//! A FAIL case must end red with its expected cause on its own stdout line ([`CAUSE_PREFIX`]: `late`, `exited`, `wrong`). Any other exit 1 (a burner or the worker that did not start) fails the row.
+//! `--break burner-start` refuses the burners' CPUWeight: every burning case must then fail the gate.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,12 +40,17 @@ const SPINNERS: usize = 64;
 /// The worker's event and the value it carries; the wrong case logs another value.
 const EVENT: &str = "host-load: event value=";
 const VALUE: u32 = 42;
+/// The stdout line a red case prints with the typed cause of its judged red (`late`, `exited`, `wrong`); the gate compares it with the case's expected cause.
+const CAUSE_PREFIX: &str = "host-load-cause: ";
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Run one case in this process (the gate runs each case so, pinned to one CPU); without it every case runs and is compared with its expected outcome.
     #[arg(long, value_enum, hide = true)]
     case: Option<Case>,
+    /// Break the gate on purpose: `burner-start` refuses the burners' CPUWeight, so every case that burns ends with a setup error and the gate goes red.
+    #[arg(long = "break", value_enum)]
+    break_: Option<Break>,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,12 +65,61 @@ enum Case {
     PassUnderLoad,
 }
 
-/// A case's outcome, as its exit code says it.
+/// A case's outcome: pass, the undecided verdict (exit 4), or red (exit 1) with the cause its child printed (`Cause`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Pass,
-    Fail,
+    Fail(Cause),
     Undecided,
+}
+
+/// The kind of miss a judged red ends on (`Miss`): what a case expects, and what its child prints as [`CAUSE_PREFIX`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Late,
+    Exited,
+    Wrong,
+}
+
+impl Cause {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Late => "late",
+            Self::Exited => "exited",
+            Self::Wrong => "wrong",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        [Self::Late, Self::Exited, Self::Wrong]
+            .into_iter()
+            .find(|c| c.word() == word)
+    }
+
+    /// The cause of a judged miss; None for `NotReached`, which is never a case's own red.
+    fn of(miss: &Miss) -> Option<Self> {
+        match miss {
+            Miss::Late { .. } => Some(Self::Late),
+            Miss::Exited { .. } => Some(Self::Exited),
+            Miss::Wrong(_) => Some(Self::Wrong),
+            Miss::NotReached { .. } => None,
+        }
+    }
+}
+
+/// A deliberate break of the gate (`--break`), to show its rows red.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Break {
+    /// The burners do not start: systemd-run refuses their CPUWeight, so each ends at once.
+    BurnerStart,
+}
+
+impl Break {
+    fn name(self) -> &'static str {
+        match self {
+            Self::BurnerStart => "burner-start",
+        }
+    }
 }
 
 impl Case {
@@ -91,11 +147,16 @@ impl Case {
         }
     }
 
+    /// The outcome the case must end with: the undecided verdict, a pass, or a red with the cause the case is built to produce.
     fn expect(self) -> Outcome {
         match self {
             Self::Starved => Outcome::Undecided,
             Self::PassUnderLoad => Outcome::Pass,
-            _ => Outcome::Fail,
+            Self::NoEvent | Self::AsleepUnderLoad | Self::SelfInflicted | Self::LateQuiet => {
+                Outcome::Fail(Cause::Late)
+            }
+            Self::CrashUnderLoad => Outcome::Fail(Cause::Exited),
+            Self::WrongUnderLoad => Outcome::Fail(Cause::Wrong),
         }
     }
 
@@ -209,7 +270,13 @@ fn spend(cpu: Duration) {
 pub(crate) struct Burners(Vec<Child>);
 
 impl Burners {
-    pub(crate) fn start(cpus: &[u32], weight: u32) -> Result<Self> {
+    pub(crate) fn start(cpus: &[u32], weight: u32, brk: Option<Break>) -> Result<Self> {
+        // CPUWeight 0 is outside systemd's 1..=10000: systemd-run refuses it and the burner ends at once, as with no scope
+        let weight = if brk == Some(Break::BurnerStart) {
+            0
+        } else {
+            weight
+        };
         let exe = std::env::current_exe().context("the harness's own path")?;
         let mut burners = Self(Vec::new());
         for cpu in cpus {
@@ -249,13 +316,13 @@ impl Drop for Burners {
 
 pub fn run(args: &Args) -> Result<ExitCode> {
     match args.case {
-        Some(case) => one(case),
-        None => every(),
+        Some(case) => one(case, args.break_),
+        None => every(args.break_),
     }
 }
 
 /// Every case in its own pinned gate process, each compared with its expected outcome.
-fn every() -> Result<ExitCode> {
+fn every(brk: Option<Break>) -> Result<ExitCode> {
     let cpu = *atl_host_load::allowed_cpus()
         .context("this process's CPU set")?
         .last()
@@ -263,10 +330,15 @@ fn every() -> Result<ExitCode> {
     let exe = std::env::current_exe().context("the harness's own path")?;
     let mut fails = Vec::new();
     for case in Case::ALL {
-        let out = Command::new("taskset")
-            .args(["-c", &cpu.to_string()])
+        let mut child = Command::new("taskset");
+        child.args(["-c", &cpu.to_string()]);
+        child
             .arg(&exe)
-            .args(["test", "host-load", "--case", case.name()])
+            .args(["test", "host-load", "--case", case.name()]);
+        if let Some(b) = brk {
+            child.args(["--break", b.name()]);
+        }
+        let out = child
             .output()
             .with_context(|| format!("taskset {}", case.name()))?;
         // indented: the case's own `host-load:` verdict is not this gate's (check_gates reads the gate's lines)
@@ -278,7 +350,8 @@ fn every() -> Result<ExitCode> {
         }
         let got = match out.status.code() {
             Some(0) => Some(Outcome::Pass),
-            Some(1) => Some(Outcome::Fail),
+            // a red names its judged cause on its own line; a red without one (a burner or the worker did not start) matches no expectation
+            Some(1) => printed_cause(&out.stdout).map(Outcome::Fail),
             Some(c) if c == i32::from(crate::verdict::UNDECIDED_EXIT) => Some(Outcome::Undecided),
             _ => None,
         };
@@ -305,21 +378,29 @@ fn every() -> Result<ExitCode> {
     Ok(ExitCode::FAILURE)
 }
 
+/// The cause a case's child printed on its [`CAUSE_PREFIX`] line; None when it printed none.
+fn printed_cause(stdout: &[u8]) -> Option<Cause> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix(CAUSE_PREFIX))
+        .and_then(Cause::from_word)
+}
+
 /// One case in this (pinned) gate process.
-fn one(case: Case) -> Result<ExitCode> {
+fn one(case: Case, brk: Option<Break>) -> Result<ExitCode> {
     let cpus = atl_host_load::allowed_cpus().context("this process's CPU set")?;
     let dir = std::env::temp_dir().join(format!("atl-host-load-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let log = dir.join("worker.log");
-    let result = judge(case, &cpus, &log);
+    let result = judge(case, &cpus, &log, brk);
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
-fn judge(case: Case, cpus: &[u32], log: &Path) -> Result<ExitCode> {
+fn judge(case: Case, cpus: &[u32], log: &Path, brk: Option<Break>) -> Result<ExitCode> {
     let burners = case
         .burners()
-        .map(|weight| Burners::start(cpus, weight))
+        .map(|weight| Burners::start(cpus, weight, brk))
         .transpose()?;
     let exe = std::env::current_exe().context("the harness's own path")?;
     let mut worker = Command::new(exe)
@@ -359,6 +440,16 @@ fn judge(case: Case, cpus: &[u32], log: &Path) -> Result<ExitCode> {
     let run = starvation::Run::cpu(case.name(), samples.as_ref());
     if let Some(why) = starvation::red(&run, &[&fault], "") {
         return Ok(starvation::undecided("host-load", case.name(), &why));
+    }
+    // no published sampler (no scope): a late wait's red is not the rule's judgement, so it cannot be the case's expected red
+    if samples.is_none() && matches!(fault, Miss::Late { .. }) {
+        anyhow::bail!(
+            "{}: no gate sampler (no scope): its late wait cannot be judged on this host",
+            case.name()
+        );
+    }
+    if let Some(cause) = Cause::of(&fault) {
+        println!("{CAUSE_PREFIX}{}", cause.word());
     }
     println!(
         "{}",
