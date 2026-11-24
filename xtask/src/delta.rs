@@ -8,7 +8,7 @@
 //! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits (the line names the holders).
 //! A process still holding it when the command returns (a daemon a build spawned: sccache server, gradle, kotlin) may still use the overlay, so the outer command ends it ([`end_holders`]): the mount and everything using it end with the command.
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
-//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends a new dir to the pool; an existing ram dir is kept and its build refused ([`fall_to_pool`]): admission never drops a dir.
+//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends a new dir to the pool; an existing ram dir waits out a land hold ([`admit_keeping`]) and is otherwise kept and its build refused ([`fall_to_pool`]): admission never drops a dir.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -295,7 +295,7 @@ pub enum Verdict {
     Refuse(String),
     /// The class can never fit this store: pool tier.
     NeverFits(String),
-    /// Fits only without land's hold ([`Hold`], counted while land is queued or running): refused at once, never waited for.
+    /// Fits only without land's hold ([`Hold`], counted while land is queued or running). A new dir takes the pool; an existing ram dir waits for the queue ([`admit_keeping`]), or is refused inside it.
     Held(String),
 }
 
@@ -519,9 +519,14 @@ fn land_now(ws: &Path) -> Result<(u64, LandState)> {
     ))
 }
 
+/// `out/land.lock`: land-seq.sh's exclusive lock for its whole queue, inherited by every process the queue starts.
+fn land_lock_path(ws: &Path) -> PathBuf {
+    ws.join("out").join("land.lock")
+}
+
 /// Whether land's queue is active: land-seq.sh holds `out/land.lock` exclusively from its start to its exit (one land at a time), and a queued land waits behind that holder, so a held lock means a land running or queued. Read by probing the lock (released at once), not from a flag file; no file = no land yet.
 fn land_active(ws: &Path) -> Result<bool> {
-    let p = ws.join("out").join("land.lock");
+    let p = land_lock_path(ws);
     let file = match std::fs::File::open(&p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -646,6 +651,66 @@ fn admit(
         drop(_gate);
         std::thread::sleep(build_pool::POLL);
     }
+}
+
+/// [`admit`] for a build that keeps its ram dir (`keep`: the dir exists). A Held verdict is waited out, not refused: the build waits until land's queue releases `out/land.lock` ([`wait_for_land_queue`]), then is judged again; a hold again while the queue runs on keeps it waiting. Nothing is held meanwhile (admit gate released, no reservation), so land's own admission and build proceed. Two lines: one when the wait starts, naming the hold (counter `delta-wait`), one when it ends with the judged verdict.
+/// Refuse and NeverFits return at once, and so does a Held inside the queue ([`inside_land_queue`]): the queue waits for that process, so it cannot wait for the queue.
+fn admit_keeping(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Class,
+    keep: bool,
+    mut probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
+) -> Result<std::result::Result<Admitted, Verdict>> {
+    let mut since = None;
+    loop {
+        let got = admit(ws, id, cfg, class, &mut probe_now)?;
+        let held = match &got {
+            Err(Verdict::Held(why)) if keep => Some(why.clone()),
+            _ => None,
+        };
+        match held {
+            Some(why) if !inside_land_queue(ws)? => {
+                if since.is_none() {
+                    println!(
+                        "out: delta ws/{id}: waiting for land: {why}; out/land.lock is held by land's queue, the build resumes when it is released"
+                    );
+                    out::count(ws, "delta-wait");
+                    since = Some(std::time::Instant::now());
+                }
+                wait_for_land_queue(ws)?;
+            }
+            _ => {
+                if let Some(t0) = since {
+                    let judged = match &got {
+                        Ok(_) => "admitted".to_owned(),
+                        Err(v) => v.reason(),
+                    };
+                    println!(
+                        "out: delta ws/{id}: out/land.lock released after {:.0} s; judged again: {judged}",
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(got);
+            }
+        }
+    }
+}
+
+/// Polls until land's queue releases `out/land.lock` ([`land_active`]); holds nothing while it polls.
+fn wait_for_land_queue(ws: &Path) -> Result<()> {
+    while land_active(ws)? {
+        std::thread::sleep(build_pool::POLL);
+    }
+    Ok(())
+}
+
+/// Whether this process inherited `out/land.lock`: the queue's fd reaches every process it starts, and the lock lives while any of them does. The queue waits for such a process, so it must not wait for the queue.
+fn inside_land_queue(ws: &Path) -> Result<bool> {
+    Ok(holders(&land_lock_path(ws), 0)?
+        .iter()
+        .any(|h| h.pid == std::process::id()))
 }
 
 /// Makes ram dir `ws/<id>` over the newest base that is an ancestor of HEAD: record (under [`bases_lock`]), empty upper/work with `.base`, the fresh marker (land's too: on ram its `target` link does not reach the dir, out::foreign_paths), the checkout's mtimes restored from the base when `restore` (out::make's rule). Err when there is no base (a build from zero is the pool tier's).
@@ -837,7 +902,9 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     ) else {
         return pool(NO_STORE);
     };
-    let admitted = admit(&ws, &id, &cfg.delta, class, || probe(&store, &cfg.delta))?;
+    let admitted = admit_keeping(&ws, &id, &cfg.delta, class, rec.is_some(), || {
+        probe(&store, &cfg.delta)
+    })?;
     let (reservation, stats, need_ram) = match admitted {
         Ok(a) => a,
         Err(Verdict::Admit { .. }) => bail!("delta admission returned Admit as a refusal"),
@@ -904,7 +971,7 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     Ok(Some(code))
 }
 
-/// The verdict of a build that admission does not admit (Refuse, Held, NeverFits). A new dir takes the pool: nothing to keep, one line. An existing ram dir is never dropped here: its upper holds the outputs and the `built-from` record of the checkout's last build, and a pool dir from base starts without them (check then refuses it as built from another source state). The build is refused (exit 1) and the dir stays, counted `delta-refused`; the line names the verdict and whether a running command holds the dir. Drops stay explicit: `out tier`, a lost store dir, a rebase's refresh.
+/// The verdict of a build that admission does not admit (Refuse, NeverFits, Held: [`admit_keeping`] waits out a Held of an existing dir unless this process is inside land's queue). A new dir takes the pool: nothing to keep, one line. An existing ram dir is never dropped here: its upper holds the outputs and the `built-from` record of the checkout's last build, and a pool dir from base starts without them (check then refuses it as built from another source state). The build is refused (exit 1) and the dir stays, counted `delta-refused`; the line names the verdict and whether a running command holds the dir. Drops stay explicit: `out tier`, a lost store dir, a rebase's refresh.
 fn fall_to_pool(
     ws: &Path,
     id: &str,
@@ -923,6 +990,8 @@ fn fall_to_pool(
     let busy = try_mount_lock(ws, id)?.is_none();
     let tail = if busy {
         "in use by a running command of this checkout; run it again when that command ends"
+    } else if matches!(v, Verdict::Held(_)) {
+        "run it again when land's queue has released out/land.lock"
     } else {
         "run it again when the store can take it"
     };
@@ -1746,7 +1815,7 @@ mod tests {
         rec
     }
 
-    /// Admission refuses an existing ram dir: its upper holds the outputs of the checkout's last build (and the `built-from` record), its `.delta` record sits in the mount point. Both must survive the refusal; nothing falls to the pool (a fall dropped them, and the next check said "built from another source state"). `want` names the verdict the case must produce; `queued`: land's lock is held (its hold applies).
+    /// Admission refuses an existing ram dir: its upper holds the outputs of the checkout's last build (and the `built-from` record), its `.delta` record sits in the mount point. Both must survive the refusal; nothing falls to the pool (a fall dropped them, and the next check said "built from another source state"). `want` names the verdict the case must produce; `queued`: this process holds land's lock (as a process inside the queue does), so a hold is refused, not waited for.
     fn refusal_keeps_outputs(
         tag: &str,
         queued: bool,
@@ -1767,7 +1836,7 @@ mod tests {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
-        let Err(v) = admit(&ws, "c", &cfg, Class::Check, probe).unwrap() else {
+        let Err(v) = admit_keeping(&ws, "c", &cfg, Class::Check, true, probe).unwrap() else {
             panic!("{tag}: the check was admitted: no refusal to test");
         };
         assert!(want(&v), "{tag}: {v:?}");
@@ -1786,7 +1855,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
-    /// Held (the land hold of `land_hold_counts_while_land_is_active`: 10 GiB limit, 3 used, land queued) keeps the dir.
+    /// Held inside the queue (the land hold of `land_hold_counts_while_land_is_active`: 10 GiB limit, 3 used; this process holds land's lock) is refused and keeps the dir: it cannot wait for the queue.
     #[test]
     fn held_ram_delta_keeps_its_outputs() {
         refusal_keeps_outputs(
@@ -1847,7 +1916,7 @@ mod tests {
         std::fs::remove_dir_all(&ws).unwrap();
     }
 
-    /// The same Held verdict while a command of this checkout still has the dir mounted (its mount lock held by a live process): the upper is live state, so nothing is dropped and the build stops, counted `delta-refused`.
+    /// The same Held verdict (inside the queue) while a command of this checkout still has the dir mounted (its mount lock held by a live process): the upper is live state, so nothing is dropped and the build stops, counted `delta-refused`.
     #[test]
     fn ram_delta_in_use_stops_the_build() {
         let pid = std::process::id();
@@ -1862,7 +1931,7 @@ mod tests {
             .delta;
         let (mut holder, mut bystander) = lingering_holder(&ws, "c");
         let _queued = hold_land_lock(&ws);
-        let verdict = admit(&ws, "c", &cfg, Class::Check, || {
+        let verdict = admit_keeping(&ws, "c", &cfg, Class::Check, true, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         })
         .unwrap();
@@ -1882,6 +1951,144 @@ mod tests {
         assert_eq!(count_of(&ws, "delta-pool"), 0);
         std::fs::remove_dir_all(&ws).unwrap();
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A Held existing ram dir waits for land's queue: another process holds `out/land.lock` until it is killed, and the build is admitted after that release. One wait counted; the hold counted once.
+    #[test]
+    fn held_ram_delta_waits_for_the_land_queue() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let mut queue = sleeper_on(&land_lock_path(&ws), true);
+        // released from another thread: a wait that never ends fails the assertions below instead of hanging the test
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = queue.kill();
+            let _ = queue.wait();
+        });
+        let got = admit_keeping(&ws, "c", &cfg, Class::Check, true, || {
+            Ok(Ok(stats(10.0, 3.0, 1950)))
+        });
+        release.join().unwrap();
+        let (reservation, _, need_ram) = match got.unwrap() {
+            Ok(admitted) => admitted,
+            Err(v) => panic!("waited for the queue, then refused: {v:?}"),
+        };
+        assert_eq!(need_ram, 2_642_949_252);
+        assert_eq!(count_of(&ws, "delta-wait"), 1);
+        assert_eq!(count_of(&ws, "delta-land-hold"), 1);
+        drop(reservation);
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Refuse (store full by its own accounting) is refused at once while land's queue holds the lock: no wait, the dir kept, exit 1 (`fall_to_pool`), counted `delta-refused`.
+    #[test]
+    fn refused_for_capacity_does_not_wait_for_the_queue() {
+        let pid = std::process::id();
+        let ws = std::env::temp_dir().join(format!("xtask-delta-capacity-{pid}"));
+        let store = std::env::temp_dir().join(format!("xtask-delta-capacity-store-{pid}"));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let rec = ram_dir_fixture(&ws, &store);
+        let mut queue = sleeper_on(&land_lock_path(&ws), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_ws = ws.clone();
+        std::thread::spawn(move || {
+            let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+                .unwrap()
+                .delta;
+            let _ = tx.send(admit_keeping(
+                &worker_ws,
+                "c",
+                &cfg,
+                Class::Check,
+                true,
+                || Ok(Ok(stats(8.0, 7.5, 1950))),
+            ));
+        });
+        // a wait would not return while the queue holds the lock: bounded, and the queue is released in any case
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20));
+        let _ = queue.kill();
+        let _ = queue.wait();
+        let Err(v) = got.expect("refused without waiting for the queue").unwrap() else {
+            panic!("the check was admitted on a full store");
+        };
+        assert!(matches!(v, Verdict::Refuse(_)), "{v:?}");
+        let msg = format!(
+            "{:#}",
+            fall_to_pool(&ws, "c", Class::Check, Some(&rec), v)
+                .expect_err("a refused ram dir is refused, not dropped")
+        );
+        assert!(msg.contains("outputs and record intact"), "{msg}");
+        assert!(rec.dir("c").join("upper").is_dir());
+        assert_eq!(count_of(&ws, "delta-wait"), 0);
+        assert_eq!(count_of(&ws, "delta-refused"), 1);
+        std::fs::remove_dir_all(&ws).unwrap();
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// No deadlock: a build waiting on land's queue holds neither the admit gate nor a reservation, so land's own admission goes through while it waits, and the build proceeds once the queue releases.
+    #[test]
+    fn waiting_build_does_not_block_the_land() {
+        let ws =
+            std::env::temp_dir().join(format!("xtask-delta-no-deadlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let mut queue = sleeper_on(&land_lock_path(&ws), true);
+        let worker_ws = ws.clone();
+        let worker = std::thread::spawn(move || {
+            let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+                .unwrap()
+                .delta;
+            admit_keeping(&worker_ws, "c", &cfg, Class::Check, true, || {
+                Ok(Ok(stats(10.0, 3.0, 1950)))
+            })
+        });
+        let started = std::time::Instant::now();
+        while count_of(&ws, "delta-wait") == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the build never started waiting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // land's admission, bounded: it would block forever if the waiting build held the admit gate
+        let land_ws = ws.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+                .unwrap()
+                .delta;
+            let _ = tx.send(admit(&land_ws, out::LAND_ID, &cfg, Class::Native, || {
+                Ok(Ok(stats(10.0, 3.0, 1950)))
+            }));
+        });
+        let land = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("land admitted while a build waits on the queue")
+            .unwrap();
+        assert!(land.is_ok(), "land refused: {:?}", land.as_ref().err());
+        // land's build ends: its reservation goes, then the queue releases
+        drop(land);
+        let _ = queue.kill();
+        let _ = queue.wait();
+        let built = worker.join().unwrap().unwrap();
+        assert!(
+            built.is_ok(),
+            "the waiting build refused after the release: {:?}",
+            built.as_ref().err()
+        );
+        assert_eq!(
+            count_of(&ws, "delta-land-hold"),
+            1,
+            "the hold counted once; land is never held"
+        );
+        drop(built);
+        std::fs::remove_dir_all(&ws).unwrap();
     }
 
     /// `delta.ram_store` has no default: unset is no RAM tier, with the reason the probe names; a file's value is the store.
