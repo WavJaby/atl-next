@@ -73,6 +73,8 @@ type FactsFn<'a> = dyn Fn(&Path, &str) -> Result<BranchFacts> + 'a;
 
 /// What `land` runs beside its git work: the build and check of the land worktree, the fetch of the main checkout, the branch's task copies, the base publish and reset, and the cleanup child. Tests substitute them.
 struct Runner<'a> {
+    /// The branch's facts, asked again before a push that recreates (`facts_child`).
+    facts: &'a FactsFn<'a>,
     /// `xtask patch --edit <up>` in the branch's worktree, by the branch's xtask (`edit_execute`).
     edit: &'a dyn Fn(&Path, &str) -> Result<String>,
     /// The checkout's verdict line, Ok only when that check passed (`check_verdict`).
@@ -232,6 +234,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let runner = Runner {
+        facts: &facts_child,
         edit: &edit_execute,
         check: &check_verdict,
         fetch: &fetch_execute,
@@ -436,10 +439,11 @@ impl Plan {
                 out::LAND_ID
             ),
             Stage::Push => format!(
-                "push: {} {} -> {} (git push origin refs/heads/{branch}:refs/heads/main)",
+                "push: {} {} -> {} (git push origin {}; refused if {branch} moved)",
                 fetch::MAIN_REF,
                 short(&self.origin),
-                short(&self.head)
+                short(&self.head),
+                self.push_refspec()
             ),
             Stage::Sync => format!(
                 "sync in {repo}: merge --ff-only origin/main, then `cargo xtask fetch --execute` (src/ moves to {})",
@@ -523,17 +527,51 @@ impl Plan {
             Stage::Verify => (runner.check)(self.land.as_path()).with_context(|| {
                 format!("nothing pushed: check in {} failed", self.land.display())
             }),
-            Stage::Push => {
-                let refspec = format!("refs/heads/{}:refs/heads/main", self.branch);
-                git(Some(&self.repo), &["push", "-q", "origin", &refspec])
-                    .context("nothing pushed: git push refused")?;
-                Ok(format!("origin/main is {}", short(&self.head)))
-            }
+            Stage::Push => self.push(runner),
             Stage::Sync => self.sync(runner),
             Stage::Publish => self.publish(runner),
             Stage::Cleanup => (runner.cleanup)(&self.repo, &self.branch)
                 .context("pushed and checked, but cleanup failed: finish it by hand"),
         }
+    }
+
+    /// The branch still is the commit this land works on. The land worktree follows the branch name (task copies resolve by it), so a commit on the branch moves its HEAD without its files: what Verify read is no longer the tip.
+    fn unmoved(&self) -> Result<()> {
+        let now = git(
+            Some(&self.repo),
+            &["rev-parse", &format!("refs/heads/{}", self.branch)],
+        )?;
+        ensure!(
+            now == self.head,
+            "nothing pushed: {} moved during land: now {now}, land works on {}: land again",
+            self.branch,
+            self.head
+        );
+        Ok(())
+    }
+
+    /// The push names the verified commit, never the branch: a commit made after [`Plan::unmoved`] cannot go out.
+    fn push_refspec(&self) -> String {
+        format!("{}:refs/heads/main", self.head)
+    }
+
+    /// The preflight's recreate facts are asked again: a task copy or branch made in a shared checkout while Verify ran would make the post-push fetch refuse, with main already pushed.
+    fn push(&self, runner: &Runner) -> Result<String> {
+        self.unmoved()?;
+        if !self.recreate.is_empty() {
+            (runner.facts)(&self.wt, &self.branch)
+                .context("nothing pushed: the post-push `fetch --recreate` would be refused")?;
+        }
+        self.push_head()
+    }
+
+    fn push_head(&self) -> Result<String> {
+        git(
+            Some(&self.repo),
+            &["push", "-q", "origin", &self.push_refspec()],
+        )
+        .context("nothing pushed: git push refused")?;
+        Ok(format!("origin/main is {}", short(&self.head)))
     }
 
     /// The land worktree on the branch. Missing -> made detached at origin/main first (its build dir follows from the newest ancestor base on the first xtask command there, `out::ensure`).
@@ -569,6 +607,8 @@ impl Plan {
                 self.branch
             )
         })?;
+        // after the checkout: what Build and Verify read is then `head`
+        self.unmoved()?;
         out::prepare(&self.land).context("nothing pushed: making the land build dir")?;
         Ok(format!("{}{made}on {}", self.land.display(), self.branch))
     }
@@ -845,14 +885,19 @@ fn branch_facts(wt: &Path) -> Result<BranchFacts> {
     }
     let mut edits = Vec::new();
     let mut recreate = Vec::new();
-    for c in sources.checkouts(None) {
+    let pinned = sources.checkouts(None);
+    for c in &pinned {
+        let stored = patch::stored(&wt.join("patches").join(&c.dir))?;
+        let edit = main.lists(c)
+            && main.refusal(c, &stored).is_some()
+            && layout.locate(&c.dir).task.is_none();
         // the shared checkout must reach the branch's keep-set by the post-push fetch: refuse here what not even `--recreate` fixes
-        if let Some(p) = fetch::keep_preflight(&layout, &c)
+        if let Some(p) = fetch::keep_preflight(&layout, c, &pinned, edit)
             .context("the branch's [aosp.sparse] change cannot be fetched into src/")?
         {
             recreate.push(p);
         }
-        if !main.lists(&c) {
+        if !main.lists(c) {
             // nothing on main reads a new upstream, so the shared checkout serves it; it has to be there to be checked
             ensure!(
                 layout.src().join(&c.dir).exists(),
@@ -862,8 +907,7 @@ fn branch_facts(wt: &Path) -> Result<BranchFacts> {
             );
             continue;
         }
-        let stored = patch::stored(&wt.join("patches").join(&c.dir))?;
-        if main.refusal(&c, &stored).is_some() && layout.locate(&c.dir).task.is_none() {
+        if edit {
             edits.push(c.dir.display().to_string());
         }
     }
@@ -1058,6 +1102,12 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
         .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     // first: once the branch is deleted, this line is the only proof that `out/<branch>/` was a task's (out prune --tasks)
     let landed = git(Some(repo), &["rev-parse", "HEAD"])?;
+    // a commit made on the branch after the push: its worktree and copies stay
+    let tip = git(Some(repo), &["rev-parse", &format!("refs/heads/{branch}")])?;
+    ensure!(
+        is_ancestor(repo, &tip, &landed)?,
+        "{branch} moved during land: now {tip}, landed main is {landed}: nothing removed"
+    );
     crate::out_tasks::record_retired(&ws, branch, &landed)?;
     let note = clean_up(repo, &ws, &wt, branch)?;
     prune_units_after_land(repo, &ws);
@@ -1224,6 +1274,7 @@ mod tests {
         let line = plan.execute(
             &plan.stages(),
             &Runner {
+                facts: &in_process,
                 edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,
@@ -1274,6 +1325,7 @@ mod tests {
         let line = plan.execute(
             &plan.stages(),
             &Runner {
+                facts: &in_process,
                 edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,
@@ -1375,6 +1427,7 @@ mod tests {
             plan.execute(
                 stages,
                 &Runner {
+                    facts: &in_process,
                     edit: &no_edit,
                     check: &check_fn,
                     fetch: &fetch_fn,
@@ -1667,7 +1720,7 @@ mod tests {
         );
         let lines = plan.describe(&stages);
         assert!(
-            lines[3].contains("refs/heads/task:refs/heads/main"),
+            lines[3].contains(&format!("{}:refs/heads/main", branch_tip(&env))),
             "{}",
             lines[3]
         );
@@ -1836,6 +1889,7 @@ mod tests {
         let line = plan.execute(
             &stages,
             &Runner {
+                facts: &in_process,
                 edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,
@@ -1858,6 +1912,110 @@ mod tests {
         assert_eq!(env.land_head(), (None, before));
     }
 
+    /// Lands `task` while something happens during Verify (`during`); fetch and cleanup must not run. Returns the verdict line.
+    fn land_interrupted(
+        plan: &Plan,
+        facts: &FactsFn<'_>,
+        during: &dyn Fn(&Path) -> Result<String>,
+    ) -> String {
+        let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { panic!("fetched after a refusal") };
+        let cleanup_fn = |_: &Path, _: &str| -> Result<String> { panic!("cleaned up") };
+        let reset_fn = |_: &Path| -> Result<String> { Ok("reset".to_owned()) };
+        plan.execute(
+            &plan.stages(),
+            &Runner {
+                facts,
+                edit: &no_edit,
+                check: during,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+                native: &no_native,
+                stale: &current,
+                publish: &no_publish,
+                reset: &reset_fn,
+            },
+        )
+    }
+
+    /// A commit made on the branch while Verify runs never reaches origin: refused before the push naming both commits; the commit stays.
+    #[test]
+    fn a_branch_that_moves_after_verify_is_not_pushed() {
+        let env = Env::new("moved-verify");
+        let before = env.origin_main();
+        let verified = branch_tip(&env);
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
+        let during = |_: &Path| -> Result<String> {
+            write(&env.wt, "late.txt", "unverified\n");
+            commit(&env.wt, "late");
+            Ok("check: ok".to_owned())
+        };
+        let line = land_interrupted(&plan, &in_process, &during);
+        let late = branch_tip(&env);
+        assert_ne!(late, verified);
+        assert!(
+            line.starts_with("land: FAILED 1 of 7 steps: push")
+                && line.contains("nothing pushed")
+                && line.contains(&late)
+                && line.contains(&verified),
+            "{line}"
+        );
+        assert_eq!(env.origin_main(), before);
+        // a commit landing after that check: the push still names the verified commit
+        plan.push_head().unwrap();
+        assert_eq!(env.origin_main(), verified);
+        // main holds `verified`, the branch one more: cleanup removes nothing
+        git(Some(&env.repo), &["merge", "-q", "--ff-only", &verified]).unwrap();
+        let err = clean_up_child(&env.repo, "task").expect_err("cleaned up a moved branch");
+        let err = format!("{err:#}");
+        assert!(err.contains(&late) && err.contains(&verified), "{err}");
+        assert!(env.wt.join("late.txt").is_file());
+    }
+
+    /// A branch that moved between the preflight and Enter is refused before Build and Verify read it.
+    #[test]
+    fn a_branch_that_moves_before_enter_is_not_verified() {
+        let env = Env::new("moved-enter");
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
+        commit_empty(&env.wt);
+        let during = |_: &Path| -> Result<String> { panic!("verified a moved branch") };
+        let line = land_interrupted(&plan, &in_process, &during);
+        assert!(
+            line.starts_with("land: FAILED 1 of 7 steps: enter"),
+            "{line}"
+        );
+    }
+
+    /// What `--recreate` would lose (the facts child says so) and appeared during Verify is refused before the push.
+    #[test]
+    fn a_recreate_refused_after_verify_is_not_pushed() {
+        let env = Env::new("recreate-late");
+        let before = env.origin_main();
+        let held = std::cell::Cell::new(false);
+        let facts = |_: &Path, _: &str| -> Result<BranchFacts> {
+            ensure!(!held.get(), "task copy src-wt/t/aosp/x exists");
+            Ok(BranchFacts {
+                host: "h".to_owned(),
+                recreate: vec!["aosp/x".to_owned()],
+                ..BranchFacts::default()
+            })
+        };
+        let plan = Plan::new(&env.repo, "task", true, &facts).unwrap();
+        let during = |_: &Path| -> Result<String> {
+            held.set(true);
+            Ok("check: ok".to_owned())
+        };
+        let line = land_interrupted(&plan, &facts, &during);
+        assert!(
+            line.starts_with("land: FAILED 1 of 7 steps: push") && line.contains("task copy"),
+            "{line}"
+        );
+        assert_eq!(env.origin_main(), before);
+    }
+
+    fn commit_empty(dir: &Path) {
+        git(Some(dir), &["commit", "-q", "--allow-empty", "-m", "late"]).unwrap();
+    }
+
     #[test]
     fn passing_checks_land_and_clean_up() {
         let env = Env::new("landed");
@@ -1877,6 +2035,7 @@ mod tests {
         let line = plan.execute(
             &stages,
             &Runner {
+                facts: &in_process,
                 edit: &no_edit,
                 check: &check_fn,
                 fetch: &fetch_fn,

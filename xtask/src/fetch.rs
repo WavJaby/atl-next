@@ -217,7 +217,7 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
             "--recreate {p}: not a pinned [aosp.projects] path"
         );
     }
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         root,
         layout: &layout,
         main: if args.bump {
@@ -230,6 +230,7 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
         ident: Ident::of_repo(root).ok(),
         execute: args.execute,
         recreate: &args.recreate,
+        pinned: sources.checkouts(None),
     };
     let mut rows = Rows::default();
     // the manifest first: it names every other AOSP project's repository
@@ -247,6 +248,7 @@ fn fetch(root: &Path, args: &Args) -> Result<bool> {
             .context("--add needs the AOSP manifest (xtask fetch --execute)")?;
         add(root, &sources, m, &args.add, jobs)?;
         sources = sources::load(root)?;
+        ctx.pinned = sources.checkouts(None);
     }
     let names = manifest.as_ref().map(Manifest::names);
     let all = sources.checkouts(names.as_ref());
@@ -411,7 +413,7 @@ fn drop_in(
     execute: bool,
 ) -> Result<bool> {
     let free = droppable(layout, sources, wanted)?;
-    let pinned: Vec<PathBuf> = sources.checkouts(None).into_iter().map(|c| c.dir).collect();
+    let pinned = sources.checkouts(None);
     let mut ok = true;
     let mut go = Vec::new();
     for d in dirs {
@@ -447,7 +449,7 @@ fn drop_in(
     }
     if execute {
         for dir in &go {
-            remove_checkout(&layout.src().join(dir), &layout.git_dir(dir))?;
+            remove_checkout(layout, dir, &pinned)?;
         }
     } else {
         println!("fetch: dry run; --execute drops {} checkouts", go.len());
@@ -455,16 +457,22 @@ fn drop_in(
     Ok(true)
 }
 
-/// Why checkout `dir` (under src/) must not be deleted: a pinned checkout inside it, a task copy of it, uncommitted changes, or a local branch (its commits may be the only copy). `--recreate`'s guards, less the pin it would clone again.
-fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[PathBuf]) -> Result<Option<String>> {
-    if let Some(inner) = pinned.iter().find(|p| *p != dir && p.starts_with(dir)) {
-        return Ok(Some(format!(
+/// Why checkout `dir` (under src/) must not be deleted, naming all it holds: a pinned checkout inside it, a task copy of it, a local branch or stash, a commit no ref holds, uncommitted changes. None = nothing a clone does not bring back.
+/// The one guard of every deletion (`--drop`, `--recreate`, an interrupted clone's re-clone): [`remove_checkout`] asks it, plans ask it early. `pinned`: sources.toml's checkouts.
+fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[Checkout]) -> Result<Option<String>> {
+    let mut held = Vec::new();
+    if let Some(inner) = pinned
+        .iter()
+        .find(|p| p.dir != dir && p.dir.starts_with(dir))
+    {
+        held.push(format!(
             "pinned checkout {} is inside it",
-            inner.display()
-        )));
+            inner.dir.display()
+        ));
     }
     // a task copy is a linked worktree: an entry under `<git dir>/worktrees`, whose `gitdir` file names the copy's `.git`
-    let linked = layout.git_dir(dir).join("worktrees");
+    let git_dir = layout.git_dir(dir);
+    let linked = git_dir.join("worktrees");
     let mut copies = Vec::new();
     if linked.is_dir() {
         for entry in
@@ -477,26 +485,53 @@ fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[PathBuf]) -> Result<Optio
         }
     }
     if !copies.is_empty() {
-        return Ok(Some(format!(
+        held.push(format!(
             "task copy {} exists: `xtask patch --done` first",
             copies.join(", ")
-        )));
+        ));
     }
-    let tree = layout.src().join(dir);
-    Ok(match inspect(&tree)? {
-        Local::Missing => None,
-        Local::Unborn { files: true } => {
-            Some("git repository without commits holding files".into())
+    if git_dir.is_dir() {
+        let git_dir = git_dir.display().to_string();
+        let refs = |args: &[&str]| {
+            let all = ["--git-dir", &git_dir, "for-each-ref"];
+            git(None, &[&all[..], args].concat())
+        };
+        // a branch pin's fetch makes refs/heads/<branch> itself: at the pin it is upstream's
+        let own = pinned
+            .iter()
+            .find(|p| p.dir == dir)
+            .map(|p| format!("{} {}", p.rev, p.commit));
+        for line in refs(&[
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/stash",
+        ])?
+        .lines()
+        .filter(|l| own.as_deref() != Some(*l))
+        {
+            let name = line.split(' ').next().unwrap_or(line);
+            held.push(match name.strip_prefix("refs/heads/") {
+                Some(b) => format!("local branch {b}: its commits may exist nowhere else"),
+                None => "stashed changes".to_owned(),
+            });
         }
-        Local::Unborn { files: false } => None,
-        Local::Present { dirty: true, .. } => Some("uncommitted changes".into()),
-        Local::Present {
-            branch: Some(b), ..
-        } => Some(format!(
-            "on local branch {b}: its commits may exist nowhere else"
-        )),
-        Local::Present { .. } => None,
-    })
+        // HEAD's commits are kept by no ref: made on a detached HEAD (a fetched pin has its tag or branch ref)
+        if let Ok(head) = git(
+            None,
+            &["--git-dir", &git_dir, "rev-parse", "-q", "--verify", "HEAD"],
+        ) && refs(&["--count=1", "--contains", &head])?.is_empty()
+        {
+            held.push(format!("commit {head}, which no ref holds"));
+        }
+    }
+    match inspect(&layout.src().join(dir))? {
+        Local::Unborn { files: true } => {
+            held.push("git repository without commits holding files".into());
+        }
+        Local::Present { dirty: true, .. } => held.push("uncommitted changes".into()),
+        Local::Missing | Local::Unborn { files: false } | Local::Present { .. } => {}
+    }
+    Ok((!held.is_empty()).then(|| held.join("; ")))
 }
 
 /// What every checkout's sync shares.
@@ -509,6 +544,8 @@ struct Ctx<'a> {
     execute: bool,
     /// `--recreate` projects: their keep-set mismatch may be fixed by deleting the checkout.
     recreate: &'a [String],
+    /// sources.toml's checkouts ([`drop_refusal`]).
+    pinned: Vec<Checkout>,
 }
 
 /// One checkout's sync: what moving it to its pin needs, then what applying its patches needs.
@@ -524,7 +561,7 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
     let dir = u.checkout();
     let local = inspect(dir)?;
     let mut action = decide(&local, &c.commit, u.branch());
-    match keep_change(&local, c) {
+    match keep_change_at(ctx.layout, &local, c, &ctx.pinned)? {
         KeepChange::Same => {}
         KeepChange::Grow(dirs) => action = Action::Grow(dirs),
         KeepChange::Recreate { project, why } if ctx.recreate.contains(&project) => {
@@ -538,7 +575,7 @@ fn sync(ctx: &Ctx, c: &Checkout) -> Result<Row> {
         KeepChange::Blocked(why) => action = Action::Blocked(why),
     }
     if ctx.execute {
-        apply(&action, c, dir, &ctx.layout.git_dir(&c.dir))?;
+        apply(&action, c, dir, ctx.layout, &ctx.pinned)?;
     }
     let patches = match action {
         Action::LeaveBranch(_) | Action::Blocked(_) => None,
@@ -858,19 +895,50 @@ fn keep_change(local: &Local, c: &Checkout) -> KeepChange {
     }
 }
 
+/// [`keep_change`] with a recreate that [`drop_refusal`] forbids turned into Blocked, so fetch's dry run and land's preflight say it before anything is deleted or pushed.
+fn keep_change_at(
+    layout: &Layout,
+    local: &Local,
+    c: &Checkout,
+    pinned: &[Checkout],
+) -> Result<KeepChange> {
+    let change = keep_change(local, c);
+    if let KeepChange::Recreate { project, why } = &change
+        && let Some(held) = drop_refusal(layout, &c.dir, pinned)?
+    {
+        return Ok(KeepChange::Blocked(format!(
+            "{why}; --recreate {project} would lose what the checkout holds: {held}"
+        )));
+    }
+    Ok(change)
+}
+
 /// Land's preflight (run by the branch's xtask on the branch's table against the shared checkout in `src/`): the AOSP project `land --recreate` must name for `fetch --execute` after the push to succeed, None when fetch needs no deletion; Err when not even `--recreate` would do (refused before anything is pushed).
-pub fn keep_preflight(layout: &Layout, c: &Checkout) -> Result<Option<String>> {
-    match keep_change(&inspect(&layout.src().join(&c.dir))?, c) {
+/// `edited`: land makes a task copy of it before the push, which is still there at that fetch: a recreate is refused as for a copy that exists.
+pub fn keep_preflight(
+    layout: &Layout,
+    c: &Checkout,
+    pinned: &[Checkout],
+    edited: bool,
+) -> Result<Option<String>> {
+    match keep_change_at(layout, &inspect(&layout.src().join(&c.dir))?, c, pinned)? {
+        KeepChange::Recreate { project, why } if edited => bail!(
+            "{}: {why}; --recreate {project} is refused while a task copy exists, and land makes one for this branch's pin or patches/ change: land the keep-set change on its own first",
+            c.dir.display()
+        ),
         KeepChange::Same | KeepChange::Grow(_) => Ok(None),
         KeepChange::Recreate { project, .. } => Ok(Some(project)),
         KeepChange::Blocked(why) => bail!("{}: {why}", c.dir.display()),
     }
 }
 
-/// Deletes a checkout and its git dir (outside the tree); the caller clones it again.
-fn remove_checkout(dir: &Path, git_dir: &Path) -> Result<()> {
-    for d in [dir, git_dir] {
-        match std::fs::remove_dir_all(d) {
+/// Deletes the shared checkout `dir` (under src/) and its git dir (outside the tree), unless [`drop_refusal`] says it holds something.
+fn remove_checkout(layout: &Layout, dir: &Path, pinned: &[Checkout]) -> Result<()> {
+    if let Some(held) = drop_refusal(layout, dir, pinned)? {
+        bail!("not deleted, the checkout holds: {held}");
+    }
+    for d in [layout.src().join(dir), layout.git_dir(dir)] {
+        match std::fs::remove_dir_all(&d) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(e).with_context(|| format!("removing {}", d.display()));
             }
@@ -880,8 +948,14 @@ fn remove_checkout(dir: &Path, git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `git_dir`: where a new checkout's git dir goes (`Layout::git_dir`); Clone and Reclone only happen to shared checkouts.
-fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()> {
+/// `dir`: the checkout `layout` places (a task copy or the shared one); a deletion is always of the shared one (a task copy is a linked worktree, which refuses it).
+fn apply(
+    action: &Action,
+    c: &Checkout,
+    dir: &Path,
+    layout: &Layout,
+    pinned: &[Checkout],
+) -> Result<()> {
     match action {
         Action::Clone => {
             verify_ref(c)?;
@@ -890,18 +964,19 @@ fn apply(action: &Action, c: &Checkout, dir: &Path, git_dir: &Path) -> Result<()
             } else {
                 Sparse::Cone(&c.sparse)
             };
-            create_checkout(dir, git_dir, c.url()?, &c.rev, &sparse, Some(&c.commit))?;
+            let git_dir = layout.git_dir(&c.dir);
+            create_checkout(dir, &git_dir, c.url()?, &c.rev, &sparse, Some(&c.commit))?;
             Ok(())
         }
         Action::Reclone => {
-            remove_checkout(dir, git_dir)?;
-            apply(&Action::Clone, c, dir, git_dir)
+            remove_checkout(layout, &c.dir, pinned)?;
+            apply(&Action::Clone, c, dir, layout, pinned)
         }
         Action::Recreate(_) => {
             // the remote must still resolve the pin before the only copy of the checkout is deleted
             verify_ref(c)?;
-            remove_checkout(dir, git_dir)?;
-            apply(&Action::Clone, c, dir, git_dir)
+            remove_checkout(layout, &c.dir, pinned)?;
+            apply(&Action::Clone, c, dir, layout, pinned)
         }
         Action::Grow(dirs) => grow_checkout(dir, &c.commit, dirs),
         Action::MoveToPin => {
@@ -1534,16 +1609,19 @@ mod tests {
     #[test]
     fn clone_then_at_pin() {
         let remote = Remote::new("clone");
-        let src = remote.dir.with_extension("src");
-        let _ = std::fs::remove_dir_all(&src);
+        let ws = remote.dir.with_extension("ws");
+        let _ = std::fs::remove_dir_all(&ws);
+        let layout = Layout::new(&ws, None);
+        let src = layout.src().to_path_buf();
         let c = remote.checkout(&remote.first);
         let dir = src.join(&c.dir);
-        let store = atl_layout::git_store(&src, &c.dir);
+        let store = layout.git_dir(&c.dir);
         apply(
             &decide(&inspect(&dir).unwrap(), &c.commit),
             &c,
             &dir,
-            &store,
+            &layout,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1566,14 +1644,16 @@ mod tests {
         git(Some(&old), &["init", "-q"]).unwrap();
         let e = format!("{:#}", inspect(&old).unwrap_err());
         assert!(e.contains("--migrate-git-dirs"), "{e}");
-        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
     }
 
     #[test]
     fn interrupted_clone_is_recloned() {
         let remote = Remote::new("reclone");
-        let src = remote.dir.with_extension("src");
-        let _ = std::fs::remove_dir_all(&src);
+        let ws = remote.dir.with_extension("ws");
+        let _ = std::fs::remove_dir_all(&ws);
+        let layout = Layout::new(&ws, None);
+        let src = layout.src().to_path_buf();
         let c = remote.checkout(&remote.first);
         let dir = src.join(&c.dir);
         // what a killed `git fetch --depth 1` leaves (measured on prebuilts/clang): a stale lock that
@@ -1598,7 +1678,7 @@ mod tests {
         std::fs::write(store.join("objects/pack/tmp_pack_x"), "partial").unwrap();
         let local = inspect(&dir).unwrap();
         assert_eq!(decide(&local, &c.commit), Action::Reclone);
-        apply(&Action::Reclone, &c, &dir, &store).unwrap();
+        apply(&Action::Reclone, &c, &dir, &layout, &[]).unwrap();
         assert_eq!(
             decide(&inspect(&dir).unwrap(), &c.commit),
             Action::AtPin { dirty: false }
@@ -1613,7 +1693,7 @@ mod tests {
             decide(&inspect(&other).unwrap(), &c.commit),
             Action::Blocked(_)
         ));
-        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
     }
 
     /// `--drop`: an unpinned or unrequested checkout goes (dry run first); a requested one, a dirty one, one on a local branch and one with a task copy are refused, and one refusal drops nothing.
@@ -1767,6 +1847,7 @@ mod tests {
             ident: Some(ident()),
             execute,
             recreate: &[],
+            pinned: Vec::new(),
         }
     }
 
@@ -1799,6 +1880,108 @@ mod tests {
         // in step: nothing to report
         let row = sync(&ctx(&f, &ws, true), &c).unwrap();
         assert_eq!((row.action, row.patches), (Action::PatchBranch, None));
+    }
+
+    /// `--recreate` deletes the shared git dir: a checkout, clean at its pin, whose git dir holds a task copy, a local branch, a stash or (dropped) a detached commit is refused by dry run, execute, land's preflight and the deletion itself, naming what it holds; one that holds nothing is recreated.
+    #[test]
+    fn recreate_refuses_what_the_git_dir_holds() {
+        let f = Fixture::new("fetch-held");
+        let c = f.aosp_checkout("v1", "pa");
+        let ws = f.layout("ws", None);
+
+        let recreate = ["pa".to_owned()];
+        let u = f.fetched(&c, "ws");
+        let dir = u.checkout().to_path_buf();
+        // the table wants a full tree
+        git(Some(&dir), &["sparse-checkout", "set", "--cone", "none"]).unwrap();
+        let ctx = |execute: bool| Ctx {
+            recreate: &recreate,
+            ..ctx(&f, &ws, execute)
+        };
+        let refused = |holds: &str| {
+            match sync(&ctx(false), &c).unwrap().action {
+                Action::Blocked(why) => assert!(why.contains(holds), "{why}"),
+                a => panic!("{holds}: {a:?}"),
+            }
+            let deleted = remove_checkout(&ws, &c.dir, &[]).expect_err(holds);
+            let preflight = keep_preflight(&ws, &c, &[], false).expect_err(holds);
+            for e in [
+                sync_err(&ctx(true), &c),
+                format!("{deleted:#}"),
+                format!("{preflight:#}"),
+            ] {
+                assert!(e.contains(holds), "{e}");
+            }
+            assert!(dir.join(".git").exists() && ws.git_dir(&c.dir).join("HEAD").exists());
+        };
+        let g = |args: &[&str]| git(Some(&dir), args).unwrap();
+
+        let copy = f
+            .root
+            .join("ws/src-wt/t")
+            .join(&c.dir)
+            .display()
+            .to_string();
+        g(&["worktree", "add", "-q", "--detach", &copy]);
+        refused(&format!("task copy {copy} exists"));
+        g(&["worktree", "remove", &copy]);
+
+        g(&["branch", "mine"]);
+        refused("local branch mine");
+        g(&["branch", "-q", "-D", "mine"]);
+
+        g(&["update-ref", "refs/stash", "HEAD"]);
+        refused("stashed changes");
+        g(&["update-ref", "-d", "refs/stash"]);
+
+        // land's own task copy, made after the preflight
+        let e = keep_preflight(&ws, &c, &[], true).unwrap_err();
+        assert!(format!("{e:#}").contains("land makes one"), "{e:#}");
+
+        // holds nothing: recreated
+        assert_eq!(
+            keep_preflight(&ws, &c, &[], false).unwrap().as_deref(),
+            Some("pa")
+        );
+        assert!(matches!(
+            sync(&ctx(true), &c).unwrap().action,
+            Action::Recreate(_)
+        ));
+        assert!(
+            matches!(inspect(&dir).unwrap(), Local::Present { sparse, .. } if sparse.is_empty())
+        );
+
+        // a commit on the detached HEAD; off the pin, so only a drop gets here
+        commit_empty(&dir);
+        let head = git(Some(&dir), &["rev-parse", "HEAD"]).unwrap();
+        let why = drop_refusal(&ws, &c.dir, &[]).unwrap();
+        assert!(why.unwrap().contains(&head));
+    }
+
+    fn commit_empty(dir: &Path) {
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let commit = ["commit", "-q", "--allow-empty", "-m", "x"];
+        git(Some(dir), &[&id[..], &commit[..]].concat()).unwrap();
+    }
+
+    /// A branch pin's own fetched branch is upstream's while at the pin, and a local branch once it holds more.
+    #[test]
+    fn a_branch_pins_own_branch_is_not_local_work() {
+        let f = Fixture::new("fetch-own-branch");
+        let c = f.checkout("v1");
+        let ws = f.layout("ws", None);
+        let u = f.fetched(&c, "ws");
+        let branch = Checkout {
+            rev: "refs/heads/rel".into(),
+            ..f.checkout("v1")
+        };
+        git(Some(u.checkout()), &["branch", "rel"]).unwrap();
+        let pinned = [branch];
+        assert_eq!(drop_refusal(&ws, &c.dir, &pinned).unwrap(), None);
+        git(Some(u.checkout()), &["checkout", "-q", "rel"]).unwrap();
+        commit_empty(u.checkout());
+        let why = drop_refusal(&ws, &c.dir, &pinned).unwrap().unwrap();
+        assert!(why.contains("local branch rel"), "{why}");
     }
 
     /// src/ keeps main's pins and patches: another checkout's go to its task copy, never into src/.
