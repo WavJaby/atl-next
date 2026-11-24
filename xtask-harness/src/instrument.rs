@@ -17,13 +17,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 
 use atl_services_types::packages::Library;
 
 use crate::atld_run::{Package, Run, Runtime, Shell, counter_lines};
 use crate::manifest;
 use crate::verdict::{Failure, Verdict};
+use crate::wait::{Miss, Wait, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -393,16 +394,18 @@ pub struct Outcome {
 pub fn am_instrument(rt: &Runtime, run: &Run, limit: Duration, verbose: bool) -> Result<Outcome> {
     let mut atld = rt.start_atld(run)?;
     let start = Instant::now();
-    let timed_out = loop {
-        if atld.try_wait()?.is_some() {
-            break false;
-        }
-        if start.elapsed() > limit {
+    // the late run is the caller's judgement (`timed_out`), not a probe stop: cts classifies it, this row's checks read its log
+    let timed_out = match until_child(
+        &Wait::exit("am-instrument", "the run outlived its limit", limit),
+        &mut atld,
+    ) {
+        Ok(_) => false,
+        Err(Miss::Late { .. }) => {
             let _ = atld.kill();
             atld.wait()?;
-            break true;
+            true
         }
-        std::thread::sleep(Duration::from_millis(200));
+        Err(miss) => bail!("{}", miss.text()),
     };
     let read = atl_diag::logfiles::read;
     let am_log = read(&run.log("am"));

@@ -12,6 +12,7 @@ use anyhow::Result;
 use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime};
+use crate::wait::{Miss, Wait, stopped_at, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -89,14 +90,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let read = atl_diag::logfiles::read;
     let log = run.log(PACKAGE);
     let start = Instant::now();
-    let ended = loop {
-        if read(&log).contains(DONE) || start.elapsed() > LIMIT {
-            break None;
-        }
-        if let Some(s) = atld.try_wait()? {
-            break Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    let done_line = |t: &str| t.contains(DONE);
+    let done = Wait::log(
+        "billing-done",
+        format!("no {DONE:?} line within {LIMIT:?}"),
+        LIMIT,
+        &log,
+        &done_line,
+    );
+    let outcome = until_child(&done, &mut atld);
+    let ended = match &outcome {
+        Err(Miss::Exited { status, .. }) => Some(status.clone()),
+        _ => None,
     };
     if ended.is_none() {
         let _ = atld.kill();
@@ -118,16 +123,22 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             },
         ),
     ];
-    let mut whys = Vec::new();
-    for (what, ok) in checks {
-        println!(
-            "billing: {} {what} (setting {setting})",
-            if ok { "pass" } else { "FAIL" }
-        );
-        if !ok {
-            whys.push(what.to_owned());
+    let mut whys = match &outcome {
+        Err(late @ Miss::Late { .. }) => stopped_at("billing", &checks, late),
+        _ => {
+            let mut fails = Vec::new();
+            for (what, ok) in checks {
+                println!(
+                    "billing: {} {what} (setting {setting})",
+                    if ok { "pass" } else { "FAIL" }
+                );
+                if !ok {
+                    fails.push(what.to_owned());
+                }
+            }
+            fails
         }
-    }
+    };
     if whys.is_empty() {
         println!(
             "billing: pass (setting {setting}, {} checks in {:.1?})",

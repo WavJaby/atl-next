@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::installer::{new_records, seccomp_records};
 use crate::stage_env::lib_env;
-use anyhow::{Context, Result, ensure};
+use crate::wait::{Miss, Wait, until_child};
+use anyhow::{Context, Result, bail, ensure};
 use atl_broker::{Broker, Mount, Process, Spawn, to_log};
 use atl_sepolicy::domains;
 
@@ -223,22 +224,20 @@ fn service_limited(
 /// How long one `service` run may take: a lookup is one binder round trip (well under 100 ms); a hang means a lost reply.
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 
-/// `child`'s exit status, or None after killing it at `limit`.
+/// `child`'s exit status, or None after killing it at `limit`. One record name for every caller (adb, binder, installer, sandbox, gralloc): `wait: exit-limited`.
 pub(crate) fn wait_limited(
     child: &mut Child,
     limit: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
-    let start = Instant::now();
-    loop {
-        if let Some(s) = child.try_wait()? {
-            return Ok(Some(s));
-        }
-        if start.elapsed() > limit {
+    let exit = Wait::exit("exit-limited", "the process outlived its limit", limit);
+    match until_child(&exit, child) {
+        Ok(_) => Ok(Some(child.wait()?)),
+        Err(Miss::Late { .. }) => {
             let _ = child.kill();
             child.wait()?;
-            return Ok(None);
+            Ok(None)
         }
-        std::thread::sleep(Duration::from_millis(10));
+        Err(miss) => bail!("{}", miss.text()),
     }
 }
 

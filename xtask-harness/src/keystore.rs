@@ -24,11 +24,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, Shell};
 use crate::tree;
+use crate::wait::{Miss, Wait, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -106,7 +107,8 @@ const PROBE_CLASS: &str = "com.example.atlkeystore.Probe";
 const PROBE_NAME: &str = "keystore-probe";
 /// A cold start (ART without a boot image interprets framework.jar's class init), as `xtask test gl`'s limit.
 const LIMIT: Duration = Duration::from_secs(120);
-const POLL: Duration = Duration::from_millis(100);
+/// The app launch's DONE wait: its record name and the `not reached` name of its checks.
+const LAUNCH_WAIT: &str = "keystore-launch-done";
 
 /// android.system.keystore2.ResponseCode.KEY_NOT_FOUND (ResponseCode.aidl).
 const KEY_NOT_FOUND: i32 = 7;
@@ -287,12 +289,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     };
     let start = Instant::now();
     let mut child = rt.start_atld(&run)?;
-    while child.try_wait()?.is_none() {
-        if start.elapsed() > LIMIT {
+    let exit = Wait::exit(
+        "keystore-probe-exit",
+        format!("atld outlived {LIMIT:?}"),
+        LIMIT,
+    );
+    match until_child(&exit, &mut child) {
+        Ok(_) => {}
+        // a late atld is killed; its end is judged below (check_end), as before
+        Err(Miss::Late { .. }) => {
             let _ = child.kill();
-            break;
         }
-        std::thread::sleep(POLL);
+        Err(miss) => bail!("{}", miss.text()),
     }
     let end = child.wait()?;
     let ended = rt.check_end(end, &run);
@@ -399,30 +407,45 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             shell: None,
             log_tags: "*:i".to_owned(),
         };
-        let started = Instant::now();
         let mut child = rt.start_atld(&run)?;
-        while !read(&run.log(PACKAGE)).contains(APP_DONE)
-            && started.elapsed() < LIMIT
-            && child.try_wait()?.is_none()
-        {
-            std::thread::sleep(POLL);
-        }
+        let log = run.log(PACKAGE);
+        let done_line = |t: &str| t.contains(APP_DONE);
+        let done = Wait::log(
+            LAUNCH_WAIT,
+            format!("launch {n}: no {APP_DONE:?} line within {LIMIT:?}"),
+            LIMIT,
+            &log,
+            &done_line,
+        );
+        let outcome = until_child(&done, &mut child);
         let end = run.stop(&mut child)?;
         let ended = rt.check_end(end, &run);
-        let text = read(&run.log(PACKAGE));
+        let text = read(&log);
         if args.verbose {
             println!("---- app launch {n} log\n{text}");
         }
         let mut checks = app_checks(n);
         checks.push(("the launch ended its stage", APP_DONE.to_owned()));
-        for (what, line) in &checks {
-            let ok = text.contains(line.as_str());
-            println!(
-                "keystore: {} launch {n}: {what}",
-                if ok { "pass" } else { "FAIL" }
-            );
-            if !ok {
-                failed.push(format!("launch {n}: {what}"));
+        match &outcome {
+            // the launch ran out its bound: its wait is the one FAIL, and the checks read what it never wrote
+            Err(late @ Miss::Late { .. }) => {
+                println!("keystore: FAIL {}", late.text());
+                for (what, _) in &checks {
+                    println!("keystore: not reached (after {LAUNCH_WAIT}) launch {n}: {what}");
+                }
+                failed.push(late.text());
+            }
+            _ => {
+                for (what, line) in &checks {
+                    let ok = text.contains(line.as_str());
+                    println!(
+                        "keystore: {} launch {n}: {what}",
+                        if ok { "pass" } else { "FAIL" }
+                    );
+                    if !ok {
+                        failed.push(format!("launch {n}: {what}"));
+                    }
+                }
             }
         }
         count += checks.len();

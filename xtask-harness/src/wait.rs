@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 //! Declared waits (gate-starved-red-design section 2.2, 2.6): one function runs a wait, bounds it and prints its record.
 //!
-//! H2a judges nothing: `bound` is the limit each call site already had, and `need` stays unset until quiet passes measure it.
+//! H2a/H2b judge nothing: `bound` is the limit each call site already had, and `need` stays unset until quiet passes measure it.
 //! `until()` returns `Miss::Late` when the bound passes and the caller decides what that means: a probe `?`s it (its first late wait ends the probe), an absence wait takes it as the answer.
+//! `until_child()` also ends a wait when the child it watches exits (`Miss::Exited`: a death, never a late wait).
 
 use std::path::Path;
+use std::process::{Child, ExitStatus};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -12,8 +14,11 @@ use crate::wayland_proxy::Event as ProxyEvent;
 
 /// How often a log is read while a wait polls it (the app's log is written by another process).
 pub(crate) const POLL: Duration = Duration::from_millis(50);
+/// How often an exit-only wait polls its child (`try_wait` is cheap; the 10 ms that binder's `wait_limited` polled before, so `took=` keeps its precision).
+const EXIT_POLL: Duration = Duration::from_millis(10);
 
-/// What a wait ends on: a log's text (polled), or a proxy event (received; its arrival time is the answer).
+/// What a wait ends on: a log's text (polled), a proxy event (received; its arrival time is the answer), or the child's exit (`until_child` only: the exit is the answer).
+/// `Log` run through `until_child` also ends on that child's exit (`Miss::Exited`).
 pub(crate) enum Until<'a> {
     Log {
         file: &'a Path,
@@ -23,6 +28,7 @@ pub(crate) enum Until<'a> {
         events: &'a Receiver<(Instant, ProxyEvent)>,
         want: &'a dyn Fn(&ProxyEvent) -> bool,
     },
+    Exit,
 }
 
 /// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time (None: not measured yet).
@@ -68,14 +74,27 @@ impl<'a> Wait<'a> {
             until: Until::Event { events, want },
         }
     }
+
+    /// The child's exit within `bound`, for `until_child`: the exit is the answer, its status the caller reads.
+    pub(crate) fn exit(name: &'static str, why: impl Into<String>, bound: Duration) -> Self {
+        Self {
+            name,
+            why: why.into(),
+            bound,
+            need: None,
+            until: Until::Exit,
+        }
+    }
 }
 
 /// Why a check did not pass. `Wrong`: its own judgement, or a probe's proxy/spawn error (never a wait). `Late`: a declared wait ran out its bound. `NotReached`: an earlier late wait ended the probe, so this check did not run.
+/// `Exited`: the child a wait watched ended before the wait's condition held. A death, not a late wait: section 2.3 never excuses it, so it is never `Late`.
 /// Owned strings: the probe's miss travels in `live.json` (LiveRecord) to the judge of a remote run.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Miss {
     Wrong(String),
     Late { name: String, why: String },
+    Exited { name: String, status: String },
     NotReached { after: String },
 }
 
@@ -84,6 +103,7 @@ impl Miss {
     pub(crate) fn text(&self) -> String {
         match self {
             Self::Wrong(s) | Self::Late { why: s, .. } => s.clone(),
+            Self::Exited { name, status } => format!("{name}: the process exited {status}"),
             Self::NotReached { after } => format!("not reached (after {after})"),
         }
     }
@@ -91,7 +111,9 @@ impl Miss {
     /// The probe's miss named for a `not reached` line: its late wait, or `probe` for a probe error.
     fn after(&self) -> String {
         match self {
-            Self::Late { name, .. } | Self::NotReached { after: name } => name.clone(),
+            Self::Late { name, .. }
+            | Self::Exited { name, .. }
+            | Self::NotReached { after: name } => name.clone(),
             Self::Wrong(_) => "probe".to_owned(),
         }
     }
@@ -103,41 +125,114 @@ impl From<String> for Miss {
     }
 }
 
-/// Runs `wait` until its condition holds (Ok: a log text seen, or an event's arrival time) or its bound passes (Late). Prints the record once, on either outcome.
+/// Runs `wait` until its condition holds (Ok: the instant it did) or its bound passes (Late). Prints the record once, on either outcome.
 pub(crate) fn until(wait: &Wait) -> Result<Instant, Miss> {
+    run(wait, None)
+}
+
+/// [`until`], also ended by `child`'s exit (`Miss::Exited`). An [`Until::Exit`] wait is that exit (Ok). An event wait does not watch its child.
+pub(crate) fn until_child(wait: &Wait, child: &mut Child) -> Result<Instant, Miss> {
+    run(wait, Some(child))
+}
+
+/// How a wait ended: its condition's instant, the watched child's exit, or the bound.
+enum Ended {
+    Held(Instant),
+    Exited(Instant, ExitStatus),
+    Late,
+}
+
+fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
     let start = Instant::now();
     let deadline = start + wait.bound;
-    let held = match &wait.until {
-        Until::Log { file, want } => {
-            let mut seen = None;
-            while Instant::now() < deadline {
-                if want(&atl_diag::logfiles::read(file)) {
-                    seen = Some(Instant::now());
-                    break;
-                }
-                std::thread::sleep(POLL);
-            }
-            seen
+    let ended = match (&wait.until, child) {
+        (Until::Event { events, want }, _) => Ok(received(events, want, deadline)),
+        (Until::Log { file, want }, child) => polled(
+            deadline,
+            child,
+            &|| want(&atl_diag::logfiles::read(file)),
+            false,
+            POLL,
+        ),
+        (Until::Exit, Some(child)) => polled(deadline, Some(child), &|| false, true, EXIT_POLL),
+        (Until::Exit, None) => {
+            return Err(Miss::Wrong(format!(
+                "{}: an exit wait needs its child (until_child)",
+                wait.name
+            )));
         }
-        Until::Event { events, want } => loop {
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                break None;
-            };
-            match events.recv_timeout(left) {
-                Ok((at, event)) if want(&event) => break Some(at),
-                Ok(_) => {}
-                Err(_) => break None,
-            }
-        },
+    }
+    .map_err(|e| Miss::Wrong(format!("{}: {e}", wait.name)))?;
+    let at = match &ended {
+        Ended::Held(at) | Ended::Exited(at, _) => *at,
+        Ended::Late => Instant::now(),
     };
-    let took = held
-        .unwrap_or_else(Instant::now)
-        .saturating_duration_since(start);
-    record(wait.name, took, wait.bound, wait.need);
-    held.ok_or_else(|| Miss::Late {
-        name: wait.name.to_owned(),
-        why: wait.why.clone(),
-    })
+    record(
+        wait.name,
+        at.saturating_duration_since(start),
+        wait.bound,
+        wait.need,
+    );
+    match ended {
+        Ended::Held(at) => Ok(at),
+        Ended::Exited(_, status) => Err(Miss::Exited {
+            name: wait.name.to_owned(),
+            status: status.to_string(),
+        }),
+        Ended::Late => Err(Miss::Late {
+            name: wait.name.to_owned(),
+            why: wait.why.clone(),
+        }),
+    }
+}
+
+/// Receives events until `want` accepts one (Held at its arrival) or `deadline` passes. Other events are skipped.
+fn received(
+    events: &Receiver<(Instant, ProxyEvent)>,
+    want: &dyn Fn(&ProxyEvent) -> bool,
+    deadline: Instant,
+) -> Ended {
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Ended::Late;
+        };
+        match events.recv_timeout(left) {
+            Ok((at, event)) if want(&event) => return Ended::Held(at),
+            Ok(_) => {}
+            Err(_) => return Ended::Late,
+        }
+    }
+}
+
+/// Polls every `interval` until `held` holds, then the child (if any) exits (`exit_holds`: that exit is the answer; else Exited), else `deadline` passes (Late). Each poll checks in that order.
+fn polled(
+    deadline: Instant,
+    mut child: Option<&mut Child>,
+    held: &dyn Fn() -> bool,
+    exit_holds: bool,
+    interval: Duration,
+) -> std::io::Result<Ended> {
+    loop {
+        if held() {
+            return Ok(Ended::Held(Instant::now()));
+        }
+        let exited = match child.as_mut() {
+            Some(c) => c.try_wait()?,
+            None => None,
+        };
+        if let Some(status) = exited {
+            let now = Instant::now();
+            return Ok(if exit_holds {
+                Ended::Held(now)
+            } else {
+                Ended::Exited(now, status)
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(Ended::Late);
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 /// The record line of a declared wait: `wait: <name> took=<ms> bound=<ms> need=<ms|unset>`.
@@ -179,6 +274,31 @@ pub(crate) fn settle<N>(
             (name, result)
         })
         .collect()
+}
+
+/// A row's bool checks, each printed `<row>: pass|FAIL <what>`. Returns the failing `what`s: the verdict's list.
+pub(crate) fn judge_checks(row: &str, checks: &[(&str, bool)]) -> Vec<String> {
+    let mut fails = Vec::new();
+    for (what, ok) in checks {
+        println!("{row}: {} {what}", if *ok { "pass" } else { "FAIL" });
+        if !*ok {
+            fails.push((*what).to_owned());
+        }
+    }
+    fails
+}
+
+/// A run-end wait `late` ran out before the checks could read the run's end: one FAIL (its why, the verdict's only failure), then every check `not reached`, judging nothing.
+pub(crate) fn stopped_at(row: &str, checks: &[(&str, bool)], late: &Miss) -> Vec<String> {
+    let not_reached = Miss::NotReached {
+        after: late.after(),
+    }
+    .text();
+    println!("{row}: FAIL {}", late.text());
+    for (what, _) in checks {
+        println!("{row}: {not_reached} {what}");
+    }
+    vec![late.text()]
 }
 
 #[cfg(test)]
@@ -285,5 +405,85 @@ mod tests {
             Err(Miss::Wrong("wrong pixel at (0,0)".to_owned()))
         );
         assert_eq!(out[1].1, Err(late("draw", "the fixture never drew")));
+    }
+
+    fn sh(script: &str) -> Child {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("sh")
+    }
+
+    #[test]
+    fn exit_wait_is_the_childs_exit_or_late_on_the_bound() {
+        let mut quick = sh("exit 3");
+        let w = Wait::exit("quick", "never exited", Duration::from_secs(5));
+        assert!(until_child(&w, &mut quick).is_ok());
+        assert_eq!(quick.wait().expect("status").code(), Some(3));
+        let mut slow = sh("sleep 30");
+        let w = Wait::exit("slow", "still running", Duration::from_millis(100));
+        assert_eq!(
+            until_child(&w, &mut slow).unwrap_err(),
+            late("slow", "still running")
+        );
+        slow.kill().expect("kill");
+        slow.wait().expect("reap");
+    }
+
+    #[test]
+    fn exit_wait_without_its_child_is_a_wrong_miss_not_a_late_one() {
+        let w = Wait::exit("orphan", "no child", Duration::from_millis(10));
+        assert!(matches!(until(&w), Err(Miss::Wrong(_))));
+    }
+
+    #[test]
+    fn log_wait_with_a_child_ends_early_when_the_child_exits() {
+        let dir = std::env::temp_dir().join(format!("wait-child-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.log");
+        std::fs::write(&file, "starting\n").unwrap();
+        let want = |t: &str| t.contains("finished");
+        let w = Wait::log(
+            "done",
+            "never finished",
+            Duration::from_secs(30),
+            &file,
+            &want,
+        );
+        let mut dead = sh("exit 4");
+        let err = until_child(&w, &mut dead).unwrap_err();
+        assert_eq!(
+            err,
+            Miss::Exited {
+                name: "done".to_owned(),
+                status: "exit status: 4".to_owned(),
+            }
+        );
+        // the text arrives while the child still runs: the wait ends on the text, not on the child
+        let mut alive = sh("sleep 30");
+        std::fs::write(&file, "starting\nfinished\n").unwrap();
+        assert!(until_child(&w, &mut alive).is_ok());
+        alive.kill().expect("kill");
+        alive.wait().expect("reap");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn judge_checks_lists_the_failing_checks_in_order() {
+        let checks = [("a", true), ("b", false), ("c", false)];
+        assert_eq!(
+            judge_checks("row", &checks),
+            vec!["b".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_late_run_end_wait_is_one_fail_and_every_check_not_reached() {
+        let miss = late("provider-done", "no done line within 180s");
+        let checks = [("first", true), ("second", false)];
+        assert_eq!(
+            stopped_at("row", &checks, &miss),
+            vec!["no done line within 180s".to_owned()]
+        );
     }
 }

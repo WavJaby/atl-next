@@ -10,7 +10,7 @@
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_broker::{Broker, Process, to_log};
@@ -20,6 +20,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::binder;
 use crate::packages;
+use crate::wait::{Miss, Wait, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -161,22 +162,6 @@ pub fn append_lib_path(env: &mut [(String, String)], dir: &Path) {
     }
 }
 
-/// `child`'s status, or None after killing it at `limit`.
-fn wait_limited(child: &mut Child, limit: Duration) -> Result<Option<std::process::ExitStatus>> {
-    let start = Instant::now();
-    loop {
-        if let Some(s) = child.try_wait()? {
-            return Ok(Some(s));
-        }
-        if start.elapsed() > limit {
-            let _ = child.kill();
-            child.wait()?;
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// `<name>=<n>` of a counters line.
 fn counter(line: &str, name: &str) -> Option<u64> {
     line.split_whitespace()
@@ -242,26 +227,30 @@ pub fn start_allocator(
     let Process {
         child: mut alloc, ..
     } = broker.spawn(s).context("starting the allocator")?;
-    let start = Instant::now();
-    loop {
-        let text = std::fs::read_to_string(log).unwrap_or_default();
-        if text.contains(READY_LINE) {
-            return Ok(alloc);
-        }
-        if let Some(s) = alloc.try_wait()? {
-            bail!(
-                "the allocator exited {s} before it registered:\n{}",
-                text.trim()
-            );
-        }
-        if start.elapsed() > READY {
+    let ready_line = |t: &str| t.contains(READY_LINE);
+    let ready = Wait::log(
+        "gralloc-ready",
+        format!("no {READY_LINE:?} line within {READY:?}"),
+        READY,
+        log,
+        &ready_line,
+    );
+    let outcome = until_child(&ready, &mut alloc);
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    match outcome {
+        Ok(_) => Ok(alloc),
+        Err(Miss::Exited { status, .. }) => bail!(
+            "the allocator exited {status} before it registered:\n{}",
+            text.trim()
+        ),
+        Err(Miss::Late { .. }) => {
             let _ = alloc.kill();
             bail!(
                 "the allocator was not ready after {READY:?}:\n{}",
                 text.trim()
-            );
+            )
         }
-        std::thread::sleep(Duration::from_millis(50));
+        Err(miss) => bail!("{}", miss.text()),
     }
 }
 
@@ -355,8 +344,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let reader_log = test_root.join("reader.log");
         let mut writer = spawn_probe(&broker, &probe, "writer", a, &env, &writer_log)?;
         let mut reader = spawn_probe(&broker, &probe, "reader", b, &env, &reader_log)?;
-        let reader_status = wait_limited(&mut reader.child, PROBE_LIMIT)?;
-        let writer_status = wait_limited(&mut writer.child, PROBE_LIMIT)?;
+        let reader_status = binder::wait_limited(&mut reader.child, PROBE_LIMIT)?;
+        let writer_status = binder::wait_limited(&mut writer.child, PROBE_LIMIT)?;
         let _ = alloc.kill();
         let _ = alloc.wait();
 

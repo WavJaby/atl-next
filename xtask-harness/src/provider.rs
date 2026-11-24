@@ -16,6 +16,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime};
 use crate::manifest;
+use crate::wait::{Miss, Wait, judge_checks, stopped_at, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -112,14 +113,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let read = atl_diag::logfiles::read;
     let log = run.log(&package);
     let start = Instant::now();
-    let ended = loop {
-        if read(&log).contains(DONE) || start.elapsed() > LIMIT {
-            break None;
-        }
-        if let Some(s) = atld.try_wait()? {
-            break Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    let done_line = |t: &str| t.contains(DONE);
+    let done = Wait::log(
+        "provider-done",
+        format!("no {DONE:?} line within {LIMIT:?}"),
+        LIMIT,
+        &log,
+        &done_line,
+    );
+    let outcome = until_child(&done, &mut atld);
+    let ended = match &outcome {
+        Err(Miss::Exited { status, .. }) => Some(status.clone()),
+        _ => None,
     };
     if ended.is_none() {
         let _ = atld.kill();
@@ -152,13 +157,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             text.contains(OWN_TYPE),
         ),
     ];
-    let mut whys = Vec::new();
-    for (what, ok) in checks {
-        println!("provider: {} {what}", if ok { "pass" } else { "FAIL" });
-        if !ok {
-            whys.push(what.to_owned());
-        }
-    }
+    let mut whys = match &outcome {
+        Err(late @ Miss::Late { .. }) => stopped_at("provider", &checks, late),
+        _ => judge_checks("provider", &checks),
+    };
     if whys.is_empty() {
         println!(
             "provider: pass ({} checks in {:.1?})",
