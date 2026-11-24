@@ -21,6 +21,7 @@
 //!
 //! Failure prints the apps' and the services' log tails; the counters are printed always.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ use atl_layout::Layout;
 
 use crate::atld_run::{Package, Run, Runtime, counter_lines, route_fifo, set_default_route};
 use crate::manifest;
+use crate::wait::{Miss, Wait, settle_for, until, until_child};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -204,34 +206,35 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let read = atl_diag::logfiles::read;
     let (sender_log, receiver_log) = (run.log(&sender), run.log(&receiver));
     let start = Instant::now();
-    let mut ping_seen: Option<Instant> = None;
-    // the sender's DONE line: the receiver sends DONE after its PING
-    let mut done_seen = false;
-    // the headless end follows the receiver's finish by EMPTY_GRACE_MS: wait for its line (LIMIT caps the wait)
+    let services_log = run.log("services");
+    // the PING's line, seen at a poll: the headless end counts only after it (the receiver finishes after its PING)
+    let ping_seen = Cell::new(false);
+    // the headless end follows the receiver's finish by EMPTY_GRACE_MS: its line (LIMIT caps the wait)
     let end_line = format!("process {receiver} ended: empty headless (grace {EMPTY_GRACE_MS} ms)");
-    let mut end_seen = false;
-    // the alarm chain's last step (Recv.java ALARM_GRANT): the run ends only once AlarmSvc started, so the grant is inside the run
-    let mut alarm_seen = false;
-    let ended = loop {
-        if ping_seen.is_none() && read(&receiver_log).contains(PING_SENT) {
-            ping_seen = Some(Instant::now());
+    // the run ends once the sender's DONE (the fence of once_before_done), the headless end and the alarm chain's last step are logged.
+    // The alarm chain (Recv.java ALARM_GRANT) ends only once AlarmSvc started, so the grant is inside the run
+    let run_end = || {
+        if !ping_seen.get() && read(&receiver_log).contains(PING_SENT) {
+            ping_seen.set(true);
         }
-        if !done_seen {
-            done_seen = read(&sender_log).contains(DONE_RECEIVED);
-        }
-        if ping_seen.is_some() && !end_seen {
-            end_seen = read(&run.log("services")).contains(&end_line);
-        }
-        if !alarm_seen {
-            alarm_seen = read(&receiver_log).contains(ALARM_SERVICE_STARTED);
-        }
-        if (done_seen && end_seen && alarm_seen) || start.elapsed() > LIMIT {
-            break None;
-        }
-        if let Some(s) = atld.try_wait()? {
-            break Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        ping_seen.get()
+            && read(&services_log).contains(&end_line)
+            && read(&sender_log).contains(DONE_RECEIVED)
+            && read(&receiver_log).contains(ALARM_SERVICE_STARTED)
+    };
+    // a run end that runs out is judged later, as before: the checks read the logs as they are. atld's death is a verdict line
+    let ended = match until_child(
+        &Wait::logs(
+            "broadcast-run-end",
+            "no done, headless end or alarm line",
+            LIMIT,
+            &run_end,
+        ),
+        &mut atld,
+    ) {
+        Ok(_) | Err(Miss::Late { .. }) => None,
+        Err(Miss::Exited { status, .. }) => Some(status),
+        Err(miss) => anyhow::bail!(miss.text()),
     };
     if ended.is_none() {
         let _ = atld.kill();
@@ -278,22 +281,33 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut atld2 = opt_in.start_atld(&run2)?;
     let (r2_log, s2_log) = (run2.log(&receiver), run2.log(&sender));
     let start2 = Instant::now();
-    let mut replaced_seen: Option<Instant> = None;
-    let ended2 = loop {
-        if replaced_seen.is_none() && read(&r2_log).contains(BOOT_MY_REPLACED) {
-            replaced_seen = Some(Instant::now());
+    // the receiver's MY_PACKAGE_REPLACED, then the sender's silence is read after REINSTALL_SETTLE (what is left of LIMIT at most): a late delivery lands before it.
+    // The settle stays a timed wait (see REINSTALL_SETTLE): no fence on the sender's queue exists in this run
+    let replaced = |t: &str| t.contains(BOOT_MY_REPLACED);
+    let mut atld2_ended = false;
+    match until_child(
+        &Wait::log(
+            "reinstall-replaced",
+            "no MY_PACKAGE_REPLACED line",
+            LIMIT,
+            &r2_log,
+            &replaced,
+        ),
+        &mut atld2,
+    ) {
+        Ok(at) => {
+            let left = LIMIT.saturating_sub(at.saturating_duration_since(start2));
+            match settle_for("reinstall-settle", REINSTALL_SETTLE.min(left), &mut atld2) {
+                Ok(()) => {}
+                Err(Miss::Exited { .. }) => atld2_ended = true,
+                Err(miss) => anyhow::bail!(miss.text()),
+            }
         }
-        // the sender's silence is read once REINSTALL_SETTLE has let a late delivery land after the receiver's line (still a fixed wait: see REINSTALL_SETTLE)
-        let settled = replaced_seen.is_some_and(|t| t.elapsed() > REINSTALL_SETTLE);
-        if settled || start2.elapsed() > LIMIT {
-            break None;
-        }
-        if let Some(s) = atld2.try_wait()? {
-            break Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    if ended2.is_none() {
+        Err(Miss::Exited { .. }) => atld2_ended = true,
+        Err(Miss::Late { .. }) => {}
+        Err(miss) => anyhow::bail!(miss.text()),
+    }
+    if !atld2_ended {
         let _ = atld2.kill();
         atld2.wait()?;
     }
@@ -329,7 +343,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
         (
             "foreign PING skipped for the not-exported receiver",
-            ping_seen.is_some() && counted(EXPORTED_DENIAL) && once_before_done(&s),
+            ping_seen.get() && counted(EXPORTED_DENIAL) && once_before_done(&s),
         ),
         (
             "an app's protected BATTERY_LOW threw SecurityException",
@@ -501,24 +515,27 @@ fn connectivity_checks(
     let mut atld = started?;
     let (fifo, app) = (route_fifo(&run), run.log(&package));
     let read = atl_diag::logfiles::read;
-    // waits up to NET_STEP for the app's log to hold `marker`
-    let seen = |marker: &str| -> bool {
-        let start = Instant::now();
-        while start.elapsed() < NET_STEP {
-            if count(&read(&app), marker) >= 1 {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        false
+    // waits up to NET_STEP for the app's log to hold `marker`: one declared wait per step (its record); a late step is false
+    let seen = |name: &'static str, marker: &str| -> bool {
+        let held = |t: &str| t.contains(marker);
+        until(&Wait::log(
+            name,
+            format!("no {marker} line"),
+            NET_STEP,
+            &app,
+            &held,
+        ))
+        .is_ok()
     };
     // each step needs the one before it: a failed step leaves the later ones unchecked (false)
-    let start_seen = seen(NET_START);
-    let sticky_start = start_seen && seen(NET_STICKY_START);
-    let lost_seen = start_seen && set_default_route(&fifo, false).is_ok() && seen(NET_LOST);
-    let sticky_lost = lost_seen && seen(NET_STICKY_LOST);
-    let again_seen = lost_seen && set_default_route(&fifo, true).is_ok() && seen(NET_AGAIN);
-    let sticky_again = again_seen && seen(NET_STICKY_AGAIN);
+    let start_seen = seen("net-start", NET_START);
+    let sticky_start = start_seen && seen("net-sticky-start", NET_STICKY_START);
+    let lost_seen =
+        start_seen && set_default_route(&fifo, false).is_ok() && seen("net-lost", NET_LOST);
+    let sticky_lost = lost_seen && seen("net-sticky-lost", NET_STICKY_LOST);
+    let again_seen =
+        lost_seen && set_default_route(&fifo, true).is_ok() && seen("net-again", NET_AGAIN);
+    let sticky_again = again_seen && seen("net-sticky-again", NET_STICKY_AGAIN);
     let _ = atld.kill();
     atld.wait()?;
     let checks = vec![

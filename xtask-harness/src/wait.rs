@@ -17,8 +17,8 @@ pub(crate) const POLL: Duration = Duration::from_millis(50);
 /// How often an exit-only wait polls its child (`try_wait` is cheap; the 10 ms that binder's `wait_limited` polled before, so `took=` keeps its precision).
 const EXIT_POLL: Duration = Duration::from_millis(10);
 
-/// What a wait ends on: a log's text (polled), a proxy event (received; its arrival time is the answer), or the child's exit (`until_child` only: the exit is the answer).
-/// `Log` run through `until_child` also ends on that child's exit (`Miss::Exited`).
+/// What a wait ends on: a log's text (polled), a proxy event (received; its arrival time is the answer), the child's exit (`until_child` only: the exit is the answer),
+/// or a condition the caller reads from any number of logs (`Logs`, polled like a log). `Log` and `Logs` run through `until_child` also end on that child's exit (`Miss::Exited`).
 pub(crate) enum Until<'a> {
     Log {
         file: &'a Path,
@@ -29,6 +29,10 @@ pub(crate) enum Until<'a> {
         want: &'a dyn Fn(&ProxyEvent) -> bool,
     },
     Exit,
+    /// `held` is the whole judgement: the caller reads each log it needs. Multi-log fences (broadcast's run end, app's marker or app end) are this kind.
+    Logs {
+        held: &'a dyn Fn() -> bool,
+    },
 }
 
 /// A declared wait. `name` is its record; `why` is what the check needed, printed when the bound passes; `need` is the quiet-host time (None: not measured yet).
@@ -83,6 +87,22 @@ impl<'a> Wait<'a> {
             bound,
             need: None,
             until: Until::Exit,
+        }
+    }
+
+    /// A condition `held` reads from any number of logs, polled for `bound`. Holds only while `held` does: a conjunction of logs is one `held`.
+    pub(crate) fn logs(
+        name: &'static str,
+        why: impl Into<String>,
+        bound: Duration,
+        held: &'a dyn Fn() -> bool,
+    ) -> Self {
+        Self {
+            name,
+            why: why.into(),
+            bound,
+            need: None,
+            until: Until::Logs { held },
         }
     }
 }
@@ -154,6 +174,7 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
             false,
             POLL,
         ),
+        (Until::Logs { held }, child) => polled(deadline, child, *held, false, POLL),
         (Until::Exit, Some(child)) => polled(deadline, Some(child), &|| false, true, EXIT_POLL),
         (Until::Exit, None) => {
             return Err(Miss::Wrong(format!(
@@ -299,6 +320,22 @@ pub(crate) fn stopped_at(row: &str, checks: &[(&str, bool)], late: &Miss) -> Vec
         println!("{row}: {not_reached} {what}");
     }
     vec![late.text()]
+}
+
+/// A timed settle with no condition: `bound` passes (Ok, its record printed) or `child` exits first (`Miss::Exited`, the caller's death).
+/// Not a fence: it stays a sleep until the thing it lets land has a fence of its own (broadcast's REINSTALL_SETTLE).
+pub(crate) fn settle_for(
+    name: &'static str,
+    bound: Duration,
+    child: &mut Child,
+) -> Result<(), Miss> {
+    let never = || false;
+    let w = Wait::logs(name, "", bound, &never);
+    match until_child(&w, child) {
+        Err(Miss::Late { .. }) => Ok(()),
+        Err(miss) => Err(miss),
+        Ok(_) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +521,57 @@ mod tests {
         assert_eq!(
             stopped_at("row", &checks, &miss),
             vec!["no done line within 180s".to_owned()]
+        );
+    }
+
+    #[test]
+    fn logs_wait_holds_only_when_every_log_it_reads_holds() {
+        let dir = std::env::temp_dir().join(format!("wait-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sender, receiver) = (dir.join("sender.log"), dir.join("receiver.log"));
+        std::fs::write(&sender, "AtlBcast: done received\n").unwrap();
+        std::fs::write(&receiver, "").unwrap();
+        let held = || {
+            atl_diag::logfiles::read(&sender).contains("done received")
+                && atl_diag::logfiles::read(&receiver).contains("alarm started")
+        };
+        // the first log holds and the second does not: late, and it does not count the first as enough
+        let w = Wait::logs(
+            "run-end",
+            "no alarm line",
+            Duration::from_millis(150),
+            &held,
+        );
+        assert_eq!(until(&w).unwrap_err(), late("run-end", "no alarm line"));
+        std::fs::write(&receiver, "alarm started\n").unwrap();
+        assert!(until(&w).is_ok());
+        // the same condition with the child's exit: a death, not a late wait (bound long enough for the exit to land)
+        std::fs::write(&receiver, "").unwrap();
+        let w = Wait::logs("run-end", "no alarm line", Duration::from_secs(5), &held);
+        let mut dead = sh("exit 5");
+        assert_eq!(
+            until_child(&w, &mut dead).unwrap_err(),
+            Miss::Exited {
+                name: "run-end".to_owned(),
+                status: "exit status: 5".to_owned(),
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settle_for_is_settled_on_its_bound_and_a_death_when_its_child_exits() {
+        let mut slow = sh("sleep 30");
+        assert!(settle_for("settle", Duration::from_millis(60), &mut slow).is_ok());
+        slow.kill().expect("kill");
+        slow.wait().expect("reap");
+        let mut quick = sh("exit 2");
+        assert_eq!(
+            settle_for("settle", Duration::from_secs(5), &mut quick).unwrap_err(),
+            Miss::Exited {
+                name: "settle".to_owned(),
+                status: "exit status: 2".to_owned(),
+            }
         );
     }
 }

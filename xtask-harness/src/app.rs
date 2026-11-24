@@ -7,6 +7,7 @@
 //! Config row ([`FIRST_CONFIG`]): the first config eglChooseConfig lists for RGB 8 minimum on pbuffer surfaces reports a FIXED Android pixel format (no float config for a request that omits the component type). The GL driver's break `--egl-break no_config_filter` must fail it.
 //! Pass: [`MARKER`] in the app's log within [`LIMIT`], then the startActivityForResult round trip after it ([`result_failures`]; `--result-break` must fail it). Always printed: the services' counters (unimplemented calls and refused parcelables, atld_run.rs `counter_lines`); on failure also the atld, app and services log tails.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ use crate::atld_run::{Package, Run, Runtime, children_outside_broker, counter_li
 use crate::gl_scene::{Judged, Scene};
 use crate::native_load::PLAYER_STEPS;
 use crate::test_fonts;
+use crate::wait::{Miss, Wait, until_child};
 use crate::window::{self, WINDOW_MS};
 use crate::{gl_probe, jni_fixture, manifest};
 
@@ -2490,22 +2492,26 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let app_log = run.log(&m.name);
     let start = Instant::now();
     let read = atl_diag::logfiles::read;
-    let (passed, ended) = loop {
-        if read(&app_log).lines().any(|l| l.contains(MARKER)) {
-            break (true, None);
-        }
-        if let Some(s) = atld_child.try_wait()? {
-            break (read(&app_log).lines().any(|l| l.contains(MARKER)), Some(s));
-        }
-        // the app's end is the run's end here, as when atld ended with it
-        if run.app_ended() {
+    let has_marker = || read(&app_log).lines().any(|l| l.contains(MARKER));
+    // the marker, or the app's end (the run's end here, as when atld ended with it), ends the wait; atld's own exit is a death
+    let marker_or_end = || has_marker() || run.app_ended();
+    let (passed, ended) = match until_child(
+        &Wait::logs(
+            "app-marker",
+            format!("no marker after {LIMIT:?}"),
+            LIMIT,
+            &marker_or_end,
+        ),
+        &mut atld_child,
+    ) {
+        Ok(_) if has_marker() => (true, None),
+        Ok(_) => {
             let s = run.stop(&mut atld_child)?;
-            break (read(&app_log).lines().any(|l| l.contains(MARKER)), Some(s));
+            (has_marker(), Some(s))
         }
-        if start.elapsed() > LIMIT {
-            break (false, None);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        Err(Miss::Exited { .. }) => (has_marker(), Some(run.stop(&mut atld_child)?)),
+        Err(Miss::Late { .. }) => (false, None),
+        Err(miss) => anyhow::bail!(miss.text()),
     };
     let elapsed = start.elapsed();
     // while atld runs with everything started: each child of it must be a broker launch (plan F1.2 B.4, runtime side of the clippy gate)
@@ -2513,38 +2519,73 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => Some(children_outside_broker(atld_child.id())?),
         Some(_) => None,
     };
-    // the watch after the marker: a crash shows within it (window.rs WINDOW_MS); the round trip and every Async row run in it too, until they are all logged
-    // or RESULT_STALL passes with no new one ([`watch_on`]); the app's death ends the watch, atld outlives it
+    // the watch after the marker, as declared waits: the window (WINDOW_MS, every row polled; the app's or atld's end ends it early), then while a row is missing or
+    // timed ([`watch_on`]) one wait per progress step, bounded by what is left of RESULT_STALL. A step: an awaited line, the sticky restart, the not-sticky death
+    // (the fence in StickyCase::finished), a foreground step. A late wait ends the watch and is judged later, as before
     let mut ended = ended;
-    let mut sticky = StickyCase::default();
-    let mut foreground = ForegroundCase::default();
+    let sticky = RefCell::new(StickyCase::default());
+    let foreground = RefCell::new(ForegroundCase::default());
     if passed && ended.is_none() {
         let watch = Instant::now();
-        let (mut seen, mut progress) = (0, watch);
-        while ended.is_none() {
+        let (seen, progress) = (Cell::new(0), Cell::new(watch));
+        // one watch step (the old tick): both rows poll, the awaited lines count. Returns (missing, timed)
+        let step = || {
             let now = sticky_wall_ms();
-            sticky.poll(&run, &m.name);
-            foreground.poll(&run, &m.name, now);
-            let steps = sticky.steps() + foreground.steps();
+            sticky.borrow_mut().poll(&run, &m.name);
+            foreground.borrow_mut().poll(&run, &m.name, now);
+            let steps = sticky.borrow().steps() + foreground.borrow().steps();
             let (got, all) = awaited_logged(&read(&app_log));
-            if got + steps > seen {
-                (seen, progress) = (got + steps, Instant::now());
+            if got + steps > seen.get() {
+                seen.set(got + steps);
+                progress.set(Instant::now());
             }
-            if !watch_on(
-                watch.elapsed(),
-                progress.elapsed(),
-                got < all || !sticky.finished() || !foreground.finished(now),
-                foreground.timer_running(now),
-            ) {
+            let (s, f) = (sticky.borrow(), foreground.borrow());
+            (
+                got < all || !s.finished() || !f.finished(now),
+                f.timer_running(now),
+            )
+        };
+        let window = || {
+            step();
+            run.app_ended()
+        };
+        match until_child(
+            &Wait::logs("app-window", "", Duration::from_millis(WINDOW_MS), &window),
+            &mut atld_child,
+        ) {
+            Ok(_) | Err(Miss::Exited { .. }) => ended = Some(run.stop(&mut atld_child)?),
+            Err(Miss::Late { .. }) => {}
+            Err(miss) => anyhow::bail!(miss.text()),
+        }
+        while ended.is_none() {
+            let (missing, timed) = step();
+            let since_progress = progress.get().elapsed();
+            if !watch_on(watch.elapsed(), since_progress, missing, timed) {
                 break;
             }
-            ended = atld_child.try_wait()?;
-            if ended.is_none() && run.app_ended() {
-                ended = Some(run.stop(&mut atld_child)?);
+            let base = seen.get();
+            let next = || {
+                let (missing, timed) = step();
+                seen.get() > base || (!missing && !timed) || run.app_ended()
+            };
+            let bound = if timed {
+                RESULT_STALL
+            } else {
+                RESULT_STALL.saturating_sub(since_progress)
+            };
+            match until_child(
+                &Wait::logs("app-progress", "", bound, &next),
+                &mut atld_child,
+            ) {
+                Err(Miss::Exited { .. }) => ended = Some(run.stop(&mut atld_child)?),
+                Ok(_) if run.app_ended() => ended = Some(run.stop(&mut atld_child)?),
+                Ok(_) | Err(Miss::Late { .. }) => {}
+                Err(miss) => anyhow::bail!(miss.text()),
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
+    let sticky = sticky.into_inner();
+    let foreground = foreground.into_inner();
     if ended.is_none() {
         run.stop(&mut atld_child)?;
     }
