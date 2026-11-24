@@ -119,10 +119,11 @@ pub(crate) struct RemoteTest {
     apply: bool,
 }
 
-/// atld's limit on the target: the marker's [`LIMIT`], then the watch and one [`RESULT_STALL`] after it. atld runs to it (nothing stops it earlier there), and its logs come back then; the target is
-/// not watched, so this is one fixed budget for the whole chain, not the local watch's progress bound.
+/// atld's limit on the target: the marker's [`LIMIT`], then the watch and one stall after it at the base [`RESULT_STALL_BASE_MS`] (x1: the run logs its multiplier only itself, so none is known before
+/// it starts, and a remote run has no watch to scale). atld runs to it (nothing stops it earlier there), and its logs come back then; the target is not watched, so this is one fixed budget for
+/// the whole chain, not the local watch's progress bound.
 const REMOTE_LIMIT: Duration =
-    Duration::from_secs(LIMIT.as_secs() + RESULT_STALL.as_secs() + WINDOW_MS / 1000 + 1);
+    Duration::from_secs(LIMIT.as_secs() + RESULT_STALL_BASE_MS / 1000 + WINDOW_MS / 1000 + 1);
 
 /// The local gate's checks the headless subset does not claim, each with why (printed as `app: SKIP`).
 const REMOTE_SKIPPED: [(&str, &str); 4] = [
@@ -1218,10 +1219,11 @@ const MAIN_NEW_INTENT: &str = "AtlTest: main new intent";
 const PERMISSION_REQUEST: &str = "AtlTest: permission-request ";
 const PERMISSION_DISMISSED: &str =
     "request=11 names=[android.permission.POST_NOTIFICATIONS] results=[-1] self=-1";
-/// How long the watch after the marker waits for the next awaited line ([`awaited_logged`]) once WINDOW_MS has passed: each awaited line that arrives restarts it, so a chain of rows logged seconds apart
-/// (Flags.java: 5-10 s per scenario under load) is bounded by its progress, not by one budget for the whole chain; a stalled chain, broken round trip or missing callback line fails this long after
-/// the last line that came. 30 s: the old whole-chain budget, which every single step fits many times over.
-const RESULT_STALL: Duration = Duration::from_secs(30);
+/// Base of the stall: how long the watch after the marker waits for the next awaited line ([`awaited_logged`]) once WINDOW_MS has passed, scaled by the run's multiplier ([`result_stall`]).
+/// Each awaited line that arrives restarts it, so a chain of rows logged seconds apart (Flags.java: 5-10 s per scenario under load) is bounded by its progress, not by one budget for the whole chain;
+/// a stalled chain, broken round trip or missing callback line fails this long after the last line that came. 30 s x1: each single step fits many times over. Scaled: a legal product timer on a slow
+/// host is not cut off by the watch (the sticky restart's bound is 1 s + PROC_START_TIMEOUT x m + 1 s: 32 s at x3, past 30 s).
+const RESULT_STALL_BASE_MS: u64 = 30 * 1000;
 
 /// The awaited lines the log holds, of how many: the round trip's last line ([`PERMISSION_REQUEST`]) and every Async row of [`judged_lines`].
 fn awaited_logged(log: &str) -> (usize, usize) {
@@ -1237,11 +1239,15 @@ fn awaited_logged(log: &str) -> (usize, usize) {
 }
 
 /// Whether the watch after the marker goes on: always within WINDOW_MS (a crash shows there), then while an awaited line is missing and the last progress (an awaited line arriving, or the
-/// watch's start) is less than [`RESULT_STALL`] ago. `timed`: a [`ForegroundCase`] timer runs (the 30 s start timeout, then the ANR's delay): no step comes in between, so the watch waits it out.
-fn watch_on(since_watch: Duration, since_progress: Duration, missing: bool, timed: bool) -> bool {
-    since_watch < Duration::from_millis(WINDOW_MS)
-        || timed
-        || (missing && since_progress < RESULT_STALL)
+/// watch's start) is less than `stall` ago (the run's [`result_stall`]). `timed`: a [`ForegroundCase`] timer runs (the 30 s start timeout, then the ANR's delay): no step comes in between, so the watch waits it out.
+fn watch_on(
+    since_watch: Duration,
+    since_progress: Duration,
+    missing: bool,
+    timed: bool,
+    stall: Duration,
+) -> bool {
+    since_watch < Duration::from_millis(WINDOW_MS) || timed || (missing && since_progress < stall)
 }
 const FONT_TEXT: &str = "Handgloves";
 /// Main.FONT_SIZE: at unitsPerEm every advance is whole pixels, so the comparison is exact; a font with another unitsPerEm fails the gate instead of being compared with rounding.
@@ -2521,7 +2527,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(_) => None,
     };
     // the watch after the marker, as declared waits: the window (WINDOW_MS, every row polled; the app's or atld's end ends it early), then while a row is missing or
-    // timed ([`watch_on`]) one wait per progress step, bounded by what is left of RESULT_STALL. A step: an awaited line, the sticky restart, the not-sticky death
+    // timed ([`watch_on`]) one wait per progress step, bounded by what is left of the run's stall ([`result_stall`]). A step: an awaited line, the sticky restart, the not-sticky death
     // (the fence in StickyCase::finished), a foreground step. A late wait ends the watch and is judged later, as before
     let mut ended = ended;
     let sticky = RefCell::new(StickyCase::default());
@@ -2565,9 +2571,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             Err(miss) => anyhow::bail!(miss.text()),
         }
         while ended.is_none() {
+            // read per step, not once: atld logs its multiplier at startup, before the marker, so the line is there unless its log is not flushed yet (then x1 for this step only)
+            let stall = result_stall(&atl_diag::logfiles::read(&run.atld_log()))
+                .map_err(anyhow::Error::msg)?;
             let (missing, timed) = step();
             let since_progress = progress.get().elapsed();
-            if !watch_on(watch.elapsed(), since_progress, missing, timed) {
+            if !watch_on(watch.elapsed(), since_progress, missing, timed, stall) {
                 break;
             }
             let base = seen.get();
@@ -2576,9 +2585,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 seen.get() > base || (!missing && !timed) || run.app_ended()
             };
             let bound = if timed {
-                RESULT_STALL
+                stall
             } else {
-                RESULT_STALL.saturating_sub(since_progress)
+                stall.saturating_sub(since_progress)
             };
             match until_child(
                 &Wait::logs("app-progress", "", bound, WATCH_POLL, &next),
@@ -2736,7 +2745,7 @@ impl StickyCase {
             return Err(format!("sticky: no {STICKY_RESTART:?} line after the kill"));
         };
         // the start budget is PROC_START_TIMEOUT_BASE_MS x the multiplier atld logged for this run: the host may set it, so never a default
-        let hw = logged_hw(atld)?;
+        let hw = logged_hw(atld).map_err(|e| format!("sticky: {e}"))?;
         let gap = restart.saturating_sub(at);
         let (lo, hi) = (
             SERVICE_RESTART_DURATION_MS,
@@ -2763,12 +2772,23 @@ impl StickyCase {
 /// atld's startup line for the multiplier it applied (main.rs, after the host props): `hw timeouts: x<N> (<source>)`. The bound reads this run's line, not the host file.
 const HW_TIMEOUTS_LINE: &str = "hw timeouts: x";
 
-/// The multiplier atld logged for this run. No line, or a value `parse_arg` refuses: the case fails. A default here would bound the restart at x1 on a host that set x2.
+/// The multiplier atld logged for this run. No line, or a value `parse_arg` refuses: Err, never a default (a default bounds a restart or a stall at x1 on a host that set x2).
 fn logged_hw(atld: &str) -> Result<HwTimeouts, String> {
     let value = value_after(atld, HW_TIMEOUTS_LINE).ok_or_else(|| {
-        format!("sticky: no {HW_TIMEOUTS_LINE:?} line in atld's log (the restart bound needs the multiplier)")
+        format!("no {HW_TIMEOUTS_LINE:?} line in atld's log (the bounds need the multiplier)")
     })?;
-    HwTimeouts::parse_arg(value).map_err(|e| format!("sticky: atld's multiplier: {e}"))
+    HwTimeouts::parse_arg(value).map_err(|e| format!("atld's multiplier: {e}"))
+}
+
+/// The watch's stall for this run: [`RESULT_STALL_BASE_MS`] x the multiplier atld logged ([`logged_hw`], the sticky bound's reader). Before the line is logged: x1 (AOSP's unset value).
+/// atld logs it at startup, before the marker the watch starts after, so x1 holds only for an unflushed log; the next step reads the logged value. A refused value is Err, not x1.
+fn result_stall(atld: &str) -> Result<Duration, String> {
+    let hw = if value_after(atld, HW_TIMEOUTS_LINE).is_some() {
+        logged_hw(atld)?
+    } else {
+        HwTimeouts::default()
+    };
+    Ok(Duration::from_millis(hw.scale(RESULT_STALL_BASE_MS)))
 }
 
 /// The not-sticky fence on the services log: a restart decided for AtlNotSticky before its process's death line is one it must not have. No death line: not judged.
@@ -2866,6 +2886,7 @@ mod sticky_case_tests {
     /// atld's startup lines for the multiplier (main.rs): x1 is AOSP's unset value, x2 is the rvvm host's `/etc/atl/vendor.prop`.
     const ATLD_X1: &str = "hw timeouts: x1 (default)\n";
     const ATLD_X2: &str = "hw timeouts: x2 (from /etc/atl/vendor.prop)\n";
+    const ATLD_X3: &str = "hw timeouts: x3 (from /etc/atl/vendor.prop)\n";
 
     /// The case as killed at wall 10 000 with `restart` logged: the restart's gap from the kill is the verdict's number.
     fn case(restart: u64) -> StickyCase {
@@ -3050,18 +3071,45 @@ mod sticky_case_tests {
         assert!(
             logged(ATLD_START)
                 .unwrap_err()
-                .starts_with("sticky: no \"hw timeouts: x\" line")
+                .starts_with("no \"hw timeouts: x\" line")
         );
         assert!(
             logged("hw timeouts: x0 (from /etc/atl/vendor.prop)\n")
                 .unwrap_err()
-                .starts_with("sticky: atld's multiplier: 0:")
+                .starts_with("atld's multiplier: 0:")
         );
         assert!(
             logged("hw timeouts: xtwo (from build.prop)\n")
                 .unwrap_err()
-                .starts_with("sticky: atld's multiplier: two:")
+                .starts_with("atld's multiplier: two:")
         );
+    }
+
+    /// The watch's stall is the base x the logged multiplier, from the literal 30 s: x1 30 s, x2 60 s, x3 90 s. Before the line is logged, x1; a refused value is Err, never x1.
+    #[test]
+    fn result_stall_is_the_base_times_the_logged_multiplier() {
+        let s = Duration::from_secs;
+        assert_eq!(result_stall(ATLD_X1), Ok(s(30)));
+        assert_eq!(result_stall(ATLD_X2), Ok(s(60)));
+        assert_eq!(result_stall(ATLD_X3), Ok(s(90)));
+        assert_eq!(result_stall(ATLD_START), Ok(s(30)), "not logged yet: x1");
+        assert!(result_stall("hw timeouts: x0 (from /etc/atl/vendor.prop)\n").is_err());
+    }
+
+    /// At x3 the watch outlasts the sticky restart's bound: 1 s + 3 x 10 s + 1 s = 32 s (literals), and the kill is watch progress, so the stall counted from it is 90 s, not x1's 30 s.
+    #[test]
+    fn sticky_bound_fits_the_stall_at_x3() {
+        let x3 = format!("{ATLD_X3}{ATLD_START}7\n");
+        // a restart at the bound's top (32 s after the kill at wall 10 000) passes at x3
+        let verdict = case(10_000 + 32_000).verdict(&x3, SERVICES_DIED, "com.example.atltest");
+        assert!(verdict.is_ok(), "{verdict:?}");
+        let stall = result_stall(&x3).expect("x3 is a multiplier");
+        assert_eq!(stall, Duration::from_secs(90));
+        // 31 s since the kill (past the window): still watched at x3, stopped at x1's 30 s
+        let s = Duration::from_secs;
+        let (since_watch, since_kill, x1) = (s(3), s(31), s(30));
+        assert!(watch_on(since_watch, since_kill, true, false, stall));
+        assert!(!watch_on(since_watch, since_kill, true, false, x1));
     }
 
     /// The verdict judges the restart only against atld's logged multiplier: a log without the line fails, it does not fall back to x1.
@@ -4735,24 +4783,29 @@ mod tests {
         );
     }
 
-    /// The watch's stop rule ([`watch_on`]) from its definition: on within WINDOW_MS; after it, on only while a line is missing and the last progress is under RESULT_STALL.
+    /// The watch's stop rule ([`watch_on`]) from its definition: on within WINDOW_MS; after it, on only while a line is missing and the last progress is under the stall.
     #[test]
     fn watch_is_bounded_by_progress() {
         let s = Duration::from_secs;
         let window = Duration::from_millis(WINDOW_MS);
+        // x1: the base stall, 30 s (literal)
+        let stall = s(30);
         // a crash window is always watched, even with nothing missing
-        assert!(watch_on(window / 2, window / 2, false, false));
+        assert!(watch_on(window / 2, window / 2, false, false, stall));
         // after it: everything logged -> done
-        assert!(!watch_on(window + s(1), s(0), false, false));
+        assert!(!watch_on(window + s(1), s(0), false, false, stall));
         // a missing line with recent progress -> on
-        assert!(watch_on(window + s(1), RESULT_STALL / 2, true, false));
-        // no progress for RESULT_STALL -> off
-        assert!(!watch_on(window + s(1), RESULT_STALL, true, false));
+        assert!(watch_on(window + s(1), stall / 2, true, false, stall));
+        // no progress for the stall -> off
+        assert!(!watch_on(window + s(1), stall, true, false, stall));
         // the flags-* case: a chain past the old whole-chain budget (30 s since the watch) still advancing 8 s ago -> on
-        assert!(watch_on(RESULT_STALL * 3, s(8), true, false));
-        // a timer running (fgstimeout's 30 s start timeout) with no step for RESULT_STALL -> on; its end (not timed) -> off
-        assert!(watch_on(RESULT_STALL * 2, RESULT_STALL, true, true));
-        assert!(!watch_on(RESULT_STALL * 2, RESULT_STALL, true, false));
+        assert!(watch_on(stall * 3, s(8), true, false, stall));
+        // a timer running (fgstimeout's 30 s start timeout) with no step for the stall -> on; its end (not timed) -> off
+        assert!(watch_on(stall * 2, stall, true, true, stall));
+        assert!(!watch_on(stall * 2, stall, true, false, stall));
+        // x3: 90 s (literal). The sticky restart's bound at x3 (32 s after the kill, which is progress) is still watched at 31 s; x1's 30 s stops it before that
+        assert!(watch_on(window + s(1), s(31), true, false, s(90)));
+        assert!(!watch_on(window + s(1), s(31), true, false, stall));
     }
 
     #[test]
