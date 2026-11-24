@@ -184,7 +184,7 @@ impl From<String> for Miss {
 /// Each wait's derived `need` (ms) from the machine's need ledger, read once per process by [`install_needs`]. Empty until installed: no wait has a need.
 static NEEDS: OnceLock<BTreeMap<String, u64>> = OnceLock::new();
 
-/// Reads the need ledger of the checkout at `root` (gate_need.rs `derived`): each wait made after this takes its derived need. An unreadable ledger leaves every need unset, named on stderr.
+/// Reads the need ledger of the checkout at `root` (gate_need.rs `derived`) for the check row this process runs: each wait made after this takes its derived need there; a process that runs no row has none. An unreadable ledger leaves every need unset, named on stderr.
 pub(crate) fn install_needs(root: &Path) {
     let needs = load_needs(root).unwrap_or_else(|e| {
         eprintln!("need ledger unreadable, every need unset: {e:#}");
@@ -195,7 +195,11 @@ pub(crate) fn install_needs(root: &Path) {
 
 fn load_needs(root: &Path) -> anyhow::Result<BTreeMap<String, u64>> {
     let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
-    gate_need::derived(&ws)
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let Some(row) = crate::check_gates::row_of(&argv) else {
+        return Ok(BTreeMap::new());
+    };
+    gate_need::derived(&ws, &row)
 }
 
 /// A wait's derived need: unset below [`gate_need::MIN_PASSES`] quiet passes, and with no ledger installed.

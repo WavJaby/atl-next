@@ -70,7 +70,7 @@ enum Command {
     /// Default dir: the workspace's dev set <workspace>/keys, shared by every build dir; `native` signs with it unless given `--keys`. Never AOSP's published keys, never committed.
     /// Dry run by default: lists the roles present and missing. `--execute` makes the missing ones with openssl as AOSP's make_key does.
     Keys(keys::Args),
-    /// Gate waits' `need` from the machine's need ledger (`<workspace>/out/pool/gate-need.tsv`, gate_need.rs): per wait, its samples, quiet samples, quiet passes, the need the harness derives (the largest quiet sample once 20 passes hold it) or `unset`, and the largest took / bound.
+    /// Gate waits' `need` from the machine's need ledger (`<workspace>/out/pool/gate-need.tsv`, gate_need.rs): per row and wait, over its newest quiet passes (one per check run): samples, passes, the largest sample, the need the harness derives (that sample once 20 passes hold it) or `unset`, and the largest took / bound.
     ///
     /// Read-only. `--seed <harvest.tsv>` imports a harvest once (refused when the ledger exists).
     GateNeed(gate_need::Args),

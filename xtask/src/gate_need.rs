@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! The need ledger: every passing gate row's wait samples on this machine, the input of each wait's `need` (gate-starved-red-design 2.2).
+//! The need ledger: each wait's newest quiet samples on this machine, per gate row, the input of each wait's `need` (gate-starved-red-design 2.2).
 //! One file for every checkout: `<workspace>/out/pool/gate-need.tsv`, one line per sample (took < bound) of a row that passed: `run commit row wait took_ms bound_ms stall`, tab-separated.
-//! `stall` = the row's host stall share (`host load:` stalled / span, percent), `-` when unknown. A pass is one `(run, row)`.
-//! Quiet = stall <= [`QUIET_STALL_PCT`], applied on read, so the constant can change without a reseed. A wait's `need` = largest quiet sample once [`MIN_PASSES`] quiet passes hold it; below that unset.
-//! Appends take the exclusive flock [`LOCK`], reads the shared one: every checkout's gates step writes here.
+//! `stall` = the row's host stall share (`host load:` stalled / span, percent), `-` when unknown. A pass is one `run` (one check step) of a row: rows of one step share the machine's load, so they are not independent.
+//! Quiet = stall <= [`QUIET_STALL_PCT`]. A wait's `need` in a row = the largest sample of its newest [`WINDOW`] quiet passes there, once [`MIN_PASSES`] hold it; below that unset.
+//! Line order is age (appends are serialized). Retention = the window: an append rewrites the ledger with only what [`windowed`] reads, so it stays within WINDOW passes per (row, wait). Raising QUIET_STALL_PCT or WINDOW cannot bring dropped lines back.
+//! Appends take the exclusive flock [`LOCK`] and replace the file by rename (a killed writer leaves the old ledger whole), reads take the shared one: every checkout's gates step writes here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,6 +22,8 @@ use crate::out;
 pub const QUIET_STALL_PCT: f64 = 5.0;
 /// Quiet passes before a wait's `need` is derived. Basis: design 2.2, `need` = max over n >= 20 quiet passes (independent runs: one run repeats a wait, app-progress 72 samples in 8 passes).
 pub const MIN_PASSES: usize = 20;
+/// Newest quiet passes of a (row, wait) its `need` is the maximum of. Basis: the rule asks for at least [`MIN_PASSES`]. Every pass more keeps an outlier longer and raises the need, which excuses more reds; a need too low only leaves a red standing, the rule's default. So the smallest window the rule allows.
+pub const WINDOW: usize = MIN_PASSES;
 /// The ledger's file name under [`out::POOL`].
 pub const LEDGER: &str = "gate-need.tsv";
 /// The lock file, beside the pool's slot and dir locks (`build_pool::dir`).
@@ -77,8 +80,9 @@ impl Sample {
         self.stall.is_some_and(|s| s <= QUIET_STALL_PCT)
     }
 
-    fn pass(&self) -> (&str, &str) {
-        (&self.run, &self.row)
+    /// The group a window is taken of: `(row, wait)`.
+    fn key(&self) -> (&str, &str) {
+        (&self.row, &self.wait)
     }
 
     fn line(&self) -> String {
@@ -114,7 +118,7 @@ pub fn ledger_path(ws: &Path) -> PathBuf {
     ws.join(out::POOL).join(LEDGER)
 }
 
-/// Takes the ledger lock: exclusive to append, shared to read.
+/// Takes the ledger lock: exclusive to rewrite, shared to read.
 fn lock(ws: &Path, mode: Mode) -> Result<Flock> {
     let dir = build_pool::dir(ws);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -129,32 +133,33 @@ fn lock(ws: &Path, mode: Mode) -> Result<Flock> {
     Flock::take(file, mode).with_context(|| format!("flock {}", path.display()))
 }
 
-/// Appends `samples` in one write under the exclusive lock.
+/// Adds `samples` as the newest and rewrites the ledger to its window, under the exclusive lock.
 pub fn append(ws: &Path, samples: &[Sample]) -> Result<()> {
-    let _held = lock(ws, Mode::Exclusive)?;
-    write(ws, samples)
-}
-
-/// Writes `samples` to the ledger; the caller holds the lock.
-fn write(ws: &Path, samples: &[Sample]) -> Result<()> {
     if samples.is_empty() {
         return Ok(());
     }
+    let _held = lock(ws, Mode::Exclusive)?;
+    let mut all = load(ws)?.samples;
+    all.extend_from_slice(samples);
+    replace(ws, &windowed(&all))
+}
+
+/// Replaces the ledger with `samples`: temp file, sync, rename. The caller holds the exclusive lock, so one temp name is enough; a killed writer's leftover is truncated by the next.
+fn replace(ws: &Path, samples: &[&Sample]) -> Result<()> {
     let path = ledger_path(ws);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let text: String = samples.iter().map(Sample::line).collect();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| path.display().to_string())?;
+    let tmp = path.with_extension("tsv.tmp");
+    let text: String = samples.iter().map(|s| s.line()).collect();
+    let mut file = File::create(&tmp).with_context(|| tmp.display().to_string())?;
     file.write_all(text.as_bytes())
-        .with_context(|| path.display().to_string())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("renaming to {}", path.display()))
 }
 
-/// The ledger's samples, and the lines that do not parse (a writer that died mid-line; readers skip them).
+/// The ledger's samples, and the lines that do not parse (a writer that died mid-line; readers skip them, the next append drops them).
 #[derive(Debug, Default)]
 pub struct Ledger {
     pub samples: Vec<Sample>,
@@ -164,6 +169,11 @@ pub struct Ledger {
 /// Reads the whole ledger under the shared lock. No ledger yet: empty.
 pub fn read(ws: &Path) -> Result<Ledger> {
     let _held = lock(ws, Mode::Shared)?;
+    load(ws)
+}
+
+/// Reads the ledger; the caller holds the lock.
+fn load(ws: &Path) -> Result<Ledger> {
     let path = ledger_path(ws);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -180,51 +190,57 @@ pub fn read(ws: &Path) -> Result<Ledger> {
     Ok(ledger)
 }
 
-/// A wait's quiet passes (distinct `(run, row)`) and the largest quiet sample among them.
-type Quiet<'a> = (BTreeSet<(&'a str, &'a str)>, u64);
-
-/// Each wait's derived `need` (ms): the largest quiet sample, once [`MIN_PASSES`] quiet passes hold the wait. A wait below that has no entry (unset).
-pub fn needs(samples: &[Sample]) -> BTreeMap<String, u64> {
-    let mut passes: BTreeMap<&str, Quiet> = BTreeMap::new();
-    for s in samples.iter().filter(|s| s.quiet()) {
-        let (set, max) = passes.entry(s.wait.as_str()).or_default();
-        set.insert(s.pass());
-        *max = (*max).max(s.took_ms);
-    }
-    passes
-        .into_iter()
-        .filter(|(_, (set, _))| set.len() >= MIN_PASSES)
-        .map(|(wait, (_, max))| (wait.to_owned(), max))
-        .collect()
+/// The samples the window reads, in ledger order: per (row, wait), every quiet sample of its newest [`WINDOW`] quiet runs.
+pub fn windowed(samples: &[Sample]) -> Vec<&Sample> {
+    let mut runs: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
+    let mut kept: Vec<&Sample> = samples
+        .iter()
+        .rev()
+        .filter(|s| {
+            if !s.quiet() {
+                return false;
+            }
+            let seen = runs.entry(s.key()).or_default();
+            if seen.len() < WINDOW {
+                seen.insert(&s.run);
+                return true;
+            }
+            seen.contains(s.run.as_str())
+        })
+        .collect();
+    kept.reverse();
+    kept
 }
 
-/// One wait's line of the view.
+/// One (row, wait)'s line of the view, over its window.
 #[derive(Debug, PartialEq)]
 pub struct Stat {
+    pub row: String,
     pub wait: String,
     pub samples: usize,
-    pub quiet: usize,
-    /// distinct quiet `(run, row)` passes: the count [`MIN_PASSES`] tests
+    /// distinct quiet runs in the window: the count [`MIN_PASSES`] tests
     pub passes: usize,
+    /// largest sample in the window
+    pub max_ms: u64,
+    /// `max_ms` once [`MIN_PASSES`] passes hold it
     pub need: Option<u64>,
     /// smallest and largest bound over the samples
     pub bound_ms: (u64, u64),
-    /// largest took / bound over all samples
+    /// largest took / bound over the samples
     pub max_ratio: f64,
 }
 
-/// Every wait in the ledger, largest took / bound first.
+/// Every (row, wait) with a quiet sample, largest took / bound first.
 pub fn stats(samples: &[Sample]) -> Vec<Stat> {
-    let needs = needs(samples);
-    let mut by_wait: BTreeMap<&str, Vec<&Sample>> = BTreeMap::new();
-    for s in samples {
-        by_wait.entry(s.wait.as_str()).or_default().push(s);
+    let mut groups: BTreeMap<(&str, &str), Vec<&Sample>> = BTreeMap::new();
+    for s in windowed(samples) {
+        groups.entry(s.key()).or_default().push(s);
     }
-    let mut stats: Vec<Stat> = by_wait
+    let mut stats: Vec<Stat> = groups
         .into_iter()
-        .map(|(wait, group)| {
-            let quiet: Vec<&&Sample> = group.iter().filter(|s| s.quiet()).collect();
-            let passes: BTreeSet<(&str, &str)> = quiet.iter().map(|s| s.pass()).collect();
+        .map(|((row, wait), group)| {
+            let runs: BTreeSet<&str> = group.iter().map(|s| s.run.as_str()).collect();
+            let max_ms = group.iter().map(|s| s.took_ms).fold(0, u64::max);
             let bound_ms = group.iter().fold((u64::MAX, 0), |(lo, hi), s| {
                 (lo.min(s.bound_ms), hi.max(s.bound_ms))
             });
@@ -233,11 +249,12 @@ pub fn stats(samples: &[Sample]) -> Vec<Stat> {
                 .map(|s| s.took_ms as f64 / s.bound_ms as f64)
                 .fold(0.0, f64::max);
             Stat {
+                row: row.to_owned(),
                 wait: wait.to_owned(),
                 samples: group.len(),
-                quiet: quiet.len(),
-                passes: passes.len(),
-                need: needs.get(wait).copied(),
+                passes: runs.len(),
+                max_ms,
+                need: (runs.len() >= MIN_PASSES).then_some(max_ms),
                 bound_ms,
                 max_ratio,
             }
@@ -246,14 +263,23 @@ pub fn stats(samples: &[Sample]) -> Vec<Stat> {
     stats.sort_by(|a, b| {
         b.max_ratio
             .total_cmp(&a.max_ratio)
-            .then_with(|| a.wait.cmp(&b.wait))
+            .then_with(|| (&a.row, &a.wait).cmp(&(&b.row, &b.wait)))
     });
     stats
 }
 
-/// The derived needs of workspace `ws`'s ledger: what the harness reads once per process (xtask-harness wait.rs).
-pub fn derived(ws: &Path) -> Result<BTreeMap<String, u64>> {
-    Ok(needs(&read(ws)?.samples))
+/// Each wait's derived `need` (ms) in `row`. A wait below [`MIN_PASSES`] quiet passes there has no entry (unset).
+pub fn needs(samples: &[Sample], row: &str) -> BTreeMap<String, u64> {
+    stats(samples)
+        .into_iter()
+        .filter(|s| s.row == row)
+        .filter_map(|s| Some((s.wait, s.need?)))
+        .collect()
+}
+
+/// `row`'s derived needs in workspace `ws`'s ledger: what the harness reads once per process (xtask-harness wait.rs).
+pub fn derived(ws: &Path, row: &str) -> Result<BTreeMap<String, u64>> {
+    Ok(needs(&read(ws)?.samples, row))
 }
 
 /// What a harvest import wrote, and what it left out.
@@ -267,7 +293,7 @@ pub struct Seeded {
 }
 
 /// Imports a harvest TSV (header `file share_pct wait took_ms bound_ms need`) as the ledger's first passes, once: refused when the ledger exists.
-/// Each harvest file is one pass (run `seed:<file>`, row `-`); its share is the stall. The harvest's own dedupe already ran.
+/// Each harvest file is one pass (run `seed:<file>`, row `-`: the harvest has no row, so no row's need reads it); its share is the stall. The harvest's own dedupe already ran.
 pub fn import_harvest(ws: &Path, tsv: &str) -> Result<Seeded> {
     let _held = lock(ws, Mode::Exclusive)?;
     let path = ledger_path(ws);
@@ -307,8 +333,9 @@ pub fn import_harvest(ws: &Path, tsv: &str) -> Result<Seeded> {
             stall: Some(share.parse()?),
         });
     }
-    seeded.imported = samples.len();
-    write(ws, &samples)?;
+    let kept = windowed(&samples);
+    seeded.imported = kept.len();
+    replace(ws, &kept)?;
     Ok(seeded)
 }
 
@@ -319,7 +346,7 @@ pub struct Args {
     seed: Option<PathBuf>,
 }
 
-/// `cargo xtask gate-need`: each gate wait's samples, quiet samples, quiet passes, need (or unset) and largest took / bound. Read-only unless `--seed`.
+/// `cargo xtask gate-need`: each (row, wait)'s window: its samples, quiet passes, largest sample, need (or unset) and largest took / bound. Read-only unless `--seed`.
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
     if let Some(tsv) = &args.seed {
@@ -331,21 +358,28 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
     }
     let ledger = read(&ws)?;
-    let quiet = ledger.samples.iter().filter(|s| s.quiet()).count();
     println!(
-        "gate-need: {} samples, {quiet} quiet (stall <= {QUIET_STALL_PCT} %), {} malformed lines; {}",
+        "gate-need: {} samples, {} in the windows (newest {WINDOW} passes, stall <= {QUIET_STALL_PCT} %), {} malformed lines; {}",
         ledger.samples.len(),
+        windowed(&ledger.samples).len(),
         ledger.malformed,
         ledger_path(&ws).display()
     );
-    println!("wait\tsamples\tquiet\tpasses\tneed_ms\tmax/bound\tbound_ms");
+    println!("row\twait\tsamples\tpasses\tmax_ms\tneed_ms\tmax/bound\tbound_ms");
     for st in stats(&ledger.samples) {
         let need = st
             .need
             .map_or_else(|| "unset".to_owned(), |n| n.to_string());
         println!(
-            "{}\t{}\t{}\t{}\t{need}\t{:.3}\t{}-{}",
-            st.wait, st.samples, st.quiet, st.passes, st.max_ratio, st.bound_ms.0, st.bound_ms.1
+            "{}\t{}\t{}\t{}\t{}\t{need}\t{:.3}\t{}-{}",
+            st.row,
+            st.wait,
+            st.samples,
+            st.passes,
+            st.max_ms,
+            st.max_ratio,
+            st.bound_ms.0,
+            st.bound_ms.1
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -397,9 +431,12 @@ mod tests {
         let mut samples: Vec<Sample> = (1..=19)
             .map(|i| sample(&format!("run{i}"), "app", "marker", i * 100, Some(0.1)))
             .collect();
-        assert!(needs(&samples).is_empty(), "19 passes derive nothing");
+        assert!(
+            needs(&samples, "app").is_empty(),
+            "19 passes derive nothing"
+        );
         samples.push(sample("run20", "app", "marker", 2_500, Some(0.1)));
-        assert_eq!(needs(&samples).get("marker"), Some(&2_500));
+        assert_eq!(needs(&samples, "app").get("marker"), Some(&2_500));
     }
 
     #[test]
@@ -408,9 +445,27 @@ mod tests {
             .map(|i| sample("run1", "app", "wait-x", i, Some(0.1)))
             .collect();
         assert!(
-            needs(&samples).is_empty(),
+            needs(&samples, "app").is_empty(),
             "one pass of 20 samples is not 20 passes"
         );
+    }
+
+    /// Two rows in each of 10 runs: 20 `(run, row)`, 10 runs. Neither row has its 20, and one row's samples never set the other's need.
+    #[test]
+    fn passes_are_runs_and_rows_do_not_share_a_need() {
+        let mut samples = Vec::new();
+        for i in 1..=10 {
+            let run = format!("run{i}");
+            samples.push(sample(&run, "ime", "marker", 100, Some(0.1)));
+            samples.push(sample(&run, "tiled", "marker", 900, Some(0.1)));
+        }
+        assert!(needs(&samples, "ime").is_empty());
+        assert!(needs(&samples, "tiled").is_empty());
+        for i in 11..=20 {
+            samples.push(sample(&format!("run{i}"), "ime", "marker", 200, Some(0.1)));
+        }
+        assert_eq!(needs(&samples, "ime").get("marker"), Some(&200));
+        assert!(needs(&samples, "tiled").is_empty());
     }
 
     #[test]
@@ -420,85 +475,144 @@ mod tests {
             .collect();
         samples.push(sample("run-busy", "app", "marker", 99_000, Some(6.0)));
         assert!(
-            needs(&samples).is_empty(),
+            needs(&samples, "app").is_empty(),
             "19 quiet passes and one busy one"
         );
         samples.push(sample("run20", "app", "marker", 1_200, Some(0.2)));
-        assert_eq!(needs(&samples).get("marker"), Some(&1_900));
+        assert_eq!(needs(&samples, "app").get("marker"), Some(&1_900));
+    }
+
+    /// The outlier is the oldest pass: it holds the need while 19 passes follow it, and the 20th drops it.
+    #[test]
+    fn an_outlier_leaves_with_the_twentieth_pass_after_it() {
+        let mut samples = vec![sample("run0", "app", "marker", 50_000, Some(0.1))];
+        for i in 1..=19 {
+            let run = format!("run{i}");
+            samples.push(sample(&run, "app", "marker", 100 + i, Some(0.1)));
+        }
+        assert_eq!(needs(&samples, "app").get("marker"), Some(&50_000));
+        // a busy pass does not move the window
+        samples.push(sample("busy", "app", "marker", 70_000, Some(9.0)));
+        assert_eq!(needs(&samples, "app").get("marker"), Some(&50_000));
+        samples.push(sample("run20", "app", "marker", 110, Some(0.1)));
+        // the largest of runs 1..=20: run19's 100 + 19
+        assert_eq!(needs(&samples, "app").get("marker"), Some(&119));
     }
 
     #[test]
-    fn stats_count_samples_quiet_passes_and_need() {
+    fn stats_count_the_windows_samples_and_passes() {
         let samples = vec![
             sample("r1", "app", "marker", 100, Some(0.1)),
             sample("r1", "app", "marker", 300, Some(9.0)),
             sample("r2", "app", "marker", 200, Some(0.2)),
-            sample("r2", "ime", "marker", 200, Some(0.2)),
+            sample("r2", "app", "marker", 150, Some(0.2)),
+            sample("r2", "ime", "marker", 400, Some(0.2)),
         ];
         let stats = stats(&samples);
-        let marker = stats.iter().find(|s| s.wait == "marker").expect("marker");
-        assert_eq!((marker.samples, marker.quiet, marker.passes), (4, 3, 3));
-        assert_eq!(marker.need, None);
-        assert_eq!(marker.bound_ms, (60_000, 60_000));
+        let app = stats.iter().find(|s| s.row == "app").expect("app");
+        assert_eq!((app.samples, app.passes, app.max_ms), (3, 2, 200));
+        assert_eq!(app.need, None);
+        assert_eq!(app.bound_ms, (60_000, 60_000));
+    }
+
+    /// 30 runs of two marker samples and a busy one: the newest 20 runs stay, both samples of each, in order; another wait's window is its own.
+    #[test]
+    fn the_ledger_keeps_only_the_window() {
+        let ws = scratch("retention");
+        append(&ws, &[sample("run-rare", "app", "rare", 7, Some(0.1))]).expect("append");
+        for i in 0..30 {
+            let run = format!("run{i}");
+            let batch = [
+                sample(&run, "app", "marker", i, Some(0.1)),
+                sample(&run, "app", "marker", i + 1, Some(0.1)),
+                sample(&run, "app", "busy", 5, Some(9.0)),
+            ];
+            append(&ws, &batch).expect("append");
+        }
+        let runs: Vec<String> = read(&ws)
+            .expect("read")
+            .samples
+            .into_iter()
+            .map(|s| s.run)
+            .collect();
+        let mut want = vec!["run-rare".to_owned()];
+        want.extend((10..30).flat_map(|i| [format!("run{i}"), format!("run{i}")]));
+        assert_eq!(runs, want);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A rewrite is a new file renamed into place: a handle on the old one still reads it whole, a killed writer's leftover temp is not read, and no temp stays.
+    #[test]
+    fn a_rewrite_replaces_the_ledger_by_rename() {
+        let ws = scratch("rename");
+        append(&ws, &[sample("r1", "app", "marker", 100, Some(0.1))]).expect("append");
+        let path = ledger_path(&ws);
+        let tmp = path.with_extension("tsv.tmp");
+        fs::write(&tmp, "r9\tc0\tapp\tmar").expect("leftover");
+        let mut old = File::open(&path).expect("open");
+        append(&ws, &[sample("r2", "app", "marker", 200, Some(0.1))]).expect("append");
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut old, &mut text).expect("read old");
+        assert_eq!(text, "r1\tc0ffee\tapp\tmarker\t100\t60000\t0.10\n");
+        let ledger = read(&ws).expect("read");
+        assert_eq!((ledger.samples.len(), ledger.malformed), (2, 0));
+        assert!(!tmp.exists());
+        fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     #[test]
     fn a_ledger_line_round_trips_and_a_torn_one_is_counted_not_read() {
         let ws = scratch("torn");
-        append(
-            &ws,
-            &[
-                sample("r1", "app", "marker", 100, Some(0.25)),
-                sample("r1", "app", "pong", 5, None),
-            ],
-        )
-        .expect("append");
+        append(&ws, &[sample("r1", "app", "marker", 100, Some(0.25))]).expect("append");
         let mut file = OpenOptions::new()
             .append(true)
             .open(ledger_path(&ws))
             .expect("open");
-        file.write_all(b"r2\tc0\tapp\tmark").expect("torn line");
+        file.write_all(b"r1\tc0\tapp\tpong\t5\t10\t-\nr2\tc0\tapp\tmark")
+            .expect("torn line");
         let ledger = read(&ws).expect("read");
-        assert_eq!(ledger.samples.len(), 2);
-        assert_eq!(ledger.malformed, 1);
+        assert_eq!((ledger.samples.len(), ledger.malformed), (2, 1));
         assert_eq!(ledger.samples[0].stall, Some(0.25));
         assert_eq!(ledger.samples[1].stall, None);
+        // the next append starts on its own line, not on the torn one; the unknown-stall line goes with it
+        append(&ws, &[sample("r3", "app", "marker", 7, Some(0.1))]).expect("append");
+        let ledger = read(&ws).expect("read");
+        assert_eq!((ledger.samples.len(), ledger.malformed), (2, 0));
+        assert_eq!(ledger.samples[1].run, "r3");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
+    /// Eight writers on a full window, so every append drops lines as it rewrites: each writer's own rows all stay, and the full row holds its newest 20.
     #[test]
-    fn concurrent_appends_keep_every_line_whole() {
+    fn concurrent_appends_survive_each_others_rewrites() {
         let ws = scratch("concurrent");
+        let full: Vec<Sample> = (0..20)
+            .map(|i| sample(&format!("full{i}"), "app", "marker", i, Some(0.1)))
+            .collect();
+        append(&ws, &full).expect("append");
         std::thread::scope(|scope| {
-            for t in 0..8_u64 {
-                let ws = ws.clone();
+            for t in 0..8 {
+                let ws = &ws;
                 scope.spawn(move || {
-                    let batch: Vec<Sample> = (0..25)
-                        .map(|i| {
-                            sample(
-                                &format!("t{t}-{i}"),
-                                "app",
-                                "marker",
-                                t * 100 + i,
-                                Some(0.1),
-                            )
-                        })
-                        .collect();
-                    append(&ws, &batch).expect("append");
+                    for i in 0..10 {
+                        let run = format!("t{t}-{i}");
+                        let batch = [
+                            sample(&run, "app", "marker", 1, Some(0.1)),
+                            sample(&run, &format!("row{t}"), "marker", 1, Some(0.1)),
+                        ];
+                        append(ws, &batch).expect("append");
+                    }
                 });
             }
         });
         let ledger = read(&ws).expect("read");
         assert_eq!(ledger.malformed, 0, "a torn line from two writers");
-        assert_eq!(ledger.samples.len(), 200);
+        let of = |row: &str| ledger.samples.iter().filter(|s| s.row == row).count();
         for t in 0..8 {
-            let mine = ledger
-                .samples
-                .iter()
-                .filter(|s| s.run.starts_with(&format!("t{t}-")))
-                .count();
-            assert_eq!(mine, 25, "writer {t}");
+            assert_eq!(of(&format!("row{t}")), 10, "writer {t}");
         }
+        assert_eq!(of("app"), 20);
+        assert!(!ledger.samples.iter().any(|s| s.run.starts_with("full")));
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 

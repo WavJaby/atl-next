@@ -177,6 +177,18 @@ pub const ROWS: &[Row] = &[
     Row::new(&["window", "--stage", "tiled"], true, true),
 ];
 
+/// The name of the row a harness command line (`test <row args> ...`) runs: the row with the most matching leading arguments. None: no row's.
+pub(crate) fn row_of(argv: &[String]) -> Option<String> {
+    let (first, rest) = argv.split_first()?;
+    if first != "test" {
+        return None;
+    }
+    ROWS.iter()
+        .filter(|r| rest.len() >= r.args.len() && rest.iter().zip(r.args).all(|(a, b)| a == b))
+        .max_by_key(|r| r.args.len())
+        .map(Row::name)
+}
+
 /// One row's run: its `gates:` line, its outcome, and the evidence the step's counters and ledger read. The lines stay in table order whatever ends first.
 struct Done {
     outcome: Outcome,
@@ -297,7 +309,7 @@ fn starvation_of(done: &[Done]) -> Starvation {
     counts
 }
 
-/// The need-ledger samples of one step: each passing row's wait samples from its deciding run (the rerun, when there was one). A pass is `(run, row)`; the self-test row's waits are not gate waits.
+/// The need-ledger samples of one step: each passing row's wait samples from its deciding run (the rerun, when there was one). A pass is one `run` of a row; the self-test row's waits are not gate waits.
 fn need_samples(run: &str, commit: &str, rows: &[(&Row, &Done)]) -> Vec<gate_need::Sample> {
     rows.iter()
         .filter(|(row, d)| row.samples && d.outcome == Outcome::Pass)
@@ -1102,6 +1114,25 @@ mod tests {
             t.count(phases_field(text).map(|p| p.end).as_deref());
         }
         assert_eq!(t.line(), "probe=1 window=1 ended=0 limit=0 unknown=1");
+    }
+
+    /// A row's own command line names it (the need lookup key is the ledger key); any other command names none.
+    #[test]
+    fn a_rows_command_line_names_its_row() {
+        for row in ROWS {
+            let mut argv = vec!["test".to_owned()];
+            argv.extend(row.argv("h", "o").into_iter().map(str::to_owned));
+            assert_eq!(row_of(&argv), Some(row.name()));
+        }
+        let others: [&[&str]; 3] = [
+            &["test", "window", "--stage", "draw"],
+            &["run-apk", "app"],
+            &[],
+        ];
+        for other in others {
+            let argv: Vec<String> = other.iter().map(|&a| a.to_owned()).collect();
+            assert_eq!(row_of(&argv), None, "{other:?}");
+        }
     }
 
     #[test]
