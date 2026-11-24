@@ -207,6 +207,7 @@ fn confirm(
     last.map_err(|why| Miss::Late {
         name: "edit".to_owned(),
         why,
+        budget: None,
     })
 }
 
@@ -854,13 +855,11 @@ mod tests {
             "AtlWindow: layout label left=16 top=16 width=448 height=33\n",
         )
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             await_layout_input(&file, Duration::from_millis(100)),
-            Err(Miss::Late {
-                name: "layout-input".to_owned(),
-                why: "no layout line for input".to_owned(),
-            })
-        );
+            Err(Miss::Late { name, why, .. })
+                if name == "layout-input" && why == "no layout line for input"
+        ));
         let _ = std::fs::remove_file(&file);
     }
 
@@ -888,6 +887,7 @@ mod tests {
         let miss = Miss::Late {
             name: "edit".to_owned(),
             why: stop.to_owned(),
+            budget: None,
         };
         let shape: Vec<String> =
             settle(checks(&app, "", &Err(stop.to_owned()), 10002), Some(&miss))

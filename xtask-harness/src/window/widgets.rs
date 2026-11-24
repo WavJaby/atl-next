@@ -25,7 +25,6 @@ use crate::composer::word;
 use crate::nested_wayland::{GATE_OUTPUT, Output};
 use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy, TouchAction};
-use atl_host_load::Samples;
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask-harness/testdata/widgets";
@@ -882,7 +881,6 @@ pub fn checks(
     probe: &Result<Liveness, String>,
     display: DisplayModel,
     rate: Rate,
-    pressure: &Samples,
     pictures: &Mutex<capture::Seen>,
     esc_back: bool,
 ) -> Vec<Sub> {
@@ -915,10 +913,7 @@ pub fn checks(
         ("touch", touch_check(app)),
         ("readback", readback_check(pictures, app)),
         ("presents", presents_check(app)),
-        (
-            "cadence",
-            cadence_check(after, display.refresh_hz, rate, pressure),
-        ),
+        ("cadence", cadence_check(after, display.refresh_hz, rate)),
         ("idle", idle_check(idle, app, display.refresh_hz)),
         ("resume", resume_check(idle, app)),
     ]

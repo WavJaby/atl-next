@@ -35,7 +35,6 @@ use crate::nested_wayland::{GATE_OUTPUT, NestedCompositor, Output};
 pub(crate) use crate::wait::POLL;
 use crate::wait::{Miss, Wait, settle, until};
 use crate::wayland_proxy::{Event as ProxyEvent, PointerAction, Proxy};
-use atl_host_load::{Sampler, Samples, judge_window};
 
 mod aux_process;
 mod capture;
@@ -46,7 +45,6 @@ mod ime;
 mod move_output;
 mod slow_display;
 mod splash;
-mod starvation;
 mod surface_view;
 mod suspended;
 mod ui_block;
@@ -179,6 +177,15 @@ pub struct Args {
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
+    /// Stage capture only, a manual run of the starvation rule (gate-starved-red-design H4): from the first close until its sub-gates read the logs, burners at CPUWeight 10000 hold every CPU
+    /// this gate may use (host_load.rs `Burners`), so the fixture's destroy misses the 1 s removeTask kill timer. Expected: `undecided` naming the timer once its line carries `at=` (H6);
+    /// until then the timer is unknown and the run stays red.
+    #[arg(long)]
+    starve_close: bool,
+    /// Stage capture only (the control of --starve-close): F11 arms the fixture's delayed onDestroy before the first close, so the kill timer ends the process on a quiet host: a real
+    /// `ended` red the starvation rule must judge.
+    #[arg(long)]
+    break_delayed_close: bool,
     /// Stage gles2 only: the fixture's worker thread parks forever instead of exiting, so the bridge never detaches it and the balance sub-gate must fail (the gate's deliberate break, fixture-side).
     #[arg(long)]
     break_no_detach: bool,
@@ -450,7 +457,7 @@ pub(crate) type Sub = (&'static str, Result<String, String>);
 /// A stage's sub-gates: functional ones, always judged, and timed ones, whose bound assumes a render time (starvation.rs decides whether this run's host left them unjudged).
 pub struct Checks {
     pub subs: Vec<Sub>,
-    pub timed: Vec<starvation::Timed>,
+    pub timed: Vec<crate::starvation::Timed>,
 }
 
 /// The fixture's dir.
@@ -610,7 +617,7 @@ pub(crate) fn stamp_text(ms: u64) -> String {
 }
 
 /// A logcat line's time: its first field.
-fn line_stamp(line: &str) -> Option<u64> {
+pub(crate) fn line_stamp(line: &str) -> Option<u64> {
     parse_stamp(line.split_whitespace().next()?)
 }
 
@@ -2046,24 +2053,14 @@ fn frame_time(line: &str) -> Option<u64> {
 
 /// Sub-gate (b): the first FRAME_CALLBACKS callbacks after the marker come once per display period. The mean interval is within CADENCE_TOLERANCE of the period, and no
 /// interval is longer than CADENCE_MAX_PERIODS periods. Times are the vsync's (the display clock's grid point each callback was scheduled for, not a wall-clock stamp of the app's own),
-/// so the mean does not depend on when the app ran its callbacks; a missed interval is a vsync the client did not ask for in time. A failed judgement while the host was starved
-/// (`atl_host_load::judge_window`, share over the window) is `undecidable`: still a failure, so `land` needs a rerun that decides.
-pub(crate) fn cadence_check(
-    after: &[&str],
-    refresh_hz: f32,
-    rate: Rate,
-    pressure: &Samples,
-) -> Result<String, String> {
+/// so the mean does not depend on when the app ran its callbacks; a missed interval is a vsync the client did not ask for in time. A real-time assertion (design class R): judged on any host.
+pub(crate) fn cadence_check(after: &[&str], refresh_hz: f32, rate: Rate) -> Result<String, String> {
     let times: Vec<u64> = after
         .iter()
         .filter_map(|l| frame_time(l))
         .take(FRAME_CALLBACKS)
         .collect();
-    let share = match (times.first(), times.last()) {
-        (Some(&a), Some(&b)) => pressure.stall_share(a as i64, b as i64),
-        _ => None,
-    };
-    judge_window(cadence_judge(&times, refresh_hz, rate), share, "the window")
+    cadence_judge(&times, refresh_hz, rate)
 }
 
 /// What the run's display rate promises the cadence sub-gates.
@@ -2469,8 +2466,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(self_test());
     }
     let _ = Layout::of(root)?;
-    // host CPU pressure through the run: the cadence checks tell a starved host from a client that missed frames
-    let sampler = Sampler::start();
     let key = work_key(args);
     // hwui's GraphicBufferMapper aborts the app without the mapper ("gralloc-mapper is missing"); the window path always has it, as the app and composer gates do
     let rt = Runtime::new(
@@ -2757,7 +2752,6 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             started,
         },
         &mut atld,
-        sampler,
     )?;
     if let Some(secs) = args.hold {
         return Ok(hold_report(
@@ -2893,7 +2887,6 @@ struct LiveOut {
     ended: Option<std::process::ExitStatus>,
     /// atld ended because the gate stopped it at the window's end.
     stopped: Option<std::process::ExitStatus>,
-    pressure: Samples,
     /// The proxy's count of the compositor's `presented` feedback (vsync-flagged, other); None: the stage ran without a proxy (no Wayland connection the harness sees).
     presented: Option<(u64, u64)>,
     /// The proxy's frame-callback throttle (held, released); (0, 0) unless the stage throttled (slow-display).
@@ -2906,7 +2899,7 @@ struct LiveOut {
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
 /// atld is stopped. One implementation for `test window` (this host) and the target agent ([`agent`]).
-fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
+fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
     let LiveIn {
         args,
         run,
@@ -2941,6 +2934,8 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         seen: Arc::clone(&captured),
         component: format!("{package}/{activity}"),
         timeout_close: !args.exit_with_last_app,
+        starve_close: args.starve_close,
+        delayed_close: args.break_delayed_close,
     });
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
@@ -3113,7 +3108,6 @@ fn live(l: LiveIn, atld: &mut Atld, sampler: Sampler) -> Result<LiveOut> {
         splash_shot,
         ended,
         stopped,
-        pressure: sampler.stop(),
         presented: presented.map(|p| p.counts()),
         throttle: throttle.map_or((0, 0), |t| t.counts()),
         commits: commits.map(|c| c.times_ns()),
@@ -3158,7 +3152,6 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         mut splash_shot,
         ended,
         stopped,
-        pressure,
         presented,
         throttle,
         commits,
@@ -3187,19 +3180,14 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         println!("---- app log\n{app}");
     }
     // the sub-gates, once the marker is logged (they read the frames or the touches after it); timed ones go through the one starvation rule below
-    let mut timed: Vec<starvation::Timed> = Vec::new();
+    let mut timed: Vec<crate::starvation::Timed> = Vec::new();
     let sub: Vec<Sub> = match (args.stage, v.marker_ms) {
         (Stage::Frames, Some(_)) => {
             vec![
                 ("picture", picture_check(&app, display, WINDOW_TITLE)),
                 (
                     "cadence",
-                    cadence_check(
-                        &after_marker(&app, marker),
-                        display.refresh_hz,
-                        rate,
-                        &pressure,
-                    ),
+                    cadence_check(&after_marker(&app, marker), display.refresh_hz, rate),
                 ),
             ]
         }
@@ -3264,7 +3252,6 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             &liveness,
             display,
             rate,
-            &pressure,
             &captured,
             args.esc_back,
         ),
@@ -3428,10 +3415,12 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
     if !sub.is_empty() && matches!(args.stage, Stage::Frames | Stage::Widgets | Stage::UiBlock) {
         sub.push(("vsync-tier", vsync_tier_check(&app, presented)));
     }
-    // the one host-GPU-starvation rule, every stage: the window's own render after the marker, printed whether or not a timed sub-gate exists, so land logs show the host's state
+    // the one starvation rule, every stage (starvation.rs): the window's own render after the marker, printed whether or not a timed sub-gate exists, so land logs show the host's state;
+    // the gate's CPU samples for a late wait or a fired product timer (None: no scope, so judged)
+    let samples = crate::starvation::live();
     let mut undecided = Vec::new();
     if let Some(marked) = v.marker_ms {
-        match starvation::host_render_us(&app, marked) {
+        match crate::starvation::host_render_us(&app, marked) {
             Some((median, max, n)) => println!(
                 "window: host gpu: window render median {} ms, max {} ms over {n} paint lines after the marker",
                 median / 1000,
@@ -3439,7 +3428,13 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             ),
             None => println!("window: host gpu: no paint line after the marker"),
         }
-        let (judged, unjudged) = starvation::apply(&app, args.stage.name(), marked, timed);
+        let run = crate::starvation::Run {
+            stage: args.stage.name(),
+            app: &app,
+            from: marked,
+            samples: samples.as_ref(),
+        };
+        let (judged, unjudged) = crate::starvation::apply(&run, timed);
         sub.extend(judged);
         undecided = unjudged;
     }
@@ -3460,17 +3455,36 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         let (Ok(s) | Err(s)) = result;
         println!("window: {name}: undecided {why}: {s}");
     }
-    // a real failure elsewhere still fails the run; undecided replaces only a pass
-    if let (Some(_), None, None, Some((_, why, _))) =
-        (v.marker_ms, &v.fault, &sub_fault, undecided.first())
-    {
+    // GPU: a real failure elsewhere still fails the run; undecided replaces only a pass. CPU and product timers: a red whose faults the rule excuses (starvation::red). A fault of the
+    // run itself (FATAL EXCEPTION, abort, atld's exit) is never excused
+    let starved = match (&v.fault, &sub_fault) {
+        (Some(_), _) => None,
+        (None, None) => v
+            .marker_ms
+            .and(undecided.first())
+            .map(|(_, why, _)| why.clone()),
+        (None, Some(_)) => {
+            let faults: Vec<&Miss> = sub
+                .iter()
+                .filter_map(|(_, r)| r.as_ref().err())
+                .filter(|m| !matches!(m, Miss::NotReached { .. }))
+                .collect();
+            let run = crate::starvation::Run {
+                stage: args.stage.name(),
+                app: &app,
+                from: v.marker_ms.unwrap_or(0),
+                samples: samples.as_ref(),
+            };
+            crate::starvation::red(&run, &faults, &services)
+        }
+    };
+    if let Some(why) = starved {
         // check_gates.rs `undecided_line` reads this line; the exit code alone carries the outcome
-        println!(
-            "window: {}{}: {why}",
-            crate::verdict::UNDECIDED_WORD,
-            args.stage.name()
-        );
-        return Ok(ExitCode::from(crate::verdict::UNDECIDED_EXIT));
+        return Ok(crate::starvation::undecided(
+            "window",
+            args.stage.name(),
+            &why,
+        ));
     }
     if let (Some(marked), None, None) = (v.marker_ms, &v.fault, &sub_fault) {
         let skip_note = if not_judged.is_empty() {
@@ -3576,7 +3590,6 @@ struct LiveRecord {
     captured: capture::Seen,
     ended: bool,
     stopped: bool,
-    pressure: Samples,
     presented: Option<(u64, u64)>,
 }
 
@@ -3635,7 +3648,6 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
         std::thread::sleep(POLL);
     };
     println!("window-live: atld pid {pid}, stage {}", args.stage.name());
-    let sampler = Sampler::start();
     let mut atld = Atld::Pid(pid);
     let out = live(
         LiveIn {
@@ -3651,7 +3663,6 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
             started: Instant::now(),
         },
         &mut atld,
-        sampler,
     )?;
     let record = LiveRecord {
         liveness: out.liveness,
@@ -3663,7 +3674,6 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
         ),
         ended: out.ended.is_some(),
         stopped: out.stopped.is_some(),
-        pressure: out.pressure,
         presented: out.presented,
     };
     let path = run.scratch.join(crate::remote::LIVE_JSON);
@@ -3889,7 +3899,6 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         splash_shot: None,
         ended: record.ended.then_some(status),
         stopped: record.stopped.then_some(status),
-        pressure: record.pressure,
         presented: record.presented,
         // remote stages do not throttle (slow-display is local)
         throttle: (0, 0),
@@ -4649,12 +4658,12 @@ mod tests {
         let check = |times: &[u64], hz: f32| {
             let owned = lines(times);
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, hz, Rate::Fixed, &Samples::default())
+            cadence_check(&refs, hz, Rate::Fixed)
         };
         let session = |times: &[u64], hz: f32| {
             let owned = lines(times);
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, hz, Rate::Session, &Samples::default())
+            cadence_check(&refs, hz, Rate::Session)
         };
         let steady: Vec<u64> = (0..31).map(|i| 5_000_000_000 + i * STEP).collect();
         let ok = check(&steady, 60.0);
@@ -4688,53 +4697,6 @@ mod tests {
         assert!(session(&short, 60.0).is_err());
         assert!(session(&rephased, 60.0).is_err());
         assert!(frame_time("1000.000 1 2 I AtlWindow: onDraw reached").is_none());
-    }
-
-    /// The starvation rule: a client that skips every other vsync (the stage's deliberate-skip case) FAILs on a quiet host and is undecidable on a starved one; steady callbacks
-    /// PASS on both (a pass under load is a pass). Pressure samples bracket the window at the threshold's half and double.
-    #[test]
-    fn cadence_undecidable_only_when_starved() {
-        use atl_host_load::{STARVED_STALL_SHARE, Sample};
-        const STEP: u64 = 16_666_667;
-        const T0: u64 = 5_000_000_000;
-        let pressure = |share: f64| {
-            let wall_ns = 2_000_000_000_i64;
-            Samples(vec![
-                Sample {
-                    at_ns: T0 as i64 - 1,
-                    stall_us: 0,
-                    ..Default::default()
-                },
-                Sample {
-                    at_ns: T0 as i64 - 1 + wall_ns,
-                    stall_us: (share * wall_ns as f64 / 1e3) as u64,
-                    ..Default::default()
-                },
-            ])
-        };
-        let run = |times: &[u64], p: &Samples| {
-            let owned: Vec<String> = times
-                .iter()
-                .map(|t| format!("1000.000 1 2 I AtlWindow: frame 1 time={t}"))
-                .collect();
-            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            cadence_check(&refs, 60.0, Rate::Fixed, p)
-        };
-        let quiet = pressure(STARVED_STALL_SHARE / 2.0);
-        let starved = pressure(STARVED_STALL_SHARE * 2.0);
-        let steady: Vec<u64> = (0..31).map(|i| T0 + i * STEP).collect();
-        let skipping: Vec<u64> = (0..31).map(|i| T0 + i * 2 * STEP).collect();
-        assert!(run(&steady, &quiet).is_ok());
-        assert!(run(&steady, &starved).is_ok());
-        let fail = run(&skipping, &quiet).expect_err("skips on a quiet host");
-        assert!(!fail.starts_with("undecidable"), "{fail}");
-        let undecided = run(&skipping, &starved).expect_err("skips on a starved host");
-        assert!(undecided.starts_with("undecidable"), "{undecided}");
-        let unknown = run(&skipping, &Samples::default()).expect_err("no samples");
-        assert!(
-            !unknown.starts_with("undecidable"),
-            "no evidence decides FAIL: {unknown}"
-        );
     }
 
     /// The fixture's touch line reads as its action, x, y and pointer count; any other line is no touch.

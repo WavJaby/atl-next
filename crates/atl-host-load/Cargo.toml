@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Host load over a test gate's run: the gate's own cgroup (`cpu.pressure`, `cpu.stat`) against the busy CPU of its allowed set, and the one system-wide PSI judgement (`judge_window`) the cadence window and g4 keep. Core crate: no unsafe.
+# Host load over a test gate's run: the gate's own cgroup (`cpu.pressure`, `cpu.stat`) against the busy CPU of its allowed set; the running gate's samples (`live`) are what the harness's starvation rule weighs. Core crate: no unsafe.
 [dependencies]
 rustix.workspace = true
 serde = { workspace = true, optional = true }

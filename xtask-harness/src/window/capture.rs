@@ -106,6 +106,10 @@ pub(super) struct Probe {
     pub component: String,
     /// Sub-gate (d) runs: false with `--exit-with-last-app`, where atld ends the run at the first close.
     pub timeout_close: bool,
+    /// `--starve-close`: burners hold every CPU from the first close until its sub-gates read the logs.
+    pub starve_close: bool,
+    /// `--break-delayed-close`: F11 arms the delayed onDestroy before the first close.
+    pub delayed_close: bool,
 }
 
 impl Probe {
@@ -301,6 +305,19 @@ pub(super) fn drive(
     if let Ok(mut seen) = probe.seen.lock() {
         seen.ran = ran;
     }
+    if probe.delayed_close {
+        arm_delayed_destroy(&proxy, app_log)?;
+    }
+    let burners = if probe.starve_close {
+        let cpus =
+            atl_host_load::allowed_cpus().ok_or_else(|| "--starve-close: no CPU set".to_owned())?;
+        Some(
+            crate::host_load::Burners::start(&cpus, crate::host_load::STARVE_WEIGHT)
+                .map_err(|e| format!("--starve-close: {e:#}"))?,
+        )
+    } else {
+        None
+    };
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
     // the line, not its arguments: a removal the registry refused never writes it, and close_judged names what is missing
     let _ = until(&Wait::log(
@@ -327,6 +344,7 @@ pub(super) fn drive(
         seen.destroy = Some(destroy_judged(&app));
         seen.ended = Some(ended_judged(&services, still));
     }
+    drop(burners);
     // after the rows above read their logs: the second close's lines must not reach them
     if probe.timeout_close {
         let timeout = timed_close(&proxy, app_log, services_log, probe);
@@ -440,16 +458,7 @@ fn timed_close(
         return Err("the relaunched fixture never drew".to_owned());
     }
     std::thread::sleep(INPUT_SETTLE);
-    for pressed in [true, false] {
-        proxy
-            .inject_key(KEY_F11, pressed)
-            .map_err(|e| e.to_string())?;
-    }
-    if !wait_line_after(app_log, app_start, ARMED_LINE, CLOSE_WAIT) {
-        return Err(format!(
-            "no `{ARMED_LINE}` after F11: the fixture did not arm its delay"
-        ));
-    }
+    arm_delayed_destroy(proxy, app_log)?;
     let app_close = len_of(app_log);
     let services_close = len_of(services_log);
     proxy.inject_toplevel_close().map_err(|e| e.to_string())?;
@@ -459,6 +468,22 @@ fn timed_close(
     let app = text_after(app_log, app_close);
     let services = text_after(services_log, services_close);
     timeout_judged(&app, &services, killed_pids(&services).map(gone_within))
+}
+
+/// F11 arms the shown fixture's delayed onDestroy (Main.java onKeyUp); Err when its line does not follow.
+fn arm_delayed_destroy(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
+    let start = len_of(app_log);
+    for pressed in [true, false] {
+        proxy
+            .inject_key(KEY_F11, pressed)
+            .map_err(|e| e.to_string())?;
+    }
+    if !wait_line_after(app_log, start, ARMED_LINE, CLOSE_WAIT) {
+        return Err(format!(
+            "no `{ARMED_LINE}` after F11: the fixture did not arm its delay"
+        ));
+    }
+    Ok(())
 }
 
 /// Sub-gate (d) timeout, on the lines after the second close: the composer sent REMOVE_TASK for a Task; the services' timer fired for it (`no destroy within <D>`, D as the product prints

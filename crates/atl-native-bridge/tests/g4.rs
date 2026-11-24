@@ -7,7 +7,7 @@
 //!
 //! Reports median and min-max ns per call over the runs, and whether the CPU has FSGSBASE (without it the engine refuses to start).
 //! Gate: median per crossing (minus baseline) < BAND_NS for both directions, and the host target ran exactly RUNS x CALLS times.
-//! Starvation: the host's CPU stall share over the whole run (atl-host-load, the measure the cadence window is judged with); a band failure while it is over the threshold is `undecidable`, still a failure. A pass stands.
+//! Starvation: cargo test has no third outcome, so a band failure stays a failure; its text names the gate's own CPU stall over the run (atl-host-load `Samples::stalled`, `starved cpu`), unknown outside a gate scope.
 //! Deliberate break: `ATL_NB_BREAK=g4_break` adds SYSCALLS_IN_BREAK `getppid` syscalls to the crossed path only -> guest->host must leave the band.
 //! Timing is wall clock on an uncontrolled host (WSL2 here): a band, not a measurement of record; run in release (`--release`) for numbers worth reporting.
 #![allow(
@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use atl_host_load::{Sampler, judge_window};
+use atl_host_load::Sampler;
 use atl_native_bridge::engine::{Engine, HostThread, Tp, identity};
 
 /// Plan bridge1-plan step 3 g4: target < 50 ns per crossing.
@@ -156,7 +156,17 @@ fn run() -> Result<String, String> {
             h2g.0
         ))
     };
-    judge_window(band_judgement, pressure.span_share(), "the run")
+    let stalled = pressure
+        .span()
+        .and_then(|span| Some((pressure.stalled(span)?, span.to_ns - span.from_ns)));
+    band_judgement.map_err(|e| match stalled {
+        Some((us, ns)) => format!(
+            "{e}; starved cpu {} ms of the run's {} ms",
+            us / 1000,
+            ns / 1_000_000
+        ),
+        None => format!("{e}; host load unknown"),
+    })
 }
 
 fn main() -> ExitCode {

@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use rustix::time::{ClockId, clock_gettime};
 
 use crate::scope;
 
-/// System-wide PSI. CPU is the input of `judge_window`; io and memory are printed, not judged.
+/// System-wide PSI: printed, not judged (the gate's own `cpu.pressure` is the judged stall).
 const PSI_CPU: &str = "/proc/pressure/cpu";
 const PSI_IO: &str = "/proc/pressure/io";
 const PSI_MEMORY: &str = "/proc/pressure/memory";
@@ -50,7 +50,7 @@ pub struct Sample {
 }
 
 /// A window of the run, CLOCK_MONOTONIC ns.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub from_ns: i64,
     pub to_ns: i64,
@@ -61,32 +61,17 @@ pub struct Span {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Samples(pub Vec<Sample>);
 
-/// Between two consecutive samples: the gate's `some` stall, its own CPU, and the foreign CPU (busy minus own) of its allowed set.
+/// Between two consecutive samples, or the part of it inside a span: the gate's `some` stall, its own CPU, and the foreign CPU (busy minus own) of its allowed set.
+/// `counts`: foreign >= own over the whole interval (the part inside a span takes its interval's answer).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Interval {
     stall_us: u64,
     own_us: u64,
     foreign_us: u64,
+    counts: bool,
 }
 
 impl Samples {
-    /// Stall time / wall time from the last sample at or before `from_ns` to the first at or after `to_ns`. `None` when the samples do not bracket the window.
-    pub fn stall_share(&self, from_ns: i64, to_ns: i64) -> Option<f64> {
-        let a = self.0.iter().rev().find(|s| s.at_ns <= from_ns)?;
-        let b = self.0.iter().find(|s| s.at_ns >= to_ns)?;
-        let wall_us = (b.at_ns - a.at_ns) as f64 / 1e3;
-        if wall_us <= 0.0 {
-            return None;
-        }
-        Some(b.stall_us.saturating_sub(a.stall_us) as f64 / wall_us)
-    }
-
-    /// [`Self::stall_share`] over the whole sampled span, i.e. the sampler's lifetime (one run). `None` with fewer than two samples.
-    pub fn span_share(&self) -> Option<f64> {
-        let span = self.span()?;
-        self.stall_share(span.from_ns, span.to_ns)
-    }
-
     /// The first sample to the last. `None` under two samples.
     pub fn span(&self) -> Option<Span> {
         let (first, last) = (self.0.first()?, self.0.last()?);
@@ -96,25 +81,31 @@ impl Samples {
         })
     }
 
-    /// The intervals wholly inside `span`. Unknown (`None`) when the samples do not cover `span`, or an interval inside it lacks the gate's scope or the busy CPU: a partial record is never summed.
+    /// The intervals overlapping `span`, each scaled to its part inside `span` (spread evenly over the interval): a wait between two samples is not rounded to them, which would lose
+    /// up to two periods (100 ms) of a 1 s wait. Unknown (`None`) when the samples do not cover `span`, or an interval in it lacks the gate's scope or the busy CPU: a partial record is never summed.
     fn intervals(&self, span: Span) -> Option<Vec<Interval>> {
         let covered = self.0.first()?.at_ns <= span.from_ns && self.0.last()?.at_ns >= span.to_ns;
-        if !covered {
+        if !covered || span.to_ns < span.from_ns {
             return None;
         }
         let intervals: Vec<Interval> = self
             .0
             .windows(2)
-            .filter(|w| w[0].at_ns >= span.from_ns && w[1].at_ns <= span.to_ns)
+            .filter(|w| w[1].at_ns > span.from_ns && w[0].at_ns < span.to_ns)
             .map(|w| {
                 let (a, b) = (&w[0], &w[1]);
                 let (ga, gb) = (a.gate?, b.gate?);
                 let own_us = gb.usage_us.saturating_sub(ga.usage_us);
                 let busy_us = b.busy_us?.saturating_sub(a.busy_us?);
+                let foreign_us = busy_us.saturating_sub(own_us);
+                let inside = (b.at_ns.min(span.to_ns) - a.at_ns.max(span.from_ns)) as f64
+                    / (b.at_ns - a.at_ns) as f64;
+                let part = |us: u64| (us as f64 * inside).round() as u64;
                 Some(Interval {
-                    stall_us: gb.stall_us.saturating_sub(ga.stall_us),
-                    own_us,
-                    foreign_us: busy_us.saturating_sub(own_us),
+                    stall_us: part(gb.stall_us.saturating_sub(ga.stall_us)),
+                    own_us: part(own_us),
+                    foreign_us: part(foreign_us),
+                    counts: foreign_us >= own_us,
                 })
             })
             .collect::<Option<_>>()?;
@@ -123,11 +114,14 @@ impl Samples {
 
     /// The gate's stall (us) over `span`, counting only the intervals whose foreign CPU is at least its own. A runaway inside the gate makes its own CPU the larger part, so its waits are not excused.
     pub fn stalled(&self, span: Span) -> Option<u64> {
-        let counted = self
-            .intervals(span)?
-            .into_iter()
-            .filter(|i| i.foreign_us >= i.own_us);
+        let counted = self.intervals(span)?.into_iter().filter(|i| i.counts);
         Some(counted.map(|i| i.stall_us).sum())
+    }
+
+    /// The CLOCK_MONOTONIC time (ns) of a wall time (ns since the epoch), through the sample nearest to it (both clocks are read together). None without samples.
+    pub fn monotonic_of(&self, wall_ns: i64) -> Option<i64> {
+        let s = self.0.iter().min_by_key(|s| (s.wall_ns - wall_ns).abs())?;
+        Some(s.at_ns + (wall_ns - s.wall_ns))
     }
 
     /// The gate's own CPU (us) over `span`.
@@ -159,6 +153,32 @@ impl Samples {
         }
         Some(field(last)?.saturating_sub(field(first)?) as f64 / wall_us)
     }
+}
+
+/// The samples of the running gate's sampler ([`Sampler::publish`]): one gate per process.
+static LIVE: OnceLock<Arc<Mutex<Vec<Sample>>>> = OnceLock::new();
+
+/// The running gate's samples once one is at or after `through_ns` (CLOCK_MONOTONIC): what a judge reads over a span that just ended. Waits at most four periods for that sample.
+/// None without a published sampler (no scope: unknown, so judged).
+pub fn live(through_ns: i64) -> Option<Samples> {
+    let shared = LIVE.get()?;
+    for _ in 0..4 {
+        let covered = shared
+            .lock()
+            .expect("sampler lock")
+            .last()
+            .is_some_and(|s| s.at_ns >= through_ns);
+        if covered {
+            break;
+        }
+        thread::sleep(SAMPLE_PERIOD);
+    }
+    Some(Samples(shared.lock().expect("sampler lock").clone()))
+}
+
+/// CLOCK_MONOTONIC now (ns): the clock of [`Sample::at_ns`], so a wait's span is stamped on it.
+pub fn monotonic_ns() -> i64 {
+    clock_ns(ClockId::Monotonic)
 }
 
 /// The running sampler; [`Sampler::stop`] ends it and returns what it read.
@@ -210,6 +230,11 @@ impl Sampler {
     pub fn start() -> Self {
         let gate = scope::own().ok().map(|s| s.dir);
         Self::start_for(gate.as_deref(), allowed_cpus().as_deref())
+    }
+
+    /// Makes these samples the process's [`live`] record. The first published sampler stays it: one gate per process.
+    pub fn publish(&self) {
+        let _ = LIVE.set(Arc::clone(&self.samples));
     }
 
     pub fn stop(self) -> Samples {
@@ -429,6 +454,35 @@ mod tests {
         assert_eq!(s.own(inner), Some(100_000));
         assert_eq!(s.foreign(inner), Some(0));
         assert_eq!(s.stalled(inner), Some(0));
+    }
+
+    /// An edge interval counts its part inside the span: 0.5..1.5 s takes half of each interval of the counting test, so stalled 0.05 s (interval 1's half; interval 2 does not count), own 0.15 + 0.05 s, foreign 0.2 + 0.
+    #[test]
+    fn edge_intervals_count_their_part_inside_the_span() {
+        let s = Samples(vec![
+            gate_at(0, 0, 0, 0),
+            gate_at(1_000_000_000, 100_000, 300_000, 700_000),
+            gate_at(2_000_000_000, 400_000, 400_000, 800_000),
+        ]);
+        let mid = Span {
+            from_ns: 500_000_000,
+            to_ns: 1_500_000_000,
+        };
+        assert_eq!(s.stalled(mid), Some(50_000));
+        assert_eq!(s.own(mid), Some(200_000));
+        assert_eq!(s.foreign(mid), Some(200_000));
+    }
+
+    /// Wall to monotonic through the nearest sample: a sample at mono 10 s / wall 1000 s maps wall 1000.5 s to mono 10.5 s.
+    #[test]
+    fn wall_maps_to_monotonic_through_the_nearest_sample() {
+        let s = Samples(vec![Sample {
+            at_ns: 10_000_000_000,
+            wall_ns: 1_000_000_000_000,
+            ..Default::default()
+        }]);
+        assert_eq!(s.monotonic_of(1_000_500_000_000), Some(10_500_000_000));
+        assert_eq!(Samples::default().monotonic_of(0), None);
     }
 
     /// Unknown, never partial: a span the samples do not cover, or an interval inside it without a busy reading.

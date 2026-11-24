@@ -105,6 +105,8 @@ impl Row {
 /// The gates `check` runs, in report order (cheapest first). Serial rows are the timing assertions (time bounds that other rows' load would break).
 pub const ROWS: &[Row] = &[
     Row::new(&["task-bind"], false, false),
+    // the starvation rule's own gate: a starved wait undecided, every real red still red (about 10 s on one CPU)
+    Row::new(&["host-load"], false, false),
     Row::new(&["sandbox"], true, true),
     Row::new(&["signing"], true, true),
     Row::new(&["sepolicy"], true, true),

@@ -12,9 +12,9 @@
 //!   commits in it less [`SLACK`].
 //! - Timeouts (every run): no dequeue timed out (`-110`).
 
-use super::starvation::{Fakes, Timed, span};
 use super::{ACK_WAIT, Checks, Liveness};
 use crate::composer::word;
+use crate::starvation::{Fakes, Render, Timed, span};
 use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
@@ -184,9 +184,12 @@ pub fn checks(app: &str, refresh_hz: f32, commits_ns: Option<&[u64]>) -> Checks 
                 match steady_p95(&phases) {
                     Ok(p95) => timed.push(Timed {
                         sub: ("commits", commits_check(&phases, p95)),
-                        limit_us: p95 * 1000.0,
-                        limit: format!("steady p95 {p95:.1} ms"),
-                        span: span(app, BLOCK_START, BLOCK_END),
+                        gpu: Some(Render {
+                            limit_us: p95 * 1000.0,
+                            limit: format!("steady p95 {p95:.1} ms"),
+                            span: span(app, BLOCK_START, BLOCK_END),
+                        }),
+                        cpu: None,
                         fakes: Fakes::Fail,
                     }),
                     Err(e) => subs.push(("commits", Err(e))),
@@ -223,8 +226,8 @@ pub fn drive(proxy: Proxy, app_log: &Path) -> Result<Liveness, Miss> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::starvation::apply;
     use super::*;
+    use crate::starvation::{Run, apply};
 
     /// Steady phase 6000..10000 ms, block 10000..12000 ms on the app's uptimeMillis.
     fn edges(during: u64) -> String {
@@ -281,7 +284,15 @@ mod tests {
             let c = checks(log, 60.0, Some(commits));
             let names: Vec<&str> = c.subs.iter().map(|(n, _)| *n).collect();
             assert_eq!(names, ["timeouts", "posts"]);
-            apply(log, "ui-block", 0, c.timed)
+            apply(
+                &Run {
+                    stage: "ui-block",
+                    app: log,
+                    from: 0,
+                    samples: None,
+                },
+                c.timed,
+            )
         };
         let (judged, undecided) = judge(&app(Some(20_001)), &steady);
         assert!(judged.is_empty());

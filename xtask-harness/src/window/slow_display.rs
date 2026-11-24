@@ -8,10 +8,10 @@
 //! rule (starvation.rs) leaves them unjudged, pass or fail, when the window's own measured render exceeds it -- never decided from the composer's counters, which broken backpressure moves the
 //! same way (R6-8).
 
-use super::starvation::{Fakes, Timed, render_max_us, span};
 use super::ui_block::{FIXTURE as UI_BLOCK_FIXTURE, number, period_ms, result_line};
 use super::{ACK_WAIT, Checks, Liveness, Sub, line_stamp};
 use crate::composer::word;
+use crate::starvation::{Fakes, Render, Timed, render_max_us, span};
 use crate::wait::{Miss, Wait, until};
 use crate::wayland_proxy::{Event as ProxyEvent, Proxy};
 use std::path::Path;
@@ -193,9 +193,12 @@ pub fn checks(app: &str, refresh_hz: f32, throttle: (u64, u64)) -> Checks {
             .into_iter()
             .map(|sub| Timed {
                 sub,
-                limit_us: (bound * 1000) as f64,
-                limit: format!("hold bound {bound} ms"),
-                span: span(app, STEADY_START, STEADY_END),
+                gpu: Some(Render {
+                    limit_us: (bound * 1000) as f64,
+                    limit: format!("hold bound {bound} ms"),
+                    span: span(app, STEADY_START, STEADY_END),
+                }),
+                cpu: None,
                 fakes: Fakes::Both,
             })
             .collect(),
@@ -229,8 +232,8 @@ pub fn drive(proxy: Proxy, app_log: &Path, refresh_hz: f32) -> Result<Liveness, 
 
 #[cfg(test)]
 mod tests {
-    use super::super::starvation::apply;
     use super::*;
+    use crate::starvation::{Run, apply};
 
     fn result(ms: u64, posts: u64) -> String {
         format!(
@@ -283,7 +286,15 @@ mod tests {
         let off = "0.5 INFO atl-composer: ui: backpressure=false bound_ms=100\n";
         let judge = |l: &str| {
             let c = checks(l, 60.0, (1, 1));
-            apply(l, "slow-display", 0, c.timed)
+            apply(
+                &Run {
+                    stage: "slow-display",
+                    app: l,
+                    from: 0,
+                    samples: None,
+                },
+                c.timed,
+            )
         };
         let replaced = |l: &str| {
             let (judged, undecided) = judge(l);

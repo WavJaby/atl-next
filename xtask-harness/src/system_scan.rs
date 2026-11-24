@@ -140,6 +140,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         );
         return Ok(ExitCode::SUCCESS);
     }
+    // the starvation rule (starvation.rs): a late done-line wait or a fired product timer the host starved; a run whose atld exited is never excused
+    if ended.is_none() {
+        let faults: Vec<Miss> = match &outcome {
+            Err(late @ Miss::Late { .. }) => vec![late.clone()],
+            _ => whys.iter().cloned().map(Miss::Wrong).collect(),
+        };
+        let services = read(&run.log("services"));
+        if let Some(code) = crate::starvation::judge_row("system-scan", &faults, &services) {
+            return Ok(code);
+        }
+    }
     if let Some(e) = ended {
         whys.push(format!("atld exited {e}"));
     }

@@ -40,6 +40,7 @@ mod gl_scene;
 mod gles2_fixture;
 mod gralloc;
 mod host_fonts;
+mod host_load;
 mod installer;
 mod installer_parse;
 mod instrument;
@@ -73,6 +74,7 @@ mod services;
 mod session_bus;
 mod signing;
 mod sles_bridge;
+mod starvation;
 mod system_scan;
 mod test_fonts;
 mod tree_gate;
@@ -137,6 +139,9 @@ enum Command {
     /// This host's first monitor as atld's `--display` value (window.rs `display_probe`), run on a remote target before a UI stage; needs no checkout.
     #[command(hide = true)]
     DisplayProbe,
+    /// The worker and burner processes of `test host-load` (host_load.rs `child`); no checkout, no gate scope.
+    #[command(hide = true)]
+    HostLoadChild(host_load::ChildArgs),
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -312,6 +317,10 @@ enum Test {
     EglBridge(egl_bridge::Args),
     /// A CJK and an emoji code point each resolve to a real font file through the product's font list over the desktop's own fontconfig (host_fonts.rs); prints family + file per code point. A host without such a face is its own verdict (`host lacks a CJK font`), not a failure. `--break empty-dir` / `no-fallback` must leave the ok verdict.
     HostFonts(host_fonts::Args),
+    /// The starvation rule on a process tree it controls, no atld (gate-starved-red-design H4): each case runs as its own gate pinned to one CPU, with burners in sibling scopes.
+    /// A starved wait (burners at CPUWeight 10000) must be `undecided`; a silent, asleep, crashed, wrong, self-starved or late worker must FAIL; equal-weight load inside the bound must pass.
+    /// Needs a user systemd that makes scopes with CPUWeight (`systemd-run --user --scope`), and `taskset`.
+    HostLoad(host_load::Args),
     /// The riscv64 host's CPU-side checks under qemu-user, once per CPU model: the host row's derived baseline and V models (default RVA23U64 at VLEN 128 and 256). Per model: AT_HWCAP/hwprobe probe with a V instruction (SIGILL without V), libz's V tier against an independent adler32, libunwindstack's vlenb in a ucontext unwind, the riscv64 unit tests. One verdict line per model, then the gate's. `--break baseline` must turn it red. Needs `native --host riscv64 --for rv-qemu` and the `qemu-user` deps row.
     RvQemu(rv_qemu::Args),
 }
@@ -322,6 +331,7 @@ fn main() -> Result<ExitCode> {
     match &cli.command {
         Command::WindowLive(args) => return window::agent(args),
         Command::DisplayProbe => return window::display_probe(),
+        Command::HostLoadChild(args) => return host_load::child(args),
         _ => {}
     }
     // a test gate runs in its own scope when the host can make one (atl-host-load): begun here, its `host load:` line printed after its verdict
@@ -484,8 +494,13 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::HostFonts(args),
         } => host_fonts::run(&root, &args),
+        Command::Test {
+            test: Test::HostLoad(args),
+        } => host_load::run(&args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
-        Command::WindowLive(_) | Command::DisplayProbe => unreachable!("dispatched above"),
+        Command::WindowLive(_) | Command::DisplayProbe | Command::HostLoadChild(_) => {
+            unreachable!("dispatched above")
+        }
     };
     if let Some(gate) = gate {
         println!("{}", gate.finish());
@@ -588,8 +603,12 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::SlesBridge(_) => "sles-bridge",
             Test::EglBridge(_) => "egl-bridge",
             Test::HostFonts(_) => "host-fonts",
+            Test::HostLoad(_) => "host-load",
             Test::RvQemu(_) => "rv-qemu",
         },
-        Command::CheckStep { .. } | Command::WindowLive(_) | Command::DisplayProbe => return None,
+        Command::CheckStep { .. }
+        | Command::WindowLive(_)
+        | Command::DisplayProbe
+        | Command::HostLoadChild(_) => return None,
     })
 }

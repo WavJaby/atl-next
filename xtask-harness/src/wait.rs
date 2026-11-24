@@ -10,6 +10,9 @@ use std::process::{Child, ExitStatus};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use atl_host_load::Span;
+
+use crate::starvation::Budget;
 use crate::wayland_proxy::Event as ProxyEvent;
 
 /// How often a log is read while a wait polls it (the app's log is written by another process): the window waits' interval. A row wait polls at the sleep of the loop it replaced ([`Wait::every`]): H2 moves no poll interval.
@@ -128,13 +131,24 @@ impl<'a> Wait<'a> {
 
 /// Why a check did not pass. `Wrong`: its own judgement, or a probe's proxy/spawn error (never a wait). `Late`: a declared wait ran out its bound. `NotReached`: an earlier late wait ended the probe, so this check did not run.
 /// `Exited`: the child a wait watched ended before the wait's condition held. A death, not a late wait: section 2.3 never excuses it, so it is never `Late`.
-/// Owned strings: the probe's miss travels in `live.json` (LiveRecord) to the judge of a remote run.
+/// Owned strings: the probe's miss travels in `live.json` (LiveRecord) to the judge of a remote run. A late wait's `budget` (its span on this host's clock) does not travel: a remote miss is judged.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Miss {
     Wrong(String),
-    Late { name: String, why: String },
-    Exited { name: String, status: String },
-    NotReached { after: String },
+    Late {
+        name: String,
+        why: String,
+        /// What the starvation rule weighs (starvation.rs); None when the wait was not run by [`until`] here.
+        #[serde(skip)]
+        budget: Option<Budget>,
+    },
+    Exited {
+        name: String,
+        status: String,
+    },
+    NotReached {
+        after: String,
+    },
 }
 
 impl Miss {
@@ -182,6 +196,7 @@ enum Ended {
 }
 
 fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
+    let from_ns = atl_host_load::monotonic_ns();
     let start = Instant::now();
     let deadline = start + wait.bound;
     let ended = match (&wait.until, child) {
@@ -222,6 +237,15 @@ fn run(wait: &Wait, child: Option<&mut Child>) -> Result<Instant, Miss> {
         Ended::Late => Err(Miss::Late {
             name: wait.name.to_owned(),
             why: wait.why.clone(),
+            budget: Some(Budget {
+                wait: wait.name.to_owned(),
+                bound: wait.bound,
+                need: wait.need,
+                span: Span {
+                    from_ns,
+                    to_ns: atl_host_load::monotonic_ns(),
+                },
+            }),
         }),
     }
 }
@@ -367,7 +391,40 @@ mod tests {
         Miss::Late {
             name: name.to_owned(),
             why: why.to_owned(),
+            budget: None,
         }
+    }
+
+    /// A miss as the tests compare it: a late wait's budget (its measured span) cleared.
+    fn bare(miss: Miss) -> Miss {
+        match miss {
+            Miss::Late { name, why, .. } => Miss::Late {
+                name,
+                why,
+                budget: None,
+            },
+            other => other,
+        }
+    }
+
+    /// A late wait run here carries its budget: bound, need and a span as long as the wait.
+    #[test]
+    fn a_late_wait_carries_its_budget() {
+        let (_tx, rx) = channel::<(Instant, ProxyEvent)>();
+        let want = |_: &ProxyEvent| false;
+        let mut w = Wait::event("pong", "no pong", Duration::from_millis(30), &rx, &want);
+        w.need = Some(Duration::from_millis(5));
+        let Err(Miss::Late {
+            budget: Some(b), ..
+        }) = until(&w)
+        else {
+            panic!("late without a budget");
+        };
+        assert_eq!(
+            (b.wait.as_str(), b.bound, b.need),
+            ("pong", w.bound, w.need)
+        );
+        assert!(b.span.to_ns - b.span.from_ns >= 30_000_000, "{b:?}");
     }
 
     #[test]
@@ -388,7 +445,7 @@ mod tests {
         let (_tx, rx) = channel::<(Instant, ProxyEvent)>();
         let want = |e: &ProxyEvent| *e == ProxyEvent::Pong { serial: 1 };
         let w = Wait::event("pong", "no pong", Duration::from_millis(20), &rx, &want);
-        assert_eq!(until(&w).unwrap_err(), late("pong", "no pong"));
+        assert_eq!(bare(until(&w).unwrap_err()), late("pong", "no pong"));
     }
 
     #[test]
@@ -479,7 +536,7 @@ mod tests {
         let mut slow = sh("sleep 30");
         let w = Wait::exit("slow", "still running", Duration::from_millis(100), POLL);
         assert_eq!(
-            until_child(&w, &mut slow).unwrap_err(),
+            bare(until_child(&w, &mut slow).unwrap_err()),
             late("slow", "still running")
         );
         slow.kill().expect("kill");
@@ -562,7 +619,10 @@ mod tests {
             LOOP_POLL,
             &held,
         );
-        assert_eq!(until(&w).unwrap_err(), late("run-end", "no alarm line"));
+        assert_eq!(
+            bare(until(&w).unwrap_err()),
+            late("run-end", "no alarm line")
+        );
         std::fs::write(&receiver, "alarm started\n").unwrap();
         assert!(until(&w).is_ok());
         // the same condition with the child's exit: a death, not a late wait (bound long enough for the exit to land)
