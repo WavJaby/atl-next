@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure as check};
 use crate::{cargo_command, cdylib, unit_use};
 
 /// The release binaries (`<out>/cargo/release/<name>`, package = bin name): the broker's helpers and atld (atld_run), binderd and the stub (binder.rs), the gates' probes.
-const BINS: [&str; 8] = [
+const BINS: [&str; 9] = [
     "atl-binderd",
     "atl-sandbox-stub",
     "atl-sandbox-join",
@@ -21,6 +21,8 @@ const BINS: [&str; 8] = [
     "atl-sandbox-probe",
     "atl-egl-probe",
     "atl-engine-cpuinfo",
+    // the labwc setup a remote test run starts on its target beside its labwc (remote.rs `labwc_setup_script`)
+    "atl-labwc-setup",
 ];
 
 /// atld runs: the native bridge's dir on every app's library path (atld_run).
@@ -137,15 +139,21 @@ fn lib_file(package: &str) -> String {
     format!("lib{}.so", package.replace('-', "_"))
 }
 
-/// Builds `groups` on build dir `out` and stages the cdylibs; a group already current costs one no-op cargo run and no copy.
-pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
-    let mut packages: Vec<&str> = BINS.to_vec();
-    let staged = staged();
-    for (p, _, _) in &staged {
+/// The package set of [`Group::Release`], the same for every host.
+fn packages(staged: &[(&'static str, &'static str, String)]) -> Vec<&'static str> {
+    let mut packages = BINS.to_vec();
+    for (p, _, _) in staged {
         if !packages.contains(p) {
             packages.push(p);
         }
     }
+    packages
+}
+
+/// Builds `groups` on build dir `out` and stages the cdylibs; a group already current costs one no-op cargo run and no copy.
+pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
+    let staged = staged();
+    let packages = packages(&staged);
     let (mut cmd, release) = cdylib::release_build(root, out, &packages)?;
     let mut products = Products {
         release,
@@ -369,6 +377,15 @@ mod tests {
             lines[0]
         );
         std::fs::remove_dir_all(&d).expect("cleanup");
+    }
+
+    /// The build [`ensure`] runs makes every program a remote run starts (remote.rs `RUN_PROGRAMS`), for any host: the package set does not vary. Break: a program dropped from [`BINS`].
+    #[test]
+    fn release_group_builds_every_run_program() {
+        let packages = packages(&staged());
+        for p in crate::remote::RUN_PROGRAMS {
+            assert!(packages.contains(&p), "{p} not in {packages:?}");
+        }
     }
 
     /// Staging twice keeps the installed file (same inode): a re-stage under a running process is what the guard would catch; a changed build is installed anew.

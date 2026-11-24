@@ -25,6 +25,10 @@ atl-property-service = { path = "../crates/atl-property-service" }
 atl-sepolicy = { path = "../crates/atl-sepolicy" }
 atl-diag = { path = "../crates/atl-diag", features = ["serde"] }
 atl-services-types = { path = "../crates/atl-services-types" }
+# the labwc setup of every headless labwc (local gates; the remote helper is the same library): nested_wayland.rs
+atl-labwc-setup = { path = "../crates/atl-labwc-setup" }
+# the test environment's Wayland wire client: nested_wayland.rs, wayland_proxy.rs
+atl-wayland-wire = { path = "../crates/atl-wayland-wire" }
 clap.workspace = true
 object.workspace = true
 png.workspace = true

@@ -18,6 +18,7 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use atl_labwc_setup::READY_LINE;
 use sha2::{Digest, Sha256};
 
 use crate::{arches, gate_goals, gl_probe, nested_wayland, out, provided_gate, verdict};
@@ -71,8 +72,13 @@ const LLVM_RUNTIMES: [(&str, &str); 3] = [
 const LIB_PREFIX: &str = "lib/";
 /// The break's entry: its name in the bundle.
 const LIBUNWIND: &str = "lib/libunwind.so.1";
-/// atld's entry: `cargo_bin` (atld_run.rs) under the build dir.
-const ATLD: &str = "out/cargo/release/atld";
+/// atld and the labwc setup helper: the two programs a run starts by name, out of the gate products of the run's host (gate_build.rs `BINS`, one release dir). Each is a runtime input (atld_run.rs `runtime_inputs`), so a record names it; a record without one is refused ([`Bundle::of`]).
+pub const RUN_PROGRAMS: [&str; 2] = [ATLD, LABWC_SETUP];
+const ATLD: &str = "atld";
+/// A remote test run starts it beside its own labwc ([`labwc_setup_script`]).
+const LABWC_SETUP: &str = "atl-labwc-setup";
+/// The helper's log in a run's scratch dir: its lines come back with the run.
+const LABWC_SETUP_LOG: &str = "labwc-setup.log";
 /// Bundle names of a record's roots: the build dir, the java out and the AOSP tree.
 const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree", "src/aosp")];
 /// The target's directory for a build dir's bundle, relative to the host's home: `~/atl-next-run/<name>/`.
@@ -528,7 +534,7 @@ pub enum Display {
     Session,
     /// An X11 session without a Wayland socket: the run starts labwc nested in it ([`nested_script`]) and ends it after atld.
     NestedX11,
-    /// The run's own headless labwc ([`nested_headless_script`], as the local gates do, nested_wayland.rs), ended after atld: a test run's answer wherever the target has labwc ([`probe_test_display`]),
+    /// The run's own headless labwc ([`nested_headless_script`], as the local gates do, nested_wayland.rs), given its outputs and seat by the labwc setup helper ([`labwc_setup_script`]), ended after atld: a test run's answer wherever the target has labwc ([`probe_test_display`]),
     /// run-apk's where the session has no switch ([`probe_display`]). Nothing maps on the session.
     NestedHeadless,
 }
@@ -641,6 +647,15 @@ fn nested_headless_script(tag: &str, cfg: &str, log: &str) -> String {
     let env = labwc_words();
     format!(
         "{wl}command -v labwc >/dev/null 2>&1 || {{ echo \"remote run {tag}: no labwc on PATH\" >&2; exit 5; }}\nNEST_DIR=\"$WL_DIR/atl-nest-$$\"\nLW=\"\"\nnest_end() {{\n  [ -z \"$LW\" ] || kill -TERM \"$LW\" 2>/dev/null\n  rm -rf \"$NEST_DIR\"\n}}\ntrap nest_end EXIT\ntrap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 141' PIPE\ntrap 'exit 143' TERM\nmkdir -m 700 \"$NEST_DIR\" || exit 5\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$NEST_DIR\"{env} labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\nWL_DIR=\"$NEST_DIR\"\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: headless labwc gave $WL_N Wayland sockets, want 1\" >&2; exit 5; }}\nWL=\"$NEST_DIR/$WL\"\n"
+    )
+}
+
+/// Starts the labwc setup helper (crate atl-labwc-setup's binary) on the run's labwc socket `$WL` and waits for its ready line, printed once the gate output and the seat's pointer and keyboard are set; the helper then holds them until labwc ends.
+/// Sets `HS` (its pid): the run's end stops it ([`Plan::script`]). Exit 5 when it exits first or is not ready within [`NESTED_WAIT_S`]; the last lines of its log go to the transcript (a failed run's logs do not come back).
+fn labwc_setup_script(tag: &str, bin: &str, log: &str) -> String {
+    let ready = sh_quote(READY_LINE);
+    format!(
+        "{bin} \"$WL\" > {log} 2>&1 < /dev/null &\nHS=$!\ni=0\nwhile ! grep -qx {ready} {log} 2>/dev/null && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$HS\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\ngrep -qx {ready} {log} 2>/dev/null || {{ echo \"remote run {tag}: labwc setup not ready (see {LABWC_SETUP_LOG}):\" >&2; tail -n 5 {log} >&2; exit 5; }}\n"
     )
 }
 
@@ -905,11 +920,20 @@ impl Plan {
                 &word(&out_path(&labwc_dir(&self.scratch))),
                 &word(&out_path(&labwc_log)),
             )),
-            Display::NestedHeadless => s.push_str(&nested_headless_script(
-                &self.tag,
-                &word(&out_path(&labwc_dir(&self.scratch))),
-                &word(&out_path(&labwc_log)),
-            )),
+            Display::NestedHeadless => {
+                s.push_str(&nested_headless_script(
+                    &self.tag,
+                    &word(&out_path(&labwc_dir(&self.scratch))),
+                    &word(&out_path(&labwc_log)),
+                ));
+                // atld's sibling: both come from one release dir ([`RUN_PROGRAMS`]), a cross host's under its triple
+                let dir = self.program.rsplit_once('/').map_or("", |(d, _)| d);
+                s.push_str(&labwc_setup_script(
+                    &self.tag,
+                    &word(&format!("{dir}/{LABWC_SETUP}")),
+                    &word(&out_path(&format!("{}/{LABWC_SETUP_LOG}", self.scratch))),
+                ));
+            }
         }
         for name in &self.session_env {
             s.push_str(&session_env_script(name));
@@ -1028,6 +1052,12 @@ mkdir -p {pw_dir}
                 s.push_str(crate::audio_pcm::holder_end_sh());
             }
         }
+        // the labwc setup helper ends first: its devices go with labwc's socket, and the run's labwc log keeps labwc's own end
+        if self.display == Display::NestedHeadless {
+            s.push_str(
+                "kill -TERM \"$HS\" 2>/dev/null || true\nwait \"$HS\" 2>/dev/null || true\n",
+            );
+        }
         // the nested compositor lives for the run only: its window leaves the target's desktop with it
         if self.display.nested() {
             s.push_str(
@@ -1071,6 +1101,9 @@ mkdir -p {pw_dir}
         let mut extra = Vec::new();
         if self.display.nested() {
             extra.push(labwc_log);
+        }
+        if self.display == Display::NestedHeadless {
+            extra.push(format!("{}/{LABWC_SETUP_LOG}", self.scratch));
         }
         if self.audio.is_some() {
             extra.push(format!("{}/{PW_SAMPLES}", self.scratch));
@@ -1492,9 +1525,9 @@ impl Target {
         brk: Option<Break>,
     ) -> Result<Target> {
         let host = Host::parse(host)?;
-        let cross = xtask::native::cross_host_of(root, out)?.is_some();
-        let dir_name = target_dir_name(out, cross)?;
-        let bundle = Bundle::of(gate, out, brk)?;
+        let cross = xtask::native::cross_host_of(root, out)?;
+        let dir_name = target_dir_name(out, cross.is_some())?;
+        let bundle = Bundle::of(gate, out, cross.as_deref(), brk)?;
         let elf = bundle.elf_names()?;
         let lib_dirs = bundle.lib_dirs(&elf);
         Ok(Target {
@@ -1747,12 +1780,34 @@ pub struct Record {
 /// The record's root line naming the run's LLVM runtimes dir.
 const LIB_ROOT: &str = "lib";
 
-fn read_record(out: &Path, gate: &str) -> Result<Record> {
+/// The command that writes gate `gate`'s record again, after building what it names for that host (atld_run.rs `Runtime::new`, gate_build.rs `ensure`). A cross host's gates do not run on this host: its record comes from the remote form, whose dry run writes it too.
+fn record_again(gate: &str, cross: Option<&str>) -> String {
+    let arch = cross.map(|c| format!(" --arch {c}")).unwrap_or_default();
+    match (gate, cross) {
+        ("run-apk", _) => format!("run `cargo xtask remote run-apk <target> --host <alias>{arch}`"),
+        ("app", Some(_)) => format!(
+            "run `cargo xtask remote test app --host <alias>{arch}` (with `--fixture-arch <isa>` where the arch has no identity engine)"
+        ),
+        (_, Some(c)) => format!("a {c} out dir records only `app` and `run-apk`"),
+        (_, None) => format!("run `cargo xtask test {gate}`"),
+    }
+}
+
+/// The bundle name of gate product `program` (`out/cargo/release/<program>`, a cross host's `out/cargo/<triple>/release/<program>`: xtask cdylib.rs `release_build`).
+fn program_entry(map: &BTreeMap<String, Entry>, program: &str) -> Option<String> {
+    let end = format!("/release/{program}");
+    map.keys()
+        .find(|n| n.starts_with("out/cargo/") && n.ends_with(&end))
+        .cloned()
+}
+
+fn read_record(out: &Path, gate: &str, cross: Option<&str>) -> Result<Record> {
     let file = record_path(out, gate);
     let text = std::fs::read_to_string(&file).with_context(|| {
         format!(
-            "gate `{gate}`: no runtime-input record at {}: run `cargo xtask test {gate}` in this build dir once (its run records what it reads)",
-            file.display()
+            "gate `{gate}`: no runtime-input record at {}: {} (a run records what it reads)",
+            file.display(),
+            record_again(gate, cross)
         )
     })?;
     parse_record(&text)
@@ -1958,15 +2013,17 @@ fn add_entries(
 
 impl Bundle {
     /// The bundle of gate `gate` from its record in `out`, with `brk` applied. The name is checked against gate_goals.rs first.
-    fn of(gate: &str, out: &Path, brk: Option<Break>) -> Result<Bundle> {
+    /// `cross`: the cross host whose out dir `out` is, if any.
+    fn of(gate: &str, out: &Path, cross: Option<&str>, brk: Option<Break>) -> Result<Bundle> {
         gate_goals::declared(gate)?;
-        let record = read_record(out, gate)?;
+        let record = read_record(out, gate, cross)?;
         let mut map = BTreeMap::new();
         for file in &record.files {
             ensure!(
                 file.is_file(),
-                "record names {} but it is not a file: rebuild the build dir or rerun `cargo xtask test {gate}`",
-                file.display()
+                "record names {} but it is not a file: {}",
+                file.display(),
+                record_again(gate, cross)
             );
             insert(
                 &mut map,
@@ -1982,8 +2039,9 @@ impl Bundle {
         for dir in &record.dirs {
             ensure!(
                 dir.is_dir(),
-                "record names {} but it is not a directory: rebuild the build dir or rerun `cargo xtask test {gate}`",
-                dir.display()
+                "record names {} but it is not a directory: {}",
+                dir.display(),
+                record_again(gate, cross)
             );
             add_tree(dir, &bundle_name(dir, &record.roots)?, &mut map)?;
         }
@@ -2005,6 +2063,13 @@ impl Bundle {
                 },
             )?;
         }
+        for program in RUN_PROGRAMS {
+            ensure!(
+                program_entry(&map, program).is_some(),
+                "gate `{gate}`: its record names no {program}, which a run starts on the target: {}",
+                record_again(gate, cross)
+            );
+        }
         if brk == Some(Break::DropLibunwind) {
             ensure!(
                 map.remove(LIBUNWIND).is_some(),
@@ -2012,10 +2077,9 @@ impl Bundle {
             );
         }
         if brk == Some(Break::DropAtld) {
-            ensure!(
-                map.remove(ATLD).is_some(),
-                "break drop-atld: no {ATLD} in the bundle"
-            );
+            let atld =
+                program_entry(&map, ATLD).context("break drop-atld: no atld in the bundle")?;
+            map.remove(&atld);
         }
         Ok(Bundle {
             gate: gate.to_owned(),
@@ -2739,7 +2803,7 @@ mod tests {
             dirs: vec![out.join("gl-art")],
         };
         write_record(&out, "gl", &out, &tree, Path::new(LLVM_LIB_DIR), &inputs).unwrap();
-        let rec = read_record(&out, "gl").unwrap();
+        let rec = read_record(&out, "gl", None).unwrap();
         assert_eq!(rec.files, inputs.files);
         assert_eq!(rec.dirs, inputs.dirs);
         assert_eq!(rec.roots["out"], out);
@@ -3567,6 +3631,29 @@ esac
             "{s}"
         );
         assert!(s.contains(" 'app/scratch/labwc.log'"), "{s}");
+        // the labwc setup helper: started on the run's socket once labwc listens, ready before atld, stopped before labwc ends; its log comes back with the run
+        assert!(
+            at("\nWL=\"$NEST_DIR/$WL\"\n")
+                < at(
+                    "\"$BASE/out/cargo/release/atl-labwc-setup\" \"$WL\" > \"$BASE/out/app/scratch/labwc-setup.log\" 2>&1 < /dev/null &\nHS=$!\n"
+                )
+                && at("HS=$!\n") < at("grep -qx ")
+                && at("grep -qx ") < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
+                && at("kill -TERM \"$HS\" 2>/dev/null || true")
+                    < at("kill -TERM \"$LW\" 2>/dev/null || true"),
+            "{s}"
+        );
+        assert!(s.contains(" 'app/scratch/labwc-setup.log'"), "{s}");
+        let cross = Plan {
+            program: "@BASE@/out/cargo/riscv64gc-unknown-linux-gnu/release/atld".to_owned(),
+            ..plan
+        };
+        assert!(
+            cross.script("atl-next-run/x").contains(
+                "\"$BASE/out/cargo/riscv64gc-unknown-linux-gnu/release/atl-labwc-setup\" \"$WL\" > "
+            ),
+            "the helper is not beside the cross host's atld"
+        );
     }
 
     /// The probe's answers; anything else is an error, not a mode.
@@ -3727,28 +3814,33 @@ esac
         std::os::unix::fs::symlink(".", art.join("com.android.art")).unwrap();
         std::fs::create_dir_all(out.join("device")).unwrap();
         std::fs::write(out.join("device/a.so"), b"x").unwrap();
+        let programs = run_programs(&out.join("cargo/release"));
         // a file link to an out dir file: bundled as that file's content, its absolute target not kept
         std::os::unix::fs::symlink(out.join("device/a.so"), art.join("lib64/b.so")).unwrap();
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("x.kcm"), b"x").unwrap();
         // a record file that is a symlink (an out dir's libglapi.so.0 is one): bundled from the real file
         std::os::unix::fs::symlink("a.so", out.join("device/link.so")).unwrap();
+        let mut files = vec![
+            out.join("device/a.so"),
+            out.join("device/link.so"),
+            tree.join("x.kcm"),
+        ];
+        files.extend(programs);
         let inputs = Inputs {
-            files: vec![
-                out.join("device/a.so"),
-                out.join("device/link.so"),
-                tree.join("x.kcm"),
-            ],
+            files,
             dirs: vec![art],
         };
         write_record(&out, "gl", &out, &tree, Path::new(LLVM_LIB_DIR), &inputs).unwrap();
-        let full = Bundle::of("gl", &out, None).unwrap();
+        let full = Bundle::of("gl", &out, None, None).unwrap();
         assert_eq!(
             names(&full),
             [
                 "lib/libc++.so.1",
                 "lib/libc++abi.so.1",
                 "lib/libunwind.so.1",
+                "out/cargo/release/atl-labwc-setup",
+                "out/cargo/release/atld",
                 "out/device/a.so",
                 "out/device/link.so",
                 "out/gl-art/com.android.art",
@@ -3782,7 +3874,7 @@ esac
             record_link.src,
             std::fs::canonicalize(out.join("device/a.so")).unwrap()
         );
-        let broken = Bundle::of("gl", &out, Some(Break::DropLibunwind)).unwrap();
+        let broken = Bundle::of("gl", &out, None, Some(Break::DropLibunwind)).unwrap();
         assert_eq!(names(&broken).len(), names(&full).len() - 1);
         assert!(!names(&broken).contains(&LIBUNWIND.to_owned()));
         let stage = dir.join("stage");
@@ -3796,6 +3888,68 @@ esac
         let staged = stage.join("out/gl-art/lib64/b.so");
         assert!(std::fs::symlink_metadata(&staged).unwrap().is_file());
         assert_eq!(std::fs::read(&staged).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// [`RUN_PROGRAMS`] as files of the release dir `release`.
+    fn run_programs(release: &Path) -> Vec<PathBuf> {
+        std::fs::create_dir_all(release).unwrap();
+        RUN_PROGRAMS
+            .iter()
+            .map(|p| {
+                let f = release.join(p);
+                std::fs::write(&f, b"x").unwrap();
+                f
+            })
+            .collect()
+    }
+
+    /// A cross out dir's record without a program the run starts is refused by name, with the command that records again for that host, even when the file is there: the record names the products. Break: a bundle that adds the file itself passes the second record.
+    #[test]
+    fn a_cross_record_without_a_run_program_is_refused() {
+        let dir = temp("no-program");
+        let out = dir.join("build/riscv64");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let release = out.join("cargo/riscv64gc-unknown-linux-gnu/release");
+        let programs = run_programs(&release);
+        let bundle = |files: &[PathBuf], brk| {
+            let inputs = Inputs {
+                files: files.to_vec(),
+                dirs: vec![],
+            };
+            write_record(&out, "app", &out, &tree, Path::new(LLVM_LIB_DIR), &inputs).unwrap();
+            Bundle::of("app", &out, Some("riscv64"), brk)
+        };
+        let full = bundle(&programs, None).unwrap();
+        let entry = |p: &str| format!("out/cargo/riscv64gc-unknown-linux-gnu/release/{p}");
+        assert!(names(&full).contains(&entry("atl-labwc-setup")));
+        // drop-atld takes the cross host's atld
+        let dropped = bundle(&programs, Some(Break::DropAtld)).unwrap();
+        assert!(!names(&dropped).contains(&entry("atld")));
+        for missing in RUN_PROGRAMS {
+            let without: Vec<PathBuf> = programs
+                .iter()
+                .filter(|p| !p.ends_with(missing))
+                .cloned()
+                .collect();
+            let refused = bundle(&without, None).err().expect("refused").to_string();
+            assert!(
+                refused.contains(&format!("its record names no {missing},")),
+                "{refused}"
+            );
+            assert!(
+                refused.contains("cargo xtask remote test app --host <alias> --arch riscv64"),
+                "{refused}"
+            );
+        }
+        // named, but gone from the build dir
+        std::fs::remove_file(release.join("atl-labwc-setup")).unwrap();
+        let gone = bundle(&programs, None).err().expect("refused").to_string();
+        assert!(
+            gone.contains("atl-labwc-setup but it is not a file"),
+            "{gone}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

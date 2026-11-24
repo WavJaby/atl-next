@@ -444,6 +444,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atl-labwc-setup"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "atl-services-types",
+ "atl-wayland-wire",
+]
+
+[[package]]
 name = "atl-launch"
 version = "0.0.0"
 dependencies = [
@@ -831,6 +840,14 @@ dependencies = [
  "libloading",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "atl-wayland-wire"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "rustix",
 ]
 
 [[package]]
@@ -3080,6 +3097,7 @@ dependencies = [
  "atl-fonts-table",
  "atl-gralloc",
  "atl-host-load",
+ "atl-labwc-setup",
  "atl-layout",
  "atl-native-bridge",
  "atl-platform-host",
@@ -3087,6 +3105,7 @@ dependencies = [
  "atl-sepolicy",
  "atl-services-types",
  "atl-sigaction-hook",
+ "atl-wayland-wire",
  "clap",
  "object",
  "png",

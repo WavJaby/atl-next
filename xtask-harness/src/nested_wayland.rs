@@ -1,52 +1,30 @@
 // SPDX-License-Identifier: MIT
 //! The automated gates' own Wayland compositor: a headless labwc per gate run, so no test window maps on the maintainer's desktop and the maintainer's pointer cannot reach one (maintainer, 2026-11-05); this holds for every local gate and for `check`. `--hold` runs keep the desktop's compositor ($WAYLAND_DISPLAY): the maintainer watches those.
-//! One exception (maintainer, 2026-11-18): `remote run-apk` maps its window on the target's session display, on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`). Every other remote test run starts its own headless labwc on the target (decision 2026-11-23, remote.rs `probe_test_display`), configured from [`RC_XML`] and [`labwc_env`]; the window UI stages take the session where the target has no labwc and are refused where it has one, until slice 2 ports them.
+//! One exception (maintainer, 2026-11-18): `remote run-apk` maps its window on the target's session display, on an empty workspace that the run switches to and back from, also on failure or interruption (remote.rs `workspace_script`). Every other remote test run starts its own headless labwc on the target (decision 2026-11-23, remote.rs `probe_test_display`), configured from [`RC_XML`], [`labwc_env`] and the setup helper (remote.rs `labwc_setup_script`: the same `atl_labwc_setup::setup` as [`NestedCompositor`]); the window UI stages take the session where the target has no labwc and are refused where it has one, until their port lands.
 //! Test-environment setup only: the product reads WAYLAND_DISPLAY as it would on any desktop; nothing in a product crate knows about this.
 //!
 //! Why labwc (measured 2026-11-06, all headless, pixman renderer):
 //! - sway tiles, and even with every window floating it configures them with an explicit size, so `gtk_window_set_default_size` on a mapped window never resizes it (`test platform-ui` phase 2b stalls); WSLg's weston leaves a floating window's size to the client.
 //! - weston headless has no `wl_seat` at all: GTK binds no `wl_pointer`, so the window gates' injected pointer has nothing to go to. wlroots compositors refuse `get_pointer` on a seat that never had a pointer (protocol error), so the proxy cannot fake the capability either.
-//! - labwc (wlroots, stacking) has a seat; this module gives it a pointer device through `zwlr_virtual_pointer_manager_v1` that never moves, and a keyboard through `zwp_virtual_keyboard_manager_v1` that never types (GTK's `is-active` needs a wl_keyboard enter), so the gates' input still comes only from the proxy's injections. Its outputs are configured through `zwlr_output_manager_v1` ([`Output`]): size, rate and (fractional) scale; `WLR_HEADLESS_OUTPUTS` sets the output count.
+//! - labwc (wlroots, stacking) has a seat; atl-labwc-setup gives it a pointer device through `zwlr_virtual_pointer_manager_v1` that never moves, and a keyboard through `zwp_virtual_keyboard_manager_v1` that never types (GTK's `is-active` needs a wl_keyboard enter), so the gates' input still comes only from the proxy's injections. Its outputs are configured through `zwlr_output_manager_v1` ([`Output`]): size, rate and (fractional) scale; `WLR_HEADLESS_OUTPUTS` sets the output count.
 //!
 //! Needs `labwc` (>= 0.8) on PATH; in WSL a wrapper supplies what wlroots needs there (environment setup, not this module).
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_services_types::display_model::DisplayModel;
+use atl_wayland_wire::{Client, op as wire_op, string, word_after_string};
 
-/// One headless output: its mode in physical pixels (wlroots divides by the scale for the logical size).
-#[derive(Clone, Copy, Debug)]
-pub struct Output {
-    pub width: i32,
-    pub height: i32,
-    /// mHz.
-    pub refresh_mhz: i32,
-    /// Physical per logical pixel; fractional scales go to clients as `wp_fractional_scale_v1`.
-    pub scale: f64,
-    /// `wl_output.transform` (wayland.xml: 1 = 90° counter-clockwise .. 3 = 270°), sent as `set_transform`.
-    pub transform: i32,
-}
+pub use atl_labwc_setup::{GATE_OUTPUT, Output, OutputControl};
+pub(crate) use atl_wayland_wire::{Arg, word};
 
-/// The gates' output. It must hold the largest gate window plus its chrome, or GTK shrinks the window to the work area (a 1280 x 800 output cut the gtk stage's 1280 x 800 content to 1280 x 761, measured 2026-11-06); largest: the resize stage's 1600 x 1000 configure.
-/// Rate: the test display's (DisplayModel::default, 60 Hz), so the cadence gates judge the same rate as on WSLg; scale 1, as the display model's density assumes.
-pub const GATE_OUTPUT: Output = Output {
-    width: 1920,
-    height: 1200,
-    refresh_mhz: 60_000,
-    scale: 1.0,
-    transform: 0,
-};
-
-/// How long labwc may take to listen and to answer a roundtrip; it takes ~30 ms unloaded (measured 2026-11-06), so this only bounds a hang.
+/// How long labwc may take to listen; it takes ~30 ms unloaded (measured 2026-11-06), so this only bounds a hang.
 const READY_WAIT: Duration = Duration::from_secs(10);
 /// How long the compositor may take to exit after SIGTERM before it is killed.
 const STOP_WAIT: Duration = Duration::from_secs(5);
@@ -137,7 +115,7 @@ impl Drop for ChildGuard {
 }
 
 /// `wl_registry.bind`, for clients of [`NestedCompositor::connect`] outside this module.
-pub(crate) const REGISTRY_BIND: u16 = op::REGISTRY_BIND;
+pub(crate) const REGISTRY_BIND: u16 = wire_op::REGISTRY_BIND;
 
 /// A registry's globals: interface -> (global name, version).
 pub type Globals = HashMap<String, (u32, u32)>;
@@ -158,31 +136,10 @@ impl NestedCompositor {
         Self::start_rc(work, &[GATE_OUTPUT], RC_XML)
     }
 
-    /// As [`start`](Self::start), but every window opens at the output's top-left corner ([`RC_XML_PLACED`]), and the cursor waits in the opposite corner: wlroots draws it in software into the output, so a capture holds it whatever `overlay_cursor` says (measured 2026-11-07: an arrow over the fixture's quadrants).
+    /// As [`start`](Self::start), but every window opens at the output's top-left corner ([`RC_XML_PLACED`]), and the cursor waits in the opposite corner ([`OutputControl::park_pointer`]).
     pub fn start_placed(work: &Path) -> Result<Self> {
         let nested = Self::start_rc(work, &[GATE_OUTPUT], RC_XML_PLACED)?;
-        {
-            let mut s = nested
-                .setup
-                .0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("output setup poisoned"))?;
-            let (pointer, w, h) = (
-                s.pointer,
-                GATE_OUTPUT.width as u32,
-                GATE_OUTPUT.height as u32,
-            );
-            let args = [
-                Arg::U(0),
-                Arg::U(w - 1),
-                Arg::U(h - 1),
-                Arg::U(w),
-                Arg::U(h),
-            ];
-            s.client.send(pointer, op::VPOINTER_MOTION_ABSOLUTE, &args);
-            s.client.send(pointer, op::VPOINTER_FRAME, &[]);
-            s.client.roundtrip()?;
-        }
+        nested.setup.park_pointer(GATE_OUTPUT)?;
         Ok(nested)
     }
 
@@ -240,7 +197,7 @@ impl NestedCompositor {
             }
             std::thread::sleep(POLL);
         };
-        let setup = setup(stream, outputs)
+        let setup = atl_labwc_setup::setup(stream, outputs)
             .with_context(|| format!("setting up labwc (log {})", log.display()))?;
         println!(
             "nested compositor: labwc headless pid {} on {} (log {})",
@@ -249,14 +206,14 @@ impl NestedCompositor {
             log.display()
         );
         Ok(Self {
-            setup: OutputControl(Arc::new(Mutex::new(setup))),
+            setup,
             _child: child,
             outputs: outputs.to_vec(),
             socket,
         })
     }
 
-    /// The outputs' control, for a probe thread: [`OutputControl::disable`].
+    /// The outputs' control, for a probe thread: [`OutputControl::only`].
     pub fn control(&self) -> OutputControl {
         self.setup.clone()
     }
@@ -275,10 +232,10 @@ impl NestedCompositor {
     pub fn connect(&self) -> Result<(Client, u32, Globals)> {
         let mut c = Client::new(UnixStream::connect(&self.socket)?)?;
         let registry = c.new_id();
-        c.send(1, op::DISPLAY_GET_REGISTRY, &[Arg::U(registry)]);
+        c.send(1, wire_op::DISPLAY_GET_REGISTRY, &[Arg::U(registry)]);
         let mut globals = HashMap::new();
         for (object, opcode, body) in c.roundtrip()? {
-            if object == registry && opcode == op::REGISTRY_GLOBAL {
+            if object == registry && opcode == wire_op::REGISTRY_GLOBAL {
                 globals.insert(
                     string(&body, 4)?,
                     (word(&body, 0)?, word_after_string(&body, 4)?),
@@ -287,54 +244,6 @@ impl NestedCompositor {
         }
         Ok((c, registry, globals))
     }
-}
-
-impl Output {
-    /// This output as Android's display: the mode this module sets (`set_custom_mode`: physical pixels), its rate and scale. The headless window stages (no Wayland window) take [`GATE_OUTPUT`]'s, so they judge the same display as the stages on a compositor, whatever the desktop's monitor runs at.
-    /// The transform: wayland.xml turns are counter-clockwise, Android's Surface.ROTATION_* clockwise (Display.getRotation docs), so n counter-clockwise quarter turns are (4 - n) mod 4 clockwise;
-    /// a quarter-turned output shows its mode with the sides swapped (wlroots' transformed output size, GDK's geometry).
-    pub fn display(&self) -> DisplayModel {
-        let physical = |px: i32| u32::try_from(px).unwrap_or(0);
-        let ccw = self.transform.rem_euclid(4);
-        let (w, h) = if ccw % 2 == 1 {
-            (self.height, self.width)
-        } else {
-            (self.width, self.height)
-        };
-        DisplayModel::from_monitor(
-            physical(w),
-            physical(h),
-            Some(self.refresh_mhz as f32 / 1000.0),
-            self.scale,
-            ((4 - ccw) % 4) as u8,
-        )
-    }
-}
-
-/// Opcodes from wayland.xml, wlr-output-management-unstable-v1.xml and wlr-virtual-pointer-unstable-v1.xml (requests and events numbered separately, in declaration order).
-mod op {
-    pub const DISPLAY_SYNC: u16 = 0;
-    pub const DISPLAY_GET_REGISTRY: u16 = 1;
-    pub const DISPLAY_ERROR: u16 = 0;
-    pub const REGISTRY_BIND: u16 = 0;
-    pub const REGISTRY_GLOBAL: u16 = 0;
-    pub const CALLBACK_DONE: u16 = 0;
-    pub const VPOINTER_MANAGER_CREATE: u16 = 0;
-    pub const VPOINTER_MOTION_ABSOLUTE: u16 = 1;
-    pub const VPOINTER_FRAME: u16 = 4;
-    pub const VKEYBOARD_MANAGER_CREATE: u16 = 0;
-    pub const OUTPUT_MANAGER_CREATE_CONFIGURATION: u16 = 0;
-    pub const OUTPUT_MANAGER_HEAD: u16 = 0;
-    pub const OUTPUT_MANAGER_DONE: u16 = 1;
-    pub const HEAD_NAME: u16 = 0;
-    pub const CONFIGURATION_ENABLE_HEAD: u16 = 0;
-    pub const CONFIGURATION_DISABLE_HEAD: u16 = 1;
-    pub const CONFIGURATION_APPLY: u16 = 2;
-    pub const CONFIGURATION_SUCCEEDED: u16 = 0;
-    pub const CONFIG_HEAD_SET_CUSTOM_MODE: u16 = 1;
-    pub const CONFIG_HEAD_SET_POSITION: u16 = 2;
-    pub const CONFIG_HEAD_SET_TRANSFORM: u16 = 3;
-    pub const CONFIG_HEAD_SET_SCALE: u16 = 4;
 }
 
 /// Opcodes from input-method-unstable-v2.xml (requests and events numbered separately, declaration order).
@@ -385,7 +294,7 @@ impl Ime {
             let id = c.new_id();
             c.send(
                 registry,
-                op::REGISTRY_BIND,
+                wire_op::REGISTRY_BIND,
                 &[Arg::U(name), Arg::S(iface), Arg::U(1), Arg::U(id)],
             );
             Ok(id)
@@ -513,356 +422,6 @@ fn journal_line(at: Duration, what: &str) -> String {
     format!("+{:>6} ms {what}", at.as_millis())
 }
 
-const VPOINTER_MANAGER: &str = "zwlr_virtual_pointer_manager_v1";
-const VKEYBOARD_MANAGER: &str = "zwp_virtual_keyboard_manager_v1";
-const OUTPUT_MANAGER: &str = "zwlr_output_manager_v1";
-/// Version 2 has `set_custom_mode` and everything used here.
-const OUTPUT_MANAGER_VERSION: u32 = 2;
-
-/// The setup connection: it keeps the virtual pointer alive and holds the output manager and its heads (ordered as the outputs), so the outputs can be changed later.
-struct Setup {
-    client: Client,
-    /// The virtual pointer.
-    pointer: u32,
-    om: u32,
-    heads: Vec<u32>,
-    outputs: Vec<Output>,
-    /// Which outputs the last configuration turned on.
-    on: Vec<bool>,
-    /// The last `zwlr_output_manager_v1.done` serial: a configuration names it, or the compositor cancels it.
-    serial: u32,
-}
-
-impl Setup {
-    /// Applies one configuration: output i on (its mode, rate, scale, position) where `on[i]`, else off. Positions are left to right over all outputs, on or off, so an output keeps its place.
-    fn configure(&mut self, on: &[bool]) -> Result<()> {
-        ensure!(
-            on.len() == self.heads.len(),
-            "{} heads, {} switches",
-            self.heads.len(),
-            on.len()
-        );
-        // events since the last configuration (a later done) come in with this roundtrip
-        let events = self.client.roundtrip()?;
-        self.note_serial(&events)?;
-        let c = &mut self.client;
-        let config = c.new_id();
-        c.send(
-            self.om,
-            op::OUTPUT_MANAGER_CREATE_CONFIGURATION,
-            &[Arg::U(config), Arg::U(self.serial)],
-        );
-        let mut x = 0;
-        for ((head, o), &enable) in self.heads.iter().zip(&self.outputs).zip(on) {
-            if enable {
-                let ch = c.new_id();
-                c.send(
-                    config,
-                    op::CONFIGURATION_ENABLE_HEAD,
-                    &[Arg::U(ch), Arg::U(*head)],
-                );
-                c.send(
-                    ch,
-                    op::CONFIG_HEAD_SET_CUSTOM_MODE,
-                    &[Arg::I(o.width), Arg::I(o.height), Arg::I(o.refresh_mhz)],
-                );
-                c.send(ch, op::CONFIG_HEAD_SET_POSITION, &[Arg::I(x), Arg::I(0)]);
-                c.send(ch, op::CONFIG_HEAD_SET_SCALE, &[Arg::F(o.scale)]);
-                c.send(ch, op::CONFIG_HEAD_SET_TRANSFORM, &[Arg::I(o.transform)]);
-            } else {
-                c.send(config, op::CONFIGURATION_DISABLE_HEAD, &[Arg::U(*head)]);
-            }
-            // the next output starts where this one ends: its logical width at the scale as sent (wl_fixed: 1.6 goes as 410/256, 1920 px -> 1198 logical, as wlroots computes it)
-            x += (f64::from(o.width) / fixed(o.scale)).floor() as i32;
-        }
-        c.send(config, op::CONFIGURATION_APPLY, &[]);
-        let events = c.roundtrip()?;
-        self.note_serial(&events)?;
-        ensure!(
-            events
-                .iter()
-                .any(|(o, opcode, _)| *o == config && *opcode == op::CONFIGURATION_SUCCEEDED),
-            "the compositor did not apply the output configuration {:?} on {on:?}",
-            self.outputs
-        );
-        Ok(())
-    }
-
-    fn note_serial(&mut self, events: &[(u32, u16, Vec<u8>)]) -> Result<()> {
-        for (object, opcode, body) in events {
-            if *object == self.om && *opcode == op::OUTPUT_MANAGER_DONE {
-                self.serial = word(body, 0)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The outputs of a running [`NestedCompositor`], shareable with a probe thread.
-#[derive(Clone)]
-pub struct OutputControl(Arc<Mutex<Setup>>);
-
-impl OutputControl {
-    /// Output `index` on, every other one off, in one configuration: the compositor moves the windows of an output going off to the one left on (labwc output_disable -> views to another output). Before a window opens, it makes that output the window's: labwc opens a view on the output under the cursor or the last added, not the first (measured 2026-11-06: HEADLESS-2).
-    pub fn only(&self, index: usize) -> Result<()> {
-        let mut s = self
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
-        ensure!(index < s.heads.len(), "no output {index}");
-        let on: Vec<bool> = (0..s.heads.len()).map(|i| i == index).collect();
-        s.configure(&on)?;
-        s.on = on;
-        Ok(())
-    }
-
-    /// Output `index` takes `scale` in place: the outputs on stay on; a window on it gets the new preferred scale (wp_fractional_scale_v1) after the change, not before.
-    pub fn set_scale(&self, index: usize, scale: f64) -> Result<()> {
-        let mut s = self
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
-        ensure!(index < s.heads.len(), "no output {index}");
-        s.outputs[index].scale = scale;
-        let on = s.on.clone();
-        s.configure(&on)
-    }
-
-    /// Output `index` takes `transform` in place: the outputs on stay on, so windows stay where they are; the compositor sends the new `wl_output.geometry` + `done`.
-    pub fn set_transform(&self, index: usize, transform: i32) -> Result<()> {
-        let mut s = self
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("the output control's lock is poisoned"))?;
-        ensure!(index < s.heads.len(), "no output {index}");
-        s.outputs[index].transform = transform;
-        let on = s.on.clone();
-        s.configure(&on)
-    }
-}
-
-/// Gives the seat its pointer device and configures the outputs, over `stream`; the returned connection keeps the virtual pointer alive.
-fn setup(stream: UnixStream, outputs: &[Output]) -> Result<Setup> {
-    let mut c = Client::new(stream)?;
-    let registry = c.new_id();
-    c.send(1, op::DISPLAY_GET_REGISTRY, &[Arg::U(registry)]);
-    let mut globals: HashMap<String, (u32, u32)> = HashMap::new();
-    for (object, opcode, body) in c.roundtrip()? {
-        if object == registry && opcode == op::REGISTRY_GLOBAL {
-            globals.insert(
-                string(&body, 4)?,
-                (word(&body, 0)?, word_after_string(&body, 4)?),
-            );
-        }
-    }
-    let bind = |c: &mut Client, iface: &str, max: u32| -> Result<u32> {
-        let &(name, version) = globals
-            .get(iface)
-            .with_context(|| format!("the compositor has no {iface}"))?;
-        let id = c.new_id();
-        c.send(
-            registry,
-            op::REGISTRY_BIND,
-            &[
-                Arg::U(name),
-                Arg::S(iface),
-                Arg::U(version.min(max)),
-                Arg::U(id),
-            ],
-        );
-        Ok(id)
-    };
-    let vpm = bind(&mut c, VPOINTER_MANAGER, 1)?;
-    let pointer = c.new_id();
-    // seat 0 (null): the compositor's default seat
-    c.send(
-        vpm,
-        op::VPOINTER_MANAGER_CREATE,
-        &[Arg::U(0), Arg::U(pointer)],
-    );
-    // keyboard device: GTK's window `is-active` follows wl_keyboard enter/leave, not xdg `activated`, and a seat without a keyboard has no wl_keyboard to enter. No keymap sent and no key ever pressed: clients get the seat's (labwc's keyboard group) keymap, gates' keys come from the proxy.
-    let seat = bind(&mut c, "wl_seat", 1)?;
-    let vkm = bind(&mut c, VKEYBOARD_MANAGER, 1)?;
-    let keyboard = c.new_id();
-    c.send(
-        vkm,
-        op::VKEYBOARD_MANAGER_CREATE,
-        &[Arg::U(seat), Arg::U(keyboard)],
-    );
-    let om = bind(&mut c, OUTPUT_MANAGER, OUTPUT_MANAGER_VERSION)?;
-    let mut heads: Vec<(u32, String)> = Vec::new();
-    let mut serial = None;
-    for (object, opcode, body) in c.roundtrip()? {
-        if object == om && opcode == op::OUTPUT_MANAGER_HEAD {
-            heads.push((word(&body, 0)?, String::new()));
-        } else if object == om && opcode == op::OUTPUT_MANAGER_DONE {
-            serial = Some(word(&body, 0)?);
-        } else if opcode == op::HEAD_NAME
-            && let Some(h) = heads.iter_mut().find(|h| h.0 == object)
-        {
-            h.1 = string(&body, 0)?;
-        }
-    }
-    let serial = serial.context("no zwlr_output_manager_v1.done")?;
-    // order by name (HEADLESS-1, -2, ...) so outputs[i] is the i-th
-    heads.sort_by(|a, b| a.1.cmp(&b.1));
-    ensure!(
-        heads.len() == outputs.len(),
-        "{} outputs asked for, the compositor has {}",
-        outputs.len(),
-        heads.len()
-    );
-    let mut s = Setup {
-        client: c,
-        pointer,
-        om,
-        heads: heads.into_iter().map(|(h, _)| h).collect(),
-        outputs: outputs.to_vec(),
-        on: vec![true; outputs.len()],
-        serial,
-    };
-    s.configure(&vec![true; outputs.len()])?;
-    Ok(s)
-}
-
-#[derive(Debug)]
-pub(crate) enum Arg<'a> {
-    U(u32),
-    I(i32),
-    /// wl_fixed: 24.8.
-    F(f64),
-    S(&'a str),
-}
-
-/// `v` as wl_fixed (24.8) carries it.
-fn fixed(v: f64) -> f64 {
-    (v * 256.0).round() / 256.0
-}
-
-pub(crate) fn word(body: &[u8], at: usize) -> Result<u32> {
-    body.get(at..at + 4)
-        .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
-        .context("short Wayland message")
-}
-
-/// A string argument at `at`: length (with the NUL), bytes, padding to 4.
-pub(crate) fn string(body: &[u8], at: usize) -> Result<String> {
-    let len = word(body, at)? as usize;
-    let text = body
-        .get(at + 4..at + 4 + len)
-        .context("short Wayland string")?;
-    Ok(String::from_utf8_lossy(text.strip_suffix(&[0]).unwrap_or(text)).into_owned())
-}
-
-/// The word after the string argument at `at`.
-fn word_after_string(body: &[u8], at: usize) -> Result<u32> {
-    let len = word(body, at)? as usize;
-    word(body, at + 4 + len.div_ceil(4) * 4)
-}
-
-/// A minimal Wayland client: requests out (fds through [`Client::attach`]), events back by roundtrip. No fds in: nothing it binds sends any.
-pub struct Client {
-    stream: UnixStream,
-    next: u32,
-    pending: Vec<u8>,
-    pending_fds: Vec<OwnedFd>,
-    /// Bytes read past the last roundtrip's `done`: events the compositor sent on its own (an input method's `done`), kept for the next roundtrip. Dropping them lost IME serials (measured 2026-11-06: 4 of 5 ime gate runs).
-    inbox: Vec<u8>,
-}
-
-impl Client {
-    fn new(stream: UnixStream) -> Result<Self> {
-        stream.set_read_timeout(Some(READY_WAIT))?;
-        // id 1 is wl_display
-        Ok(Self {
-            stream,
-            next: 2,
-            pending: Vec::new(),
-            pending_fds: Vec::new(),
-            inbox: Vec::new(),
-        })
-    }
-
-    /// `fd` for the next request taking one: fds travel beside the bytes, in order (the wire has no slot for them).
-    pub(crate) fn attach(&mut self, fd: OwnedFd) {
-        self.pending_fds.push(fd);
-    }
-
-    pub(crate) fn new_id(&mut self) -> u32 {
-        let id = self.next;
-        self.next += 1;
-        id
-    }
-
-    pub(crate) fn send(&mut self, object: u32, opcode: u16, args: &[Arg<'_>]) {
-        let mut body = Vec::new();
-        for a in args {
-            match a {
-                Arg::U(v) => body.extend(v.to_ne_bytes()),
-                Arg::I(v) => body.extend(v.to_ne_bytes()),
-                Arg::F(v) => body.extend(((fixed(*v) * 256.0) as i32).to_ne_bytes()),
-                Arg::S(s) => {
-                    let len = s.len() + 1;
-                    body.extend((len as u32).to_ne_bytes());
-                    body.extend(s.as_bytes());
-                    body.resize(body.len() + len.div_ceil(4) * 4 - s.len(), 0);
-                }
-            }
-        }
-        let size = (8 + body.len()) as u32;
-        self.pending.extend(object.to_ne_bytes());
-        self.pending
-            .extend(((size << 16) | u32::from(opcode)).to_ne_bytes());
-        self.pending.extend(body);
-    }
-
-    /// Flushes the requests, then reads events until a `wl_display.sync` sent after them is done; a `wl_display.error` fails.
-    pub(crate) fn roundtrip(&mut self) -> Result<Vec<(u32, u16, Vec<u8>)>> {
-        let done = self.new_id();
-        self.send(1, op::DISPLAY_SYNC, &[Arg::U(done)]);
-        crate::wayland_proxy::forward(
-            self.stream.as_fd(),
-            &std::mem::take(&mut self.pending),
-            &mut self.pending_fds,
-        )?;
-        let mut events = Vec::new();
-        let mut buf = std::mem::take(&mut self.inbox);
-        loop {
-            let mut chunk = [0u8; 4096];
-            let n = self
-                .stream
-                .read(&mut chunk)
-                .context("reading from the compositor")?;
-            ensure!(n > 0, "the compositor closed the connection");
-            buf.extend(&chunk[..n]);
-            while buf.len() >= 8 {
-                let object = word(&buf, 0)?;
-                let second = word(&buf, 4)?;
-                let size = (second >> 16) as usize;
-                if buf.len() < size {
-                    break;
-                }
-                let opcode = (second & 0xffff) as u16;
-                let body = buf[8..size].to_vec();
-                buf.drain(..size);
-                if object == 1 && opcode == op::DISPLAY_ERROR {
-                    bail!(
-                        "protocol error on object {}: code {}, {}",
-                        word(&body, 0)?,
-                        word(&body, 4)?,
-                        string(&body, 8)?
-                    );
-                }
-                if object == done && opcode == op::CALLBACK_DONE {
-                    self.inbox = buf;
-                    return Ok(events);
-                }
-                events.push((object, opcode, body));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,28 +478,5 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         drop(g);
         assert!(!alive(pid), "pid {pid} outlived the guard");
-    }
-
-    /// wayland.xml's wire format, written out by hand: `wl_registry.bind(7, "wl_seat", 5, 9)` on object 2 is 8 header bytes, name, string length 8 ("wl_seat" + NUL), 8 string bytes, version, id = 32 bytes.
-    #[test]
-    fn bind_follows_the_wire_format() {
-        let (a, _b) = UnixStream::pair().expect("pair");
-        let mut c = Client::new(a).expect("client");
-        c.send(
-            2,
-            op::REGISTRY_BIND,
-            &[Arg::U(7), Arg::S("wl_seat"), Arg::U(5), Arg::U(9)],
-        );
-        let mut want = Vec::new();
-        for w in [2u32, 32 << 16, 7, 8] {
-            want.extend(w.to_ne_bytes());
-        }
-        want.extend(b"wl_seat\0");
-        for w in [5u32, 9] {
-            want.extend(w.to_ne_bytes());
-        }
-        assert_eq!(c.pending, want);
-        assert_eq!(string(&want[8..], 4).expect("string"), "wl_seat");
-        assert_eq!(word_after_string(&want[8..], 4).expect("version"), 5);
     }
 }

@@ -22,7 +22,7 @@
 //! Forwarding keeps libwayland's fd semantics: fds are a FIFO attached to bytes, so each batch of complete messages goes out with all fds received so far (at most [`MAX_FDS_PER_SEND`] per `sendmsg`).
 
 use std::collections::HashMap;
-use std::io::{IoSlice, IoSliceMut};
+use std::io::IoSliceMut;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -34,12 +34,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use atl_wayland_wire::{FD_CONTROL_BYTES, forward};
 use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::io::{read, write};
-use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
-};
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
 
 /// Message header: object id and `size << 16 | opcode`.
 const HEADER_BYTES: usize = 8;
@@ -311,10 +309,6 @@ const VALUE120_PER_NOTCH: f64 = 120.0;
 const FIXED_ONE: f64 = 256.0;
 /// `wl_shm.create_pool(new_id, fd, size)`, request 0.
 const WL_SHM_CREATE_POOL: u16 = 0;
-/// libwayland's `MAX_FDS_OUT`: fds one `sendmsg` carries (wayland connection.c).
-const MAX_FDS_PER_SEND: usize = 28;
-/// Ancillary buffer for one `SCM_RIGHTS` message of `MAX_FDS_PER_SEND` fds.
-const FD_CONTROL_BYTES: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_SEND));
 /// Read size per `recvmsg`; Wayland traffic between a client and its compositor is small.
 const READ_BYTES: usize = 64 * 1024;
 const WM_BASE: &str = "xdg_wm_base";
@@ -577,29 +571,6 @@ fn receive(from: BorrowedFd<'_>) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
         }
     }
     Ok((data, fds))
-}
-
-/// Sends `bytes`, the first `sendmsg` carrying up to `MAX_FDS_PER_SEND` of `fds` (removed from the queue).
-pub(crate) fn forward(to: BorrowedFd<'_>, bytes: &[u8], fds: &mut Vec<OwnedFd>) -> Result<()> {
-    let mut sent = 0;
-    while sent < bytes.len() || !fds.is_empty() {
-        let take = fds.len().min(MAX_FDS_PER_SEND);
-        let batch: Vec<OwnedFd> = fds.drain(..take).collect();
-        let borrowed: Vec<BorrowedFd<'_>> = batch.iter().map(AsFd::as_fd).collect();
-        let mut space = [MaybeUninit::uninit(); FD_CONTROL_BYTES];
-        let mut control = SendAncillaryBuffer::new(&mut space);
-        if !borrowed.is_empty() {
-            control.push(SendAncillaryMessage::ScmRights(&borrowed));
-        }
-        let n = sendmsg(
-            to,
-            &[IoSlice::new(&bytes[sent..])],
-            &mut control,
-            SendFlags::NOSIGNAL,
-        )?;
-        sent += n;
-    }
-    Ok(())
 }
 
 /// A pointer action the proxy injects; each is followed by its `frame`. Coordinates are surface-local, logical; `button` is a linux input code (BTN_LEFT = 0x110).

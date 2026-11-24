@@ -367,6 +367,8 @@ pub struct Runtime {
     /// atl-sandbox-join and the `flatpak-spawn` shim: atld's `--sandbox-join` / `--flatpak-spawn` (the apps' web-process channel, atl_broker::webspawn)
     sandbox_join: PathBuf,
     flatpak_spawn: PathBuf,
+    /// What a remote run starts beside its own labwc on the target (remote.rs `labwc_setup_script`); atld never sees it.
+    labwc_setup: PathBuf,
     /// Whether atld gets the two above; false only for the deliberate break that shows WebKit's abort without the channel.
     webspawn: bool,
     atld: PathBuf,
@@ -897,6 +899,7 @@ impl Runtime {
         let sandbox_join = built.bin("atl-sandbox-join");
         // shown in the sandbox as flatpak-spawn (atl_broker::webspawn::SHIM_AT), the name WebKit runs
         let flatpak_spawn = built.bin("atl-flatpak-spawn");
+        let labwc_setup = built.bin("atl-labwc-setup");
         let atld = built.bin("atld");
         let installer = packages::bin(root, &out, "atl-app-launcher", "atl-installer")?;
         let api_impl = host_art::api_impl_dex(&java_out);
@@ -959,6 +962,7 @@ impl Runtime {
             sandbox_stub,
             sandbox_join,
             flatpak_spawn,
+            labwc_setup,
             keystore: None,
             health: (health, health_fragment),
             webspawn: true,
@@ -1855,6 +1859,7 @@ impl Runtime {
             self.sandbox_stub.clone(),
             self.sandbox_join.clone(),
             self.flatpak_spawn.clone(),
+            self.labwc_setup.clone(),
             self.atld.clone(),
             self.installer.clone(),
             self.api_impl.clone(),

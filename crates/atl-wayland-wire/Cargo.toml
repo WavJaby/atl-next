@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "atl-wayland-wire"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The test environment's Wayland wire client: requests written by hand, events read by roundtrip, and the fd forwarding it and the window proxy share. Test-environment only: no product crate depends on it.
+
+[dependencies]
+anyhow.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true
