@@ -737,8 +737,10 @@ impl Inner {
         };
         let rec = st.processes.remove(i);
         log(format_args!(
-            "process {} (pid {}) failed to attach: start timeout",
-            rec.process_name, rec.pid
+            "process {} (pid {}) failed to attach: start timeout at={}",
+            rec.process_name,
+            rec.pid,
+            atl_diag::wall_stamp()
         ));
         let lost = self.unattached_ended_locked(&mut st, &rec);
         if let Some(task) = rec.task {

@@ -256,9 +256,10 @@ impl Inner {
                     // the backstop: the slot is released and the delivery re-enqueued or failed. The process is not ended here; an unattached one ends at its start timeout
                     atl_diag::answered(AM, "cold start abandoned: slot released");
                     log(format_args!(
-                        "cold start of {} abandoned: not attached within {} ms",
+                        "cold start of {} abandoned: not attached within {} ms at={}",
                         key.name,
-                        self.hw.scale(PENDING_COLD_START_ABANDON_BASE_MS)
+                        self.hw.scale(PENDING_COLD_START_ABANDON_BASE_MS),
+                        atl_diag::wall_stamp()
                     ));
                 }
                 Action::Skip { id, index, reason } => {

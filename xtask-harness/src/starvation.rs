@@ -18,6 +18,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use atl_host_load::{Samples, Span};
+use atl_services_types::hw_timeouts::{
+    HwTimeouts, PENDING_COLD_START_ABANDON_BASE_MS, PROC_START_TIMEOUT_BASE_MS,
+};
 use xtask::harness::{RULING_PREFIX, Ruling, Supply, VERDICT_PREFIX};
 
 use crate::composer::word;
@@ -106,11 +109,14 @@ pub struct Timed {
 pub type Undecided = (&'static str, Ruling, Result<String, String>);
 
 /// What the rule reads besides the sub-checks: the stage's name, the app log and the marker's stamp (GPU), and the gate's samples (CPU; None: unknown).
+/// `hw`: the run's multiplier for the scaled product timers (None: atld logged none). `subject`: the gate's own timer line (design 2.4): a services line containing it is no fired timer of this run.
 pub(crate) struct Run<'a> {
     pub(crate) stage: &'a str,
     pub(crate) app: &'a str,
     pub(crate) from: u64,
     pub(crate) samples: Option<&'a Samples>,
+    pub(crate) hw: Option<HwTimeouts>,
+    pub(crate) subject: Option<&'a str>,
 }
 
 impl<'a> Run<'a> {
@@ -121,6 +127,8 @@ impl<'a> Run<'a> {
             app: "",
             from: 0,
             samples,
+            hw: None,
+            subject: None,
         }
     }
 }
@@ -215,39 +223,69 @@ fn print_ruling(stage: &str, what: &str, was: Option<&str>, ruling: &Ruling) {
     );
 }
 
+/// A product timer's period: AOSP's constant (`Fixed`), or a base the product scales by the run's `ro.hw_timeout_multiplier` (`Scaled`, hw_timeouts.rs).
+pub(crate) enum Period {
+    Fixed(Duration),
+    /// the base in ms, scaled by [`HwTimeouts::scale`]
+    Scaled(u64),
+}
+
 /// A product timer a gate can trip (design 2.4): the services' line when it fires (text after `services: `), its period, and the time it needs on a quiet host.
 pub(crate) struct Timer {
     pub(crate) name: &'static str,
     pub(crate) fired: &'static str,
-    pub(crate) period: Duration,
+    pub(crate) period: Period,
     pub(crate) need: Option<Duration>,
 }
 
-/// The product's timers whose firing the services log names (atl-services). Periods are the product constants (AOSP's); `need` only where kept runs measured it.
+/// The product's timers whose firing the services log names (atl-services). Periods: AOSP's constants, `Scaled` ones x the run's `hw timeouts` multiplier; `need` only where kept runs measured it.
 pub(crate) const TIMERS: &[Timer] = &[
     // activity.rs KILL_TASK_PROCESSES_TIMEOUT, `remove task N: no destroy within 1s`. need: remove -> kill 7-25 ms over 9 kept logs (gate-starved-red-design 2.4 table; n < 20, those runs' load
     // not recorded): the largest seen, until 20 quiet passes measure it
     Timer {
         name: "removeTask kill 1s",
         fired: ": no destroy within ",
-        period: Duration::from_millis(1000),
+        period: Period::Fixed(Duration::from_millis(1000)),
         need: Some(Duration::from_millis(25)),
     },
     // activity.rs PROC_START_TIMEOUT_MS / active_services.rs process_start_timed_out
     Timer {
         name: "process start 10s",
         fired: "failed to attach: start timeout",
-        period: Duration::from_secs(10),
+        period: Period::Scaled(PROC_START_TIMEOUT_BASE_MS),
         need: None,
     },
     // broadcasts_am.rs: a cold start the dispatcher stops waiting for
     Timer {
         name: "cold-start abandon 300s",
         fired: "abandoned: not attached within",
-        period: Duration::from_secs(300),
+        period: Period::Scaled(PENDING_COLD_START_ABANDON_BASE_MS),
         need: None,
     },
 ];
+
+impl Timer {
+    /// The period in this run: AOSP's constant, or the scaled base x the run's multiplier. Err when a scaled period has no multiplier (no `hw timeouts` line): unknown, so judged.
+    fn period_of(&self, hw: Option<HwTimeouts>) -> Result<Duration, String> {
+        match self.period {
+            Period::Fixed(d) => Ok(d),
+            Period::Scaled(base) => hw
+                .map(|h| Duration::from_millis(h.scale(base)))
+                .ok_or_else(|| format!("{}: the atld log has no `hw timeouts` line", self.name)),
+        }
+    }
+}
+
+/// The run's multiplier from atld's `hw timeouts: xN (<source>)` line (atld main.rs `hw_multiplier`); the last such line. None when the log has none.
+pub(crate) fn hw_of(atld_log: &str) -> Option<HwTimeouts> {
+    atld_log
+        .lines()
+        .filter_map(|l| {
+            let (_, rest) = l.split_once("hw timeouts: x")?;
+            HwTimeouts::parse_arg(rest.split(' ').next()?).ok()
+        })
+        .next_back()
+}
 
 /// The fire's wall stamp (ns since the epoch) from the line's `at=<s>.<ms>` (atl_diag::wall_stamp). None without one.
 fn fire_wall_ns(line: &str) -> Option<i64> {
@@ -257,19 +295,25 @@ fn fire_wall_ns(line: &str) -> Option<i64> {
 }
 
 /// The timer's budget over `[fire - period, fire]` on the samples' clock. Err: why it is unknown.
-fn fired_budget(t: &Timer, line: &str, samples: Option<&Samples>) -> Result<Budget, String> {
+fn fired_budget(
+    t: &Timer,
+    line: &str,
+    samples: Option<&Samples>,
+    hw: Option<HwTimeouts>,
+) -> Result<Budget, String> {
     let wall =
         fire_wall_ns(line).ok_or_else(|| format!("{}: fired line has no at= stamp", t.name))?;
+    let period = t.period_of(hw)?;
     let to_ns = samples
         .and_then(|s| s.monotonic_of(wall))
         .ok_or_else(|| format!("{}: no gate scope samples", t.name))?;
-    let period = i64::try_from(t.period.as_nanos()).unwrap_or(i64::MAX);
+    let period_ns = i64::try_from(period.as_nanos()).unwrap_or(i64::MAX);
     Ok(Budget {
         wait: t.name.to_owned(),
-        bound: t.period,
+        bound: period,
         need: t.need,
         span: Span {
-            from_ns: to_ns - period,
+            from_ns: to_ns - period_ns,
             to_ns,
         },
     })
@@ -281,6 +325,7 @@ fn fired_budget(t: &Timer, line: &str, samples: Option<&Samples>) -> Result<Budg
 pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<Ruling> {
     let fired: Vec<(&Timer, &str)> = services
         .lines()
+        .filter(|l| !run.subject.is_some_and(|s| l.contains(s)))
         .filter_map(|l| {
             let text = l.split_once("services: ")?.1;
             TIMERS
@@ -292,7 +337,7 @@ pub(crate) fn red(run: &Run, faults: &[&Miss], services: &str) -> Option<Ruling>
     if !fired.is_empty() {
         let mut verdict = None;
         for (t, line) in fired {
-            let answer = match fired_budget(t, line, run.samples) {
+            let answer = match fired_budget(t, line, run.samples, run.hw) {
                 Ok(b) => cpu(&b, run.samples),
                 Err(e) => Ruling::unknown(e),
             };
@@ -332,10 +377,19 @@ pub(crate) fn live() -> Option<Samples> {
 
 /// A row's red under the rule (rows judged on CPU only): prints the undecided verdict and returns exit 4 when [`red`] excuses `faults`; None when the red stands. The caller never passes
 /// a run whose atld exited (a death is never excused).
-pub(crate) fn judge_row(cmd: &str, faults: &[Miss], services: &str) -> Option<ExitCode> {
+pub(crate) fn judge_row(
+    cmd: &str,
+    faults: &[Miss],
+    services: &str,
+    atld_log: &str,
+) -> Option<ExitCode> {
     let samples = live();
     let faults: Vec<&Miss> = faults.iter().collect();
-    let ruling = red(&Run::cpu(cmd, samples.as_ref()), &faults, services)?;
+    let run = Run {
+        hw: hw_of(atld_log),
+        ..Run::cpu(cmd, samples.as_ref())
+    };
+    let ruling = red(&run, &faults, services)?;
     Some(undecided(cmd, cmd, &ruling))
 }
 
@@ -388,6 +442,8 @@ mod tests {
             app,
             from: 0,
             samples: None,
+            hw: None,
+            subject: None,
         }
     }
 
@@ -614,5 +670,83 @@ mod tests {
             Some(1001 * S + 50_000_000)
         );
         assert_eq!(fire_wall_ns("services: x"), None);
+    }
+
+    /// The last `hw timeouts: xN` line of atld's log; none without one.
+    #[test]
+    fn the_multiplier_is_the_last_hw_timeouts_line() {
+        assert_eq!(
+            hw_of("atld: hw timeouts: x2 (host file)\n"),
+            HwTimeouts::parse_arg("2").ok()
+        );
+        assert_eq!(
+            hw_of("atld: hw timeouts: x3 (host file)\natld: hw timeouts: x1 (default)\n"),
+            Some(HwTimeouts::default())
+        );
+        assert_eq!(hw_of("atld: started\n"), None);
+    }
+
+    /// A scaled period is the base x the run's multiplier; the kill timer (AOSP's constant) needs none. A scaled period without the multiplier is unknown.
+    #[test]
+    fn scaled_timers_take_the_runs_multiplier() {
+        let samples = load(0, 0, 0);
+        let row = |name: &str| TIMERS.iter().find(|t| t.name == name).expect("a table row");
+        let start =
+            "1001.600 I services: process p (pid 9) failed to attach: start timeout at=1001.500";
+        let x2 = HwTimeouts::parse_arg("2").ok();
+        let b = fired_budget(row("process start 10s"), start, Some(&samples), x2)
+            .expect("stamped line, multiplier known");
+        assert_eq!(b.bound, Duration::from_secs(20));
+        assert_eq!(b.span.to_ns - b.span.from_ns, 20 * S);
+        assert!(fired_budget(row("process start 10s"), start, Some(&samples), None).is_err());
+        let kill = "1001.600 I services: remove task 7: no destroy within 1s at=1001.500";
+        let b = fired_budget(row("removeTask kill 1s"), kill, Some(&samples), None)
+            .expect("the fixed period needs no multiplier");
+        assert_eq!(b.bound, Duration::from_secs(1));
+    }
+
+    /// design 2.4: the gate's own timer line is no fired timer of its run. The other task's line lies outside the samples (unknown, judged), so only the exclusion lets the starved line decide.
+    #[test]
+    fn the_gates_own_timer_line_is_no_fired_timer_of_its_run() {
+        let starved = load(490, 5, 500);
+        let services = "1001.600 I services: remove task 1: no destroy within 1s at=1001.500\n1002.100 I services: remove task 2: no destroy within 1s at=1002.050\n";
+        let wrong = Miss::Wrong("ended: killed by the timeout".to_owned());
+        assert_eq!(
+            red(&Run::cpu("capture", Some(&starved)), &[&wrong], services),
+            None
+        );
+        let own = Run {
+            subject: Some("remove task 2: no destroy within "),
+            ..Run::cpu("capture", Some(&starved))
+        };
+        assert_eq!(
+            red(&own, &[&wrong], services),
+            Some(Ruling::starved(
+                Supply::Cpu,
+                "removeTask kill 1s bound 1000 ms need 25 ms stalled 980 ms"
+            ))
+        );
+    }
+
+    /// The table's text against lines the product printed (testdata/timers/services.log, copied from runs): the kill line of the H6 `--starve-close` run (stamped), the start-timeout line of a kept run (before H6, no `at=`).
+    /// No run has printed the cold-start abandon line, so that row is not checked here.
+    #[test]
+    fn table_texts_match_lines_the_product_printed() {
+        let log = include_str!("../testdata/timers/services.log");
+        for name in ["removeTask kill 1s", "process start 10s"] {
+            let t = TIMERS.iter().find(|t| t.name == name).expect("a table row");
+            assert!(
+                log.lines().any(|l| l.contains(t.fired)),
+                "{name}: no product line"
+            );
+        }
+        let kill = log
+            .lines()
+            .find(|l| l.contains(": no destroy within "))
+            .expect("the kill line");
+        assert!(
+            fire_wall_ns(kill).is_some(),
+            "the stamped kill line parses: {kill}"
+        );
     }
 }

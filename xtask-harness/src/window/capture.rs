@@ -90,6 +90,8 @@ pub(super) struct Seen {
     pub(super) ended: Option<Result<String, String>>,
     /// Capture (d), when it runs: the second Task's timer ended its process before the delayed destroy.
     pub(super) timeout: Option<Result<String, String>>,
+    /// Sub-gate (d)'s own timer line (`remove task <n>: no destroy within `, its Task): its subject, so no fired timer of the run (design 2.4)
+    pub(super) timeout_subject: Option<String>,
     /// Every process under atld just before the close (services, binderd, gralloc, the app, sandbox helpers): none may outlive the run's end (atld-end).
     pub(super) ran: Vec<u32>,
 }
@@ -467,6 +469,9 @@ fn timed_close(
     wait_line_after(services_log, services_close, KILLED_LINE, CLOSE_WAIT);
     let app = text_after(app_log, app_close);
     let services = text_after(services_log, services_close);
+    if let (Ok(mut seen), Some(sent)) = (probe.seen.lock(), sent_task(&app)) {
+        seen.timeout_subject = Some(format!("remove task {sent}{TIMED_OUT}"));
+    }
     timeout_judged(&app, &services, killed_pids(&services).map(gone_within))
 }
 
@@ -486,14 +491,17 @@ fn arm_delayed_destroy(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The Task of the first REMOVE_TASK the composer sent in `app` (the caller passes the lines after the second close).
+fn sent_task(app: &str) -> Option<&str> {
+    app.lines()
+        .find_map(|l| l.split_once(SENT_LINE).map(|(_, t)| t.trim()))
+}
+
 /// Sub-gate (d) timeout, on the lines after the second close: the composer sent REMOVE_TASK for a Task; the services' timer fired for it (`no destroy within <D>`, D as the product prints
 /// KILL_TASK_PROCESSES_TIMEOUT); the fixture's delayed onDestroy had not reached `onDestroy reached` by the kill (the destroy did not come first); the kill line for the Task follows the timer
 /// line and its pids are gone. `still`: the pids alive after the kill ([`gone_within`]), None when there is no kill line. The delay (`onDestroy delayed ms=`) must outlast D.
 fn timeout_judged(app: &str, services: &str, still: Option<Vec<i32>>) -> Result<String, String> {
-    let sent = app
-        .lines()
-        .find_map(|l| l.split_once(SENT_LINE).map(|(_, t)| t.trim()))
-        .ok_or("the second close: the composer sent no REMOVE_TASK")?;
+    let sent = sent_task(app).ok_or("the second close: the composer sent no REMOVE_TASK")?;
     let delayed = app
         .lines()
         .find(|l| l.contains(DELAYED_LINE))
@@ -514,7 +522,7 @@ fn timeout_judged(app: &str, services: &str, still: Option<Vec<i32>>) -> Result<
         .lines()
         .nth(timer)
         .and_then(|l| l.split_once(TIMED_OUT))
-        .and_then(|(_, d)| debug_ms(d.trim()))
+        .and_then(|(_, d)| debug_ms(d.split_whitespace().next()?))
         .ok_or("the timer's line names no duration")?;
     if delay <= timeout {
         return Err(format!(
@@ -863,6 +871,9 @@ mod tests {
             "services: task 2 removed: killing com.example.atlwindow pids [4242] at=12.000\n";
         let services = format!("{timer}{kill}");
         assert!(timeout_judged(app, &services, Some(vec![])).is_ok());
+        // the product's stamped line (H6): `at=` follows the duration, which is still read
+        let stamped = "services: remove task 2: no destroy within 1s at=12.000\n";
+        assert!(timeout_judged(app, &format!("{stamped}{kill}"), Some(vec![])).is_ok());
         assert!(timeout_judged(app, &services, Some(vec![4242])).is_err());
         assert!(timeout_judged(app, &services, None).is_err());
         assert!(timeout_judged(app, &format!("{kill}{timer}"), Some(vec![])).is_err());

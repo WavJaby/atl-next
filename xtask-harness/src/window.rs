@@ -3433,6 +3433,9 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             app: &app,
             from: marked,
             samples: samples.as_ref(),
+            // `apply` judges the timed sub-checks only; the product timers are read by `red` (below)
+            hw: None,
+            subject: None,
         };
         let (judged, unjudged) = crate::starvation::apply(&run, timed);
         sub.extend(judged);
@@ -3469,13 +3472,22 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 .filter_map(|(_, r)| r.as_ref().err())
                 .filter(|m| !matches!(m, Miss::NotReached { .. }))
                 .collect();
+            // design 2.4: sub-gate (d) times its own kill timer (its subject): that line is no timer of this run, and a failed (d) is never excused
+            let subject = captured.lock().ok().and_then(|s| s.timeout_subject.clone());
+            let subject_failed = sub.iter().any(|(name, r)| *name == "timeout" && r.is_err());
             let run = crate::starvation::Run {
                 stage: args.stage.name(),
                 app: &app,
                 from: v.marker_ms.unwrap_or(0),
                 samples: samples.as_ref(),
+                hw: crate::starvation::hw_of(&atld_log),
+                subject: subject.as_deref(),
             };
-            crate::starvation::red(&run, &faults, &services)
+            if subject_failed {
+                None
+            } else {
+                crate::starvation::red(&run, &faults, &services)
+            }
         }
     };
     if let Some(why) = starved {

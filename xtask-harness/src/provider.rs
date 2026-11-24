@@ -229,7 +229,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             _ => whys.iter().cloned().map(Miss::Wrong).collect(),
         };
         let services = read(&run.log("services"));
-        if let Some(code) = crate::starvation::judge_row("provider", &faults, &services) {
+        if let Some(code) =
+            crate::starvation::judge_row("provider", &faults, &services, &read(&run.atld_log()))
+        {
             return Ok(code);
         }
     }

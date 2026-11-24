@@ -1217,8 +1217,9 @@ impl Inner {
             .contains(&task);
         if armed {
             log(format_args!(
-                "remove task {}: no destroy within {KILL_TASK_PROCESSES_TIMEOUT:?}",
-                task.raw()
+                "remove task {}: no destroy within {KILL_TASK_PROCESSES_TIMEOUT:?} at={}",
+                task.raw(),
+                atl_diag::wall_stamp()
             ));
             self.kill_task_processes(task);
         }

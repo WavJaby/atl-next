@@ -290,6 +290,8 @@ mod tests {
                     app: log,
                     from: 0,
                     samples: None,
+                    hw: None,
+                    subject: None,
                 },
                 c.timed,
             )
