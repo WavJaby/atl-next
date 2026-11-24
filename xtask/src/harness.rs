@@ -10,8 +10,6 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::Instant;
 
-use crate::build_pool::{self, Class};
-use crate::red_logs;
 use crate::timing::secs;
 use crate::verdict::Outcome;
 
@@ -93,12 +91,10 @@ pub const RULING_PREFIX: &str = "starvation-ruling: ";
 pub const VERDICT_PREFIX: &str = "starvation-verdict: ";
 
 /// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail.
-/// `log`: the harness run's output (stdout, stderr), kept by [`settle_step`] when the run is undecided.
 #[derive(Debug, Default)]
 pub struct StepDone {
     pub skipped: Option<String>,
     pub undecided: Vec<Undecided>,
-    pub log: String,
 }
 
 impl From<Option<String>> for StepDone {
@@ -162,123 +158,7 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<StepDone> {
                     .with_context(|| format!("{step}: unreadable undecided line: {json}"))
             })
             .collect::<Result<_>>()?,
-        log: format!("{stdout}{stderr}"),
     })
-}
-
-/// A harness step whose run ended with undecided gates is rerun once, alone (gate-starved-red-design 2.7). `first` is that run's result. check.rs runs the step under its own grant and must have released it before this call (a nested grant is refused).
-/// The rerun takes the pool's quiet grant when the pool is idle, else the harness class; its outcome is the step's. The first log is kept in the undecided bucket, the rerun's in its outcome's bucket (red_logs.rs). The ledger line and the ceiling are as for the gate rows (check_gates.rs).
-pub fn settle_step(
-    root: &Path,
-    ws: &Path,
-    step: &str,
-    out: &Path,
-    first: StepDone,
-) -> Result<StepDone> {
-    if first.undecided.is_empty() {
-        return Ok(first);
-    }
-    let task = red_logs::task_dir(root)?;
-    let commit = crate::git::git(Some(root), &["rev-parse", "HEAD"])?;
-    settle_once(
-        &task,
-        &red_logs::run_id(),
-        commit.trim(),
-        step,
-        out,
-        first,
-        || {
-            let grant = build_pool::acquire_rerun(ws, root, Class::Harness)?;
-            let class = grant.class;
-            let second = check_step(root, step, out);
-            drop(grant);
-            Ok((class, second))
-        },
-    )
-}
-
-/// [`settle_step`] without the grant and the process: `rerun` runs the step once more and returns the grant's class with the result. The first log and the rerun's go under `out`, the ledger line and the ceiling under `task`
-/// (red_logs.rs); `commit` is the checkout's HEAD. A test drives it with a fake `rerun`, the only part that spawns.
-fn settle_once(
-    task: &Path,
-    run: &str,
-    commit: &str,
-    step: &str,
-    out: &Path,
-    first: StepDone,
-    rerun: impl FnOnce() -> Result<(&'static str, Result<StepDone>)>,
-) -> Result<StepDone> {
-    let logs = out.join("check-gates");
-    std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
-    let supply = first.undecided.iter().find_map(Undecided::supply);
-    let mut starvation = Starvation::default();
-    starvation.record_starved(supply);
-    starvation.record_attempt(judged_in(&first.log)?, false);
-    let first_log = logs.join(format!("{step}.log"));
-    std::fs::write(&first_log, &first.log).with_context(|| first_log.display().to_string())?;
-    red_logs::keep(task, red_logs::UNDECIDED, run, &first_log)?;
-    let (class, second) = rerun()?;
-    let (outcome, rerun) = match second {
-        Ok(done) if done.undecided.is_empty() => (Outcome::Pass, done),
-        Ok(done) => (Outcome::Undecided, done),
-        Err(e) => (
-            Outcome::Fail,
-            StepDone {
-                log: format!("{e:#}"),
-                ..StepDone::default()
-            },
-        ),
-    };
-    starvation.record_attempt(judged_in(&rerun.log)?, false);
-    starvation.record_rerun(class, outcome);
-    let rerun_log = logs.join(format!("{step}.rerun.log"));
-    std::fs::write(&rerun_log, &rerun.log).with_context(|| rerun_log.display().to_string())?;
-    let kept = match red_logs::bucket_of(outcome) {
-        Some(bucket) => Some(red_logs::keep(task, bucket, run, &rerun_log)?),
-        None => None,
-    };
-    red_logs::ledger_append(
-        task,
-        &[red_logs::Entry {
-            run,
-            commit,
-            row: step,
-            outcome,
-            first: Some(Outcome::Undecided),
-            stall: None,
-            grant: class,
-            supply,
-        }],
-    )?;
-    let streak = red_logs::trailing_undecided(task)?
-        .remove(step)
-        .unwrap_or_default();
-    let ceiling = streak.len() >= red_logs::CEILING;
-    starvation.ceiling = usize::from(ceiling);
-    eprintln!("{}", starvation.line(step));
-    if ceiling {
-        let last = &streak[streak.len() - red_logs::CEILING..];
-        bail!(
-            "{step} undecided in {} consecutive runs of this checkout ({}): the ceiling fails the step",
-            red_logs::CEILING,
-            last.join(", ")
-        );
-    }
-    match outcome {
-        Outcome::Pass => Ok(StepDone {
-            skipped: rerun.skipped,
-            ..StepDone::default()
-        }),
-        Outcome::Undecided => Ok(StepDone {
-            skipped: rerun.skipped,
-            undecided: rerun.undecided,
-            log: String::new(),
-        }),
-        Outcome::Fail => {
-            let at = kept.as_deref().unwrap_or(&rerun_log);
-            bail!("{step}: starved, rerun FAILED (log {})", at.display())
-        }
-    }
 }
 
 /// Which supply starved a gate (starvation.rs): the host's CPU over a declared wait, or the window's GPU render.
@@ -637,119 +517,6 @@ mod tests {
         };
         assert_eq!(bare.to_string(), "drive-tap undecided (no verdict line)");
         assert_eq!(bare.supply(), None);
-    }
-
-    /// `out` (the logs) and `task` (kept logs, ledger) under a fresh temp dir named for the test; the test removes `out`'s parent.
-    fn settle_dirs(name: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("xtask-settle-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        (base.join("out"), base.join("task"))
-    }
-
-    /// A drive-tap first attempt that ended undecided on `supply`.
-    fn undecided_step(supply: Supply) -> StepDone {
-        StepDone {
-            undecided: vec![Undecided {
-                row: "drive-tap".to_owned(),
-                ruling: Some(Ruling::starved(
-                    supply,
-                    "drive-tap wait bound 120000 ms need 900 ms stalled 3000 ms",
-                )),
-            }],
-            log: "drive-tap: the first shot was blank\n".to_owned(),
-            ..StepDone::default()
-        }
-    }
-
-    /// The undecided path makes the drive-tap settle fire (the step's rerun is the only part faked): a starved first attempt, a passing rerun, the first log kept beside it, one ledger line with the first attempt's supply.
-    #[test]
-    fn a_starved_step_is_rerun_once_and_settles_on_the_rerun() {
-        let (out, task) = settle_dirs("pass");
-        let settled = settle_once(
-            &task,
-            "run-1",
-            "c0ffee",
-            "drive-tap",
-            &out,
-            undecided_step(Supply::Gpu),
-            || Ok(("quiet", Ok(StepDone::default()))),
-        )
-        .expect("a passing rerun settles the step");
-        assert!(settled.undecided.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(task.join(red_logs::LEDGER)).expect("ledger"),
-            "run-1\tc0ffee\tdrive-tap\tpass\tundecided\t-\tquiet\tgpu\n"
-        );
-        assert!(out.join("check-gates").join("drive-tap.log").is_file());
-        assert!(
-            task.join(red_logs::UNDECIDED)
-                .join("run-1")
-                .join("drive-tap.log")
-                .is_file()
-        );
-        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
-    }
-
-    /// Undecided in two runs is not a failure; the third consecutive undecided run fails the step, naming the three runs (red_logs::CEILING).
-    #[test]
-    fn a_step_undecided_in_three_runs_fails_at_the_ceiling() {
-        let (out, task) = settle_dirs("ceiling");
-        for run in ["r1", "r2"] {
-            let settled = settle_once(
-                &task,
-                run,
-                "c0ffee",
-                "drive-tap",
-                &out,
-                undecided_step(Supply::Cpu),
-                || Ok(("harness", Ok(undecided_step(Supply::Cpu)))),
-            )
-            .expect("undecided twice is not a failure of its run");
-            assert_eq!(settled.undecided.len(), 1);
-        }
-        let err = settle_once(
-            &task,
-            "r3",
-            "c0ffee",
-            "drive-tap",
-            &out,
-            undecided_step(Supply::Cpu),
-            || Ok(("harness", Ok(undecided_step(Supply::Cpu)))),
-        )
-        .expect_err("the third run hits the ceiling");
-        assert_eq!(
-            format!("{err:#}"),
-            "drive-tap undecided in 3 consecutive runs of this checkout (r1, r2, r3): the ceiling fails the step"
-        );
-        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
-    }
-
-    /// A rerun that fails fails the step, and its log is kept in the red bucket.
-    #[test]
-    fn a_failing_rerun_fails_the_step() {
-        let (out, task) = settle_dirs("red");
-        let err = settle_once(
-            &task,
-            "run-1",
-            "c0ffee",
-            "drive-tap",
-            &out,
-            undecided_step(Supply::Gpu),
-            || Ok(("quiet", Err(anyhow::anyhow!("the tap drive failed")))),
-        )
-        .expect_err("a red rerun fails the step");
-        assert!(
-            format!("{err:#}").starts_with("drive-tap: starved, rerun FAILED (log "),
-            "{err:#}"
-        );
-        assert!(
-            task.join(red_logs::RED)
-                .join("run-1")
-                .join("drive-tap.rerun.log")
-                .is_file(),
-            "the rerun's log is kept in the red bucket"
-        );
-        std::fs::remove_dir_all(out.parent().expect("base")).expect("cleanup");
     }
 
     /// Each counter sits in its own field of the line; a rerun on the whole pool is `quiet`, any other grant `shared`.
