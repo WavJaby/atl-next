@@ -10,12 +10,12 @@ use atl_services_types::compositor_registry::{
     DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, KEY_MAP, POINTER_PROPERTY,
     REGISTER, SERVICE, SPLASH_PROPERTY, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, Splash, TASK_INFO,
 };
-use atl_services_types::display_model::DisplayModel;
+use atl_services_types::display_model::{DENSITY_DEFAULT, DisplayModel};
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
 use binder::{Interface, SpIBinder, StatusCode, Strong, declare_binder_interface};
 
 use atl_compositor::model::CompositorConfig;
-use atl_platform_ui::{LooperPoster, PhysSize, PlatformUi, WindowAttributes};
+use atl_platform_ui::{LooperPoster, PhysSize, PlatformUi, Scale, WindowAttributes};
 
 use crate::host::{Composer, ComposerConfig, Presenter, VmHost};
 use crate::input::{self, Message};
@@ -82,8 +82,21 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
     }
 }
 
-/// The TASK_INFO transaction: the size this process's window opens at and its Task's package, from the services (compositor_registry.rs); None for a process with no Task (empty package). With a Task the size must be positive.
-fn task_info() -> Result<Option<(PhysSize, String)>, String> {
+/// What TASK_INFO answers for a process with a Task.
+struct TaskInfo {
+    size: PhysSize,
+    /// The scale `size` is expressed in.
+    scale: Scale,
+    package: String,
+}
+
+/// Physical pixels per desktop logical pixel at `dpi`: 1 dp is 1 logical pixel. The one conversion (a per-app density multiplier would divide here).
+fn window_scale(dpi: i32) -> Option<Scale> {
+    Scale::new(f64::from(dpi) / f64::from(DENSITY_DEFAULT))
+}
+
+/// The TASK_INFO transaction: the size this process's window opens at, its scale and its Task's package, from the services (compositor_registry.rs); None for a process with no Task (empty package). With a Task the size must be positive.
+fn task_info() -> Result<Option<TaskInfo>, String> {
     let proxy = registry()?;
     let binder = proxy.as_binder();
     let data = binder.prepare_transact().map_err(|e| e.to_string())?;
@@ -92,6 +105,7 @@ fn task_info() -> Result<Option<(PhysSize, String)>, String> {
         .map_err(|e| format!("task info: {e}"))?;
     let width: i32 = reply.read().map_err(|e| format!("task info width: {e}"))?;
     let height: i32 = reply.read().map_err(|e| format!("task info height: {e}"))?;
+    let dpi: i32 = reply.read().map_err(|e| format!("task info dpi: {e}"))?;
     let package: String = reply
         .read()
         .map_err(|e| format!("task info package: {e}"))?;
@@ -99,9 +113,15 @@ fn task_info() -> Result<Option<(PhysSize, String)>, String> {
         return Ok(None);
     }
     let side = |v: i32| u32::try_from(v).ok().filter(|v| *v > 0);
-    match (side(width), side(height)) {
-        (Some(width), Some(height)) => Ok(Some((PhysSize { width, height }, package))),
-        _ => Err(format!("task info {width}x{height}: not a size")),
+    match (side(width), side(height), window_scale(dpi)) {
+        (Some(width), Some(height), Some(scale)) => Ok(Some(TaskInfo {
+            size: PhysSize { width, height },
+            scale,
+            package,
+        })),
+        _ => Err(format!(
+            "task info {width}x{height} at {dpi} dpi: not a size"
+        )),
     }
 }
 
@@ -136,7 +156,12 @@ fn register(ui_agent: &SpIBinder, composer: &SpIBinder) -> Result<(), String> {
 /// the window at that size, so its first bounds report changes nothing, with the app id named before its first commit, showing the starting window from `ro.atl.splash`. `started`: the launcher's start, the origin of the `splash:` lines.
 /// No Task (a provider, service or receiver process): no window -- AOSP shows none, and a second toplevel took the desktop focus from the app's.
 pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow>, String> {
-    let Some((size, package)) = task_info()? else {
+    let Some(TaskInfo {
+        size,
+        scale,
+        package,
+    }) = task_info()?
+    else {
         return Ok(None);
     };
     let splash = optional_property(SPLASH_PROPERTY)?
@@ -147,6 +172,7 @@ pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow
         title: package.clone(),
         app_id: Some(atl_launch::app_id(&package).map_err(|e| e.to_string())?),
         size,
+        scale,
     };
     // TASK_INFO above is a binder call: it stays on this app thread, never on the display thread (display-thread plan D2 rule B1); the window is made there by `call`
     ui_window::open(ui, attributes, splash, started).map(Some)

@@ -132,6 +132,7 @@ pub const ROWS: &[Row] = &[
     Row::new(&["ui-module"], false, true),
     // ping-to-pong time bounds
     Row::new(&["platform-ui"], false, false).serial(),
+    Row::new(&["platform-ui", "--map", "pinned"], false, false),
     Row::new(&["compositor"], true, true),
     Row::new(&["parcel"], true, true),
     Row::new(&["provider"], true, true),
@@ -175,6 +176,20 @@ pub const ROWS: &[Row] = &[
     Row::new(&["window", "--stage", "ui-block"], true, true).serial(),
     // a tiling compositor's first configure differs from the requested size: the app must lay out at the configured one
     Row::new(&["window", "--stage", "tiled"], true, true),
+    // a floating compositor that keeps the first commit's size for good: that commit must be the Task's dp size
+    Row::new(&["window", "--stage", "opening"], true, true),
+    Row::new(
+        &[
+            "window",
+            "--stage",
+            "opening",
+            // taller than GDK's guess of the monitor
+            "--declare-display",
+            "411x914",
+        ],
+        true,
+        true,
+    ),
 ];
 
 /// The name of the row a harness command line (`test <row args> ...`) runs: the row with the most matching leading arguments. None: no row's.

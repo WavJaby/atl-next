@@ -23,7 +23,7 @@ use crate::scene;
 use crate::sideband;
 use crate::text_input::GtkTextInput;
 use crate::ui::GtkUi;
-use crate::view::{SceneView, logical_px};
+use crate::view::SceneView;
 
 /// GDK frame times are microseconds (`g_get_monotonic_time`); ticks and presentation samples are nanoseconds.
 const NS_PER_US: i64 = 1000;
@@ -67,8 +67,6 @@ struct Shared {
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The window surface's scale (GdkSurface `scale`: wp_fractional_scale_v1's preferred scale once it arrived), None before realise: the monitor report's density scale ([`reported_monitor`]).
     surface_scale: Cell<Option<f64>>,
-    /// The opening size is not granted yet: until the first presented scene is painted with the window on a monitor, a scale change re-fits the window to the size asked for in physical pixels ([`fit_window`]). Afterwards the window keeps its logical size, the user's or the compositor's, at every scale (AOSP keeps a window's dp size across displays). A compositor sends the preferred fractional scale with the surface's enter, so it precedes that paint.
-    opening: Cell<bool>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
     pointer_at: Cell<(f64, f64)>,
     /// Time (ms) of the last pointer event published: moves must come strictly after it (`input::motion_samples`).
@@ -121,11 +119,12 @@ impl Shared {
 
     /// After-paint of a frame that followed a present: the buffers that frame no longer shows go back, each with the reservation fences of its dma-buf as release fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` for a write: every pending GPU read of it, by this paint or an earlier one; design §3.4).
     /// A driver that attaches no implicit fences (WSL: GSK on llvmpipe, which finishes rendering before the swap) yields an already-signalled fence.
-    fn painted(&self) {
+    /// The first of them with the window on a monitor grants the opening size ([`SceneView::grant_opening`]): a compositor sends the preferred fractional scale with the surface's enter, so it precedes that paint. The window keeps its logical size, the user's or the compositor's, at every scale (AOSP keeps a window's dp size across displays).
+    fn painted(&self, view: Option<&SceneView>) {
         if !self.paint_pending.replace(false) {
             return;
         }
-        if self.monitor.borrow().is_some() && self.opening.replace(false) {
+        if self.monitor.borrow().is_some() && view.is_some_and(SceneView::grant_opening) {
             tracing::info!("atl-platform-ui: opening size granted");
         }
         let retired = std::mem::take(&mut *self.retired.borrow_mut());
@@ -254,8 +253,9 @@ impl GtkWindow {
                 }
             });
             let on_after_paint = Rc::clone(&shared);
+            let granted_view = view.clone();
             clock.connect_after_paint(move |_| {
-                on_after_paint.painted();
+                on_after_paint.painted(granted_view.upgrade().as_ref());
                 on_after_paint.report_presented();
                 let now = monotonic_ns();
                 let after = on_after_paint.paint_end.take().map(|end| now - end);
@@ -485,29 +485,111 @@ impl GtkWindow {
     }
 }
 
-/// Sizes the window to the content's wanted physical size at the surface's current scale, keeping the chrome around the content. Runs at each change of the wanted size, and at each scale change until the opening size is granted (`Shared::opening`): the window keeps its integer-scale size otherwise, when the fractional scale arrives after the first layout (Hyprland, 1.6).
+/// What GTK may size an opening window to, from the bounds GDK gives it. A compositor that sends no `configure_bounds` leaves GDK to use the union of its monitors, whose logical sizes are wrong while a monitor's scale is a guess
+/// (1440x900 at 2 for a 2880x1800 output at 1.6, really 1800x1125): those are recomputed at the opening scale. None: `bounds` are not that union, so they are the compositor's and stand.
+fn opening_bounds(
+    bounds: (i32, i32),
+    monitors: &[(gdk::Rectangle, f64)],
+    opening: Scale,
+) -> Option<(i32, i32)> {
+    let union = monitors
+        .iter()
+        .map(|(g, _)| *g)
+        .reduce(|a, b| a.union(&b))?;
+    if (union.width(), union.height()) != bounds {
+        return None;
+    }
+    monitors
+        .iter()
+        .map(|(g, scale)| {
+            let real = |v: i32| opening.to_logical(f64::from(v) * scale).round() as i32;
+            gdk::Rectangle::new(real(g.x()), real(g.y()), real(g.width()), real(g.height()))
+        })
+        .reduce(|a, b| a.union(&b))
+        .map(|r| (r.width(), r.height()))
+}
+
+/// A window layout's fixed parts, logical pixels (width, height): the chrome around the content inside the window, and the surface around the window (the client-side shadow).
+#[derive(Clone, Copy)]
+struct Frame {
+    chrome: (i32, i32),
+    shadow: (i32, i32),
+}
+
+/// Keeps GTK's clamp to phony bounds ([`opening_bounds`]) from cutting the opening size. GTK exposes neither the shadow nor the chrome before a layout, so the first (clamped) layout gives them and asks for a second in the same frame, before anything is drawn.
+/// Connected at realise: GTK's own handlers run first.
+fn follow_opening_bounds(
+    toplevel: &gdk::Toplevel,
+    window: &gtk4::Window,
+    view: &glib::WeakRef<SceneView>,
+) {
+    let frame: Rc<Cell<Option<Frame>>> = Rc::default();
+    let (measured, sized_view) = (Rc::clone(&frame), view.clone());
+    toplevel.connect_compute_size(move |toplevel, size| {
+        let (Some(frame), Some(view)) = (measured.get(), sized_view.upgrade()) else {
+            return;
+        };
+        let Some(opening) = view.opening() else {
+            return;
+        };
+        let bounds = size.bounds();
+        let wanted = view.wanted();
+        let full = (wanted.0 + frame.chrome.0, wanted.1 + frame.chrome.1);
+        if full.0 <= bounds.0 && full.1 <= bounds.1 {
+            return;
+        }
+        let monitors: Vec<_> = toplevel
+            .display()
+            .monitors()
+            .iter::<gdk::Monitor>()
+            .flatten()
+            .map(|m| (m.geometry(), m.scale()))
+            .collect();
+        if let Some(limit) = opening_bounds(bounds, &monitors, opening) {
+            size.set_size(
+                full.0.min(limit.0) + frame.shadow.0,
+                full.1.min(limit.1) + frame.shadow.1,
+            );
+        }
+    });
+    let (window, view) = (window.downgrade(), view.clone());
+    toplevel.connect_layout(move |surface, width, height| {
+        let (Some(window), Some(view)) = (window.upgrade(), view.upgrade()) else {
+            return;
+        };
+        if frame.get().is_some() || view.opening().is_none() || view.width() <= 0 {
+            return;
+        }
+        frame.set(Some(Frame {
+            chrome: (
+                window.width() - view.width(),
+                window.height() - view.height(),
+            ),
+            shadow: (width - window.width(), height - window.height()),
+        }));
+        let wanted = view.wanted();
+        if view.width() < wanted.0 || view.height() < wanted.1 {
+            surface.request_layout();
+        }
+    });
+}
+
+/// Sizes the window to the content's wanted logical size, keeping the chrome around the content. Runs at each change of the wanted size.
 fn fit_window(window: &gtk4::Window, view: &SceneView) {
     if !(window.is_mapped() && window.surface().is_some_and(|s| s.is_mapped())) {
         return;
     }
-    let wanted = view.wanted();
-    let scale = view.scale();
-    let (width, height) = (
-        logical_px(scale, wanted.width),
-        logical_px(scale, wanted.height),
-    );
+    let (width, height) = view.wanted();
     // the window is the content plus the chrome around it: keep the chrome, change the content
     let (chrome_w, chrome_h) = (
         window.width() - view.width(),
         window.height() - view.height(),
     );
     tracing::info!(
-        "atl-platform-ui: window fit to {}x{} logical at scale {}, content {}x{} physical",
+        "atl-platform-ui: window fit to {}x{} logical, content {width}x{height} at scale {}",
         width + chrome_w,
         height + chrome_h,
-        scale.get(),
-        wanted.width,
-        wanted.height,
+        view.scale().get(),
     );
     window.set_default_size(width + chrome_w, height + chrome_h);
 }
@@ -580,7 +662,6 @@ impl Window for GtkWindow {
             on_close_requested: Slot::new(),
             monitor: RefCell::new(None),
             surface_scale: Cell::new(None),
-            opening: Cell::new(true),
             on_painted: Slot::new(),
             on_presented: Slot::new(),
             presentation: RefCell::new(None),
@@ -610,9 +691,10 @@ impl Window for GtkWindow {
         Self::wire_touch(&view, &shared);
         Self::wire_keys(&window, &shared);
         // the monitor the window is on (wl_surface.enter): reported at each entry and at each change of that monitor (Window::on_monitor)
-        // and its scale (wp_fractional_scale_v1 preferred_scale arrives after realisation): the content's logical size is re-derived from the physical one
+        // and its scale (wp_fractional_scale_v1 preferred_scale arrives after realisation): the content keeps its logical size and is reported in the new physical pixels
         let entered = Rc::clone(&shared);
-        let scaled = (view.downgrade(), window.downgrade());
+        let opening_view = view.downgrade();
+        let scaled = view.downgrade();
         window.connect_realize(move |w| {
             if let Some(surface) = w.surface() {
                 entered.surface_scale.set(Some(surface.scale()));
@@ -623,29 +705,24 @@ impl Window for GtkWindow {
                 surface.connect_scale_notify(move |s| {
                     tracing::info!("atl-platform-ui: surface scale {}", s.scale());
                     // the density follows the surface's scale: the monitor is reported again at it
-                    let mut opening = false;
                     if let Some(shared) = rescaled.upgrade() {
-                        opening = shared.opening.get();
                         shared.surface_scale.set(Some(s.scale()));
                         let monitor = shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
                         if let Some(m) = monitor {
                             report_monitor(&shared, &m);
                         }
                     }
-                    // from the next idle, not inside the notification: GTK dropped a default-size request made there (the window kept its integer-scale size)
+                    // from the next idle, not inside the notification: GTK dropped a size request made there
                     let scaled = scaled.clone();
                     glib::idle_add_local_once(move || {
-                        if let (Some(view), Some(window)) = (scaled.0.upgrade(), scaled.1.upgrade())
-                        {
+                        if let Some(view) = scaled.upgrade() {
                             view.rescale();
-                            if opening {
-                                fit_window(&window, &view);
-                            }
                         }
                     });
                 });
                 // the xdg-shell states GDK reports: `suspended` is the hidden signal the window lifecycle consumes (S2); logged per change
                 if let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() {
+                    follow_opening_bounds(&toplevel, w, &opening_view);
                     toplevel.connect_state_notify(|t| {
                         let state = t.state();
                         tracing::info!(
@@ -689,6 +766,7 @@ impl Window for GtkWindow {
             text_input,
         };
         this.set_title(&attributes.title);
+        this.view.open_at(attributes.scale);
         this.set_size(attributes.size);
         this.window.present();
         Ok(this)
@@ -1029,7 +1107,27 @@ impl InputSource for GtkWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::reported_monitor;
+    use super::{opening_bounds, reported_monitor};
+    use atl_platform_ui_api::Scale;
+    use gtk4::gdk;
+
+    /// The laptop as GDK guesses it: 1440 x 2 / 1.6 = 1800, 900 x 2 / 1.6 = 1125. Any other bounds are the compositor's. A second 1440x900 guess to the right doubles the width.
+    #[test]
+    fn bounds_of_guessed_monitors_are_taken_at_the_opening_scale() {
+        let scale = Scale::new(1.6).unwrap();
+        let one = [(gdk::Rectangle::new(0, 0, 1440, 900), 2.0)];
+        assert_eq!(opening_bounds((1440, 900), &one, scale), Some((1800, 1125)));
+        assert_eq!(opening_bounds((1440, 860), &one, scale), None);
+        assert_eq!(opening_bounds((1440, 900), &[], scale), None);
+        let two = [one[0], (gdk::Rectangle::new(1440, 0, 1440, 900), 2.0)];
+        assert_eq!(opening_bounds((2880, 900), &two, scale), Some((3600, 1125)));
+        // a monitor whose scale is already the opening's stays
+        let exact = [(gdk::Rectangle::new(0, 0, 1800, 1125), 1.6)];
+        assert_eq!(
+            opening_bounds((1800, 1125), &exact, scale),
+            Some((1800, 1125))
+        );
+    }
 
     /// The laptop (2880 x 1800 panel at Hyprland scale 1.6), measured 2026-11-22. Inside a security context GDK said 1440 x 900 at scale 2 (no xdg-output: mode / integer scale) while the
     /// surface's fractional scale was 1.6; atld's own connection said 1800 x 1125 at 1.6. Both must give the mode and scale 1.6 (density 160 x 1.6 = 256, not 160 x 2 = 320).

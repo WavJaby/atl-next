@@ -294,6 +294,12 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.get(&task).map(|t| t.size)
     }
 
+    /// The size of `task` with the display's dpi it is expressed in, under one lock: a monitor change rescales both. None for no Task.
+    pub fn size_and_dpi(&self, task: TaskId) -> Option<(TaskSize, i32)> {
+        let st = self.lock();
+        st.tasks.get(&task).map(|t| (t.size, st.display.dpi))
+    }
+
     /// Sets `task`'s size; true when it changed, so its windows need `resized`. False for the size it already has and for no Task (the registry checks the owner first).
     pub fn set_size(&self, task: TaskId, size: TaskSize) -> bool {
         let mut st = self.lock();

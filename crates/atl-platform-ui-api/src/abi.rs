@@ -504,6 +504,7 @@ pub struct WindowAttributesView {
     app_id: Str,
     has_app_id: bool,
     size: PhysSize,
+    scale: Scale,
 }
 
 impl WindowAttributesView {
@@ -514,6 +515,7 @@ impl WindowAttributesView {
             app_id: Str::of(a.app_id.as_deref().unwrap_or("")),
             has_app_id: a.app_id.is_some(),
             size: a.size,
+            scale: a.scale,
         }
     }
 
@@ -530,6 +532,7 @@ impl WindowAttributesView {
                 .has_app_id
                 .then(|| unsafe { self.app_id.get() }.into_owned()),
             size: self.size,
+            scale: self.scale,
         }
     }
 }

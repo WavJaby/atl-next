@@ -35,7 +35,7 @@ use atl_gralloc_service::backend::Backend;
 use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::{
     ContentHints, ContentPurpose, FrameClock, LooperPoster, PhysRect, PhysSize, PlatformInvoker,
-    PlatformUi, PlatformWindow, PresentError, PresentTiming, Surrounding, TextInput,
+    PlatformUi, PlatformWindow, PresentError, PresentTiming, Scale, Surrounding, TextInput,
     TextInputEvent, Ui, Window, WindowAttributes,
 };
 
@@ -69,6 +69,9 @@ struct Args {
     /// The scale the window waits for before its first frame: the harness changes the output to it once MAPPED is printed, so the fractional scale arrives after the first layout (as on Hyprland). Absent: the output's scale from the start.
     #[arg(long, value_name = "SCALE")]
     await_scale: Option<f64>,
+    /// The scale the content size is expressed in (`WindowAttributes::scale`).
+    #[arg(long)]
+    scale: f64,
     /// Window content width in physical pixels.
     #[arg(long)]
     width: u32,
@@ -559,6 +562,7 @@ fn main() -> Result<()> {
                 width: args.width,
                 height: args.height,
             },
+            scale: Scale::new(args.scale).context("--scale")?,
         };
         atl_platform_ui::call(&*invoker, move || -> Result<()> {
             let window = Rc::new(PlatformWindow::create(&session, &attributes)?);

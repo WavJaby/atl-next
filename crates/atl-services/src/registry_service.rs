@@ -25,9 +25,10 @@ use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
 /// The interface name counters use.
 const INTERFACE: &str = "ICompositorRegistry";
 
-/// TASK_INFO's reply for a process with a Task: the window's opening size and the Task's package.
+/// TASK_INFO's reply for a process with a Task: the window's opening size, the dpi it is expressed in and the Task's package.
 pub struct TaskInfo {
     pub size: TaskSize,
+    pub dpi: i32,
     pub package: String,
 }
 
@@ -152,13 +153,15 @@ fn dispatch(
         return reply.write(&display.to_arg());
     }
     if code == TASK_INFO {
-        // no Task: 0 x 0 and an empty package (compositor_registry.rs TASK_INFO)
-        let (width, height, package) = match service.task_info(ThreadState::get_calling_pid())? {
-            Some(info) => (info.size.width, info.size.height, info.package),
-            None => (0, 0, String::new()),
-        };
+        // no Task: 0 x 0, dpi 0 and an empty package (compositor_registry.rs TASK_INFO)
+        let (width, height, dpi, package) =
+            match service.task_info(ThreadState::get_calling_pid())? {
+                Some(info) => (info.size.width, info.size.height, info.dpi, info.package),
+                None => (0, 0, 0, String::new()),
+            };
         reply.write(&width)?;
         reply.write(&height)?;
+        reply.write(&dpi)?;
         return reply.write(&package);
     }
     if code == KEY_MAP {
@@ -310,8 +313,10 @@ impl ICompositorRegistry for Registry {
         let Some(task) = self.activities.task_of_process(caller_pid) else {
             return Ok(None);
         };
+        let (size, dpi) = self.tasks.size_and_dpi(task).ok_or(StatusCode::BAD_VALUE)?;
         Ok(Some(TaskInfo {
-            size: self.tasks.size(task).ok_or(StatusCode::BAD_VALUE)?,
+            size,
+            dpi,
             package: self.tasks.package(task).ok_or(StatusCode::BAD_VALUE)?,
         }))
     }

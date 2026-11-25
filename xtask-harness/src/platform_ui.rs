@@ -11,6 +11,8 @@
 //!    Evidence tier: isolated runtime, a raw-protocol probe on the real connection. It shows the client side (the display thread answers pings only after the app thread's Looper ran a token); the compositor's reaction to a missing pong (the native "not responding" dialog) is not observable on WSLg and stays [argued] until the Arch-laptop run: start `xtask test platform-ui --hold-blocked` there with mutter and watch for the dialog.
 //! 5. **text input**: a fake input method (`nested_wayland::Ime`, input-method v2 on labwc's seat) is bound, then the client focuses its window's `TextInput` with a content type and surrounding text. Checks: the IME is activated; it receives the content type and surrounding text as text-input v3 numbers them; its preedit, commit and delete_surrounding_text (protocol units: UTF-8 bytes) reach the client as `TextInputEvent`s (GTK units: chars). Expected values are worked out from the encodings in the constants below. `--break-ime-commit` skips the commit_string, so the commit check must fail.
 //!    Evidence tier: isolated runtime, real compositor relay (wlroots) and GTK's own Wayland IM module; a desktop IME (fcitx5) and the candidate popup at the cursor rect stay laptop checks.
+//! 6. **opening** (`--map pinned`, alone): the window's first buffer commit is its content's logical size at `--scale` while its output still says 2, under a compositor that keeps that commit's geometry ([`judge_pinned`]). `--map unpinned` drops the pin, so the pin check must fail.
+//!    Evidence tier: isolated runtime, Hyprland's map behaviour reproduced by the proxy on labwc.
 //!
 //! The client runs with GSK_RENDERER=ngl: it imports the gralloc dma-bufs (vgem on WSL) through EGL; its own window buffers still reach the compositor through wl_shm (Mesa's software EGL on a display with no zwp_linux_dmabuf), which the proxy confirms.
 //! Needs a DRM node gralloc allocates on, `labwc` (or, with --hold-blocked, a Wayland display: WAYLAND_DISPLAY, XDG_RUNTIME_DIR) and GTK 4.14+.
@@ -28,7 +30,16 @@ use crate::gdk_dmabuf;
 use crate::nested_wayland::{Arg, GATE_OUTPUT, Ime, NestedCompositor, Output, im_op};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
-use crate::wayland_proxy::{Event, Proxy};
+use crate::wayland_proxy::{AtMap, Event, FloatAtMap, Proxy};
+
+/// What the compositor does with the window's size after its map.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Map {
+    /// Keeps the geometry of the first buffer commit.
+    Pinned,
+    /// Lets the window resize itself (the gate's deliberate break of its own pin: the pin check must fail).
+    Unpinned,
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -48,9 +59,12 @@ pub struct Args {
     #[arg(long)]
     maximized: bool,
     /// The gate output's scale (fractional ones reach the client as `wp_fractional_scale_v1`): the content must still be the requested physical size (readback size checks).
-    /// Default fractional: the window stages run at 1 (GATE_OUTPUT), and a 1.6 output once gave 293 x 192 content for 320 x 240 (logical size fixed at GTK's integer scale 2 before the fractional one arrived, 2026-11-06).
+    /// Default fractional: the window stages run at 1 (GATE_OUTPUT), and a content measured at GTK's integer scale 2 keeps 160 x 120 logical on a 1.6 output: 256 x 192 for 320 x 240.
     #[arg(long, default_value_t = 1.6)]
     scale: f64,
+    /// The window opens as a floating one on Hyprland, on an output whose scale is 2 until the map, then --scale (wayland_proxy.rs `FloatAtMap`). Only the opening is judged ([`judge_pinned`]).
+    #[arg(long, value_enum, conflicts_with_all = ["hold_blocked", "maximized"])]
+    map: Option<Map>,
     /// Keep the captures in this directory instead of a temporary one.
     #[arg(long)]
     keep: Option<PathBuf>,
@@ -180,6 +194,16 @@ fn wait_ime_line(client: &mut Client, ime: &mut Ime, prefix: &str) -> Result<Opt
 /// The window content size asked for, physical pixels. Wide enough that the title bar's minimum width does not enlarge the content (WSLg: ~280 px), and at least the composite scene's 256 x 192.
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
+/// `--map`'s content, physical pixels: the laptop's opening size (3/4 of 2880x1800).
+const PINNED: (u32, u32) = (2160, 1350);
+/// `--map`'s content at the default --scale, by hand: 2160 / 1.6 = 1350, 1350 / 1.6 = 843.75 -> 844 logical px.
+const PINNED_LOGICAL: (i32, i32) = (1350, 844);
+/// `--map`'s output: at START_SCALE 1920x1200 logical, above the window plus its chrome, so GTK's clamp to the monitor (the opening stage's row) has no part in it.
+const PINNED_OUTPUT: (i32, i32) = (3840, 2400);
+/// The header bar is the only chrome inside the window geometry, far under this height.
+const HEADER_MAX: i32 = 200;
+/// How long `--map` waits for the first frame at the target size.
+const PINNED_LIMIT: Duration = Duration::from_secs(15);
 /// GTK's integer scale on a fractional output (wl_output scale 2 for 1.6): the scale the gate's window maps at, before the target one arrives (`late` in `run`).
 const START_SCALE: f64 = 2.0;
 /// Scales compare within this: the gate's scales are read back as text (Rust's float Display: 1.6 -> "1.6").
@@ -479,6 +503,22 @@ impl Report {
             self.failures.push(Failure::step(what, detail));
         }
     }
+
+    /// Prints the verdict; the run's exit status.
+    fn exit(self) -> ExitCode {
+        if self.failures.is_empty() {
+            println!("platform-ui: all checks passed");
+            return ExitCode::SUCCESS;
+        }
+        let verdict = Verdict {
+            cmd: "platform-ui",
+            total: Some((self.total, "checks")),
+            skipped: Vec::new(),
+            failures: self.failures,
+        };
+        println!("{}", verdict.line());
+        ExitCode::FAILURE
+    }
 }
 
 /// The module's line when its ping hold is armed (atl-platform-ui-linux ping.rs `report`).
@@ -519,11 +559,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         }
     };
     // --hold-blocked is watched on the desktop's compositor; every other run maps in the gate's own (outlives the client: declared before it)
-    // the gate's output starts at START_SCALE and takes args.scale once the window has mapped (the client's --await-scale): the fractional scale arrives after the first layout, as on Hyprland
+    // the content is asked for at args.scale; the gate's output starts at START_SCALE and takes args.scale once the window has mapped (the client's --await-scale): the fractional scale arrives after the first layout, as on Hyprland
     let late = args.hold_blocked.is_none() && !args.maximized;
+    let (output_width, output_height) = if args.map.is_some() {
+        PINNED_OUTPUT
+    } else {
+        (GATE_OUTPUT.width, GATE_OUTPUT.height)
+    };
     let output = Output {
+        width: output_width,
+        height: output_height,
         scale: if late { START_SCALE } else { args.scale },
         ..GATE_OUTPUT
+    };
+    let (width, height) = if args.map.is_some() {
+        PINNED
+    } else {
+        (WIDTH, HEIGHT)
     };
     let nested = match args.hold_blocked {
         Some(_) => None,
@@ -551,6 +603,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &upstream,
         &runtime.join(format!("atl-platform-ui-gate-{}.sock", std::process::id())),
     )?;
+    match args.map {
+        Some(Map::Pinned) => proxy.float_at_map(FloatAtMap::Pin),
+        Some(Map::Unpinned) => proxy.float_at_map(FloatAtMap::Hold),
+        None => {}
+    }
     let socket = proxy.listen.clone();
     let mut probe = Probe {
         proxy,
@@ -569,7 +626,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .args(["--out"])
         .arg(&out_dir)
         .args(["--frames", &args.frames.to_string()])
-        .args(["--width", &WIDTH.to_string(), "--height", &HEIGHT.to_string()])
+        .args(["--width", &width.to_string(), "--height", &height.to_string()])
+        .args(["--scale", &args.scale.to_string()])
         .args(["--resize-step", &RESIZE_STEP.to_string()])
         .args(["--timeout-secs", &STARTUP_LIMIT.as_secs().to_string()])
         .args(&await_args)
@@ -611,6 +669,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         client.seen.push(mapped_line);
         n.control().set_scale(0, args.scale)?;
     }
+    if args.map.is_some() {
+        let frame = client.expect_line("FRAME 0 ", PINNED_LIMIT);
+        judge_pinned(&mut report, &probe.proxy.at_map(), frame);
+        if args.keep.is_none() {
+            let _ = std::fs::remove_dir_all(&out_dir);
+        }
+        return Ok(report.exit());
+    }
     let ready = client.expect_line("READY", STARTUP_LIMIT);
     if let Err(e) = &ready {
         let tail = std::fs::read_to_string(&stderr_file).unwrap_or_default();
@@ -637,9 +703,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             .last()
             .and_then(|l| scale_of(l.as_str()));
         report.check(
-            mapped_scale.is_some_and(|s| (s - START_SCALE).abs() < SCALE_TOLERANCE)
+            mapped_scale.is_some_and(|s| (s - args.scale).abs() < SCALE_TOLERANCE)
                 && last_frame_scale.is_some_and(|s| (s - args.scale).abs() < SCALE_TOLERANCE),
-            "the fractional scale arrives after the window mapped: mapped at the integer scale, the frames at the target",
+            "the window maps at its opening scale whatever its output's, and the frames are at the target the output takes after the map",
             &format!("mapped at {mapped_scale:?}, last frame at {last_frame_scale:?}"),
         );
     }
@@ -1037,18 +1103,41 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.keep.is_none() {
         let _ = std::fs::remove_dir_all(&out_dir);
     }
-    if !report.failures.is_empty() {
-        let verdict = Verdict {
-            cmd: "platform-ui",
-            total: Some((report.total, "checks")),
-            skipped: Vec::new(),
-            failures: report.failures,
-        };
-        println!("{}", verdict.line());
-        return Ok(ExitCode::FAILURE);
-    }
-    println!("platform-ui: all checks passed");
-    Ok(ExitCode::SUCCESS)
+    Ok(report.exit())
+}
+
+/// `--map`: the first buffer commit has the content's logical size at --scale (its geometry is that plus the header bar), the pin holds, and the content is the requested physical size.
+fn judge_pinned(report: &mut Report, at_map: &AtMap, frame: Result<String>) {
+    let (first, last) = (at_map.first(), at_map.last());
+    let (pinned, held) = at_map.counts();
+    report.check(
+        pinned > 0,
+        "pinned: the proxy pinned the window's configures",
+        &format!("{pinned} configures pinned, {held} preferred_scale held"),
+    );
+    let (width, height) = PINNED_LOGICAL;
+    report.check(
+        first.is_some_and(|(w, h)| w == width && (height..height + HEADER_MAX).contains(&h)),
+        "pinned: the first buffer commit's geometry is the content at the target scale",
+        &format!("first {first:?}, want {width}x{height} plus the header"),
+    );
+    report.check(
+        first.is_some() && last == first,
+        "pinned: the geometry never changed",
+        &format!("first {first:?}, last {last:?}"),
+    );
+    let content = frame
+        .as_ref()
+        .ok()
+        .and_then(|l| l.rsplit(' ').next().map(str::to_owned));
+    report.check(
+        content == Some(format!("{}x{}", PINNED.0, PINNED.1)),
+        "pinned: the content is the requested physical size",
+        &format!(
+            "{content:?} {}",
+            frame.err().map_or_else(String::new, |e| format!("{e:#}"))
+        ),
+    );
 }
 
 fn tick_summary(times_ns: &[u64]) -> String {

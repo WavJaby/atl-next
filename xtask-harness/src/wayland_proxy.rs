@@ -16,6 +16,7 @@
 //! [`Proxy::inject_touch`] writes `wl_touch` events on a touch that is the proxy's alone: the gates' compositor has no touch device and wlroots has no virtual-touch protocol, so the proxy adds TOUCH to `wl_seat.capabilities`, turns the client's `get_touch` into a `wl_display.sync` (which takes the new id in order), drops that callback's `done` and `delete_id`, and absorbs the client's requests on the touch.
 //! [`Proxy::inject_configure`] writes an `xdg_toplevel.configure` and `xdg_surface.configure` of the window the same way; the client's `ack_configure` is [`Event::Acked`].
 //! [`Proxy::tile`] rewrites the size of every `xdg_toplevel.configure` the compositor sends the window (states kept), the initial one included: a floating gate compositor stands in for a tiling one.
+//! [`Proxy::float_at_map`] gives the window Hyprland's treatment of a floating window at its map ([`AtMap`]).
 //! That tests the client's side of the protocol exactly (GDK answers pings from its Wayland source, on the thread whose Looper polls the main context), not the compositor's reaction to a missing pong, which stays the compositor's business.
 //!
 //! Security contexts: a `wp_security_context_manager_v1.create_listener` is relayed ([`relay_context`]), so atld's per-app context sockets reach the compositor through the proxy too, under the context.
@@ -224,6 +225,57 @@ impl Withheld {
     }
 }
 
+/// What a compositor does around the window's map ([`Proxy::float_at_map`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FloatAtMap {
+    /// The gate compositor's own behaviour.
+    #[default]
+    Off,
+    /// No `preferred_scale` before the first commit with a buffer (it exists only for a mapped window), no `configure_bounds` ever.
+    Hold,
+    /// [`FloatAtMap::Hold`], and the window keeps the geometry of that commit: every later toplevel configure carries it with MAXIMIZED and the four TILED states.
+    Pin,
+}
+
+/// Hyprland's floating window (0.56.2) on the gate's compositor: `preferred_scale` is sent from the map (Window.cpp updateSurfaceScaleTransformDetails), `configure_bounds` never, the box is the
+/// first buffer commit's window geometry (DefaultFloatingAlgorithm newTarget), `setMaximized(true)` follows it (XDGShell.cpp) and no later commit resizes it (commitWindow only clamps).
+/// The geometries are recorded under every policy.
+#[derive(Debug, Default)]
+pub struct AtMap {
+    policy: Mutex<FloatAtMap>,
+    /// The window geometry (logical width, height) at the first commit with a buffer.
+    first: Mutex<Option<(i32, i32)>>,
+    /// The last window geometry set.
+    last: Mutex<Option<(i32, i32)>>,
+    /// Configures of the compositor rewritten, the injected one included.
+    pinned: AtomicU64,
+    held_scales: AtomicU64,
+}
+
+impl AtMap {
+    /// The window geometry (logical width, height) at the first commit with a buffer: what a floating compositor takes as the window's size.
+    pub fn first(&self) -> Option<(i32, i32)> {
+        self.first.lock().ok().and_then(|g| *g)
+    }
+
+    /// The last window geometry set.
+    pub fn last(&self) -> Option<(i32, i32)> {
+        self.last.lock().ok().and_then(|g| *g)
+    }
+
+    /// (configures pinned, `preferred_scale` events held) so far: 0 pinned means the policy never reached the client.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.pinned.load(Ordering::Relaxed),
+            self.held_scales.load(Ordering::Relaxed),
+        )
+    }
+
+    fn policy(&self) -> FloatAtMap {
+        self.policy.lock().map(|p| *p).unwrap_or_default()
+    }
+}
+
 /// CLOCK_MONOTONIC now, ns.
 fn monotonic_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -250,8 +302,25 @@ const XDG_TOPLEVEL_SET_TITLE: u16 = 2;
 const XDG_TOPLEVEL_SET_APP_ID: u16 = 3;
 /// `xdg_toplevel.set_minimized()`, request 13 (xdg-shell.xml: destroy 0 ... unset_fullscreen 12, set_minimized 13).
 const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
-/// `wl_surface.commit` request 6 (wayland.xml).
+/// `wl_surface.attach(buffer, x, y)` request 1 (a null buffer unmaps), `commit` request 6 (wayland.xml).
+const WL_SURFACE_ATTACH: u16 = 1;
 const WL_SURFACE_COMMIT: u16 = 6;
+/// fractional-scale-v1.xml: `wp_fractional_scale_manager_v1.get_fractional_scale(new_id, surface)` request 1; `wp_fractional_scale_v1.preferred_scale(scale)` event 0.
+const FRACTIONAL_SCALE_MANAGER: &str = "wp_fractional_scale_manager_v1";
+const GET_FRACTIONAL_SCALE: u16 = 1;
+const PREFERRED_SCALE: u16 = 0;
+/// `wl_output` events (wayland.xml): geometry 0, mode 1, done 2, scale 3.
+const WL_OUTPUT: &str = "wl_output";
+const WL_OUTPUT_GEOMETRY: u16 = 0;
+const WL_OUTPUT_MODE: u16 = 1;
+const WL_OUTPUT_DONE: u16 = 2;
+const WL_OUTPUT_SCALE: u16 = 3;
+/// `xdg_toplevel.configure_bounds(width, height)` event 2 (xdg-shell.xml).
+const XDG_TOPLEVEL_CONFIGURE_BOUNDS: u16 = 2;
+/// The states of a pinned window ([`FloatAtMap::Pin`]): maximized 1, tiled_left 5, tiled_right 6, tiled_top 7, tiled_bottom 8 (xdg-shell.xml).
+const PIN_STATES: [u32; 5] = [XDG_STATE_MAXIMIZED, 5, 6, 7, 8];
+/// The pin's own configure: above any serial the gate compositor reaches in a run.
+const PIN_SERIAL: u32 = 0x7000_0101;
 /// `wl_surface.frame(callback new_id)` request 3; `wl_callback.done(data)` event 0, a destructor (wayland.xml).
 const WL_SURFACE_FRAME: u16 = 3;
 const WL_CALLBACK_DONE: u16 = 0;
@@ -342,6 +411,8 @@ pub enum Event {
     Minimized,
     /// The window's first `wl_surface.commit`: the initial one, which carries no buffer; the desktop matches the window's rules on it, before any frame.
     FirstCommit,
+    /// The window's first commit with a buffer: it maps ([`AtMap::first`] is its geometry).
+    Mapped,
     /// [`Proxy::inject_pointer`]'s action was written to the client (a dropped action reports nothing).
     PointerInjected,
     /// [`Proxy::inject_configure`]'s configure was written to the client; its `ack_configure` with the same serial comes back as [`Event::Acked`].
@@ -389,6 +460,14 @@ struct Ids {
     /// The interfaces whose globals this connection is not told of ([`Withheld`]; empty outside a security context), and the proxy-wide policy whose count it adds to.
     hidden: Vec<String>,
     withheld: Arc<Withheld>,
+    /// The proxy-wide [`AtMap`].
+    at_map: Arc<AtMap>,
+    /// The window's latest geometry, whether a buffer is attached to its surface, whether it has committed one.
+    geometry: Option<(i32, i32)>,
+    attached: bool,
+    mapped: bool,
+    /// Each `wp_fractional_scale_v1` with its `wl_surface`.
+    fractional_scales: Vec<(u32, u32)>,
 }
 
 impl Ids {
@@ -503,10 +582,32 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
         ids.frame_callbacks.extend(word(body, 0));
         return None;
     }
+    if Some(object) == ids.surface && opcode == WL_SURFACE_ATTACH {
+        ids.attached = word(body, 0)? != 0;
+        return None;
+    }
+    if ids
+        .interfaces
+        .get(&object)
+        .is_some_and(|i| i == FRACTIONAL_SCALE_MANAGER)
+        && opcode == GET_FRACTIONAL_SCALE
+    {
+        // new_id: u32, surface: object
+        let (scale, surface) = (word(body, 0)?, word(body, 4)?);
+        ids.fractional_scales.push((scale, surface));
+        return None;
+    }
     if Some(object) == ids.surface && opcode == WL_SURFACE_COMMIT {
         ids.commits.record(monotonic_ns());
         let initial = !ids.first_commit;
         ids.first_commit = true;
+        if ids.attached && !ids.mapped {
+            ids.mapped = true;
+            if let Ok(mut first) = ids.at_map.first.lock() {
+                first.get_or_insert(ids.geometry.unwrap_or_default());
+            }
+            return Some(Event::Mapped);
+        }
         return initial.then_some(Event::FirstCommit);
     }
     match (ids.interfaces.get(&object).map(String::as_str), opcode) {
@@ -531,6 +632,11 @@ fn note_request(ids: &mut Ids, object: u32, opcode: u16, body: &[u8]) -> Option<
             serial: word(body, 0)?,
         }),
         (Some(XDG_SURFACE), XDG_SURFACE_SET_WINDOW_GEOMETRY) if ids.xdg_surface == Some(object) => {
+            let size = (word(body, 8)? as i32, word(body, 12)? as i32);
+            ids.geometry = Some(size);
+            if let Ok(mut last) = ids.at_map.last.lock() {
+                *last = Some(size);
+            }
             Some(Event::Geometry {
                 x: word(body, 0)? as i32,
                 y: word(body, 4)? as i32,
@@ -635,6 +741,7 @@ pub struct Proxy {
     commits: Arc<Commits>,
     tile: Arc<Tile>,
     withheld: Arc<Withheld>,
+    at_map: Arc<AtMap>,
 }
 
 /// An injected input event's timestamp: CLOCK_MONOTONIC in ms, truncated to u32 -- the base wlroots and weston stamp input with. The protocol leaves the base undefined, but clients that turn it into Android event times read it as uptimeMillis (CLOCK_MONOTONIC), so a private epoch dates every event hours in the past.
@@ -658,6 +765,7 @@ impl Proxy {
         let commits: Arc<Commits> = Arc::default();
         let tile: Arc<Tile> = Arc::default();
         let withheld: Arc<Withheld> = Arc::default();
+        let at_map: Arc<AtMap> = Arc::default();
         let hub = Hub {
             upstream: upstream.to_owned(),
             in_context: false,
@@ -672,6 +780,7 @@ impl Proxy {
                 commits: Arc::clone(&commits),
                 tile: Arc::clone(&tile),
                 withheld: Arc::clone(&withheld),
+                at_map: Arc::clone(&at_map),
             },
         };
         thread::spawn(move || {
@@ -692,7 +801,20 @@ impl Proxy {
             commits,
             tile,
             withheld,
+            at_map,
         })
+    }
+
+    /// How the compositor treats the window around its map ([`AtMap`]): call before the client connects.
+    pub fn float_at_map(&self, policy: FloatAtMap) {
+        if let Ok(mut p) = self.at_map.policy.lock() {
+            *p = policy;
+        }
+    }
+
+    /// The map's record, valid after the proxy moves.
+    pub fn at_map(&self) -> Arc<AtMap> {
+        Arc::clone(&self.at_map)
     }
 
     /// From the next connection on, security contexts' clients are not told of `interfaces` ([`Withheld`]): call before atld starts.
@@ -808,19 +930,7 @@ impl Proxy {
         if input && self.drop_input.load(Ordering::Relaxed) {
             return Ok(());
         }
-        self.injections
-            .lock()
-            .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?
-            .push(item);
-        for wake in self
-            .wakes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("wake list poisoned"))?
-            .iter()
-        {
-            write(wake, &1u64.to_ne_bytes())?;
-        }
-        Ok(())
+        enqueue(&self.injections, &self.wakes, item)
     }
 }
 
@@ -840,6 +950,7 @@ struct Counters {
     commits: Arc<Commits>,
     tile: Arc<Tile>,
     withheld: Arc<Withheld>,
+    at_map: Arc<AtMap>,
 }
 
 /// What every connection of one proxy shares. A security context's relayed connections ([`relay_context`]) share it too, with the proxy's context listener as their upstream.
@@ -874,6 +985,7 @@ fn serve(client: UnixStream, hub: &Hub) -> Result<()> {
             Vec::new()
         },
         withheld: Arc::clone(&hub.counters.withheld),
+        at_map: Arc::clone(&hub.counters.at_map),
         ..Ids::default()
     }));
     let wake = eventfd(0, EventfdFlags::CLOEXEC)?;
@@ -926,6 +1038,7 @@ fn client_to_server(
         pending.extend_from_slice(&data);
         fds.extend(received);
         // an ack of an injected configure is absorbed: the compositor never sent that serial, so forwarding it is a protocol error that drops the client
+        let mut mapped = None;
         let (complete, forwarded) = {
             let mut ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
             let mut forwarded = Vec::new();
@@ -960,6 +1073,9 @@ fn client_to_server(
                     forwarded.extend_from_slice(raw);
                 }
                 if let Some(event) = event {
+                    if event == Event::Mapped {
+                        mapped = Some((ids.at_map.policy(), ids.geometry.unwrap_or_default()));
+                    }
                     let _ = events.send((Instant::now(), event));
                 }
                 at += size;
@@ -970,7 +1086,49 @@ fn client_to_server(
             forward(server.as_fd(), &forwarded, &mut fds)?;
         }
         pending.drain(..complete);
+        if let Some((policy, (width, height))) = mapped {
+            if policy == FloatAtMap::Pin {
+                hub.counters.at_map.pinned.fetch_add(1, Ordering::Relaxed);
+                enqueue(
+                    &hub.injections,
+                    &hub.wakes,
+                    Injection::Configure {
+                        width,
+                        height,
+                        serial: PIN_SERIAL,
+                        states: PIN_STATES.to_vec(),
+                    },
+                )?;
+            } else if policy == FloatAtMap::Hold {
+                // the other direction lets the held scale go
+                wake_all(&hub.wakes)?;
+            }
+        }
     }
+}
+
+/// Queues `item` for the window's connection ([`server_to_client`]).
+fn enqueue(
+    injections: &Shared<Vec<Injection>>,
+    wakes: &Shared<Vec<OwnedFd>>,
+    item: Injection,
+) -> Result<()> {
+    injections
+        .lock()
+        .map_err(|_| anyhow::anyhow!("injection queue poisoned"))?
+        .push(item);
+    wake_all(wakes)
+}
+
+fn wake_all(wakes: &Shared<Vec<OwnedFd>>) -> Result<()> {
+    for wake in wakes
+        .lock()
+        .map_err(|_| anyhow::anyhow!("wake list poisoned"))?
+        .iter()
+    {
+        write(wake, &1u64.to_ne_bytes())?;
+    }
+    Ok(())
 }
 
 /// `create_listener`'s fds in `fds` (listen, close: argument order) swapped for the proxy's own: the compositor serves a listener of the proxy's under the client's context (the metadata requests that follow pass unchanged),
@@ -1066,6 +1224,10 @@ fn server_to_client(
     let mut pending: Vec<u8> = Vec::new();
     let mut fds: Vec<OwnedFd> = Vec::new();
     let mut held = Held::default();
+    // the window's last `preferred_scale` before its map (FloatAtMap::Hold): goes out once the window has mapped
+    let mut held_scale: Option<Vec<u8>> = None;
+    // each wl_output's geometry and mode until its scale or done ([`scale_first`])
+    let mut output_info: HashMap<u32, Vec<u8>> = HashMap::new();
     loop {
         let mut watch = [
             PollFd::new(server, PollFlags::IN),
@@ -1092,7 +1254,7 @@ fn server_to_client(
             }
             pending.extend_from_slice(&data);
             fds.extend(received);
-            let (registry, wm_base, seats, touch, feedbacks, callbacks, tiled) = {
+            let (registry, wm_base, seats, touch, feedbacks, callbacks, tiled, at_map) = {
                 let ids = ids.lock().map_err(|_| anyhow::anyhow!("ids poisoned"))?;
                 // the window's toplevel exists before the compositor configures it (the client's get_toplevel came first)
                 let tiled = ids
@@ -1113,6 +1275,7 @@ fn server_to_client(
                     of(WP_PRESENTATION_FEEDBACK),
                     ids.frame_callbacks.clone(),
                     tiled,
+                    MapView::of(&ids),
                 )
             };
             // feedback objects the compositor destroyed (presented / discarded): their ids are free for reuse
@@ -1177,6 +1340,22 @@ fn server_to_client(
                     ));
                     return;
                 }
+                if at_map.outputs.contains(&object) {
+                    out.extend(scale_first(&mut output_info, object, opcode, body));
+                    return;
+                }
+                match at_map.edit(object, opcode, body) {
+                    MapEdit::Pass => {}
+                    MapEdit::Drop => return,
+                    MapEdit::Hold => {
+                        held_scale = Some(self::event(object, opcode, body));
+                        return;
+                    }
+                    MapEdit::Replace(bytes) => {
+                        out.extend(bytes);
+                        return;
+                    }
+                }
                 // configure(width, height, states): the tile's size replaces the first two words, the states stay the compositor's
                 if let Some((toplevel, (width, height), tile)) = &tiled
                     && object == *toplevel
@@ -1219,6 +1398,15 @@ fn server_to_client(
         if woken {
             let mut counter = [0u8; 8];
             let _ = read(wake, &mut counter);
+        }
+        if held_scale.is_some()
+            && ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ids poisoned"))?
+                .mapped
+            && let Some(scale) = held_scale.take()
+        {
+            forward(client.as_fd(), &scale, &mut Vec::new())?;
         }
         // only the window's connection takes injections: the first one to create an xdg_toplevel claims them until it ends ([`WindowRelease`]).
         // Every connection is woken per injection, so "has bound xdg_wm_base" raced: a windowless one (another process, or one that binds wm_base and never maps) took the queue and dropped the configure / tap -- drive gate's "no configure ack" and "no frame" (tap lost -> app idle).
@@ -1370,6 +1558,113 @@ fn server_to_client(
                 },
             };
             forward(client.as_fd(), &bytes, &mut Vec::new())?;
+        }
+    }
+}
+
+/// The bytes to send for one `wl_output` event: geometry and mode wait in `info` for the scale (or done), which goes out before them. wl_output states take effect at done, in any order,
+/// but GDK 4.18 without xdg-output fixes a monitor's scale at 1 at the first mode it reads (gdk_monitor_set_scale sets scale_set, set_scale_factor then returns), so it never guesses the 2 that GDK 4.24 takes from the same events.
+fn scale_first(info: &mut HashMap<u32, Vec<u8>>, output: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
+    let bytes = event(output, opcode, body);
+    match opcode {
+        WL_OUTPUT_GEOMETRY | WL_OUTPUT_MODE => {
+            info.entry(output).or_default().extend(bytes);
+            Vec::new()
+        }
+        WL_OUTPUT_SCALE | WL_OUTPUT_DONE => {
+            let held = info.remove(&output).unwrap_or_default();
+            if opcode == WL_OUTPUT_SCALE {
+                [bytes, held].concat()
+            } else {
+                [held, bytes].concat()
+            }
+        }
+        _ => bytes,
+    }
+}
+
+/// What [`AtMap`]'s policy does with one compositor event.
+#[derive(Debug, PartialEq, Eq)]
+enum MapEdit {
+    Pass,
+    Drop,
+    /// Goes out after the map, the last one only.
+    Hold,
+    Replace(Vec<u8>),
+}
+
+/// One connection's [`AtMap`] state as its compositor events are read.
+struct MapView {
+    policy: FloatAtMap,
+    /// The bound `wl_output`s, their events reordered by [`scale_first`]; none under [`FloatAtMap::Off`].
+    outputs: Vec<u32>,
+    toplevel: Option<u32>,
+    /// The size a mapped window is pinned at.
+    pin: Option<(i32, i32)>,
+    mapped: bool,
+    /// The window surface's `wp_fractional_scale_v1`s.
+    scales: Vec<u32>,
+    at_map: Arc<AtMap>,
+}
+
+impl MapView {
+    fn of(ids: &Ids) -> MapView {
+        let policy = ids.at_map.policy();
+        MapView {
+            policy,
+            outputs: ids
+                .interfaces
+                .iter()
+                .filter(|(_, i)| policy != FloatAtMap::Off && *i == WL_OUTPUT)
+                .map(|(id, _)| *id)
+                .collect(),
+            toplevel: ids.toplevel,
+            pin: ids.mapped.then(|| ids.at_map.first()).flatten(),
+            mapped: ids.mapped,
+            // before the xdg role names the window's surface, every surface may be it
+            scales: ids
+                .fractional_scales
+                .iter()
+                .filter(|(_, s)| ids.surface.is_none_or(|w| w == *s))
+                .map(|(scale, _)| *scale)
+                .collect(),
+            at_map: Arc::clone(&ids.at_map),
+        }
+    }
+
+    fn edit(&self, object: u32, opcode: u16, body: &[u8]) -> MapEdit {
+        if self.policy == FloatAtMap::Off {
+            return MapEdit::Pass;
+        }
+        if !self.mapped && opcode == PREFERRED_SCALE && self.scales.contains(&object) {
+            self.at_map.held_scales.fetch_add(1, Ordering::Relaxed);
+            return MapEdit::Hold;
+        }
+        if self.toplevel != Some(object) {
+            return MapEdit::Pass;
+        }
+        match (opcode, self.pin) {
+            (XDG_TOPLEVEL_CONFIGURE_BOUNDS, _) => MapEdit::Drop,
+            (XDG_TOPLEVEL_CONFIGURE, Some((width, height)))
+                if self.policy == FloatAtMap::Pin && body.len() >= 12 =>
+            {
+                // configure(width, height, states: u32 byte length, one u32 each): the compositor's states stay, the pin's join
+                let mut states: Vec<u32> = (12..body.len())
+                    .step_by(4)
+                    .filter_map(|at| word(body, at))
+                    .collect();
+                for state in PIN_STATES {
+                    if !states.contains(&state) {
+                        states.push(state);
+                    }
+                }
+                let mut pinned = [width.to_ne_bytes(), height.to_ne_bytes()].concat();
+                pinned.extend(((states.len() * 4) as u32).to_ne_bytes());
+                pinned.extend(states.iter().flat_map(|s| s.to_ne_bytes()));
+                self.at_map.pinned.fetch_add(1, Ordering::Relaxed);
+                MapEdit::Replace(event(object, opcode, &pinned))
+            }
+            _ => MapEdit::Pass,
         }
     }
 }
@@ -1744,6 +2039,47 @@ mod tests {
             before <= t[0] && t[0] <= t[1] && t[1] <= after,
             "{before} {t:?} {after}"
         );
+    }
+
+    /// The geometry of the first commit with a buffer is the window's size; the initial commit (no buffer) and a later geometry are not. Bytes by hand from the wire format.
+    #[test]
+    fn the_first_buffer_commit_takes_the_geometry_and_pins_it() {
+        let words = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|v| v.to_ne_bytes()).collect() };
+        let mut ids = Ids {
+            surface: Some(5),
+            xdg_surface: Some(6),
+            toplevel: Some(7),
+            ..Ids::default()
+        };
+        ids.interfaces.insert(6, XDG_SURFACE.to_owned());
+        ids.fractional_scales = vec![(8, 5), (9, 50)];
+        *ids.at_map.policy.lock().unwrap() = FloatAtMap::Pin;
+        let configure = words(&[900, 500, 4, XDG_STATE_ACTIVATED]);
+        assert_eq!(
+            note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]),
+            Some(Event::FirstCommit)
+        );
+        let before = MapView::of(&ids);
+        assert_eq!(before.edit(7, 0, &configure), MapEdit::Pass);
+        assert_eq!(before.edit(8, 0, &words(&[192])), MapEdit::Hold);
+        assert_eq!(before.edit(9, 0, &words(&[192])), MapEdit::Pass);
+        assert_eq!(before.edit(7, 2, &words(&[1800, 1125])), MapEdit::Drop);
+        note_request(&mut ids, 6, 3, &words(&[14, 12, 411, 953]));
+        note_request(&mut ids, 5, 1, &words(&[77, 0, 0]));
+        assert_eq!(
+            note_request(&mut ids, 5, WL_SURFACE_COMMIT, &[]),
+            Some(Event::Mapped)
+        );
+        note_request(&mut ids, 6, 3, &words(&[14, 12, 300, 400]));
+        assert_eq!(
+            (ids.at_map.first(), ids.at_map.last()),
+            (Some((411, 953)), Some((300, 400)))
+        );
+        let after = MapView::of(&ids);
+        assert_eq!(after.edit(8, 0, &words(&[192])), MapEdit::Pass);
+        // activated (4), then maximized 1 and tiled 5..8: 6 states, 24 bytes; 20 + 24 = 44 bytes in the header
+        let want = words(&[7, 44 << 16, 411, 953, 24, 4, 1, 5, 6, 7, 8]);
+        assert_eq!(after.edit(7, 0, &configure), MapEdit::Replace(want));
     }
 
     /// A message cut off mid-body is not consumed: the prefix ends at the last complete message.

@@ -21,7 +21,7 @@ use atl_libgui_parcel::state::FloatRect;
 use atl_platform_ui::audio::AudioHost;
 use atl_platform_ui::{
     DisplayInvoker, FrameClock, LooperPoster, PhysSize, PlatformAudioHost, PlatformUi,
-    PlatformWindow, Scene, Ui, UiError, Window, WindowAttributes, abi,
+    PlatformWindow, Scale, Scene, Ui, UiError, Window, WindowAttributes, abi,
 };
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -172,6 +172,7 @@ fn paint_window(ui: &Arc<PlatformUi>, timeout: Duration) -> Result<u64> {
                 title: "atl ui-module fixture".into(),
                 app_id: None,
                 size: PhysSize { width, height },
+                scale: Scale::ONE,
             },
         )?);
         // the colour the harness may look for in a capture; any opaque colour shows a paint

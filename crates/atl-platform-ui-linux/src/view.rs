@@ -48,11 +48,6 @@ pub fn output_scale(surface: Option<f64>, monitor: Option<f64>, widget: f64) -> 
     }
 }
 
-/// The desktop's first monitor: the output a window is measured on before its surface is on one.
-fn first_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
-    display.monitors().item(0)?.downcast().ok()
-}
-
 mod imp {
     use super::*;
 
@@ -62,8 +57,10 @@ mod imp {
         pub pieces: RefCell<Vec<Piece>>,
         /// The sideband widgets of the presented scene (children of this view) and where each lands, physical pixels.
         pub placed: RefCell<Vec<(gtk4::Widget, FloatRect)>>,
-        /// The natural size in physical pixels (what the window asked for), 0 x 0 until set; `measure` converts it at the current scale. The minimum is always 0, so the user can shrink the window.
-        pub wanted: Cell<atl_platform_ui_api::PhysSize>,
+        /// The natural size in logical pixels (what the window asked for, converted once), 0 x 0 until set. The minimum is always 0, so the user can shrink the window.
+        pub wanted: Cell<(i32, i32)>,
+        /// The scale the opening size is expressed in, until the opening is granted ([`super::SceneView::grant_opening`]).
+        pub opening: Cell<Option<atl_platform_ui_api::Scale>>,
         /// The last allocation reported to `on_allocate`, logical pixels: the same size is not reported twice.
         pub allocated: Cell<(i32, i32)>,
         /// Receives the content's size in physical pixels when a layout gives it a new one ([`super::SceneView::connect_allocation`]).
@@ -100,13 +97,11 @@ mod imp {
 
     impl WidgetImpl for SceneView {
         fn measure(&self, orientation: gtk4::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
-            let wanted = self.wanted.get();
-            let physical = match orientation {
-                gtk4::Orientation::Horizontal => wanted.width,
-                _ => wanted.height,
+            let (width, height) = self.wanted.get();
+            let natural = match orientation {
+                gtk4::Orientation::Horizontal => width,
+                _ => height,
             };
-            // derived at each layout, never stored: the scale is not final until the surface has its fractional scale (GTK's integer scale_factor before it: 2 on a 1.6 output)
-            let natural = logical_px(self.obj().scale(), physical);
             (0, natural, -1, -1)
         }
 
@@ -313,31 +308,56 @@ impl SceneView {
         *self.imp().on_allocate.borrow_mut() = Some(Box::new(on_allocate));
     }
 
-    /// Sets the natural size, in physical pixels, and asks for a new layout.
+    /// Sets the natural size, in physical pixels at the view's scale now ([`SceneView::scale`]), and asks for a new layout.
     pub fn set_wanted(&self, size: atl_platform_ui_api::PhysSize) {
-        self.imp().wanted.set(size);
+        let scale = self.scale();
+        self.imp().wanted.set((
+            logical_px(scale, size.width),
+            logical_px(scale, size.height),
+        ));
         self.queue_resize();
     }
 
-    /// The natural size last set by [`SceneView::set_wanted`], in physical pixels: the scale-free value the window's logical size is derived from.
-    pub fn wanted(&self) -> atl_platform_ui_api::PhysSize {
+    /// The natural size last set by [`SceneView::set_wanted`], in logical pixels.
+    pub fn wanted(&self) -> (i32, i32) {
         self.imp().wanted.get()
     }
 
-    /// The surface's scale changed: lay out again, so the natural size follows it and the next allocation is reported in the new physical pixels even at the same logical size.
+    /// Until [`SceneView::grant_opening`] the view is at `scale`, whatever the output's: the scale the opening size was computed at. An output's own cannot be known before the first commit (a compositor may send the preferred fractional scale only once the window is mapped, and GDK guesses an integer until then), and on some compositors the first commit's size is final.
+    pub fn open_at(&self, scale: atl_platform_ui_api::Scale) {
+        self.imp().opening.set(Some(scale));
+    }
+
+    /// The scale of an opening not yet granted.
+    pub fn opening(&self) -> Option<atl_platform_ui_api::Scale> {
+        self.imp().opening.get()
+    }
+
+    /// The opening size is granted: from here the view is at its output's scale, and a content whose scale differs from the opening one is reported in its own physical pixels. False: it was granted before.
+    pub fn grant_opening(&self) -> bool {
+        let Some(opening) = self.imp().opening.take() else {
+            return false;
+        };
+        if self.scale() != opening {
+            self.rescale();
+        }
+        true
+    }
+
+    /// The surface's scale changed: lay out again, so the next allocation is reported in the new physical pixels even at the same logical size.
     pub fn rescale(&self) {
         self.imp().allocated.set((0, 0));
         self.queue_resize();
     }
 
-    /// Physical pixels per logical pixel on the output the window is on ([`output_scale`]).
+    /// Physical pixels per logical pixel: the opening's until it is granted, then the output's the window is on ([`output_scale`]).
     pub fn scale(&self) -> atl_platform_ui_api::Scale {
+        if let Some(opening) = self.opening() {
+            return opening;
+        }
         let surface = self.native().and_then(|n| n.surface());
         let display = self.display();
-        let monitor = surface
-            .as_ref()
-            .and_then(|s| display.monitor_at_surface(s))
-            .or_else(|| first_monitor(&display));
+        let monitor = surface.as_ref().and_then(|s| display.monitor_at_surface(s));
         let scale = output_scale(
             surface.as_ref().map(|s| s.scale()),
             monitor.as_ref().map(|m| m.scale()),
@@ -363,22 +383,15 @@ mod tests {
         assert_eq!(logical_px(Scale::ONE, 320), 320);
     }
 
-    /// Derived by hand: the laptop's Task is 1125 x 1350 px (AOSP at 2880 x 1800 px, density 1.6). At 1.6 the content is 703 x 844 (1125 / 1.6 = 703.125, 1350 / 1.6 = 843.75). At GDK's
-    /// integer 2 it is 563 x 675 (562.5 -> 563, 675): the size the floating window kept.
     #[test]
-    fn first_commit_is_measured_at_the_output_scale() {
-        let scale = Scale::new(output_scale(Some(2.0), Some(1.6), 2.0)).unwrap();
-        assert_eq!(
-            (logical_px(scale, 1125), logical_px(scale, 1350)),
-            (703, 844)
-        );
+    fn a_fractional_surface_scale_wins_over_the_monitor() {
+        assert_eq!(output_scale(Some(2.0), Some(1.6), 2.0), 1.6);
         // a fractional surface scale is final even against another monitor's scale
         assert_eq!(output_scale(Some(1.6), Some(2.0), 2.0), 1.6);
         // an integer surface scale on an integer output is that scale
         assert_eq!(output_scale(Some(2.0), Some(2.0), 1.0), 2.0);
         assert_eq!(output_scale(Some(2.0), None, 1.0), 2.0);
-        // before the surface is on an output: the first monitor; with neither, the widget's
-        assert_eq!(output_scale(None, Some(1.6), 1.0), 1.6);
+        // with neither, the widget's
         assert_eq!(output_scale(None, None, 2.0), 2.0);
     }
 }

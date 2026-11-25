@@ -185,6 +185,8 @@ pub struct WindowAttributes {
     pub app_id: Option<String>,
     /// Content size requested; the compositor may grant another.
     pub size: PhysSize,
+    /// The scale `size` is expressed in: the window opens at `size` / `scale` logical pixels whatever scale its output turns out to have.
+    pub scale: Scale,
 }
 
 /// A toplevel window whose content is the compositor's [`Scene`]. The window chrome is the toolkit's; `size` always means the content area inside it.

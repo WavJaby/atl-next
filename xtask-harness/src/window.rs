@@ -43,6 +43,7 @@ mod gles1;
 mod gles2;
 mod ime;
 mod move_output;
+mod opening;
 mod slow_display;
 mod splash;
 mod surface_view;
@@ -174,7 +175,7 @@ pub struct Args {
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
-    /// Stage move only: the display declared in dp (atld `--declare-display`, display_model.rs `Declaration`), the apps see this size on each output's density; adds the `declared` sub-gate.
+    /// Stages move and opening: the display declared in dp (atld `--declare-display`, display_model.rs `Declaration`), the apps see this size on each output's density; adds the `declared` sub-gate.
     #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
     declare_display: Option<Declaration>,
     /// Stage move, undeclared only: the window is resized (a configure) before the move and must keep that dp size on the second output.
@@ -251,6 +252,8 @@ enum Stage {
     StartFinish,
     /// Two outputs, the second at scale 1.6: the first goes off, the window moves, and Android's density follows (xtask-harness/src/window/move_output.rs).
     Move,
+    /// One output at scale 1.6 and a compositor that never resizes a floating window after its map, as Hyprland: the window's first commit must be its Task's dp size (xtask-harness/src/window/opening.rs).
+    Opening,
     /// UI mode at scale 1.6: software SurfaceViews below and above a software window; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/surface_view.rs).
     SurfaceView,
     /// UI mode: a WebView (the provider placed, FEATURE_WEBVIEW's test file) with a native View over it; the readback against the picture worked out from the fixture's spec (xtask-harness/src/window/webview.rs; webview plan W3a).
@@ -308,6 +311,7 @@ impl Stage {
             Stage::Declared => "declared",
             Stage::StartFinish => "start-finish",
             Stage::Move => "move",
+            Stage::Opening => "opening",
             Stage::SurfaceView => "surface-view",
             Stage::WebView => "webview",
             Stage::WebViewOverlay => "webview-overlay",
@@ -345,6 +349,7 @@ impl Stage {
             | Stage::Orientation
             | Stage::AppId
             | Stage::Title
+            | Stage::Opening
             | Stage::Splash => GTK_WINDOW_MS,
             Stage::Dialog => DIALOG_WINDOW_MS,
             Stage::SlowDisplay => slow_display::WINDOW_MS,
@@ -601,6 +606,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move
+        | Stage::Opening
         | Stage::UiBlock
         | Stage::SlowDisplay
         | Stage::Suspended
@@ -2465,6 +2471,9 @@ pub fn work_key(args: &Args) -> String {
             .expect("every tap origin has a CLI name");
         key = format!("{key}-{}", tap.get_name());
     }
+    if let Some(declared) = args.declare_display {
+        key = format!("{key}-{}", declared.to_arg());
+    }
     if args.hold.is_some() {
         key.push_str("-hold");
     }
@@ -2494,8 +2503,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     if args.hold.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Widgets | Stage::Resize) {
         anyhow::bail!("--hold needs a UI stage (gtk, widgets or resize)");
     }
-    if args.output.is_some() && !matches!(args.stage, Stage::Gtk | Stage::Portrait | Stage::AppId) {
-        anyhow::bail!("--output needs stage gtk, portrait or app-id");
+    if args.output.is_some()
+        && !matches!(
+            args.stage,
+            Stage::Gtk | Stage::Portrait | Stage::AppId | Stage::Opening
+        )
+    {
+        anyhow::bail!("--output needs stage gtk, portrait, app-id or opening");
     }
     let work = rt.out.join(&key);
     let mut proxy = None;
@@ -2519,6 +2533,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Declared
         | Stage::StartFinish
         | Stage::Move
+        | Stage::Opening
         | Stage::SurfaceView
         | Stage::WebView
         | Stage::WebViewOverlay
@@ -2534,10 +2549,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             if args.hold.is_some() {
                 rt.with_ui("gtk")
             } else {
-                let gate = args.output.map_or(GATE_OUTPUT, |(width, height)| Output {
+                let base = match args.stage {
+                    Stage::Opening => opening::OUTPUT,
+                    _ => GATE_OUTPUT,
+                };
+                let gate = args.output.map_or(base, |(width, height)| Output {
                     width,
                     height,
-                    ..GATE_OUTPUT
+                    ..base
                 });
                 let outputs: &[Output] = match args.stage {
                     Stage::Widgets | Stage::Ime | Stage::MouseTouch => &[widgets::OUTPUT],
@@ -2554,6 +2573,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                 if matches!(args.stage, Stage::Move) {
                     // before atld starts: its app processes' contexts see Hyprland's policy (move_output.rs)
                     p.withhold_in_contexts(&move_output::WITHHELD);
+                }
+                if matches!(args.stage, Stage::Opening) {
+                    opening::setup(&p);
                 }
                 if matches!(args.stage, Stage::Tiled) {
                     // before atld starts: the window's first configure is the tile's
@@ -2625,8 +2647,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = rt.with_monitor(display.to_arg());
     // the declared display is the move stage's: the break runs without it, so the run is judged against the declaration it did not get
     ensure!(
-        args.declare_display.is_none() || matches!(args.stage, Stage::Move),
-        "--declare-display is for stage move only"
+        args.declare_display.is_none() || matches!(args.stage, Stage::Move | Stage::Opening),
+        "--declare-display is for stages move and opening only"
     );
     ensure!(
         !args.user_resize || matches!(args.stage, Stage::Move),
@@ -2922,6 +2944,8 @@ struct LiveOut {
     commits: Option<Vec<u64>>,
     /// The compositor configures the proxy tiled (wayland_proxy `Tile`); 0 unless the stage tiles (tiled).
     tiled: u64,
+    /// The window's map as the proxy recorded it (stage opening); None: no proxy, or a remote run.
+    opened: Option<opening::Record>,
 }
 
 /// The live half of a window stage, next to atld and the compositor: the probe thread drives the client through the proxy, the poll loop watches the marker's window, the app's end and [`LIMIT`], then
@@ -2967,6 +2991,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
     // the host's own vsync marking, counted by the proxy: the vsync-tier check's independent side
     let presented = proxy.as_ref().map(Proxy::presented);
     let tile = proxy.as_ref().map(Proxy::tiled);
+    let opened = proxy.as_ref().map(opening::Record::of);
     let throttle = proxy.as_ref().map(Proxy::throttle);
     let commits = proxy.as_ref().map(Proxy::commits);
     let probe = proxy.map(|p| {
@@ -3038,6 +3063,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
             (Stage::Title, _, _) => drive_title(p, &log, &titles_seen),
             (Stage::AuxProcess, _, _) => aux_process::drive(p, &log),
             (Stage::Splash, _, _) => splash::drive(p, &log),
+            (Stage::Opening, _, _) => opening::drive(p, &log),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs, user_resize),
             _ => drive(p, &log),
@@ -3140,6 +3166,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
         throttle: throttle.map_or((0, 0), |t| t.counts()),
         commits: commits.map(|c| c.times_ns()),
         tiled: tile.map_or(0, |t| t.rewritten()),
+        opened,
     })
 }
 
@@ -3184,6 +3211,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         throttle,
         commits,
         tiled,
+        opened,
     } = out;
     // the probe's miss is judged once, by `settle` below; the checks read its text
     let probe_miss = liveness.as_ref().err().cloned();
@@ -3294,6 +3322,10 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 args.user_resize,
             ),
             None => vec![("outputs", Err("no nested compositor".to_owned()))],
+        },
+        (Stage::Opening, Some(_)) => match &opened {
+            Some(record) => opening::checks(&app, &services, display, args.declare_display, record),
+            None => vec![("policy", Err("no proxy".to_owned()))],
         },
         (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
             let want = match args.stage {
@@ -3954,6 +3986,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         commits: None,
         // the tiled stage is local: a target's own compositor sizes its window
         tiled: 0,
+        opened: None,
     };
     judge(
         &Judged {
