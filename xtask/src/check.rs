@@ -14,9 +14,9 @@ use crate::timing::{self, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
-    aosp, app_ops_table, arches, converter, cts_table, deps, gtk_baseline, libcxx_gate, licenses,
-    modules, out, packages, patch, providers, prune, service_mirrors, sources, spdx, test_apks,
-    workspace,
+    aosp, app_ops_table, arches, build_state, converter, cts_table, deps, gtk_baseline,
+    libcxx_gate, licenses, modules, out, packages, patch, providers, prune, service_mirrors,
+    sources, spdx, test_apks, workspace,
 };
 use atl_layout::Layout;
 
@@ -174,6 +174,14 @@ impl Step {
             Step::Tables | Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
             _ => Class::Light,
         })
+    }
+
+    /// Reads the build dir through `build_state::ensure_current` once it runs (skip first): refused at entry under `--only` when stale. LauncherClosure's guard sits behind its built-launcher check, so it is not listed.
+    fn reads_build_dir(self) -> bool {
+        matches!(
+            self,
+            Step::ConverterPackages | Step::GlProxies | Step::DriveTap | Step::Gates
+        )
     }
 
     /// Why the step has nothing to check here, when its input is absent: printed and counted, not a failure.
@@ -422,6 +430,32 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .filter(|s| args.only.is_empty() || args.only.contains(s))
         .collect();
     let out = out::out_dir(root, args.out.as_deref())?;
+    // refused before step 1, with the text the late guard prints (build_state): a full run needs every gate's goals (land's build stage), --only only the guards its steps reach
+    let refusal = if args.only.is_empty() {
+        build_state::build_dir_staleness(root, args.out.as_deref())?
+    } else if steps
+        .iter()
+        .any(|s| s.reads_build_dir() && s.skip(&out).is_none())
+    {
+        build_state::ensure_current(root, &out)
+            .err()
+            .map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        println!(
+            "{}",
+            Verdict {
+                cmd: "check",
+                total: None,
+                skipped: Vec::new(),
+                failures: vec![Failure::gate(&why)],
+            }
+            .line()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
     let ws = Layout::of(root)?.workspace().to_owned();
     let mut skipped = Vec::new();
     // gates that could not judge on this host: named on the verdict line, neither pass nor fail (verdict.rs Outcome::Undecided)

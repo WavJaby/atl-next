@@ -213,6 +213,15 @@ pub fn gate_out(root: &Path, explicit: Option<&Path>, host: &str, gate: &str) ->
     Ok(out)
 }
 
+/// None when the build dir (`explicit`, else the checkout's) was built from `root` as it is now with every gate's goals for the build machine's host, else why not (gate_out's refusal). Land's `--build-dir` reports it; `check` refuses a full run on it before step 1.
+pub fn build_dir_staleness(root: &Path, explicit: Option<&Path>) -> Result<Option<String>> {
+    let arches = crate::arches::load(root)?;
+    let host = crate::arches::build_machine(root, &arches)?.0;
+    Ok(gate_out(root, explicit, host, crate::gate_goals::ALL)
+        .err()
+        .map(|e| format!("{e:#}")))
+}
+
 /// The record keys gate `gate` needs in guest `isa`'s foreign graph: its declared nb goals as `nb:<isa>:<module>`. The one list both [`foreign_out`] checks and `native --native-bridge <isa> --for <gate>` builds.
 pub fn foreign_goals(root: &Path, gate: &str, isa: &str) -> Result<BTreeSet<String>> {
     Ok(crate::gate_goals::of(root, gate)?

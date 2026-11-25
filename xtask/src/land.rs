@@ -191,7 +191,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         if let Some(code) = crate::delta::enter(root, None, None)? {
             return Ok(code);
         }
-        match build_dir_staleness(root)? {
+        match crate::build_state::build_dir_staleness(root, None)? {
             None => println!("{BUILD_DIR_CURRENT}"),
             Some(why) => println!("{BUILD_DIR_STALE}{why}"),
         }
@@ -968,17 +968,6 @@ fn parse_facts(stdout: &str) -> BranchFacts {
 const BUILD_DIR_CURRENT: &str = "land-build-dir: current";
 const BUILD_DIR_STALE: &str = "land-build-dir: stale ";
 
-/// None when the build dir of the checkout at `root` was built from it as it is now with every gate's goals for the build machine's host, else why not (build_state::gate_out's refusal).
-fn build_dir_staleness(root: &Path) -> Result<Option<String>> {
-    let arches = crate::arches::load(root)?;
-    let host = crate::arches::build_machine(root, &arches)?.0;
-    Ok(
-        crate::build_state::gate_out(root, None, host, crate::gate_goals::ALL)
-            .err()
-            .map(|e| format!("{e:#}")),
-    )
-}
-
 /// `cargo xtask land <branch> --build-dir` in the worktree, run by the branch's xtask: the build dir record and the goal tables are the branch's.
 fn build_dir_child(wt: &Path, branch: &str) -> Result<Option<String>> {
     let mut cmd = crate::cargo_command();
@@ -1666,7 +1655,7 @@ mod tests {
     #[test]
     fn a_build_dir_without_a_record_is_stale() {
         let env = Env::new("norecord");
-        let why = build_dir_staleness(&env.wt)
+        let why = crate::build_state::build_dir_staleness(&env.wt, None)
             .unwrap()
             .expect("no record must be stale");
         assert!(why.contains("no record"), "{why}");
