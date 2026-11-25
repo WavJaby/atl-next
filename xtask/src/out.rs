@@ -92,7 +92,7 @@ pub enum Out {
     },
     /// Publishes this checkout's `<arch>/` subtree (a cross host's outputs, `native::host_out`) as arch part `pool/part/<arch>/<HEAD>/<arch>` (dry run unless --execute).
     ///
-    /// Refused, each by name, unless: `<arch>` is a cross `[host]` row; HEAD is a base; `git status --porcelain` is empty; no task copy is bound; the arch dir's `built-from` is this source state; the dir's lower is base/HEAD. Before publishing, the arch dir's units no recorded build used for the land window are pruned (in the namespace for a ram dir).
+    /// Refused, each by name, unless: `<arch>` is a cross `[host]` row; HEAD is a base; `git status --porcelain` is empty; no task copy is bound; the arch dir's `built-from` is this source state; the dir's lower is a `pool/base` commit that is an ancestor of HEAD and holds no `<arch>/` entry. Before publishing, the arch dir's units no recorded build used for the land window are pruned (in the namespace for a ram dir).
     Part {
         /// The cross host: a `[host]` row other than the build machine.
         #[arg(long)]
@@ -1250,11 +1250,13 @@ struct PartFacts {
     no_task_copies: bool,
     /// The arch subtree's `built-from` is this source state (`build_state::ensure_matches`).
     built_from: Result<()>,
-    /// The dir's lower is base/HEAD: a ram dir's record `base`, a pool dir's `.base`.
-    lower_is_head: bool,
+    /// The dir's lower (a ram dir's record `base`, a pool dir's `.base`) is a `pool/base` commit and an ancestor of HEAD (`is_lower_ancestor`).
+    lower_ancestor: bool,
+    /// The lower holds no `<arch>/` entry (`base_has_arch`): the part is the arch's own outputs, not the base's.
+    lower_arch_free: bool,
 }
 
-/// Refuses on the first false fact. The stamps of the part are the base's relation to HEAD, so a lower other than HEAD's base is refused.
+/// Refuses on the first false fact. The part is keyed by HEAD; its lower may be any ancestor base that holds no `<arch>/` entry.
 fn part_judge(f: &PartFacts) -> Result<()> {
     ensure!(
         f.cross,
@@ -1276,10 +1278,25 @@ fn part_judge(f: &PartFacts) -> Result<()> {
         bail!("refused: the arch's built-from is not this source state: {e:#}");
     }
     ensure!(
-        f.lower_is_head,
-        "refused: the dir's lower is not base/HEAD (ram: record base; pool: .base)"
+        f.lower_ancestor,
+        "refused: the dir's lower is not a pool/base commit that is an ancestor of HEAD (ram: record base; pool: .base)"
+    );
+    ensure!(
+        f.lower_arch_free,
+        "refused: the lower base holds an <arch>/ entry: the part would not be the arch's own outputs"
     );
     Ok(())
+}
+
+/// The dir's lower is a `pool/base` commit and an ancestor of HEAD (`part`'s `lower_ancestor` fact; the HEAD commit itself passes).
+fn is_lower_ancestor(root: &Path, ws: &Path, lower: &str, head: &str) -> Result<bool> {
+    Ok(bases(ws)?.iter().any(|b| b == lower)
+        && git(Some(root), &["merge-base", "--is-ancestor", lower, head]).is_ok())
+}
+
+/// The base `lower` holds an `<arch>/` entry in any form, a dangling link included (`exists` would miss it); `part`'s `lower_arch_free` is its negation.
+fn base_has_arch(ws: &Path, lower: &str, arch: &str) -> bool {
+    std::fs::symlink_metadata(base_of(ws, lower).join(arch)).is_ok()
 }
 
 /// The pool's free bytes after a publish's writes must stay at or above the floor (`disk.pool_min_free`, GiB). A reflink writes metadata only (`writes` 0); a ram upper's copies write their bytes.
@@ -1335,16 +1352,20 @@ fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
         src.display()
     );
     let state = crate::build_state::of_build(root)?;
+    let lower_base = match &rec {
+        Some(r) => r.base.clone(),
+        None => std::fs::read_to_string(dir.join(BASE_FILE))
+            .map(|b| b.trim().to_owned())
+            .unwrap_or_default(),
+    };
     let facts = PartFacts {
         cross: crate::native::cross_host_of(root, &dir.join(arch))?.as_deref() == Some(arch),
         head_base: bases(ws)?.contains(&head),
         clean: git(Some(root), &["status", "--porcelain"])?.is_empty(),
         no_task_copies: crate::tree::overlays_of(root)?.is_empty(),
         built_from: crate::build_state::ensure_matches(&state, &src),
-        lower_is_head: match &rec {
-            Some(r) => r.base == head,
-            None => std::fs::read_to_string(dir.join(BASE_FILE)).is_ok_and(|b| b.trim() == head),
-        },
+        lower_ancestor: is_lower_ancestor(root, ws, &lower_base, &head)?,
+        lower_arch_free: !base_has_arch(ws, &lower_base, arch),
     };
     part_judge(&facts)?;
     let mut prune = crate::cargo_command();
@@ -1388,7 +1409,7 @@ fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
     let parent = dst.parent().context("part has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let _bases = crate::delta::bases_lock(ws)?;
-    let stamp = format!("commit={head}\narch={arch}\nbase={head}\n");
+    let stamp = format!("commit={head}\narch={arch}\nbase={lower_base}\n");
     let finish = |tmp: &Path| {
         std::fs::write(tmp.join(PART_FILE), &stamp)
             .with_context(|| format!("writing {}", tmp.join(PART_FILE).display()))
@@ -2375,7 +2396,8 @@ mod tests {
             clean: true,
             no_task_copies: true,
             built_from: Ok(()),
-            lower_is_head: true,
+            lower_ancestor: true,
+            lower_arch_free: true,
         }
     }
 
@@ -2383,7 +2405,7 @@ mod tests {
     #[test]
     fn part_refuses_each_fact_by_name() {
         assert!(part_judge(&all_true()).is_ok());
-        let cases: [(PartFacts, &str); 6] = [
+        let cases: [(PartFacts, &str); 7] = [
             (
                 PartFacts {
                     cross: false,
@@ -2421,10 +2443,17 @@ mod tests {
             ),
             (
                 PartFacts {
-                    lower_is_head: false,
+                    lower_ancestor: false,
                     ..all_true()
                 },
-                "lower is not base/HEAD",
+                "ancestor of HEAD",
+            ),
+            (
+                PartFacts {
+                    lower_arch_free: false,
+                    ..all_true()
+                },
+                "<arch>/ entry",
             ),
         ];
         // every case reported, so a red run names each check it lost
@@ -2436,6 +2465,92 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "not refused by name: {missed:#?}");
+    }
+
+    /// Gate: a lower that is a `pool/base` commit and an ancestor of HEAD passes; HEAD itself (the old rule's case) too. Break: `is_lower_ancestor` refuses every lower -> red.
+    #[test]
+    fn lower_that_is_an_ancestor_base_passes() {
+        let ws = scratch("lower-ancestor");
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let g = |args: &[&str]| git(Some(&repo), args).expect("git");
+        let commit = |msg: &str| {
+            g(&["add", "-A"]);
+            g(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ]);
+            g(&["rev-parse", "HEAD"])
+        };
+        g(&["init", "-q", "-b", "main"]);
+        put(&repo.join("f"));
+        let base = commit("a");
+        put(&repo.join("g"));
+        let head = commit("b");
+        for c in [&base, &head] {
+            std::fs::create_dir_all(base_of(&ws, c)).expect("base");
+        }
+        assert!(is_lower_ancestor(&repo, &ws, &base, &head).expect("judge"));
+        assert!(is_lower_ancestor(&repo, &ws, &head, &head).expect("judge"));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate: a `pool/base` commit off HEAD's history (a side branch) is refused. Break: `is_lower_ancestor` without the ancestry test passes it -> red.
+    #[test]
+    fn lower_on_a_side_branch_is_refused() {
+        let ws = scratch("lower-side");
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let g = |args: &[&str]| git(Some(&repo), args).expect("git");
+        let commit = |msg: &str| {
+            g(&["add", "-A"]);
+            g(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ]);
+            g(&["rev-parse", "HEAD"])
+        };
+        g(&["init", "-q", "-b", "main"]);
+        put(&repo.join("f"));
+        commit("a");
+        g(&["checkout", "-q", "-b", "side"]);
+        put(&repo.join("s"));
+        let side = commit("side");
+        g(&["checkout", "-q", "main"]);
+        put(&repo.join("g"));
+        let head = commit("b");
+        for c in [&side, &head] {
+            std::fs::create_dir_all(base_of(&ws, c)).expect("base");
+        }
+        assert!(!is_lower_ancestor(&repo, &ws, &side, &head).expect("judge"));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate: a `pool/base` holding an `<arch>/` entry is refused (a dir; a dangling link too); an arch-free base and another arch's dir are not. Break: `base_has_arch` answers false -> red.
+    #[test]
+    fn base_with_an_arch_entry_is_refused() {
+        let ws = scratch("base-arch");
+        let base = base_of(&ws, "c1");
+        std::fs::create_dir_all(base.join("x86_64")).expect("other arch");
+        assert!(!base_has_arch(&ws, "c1", "riscv64"));
+        put(&base.join("riscv64").join("out"));
+        assert!(base_has_arch(&ws, "c1", "riscv64"));
+        assert!(!base_has_arch(&ws, "c1", "arm64"));
+        std::os::unix::fs::symlink("/nonexistent", base.join("arm64")).expect("link");
+        assert!(base_has_arch(&ws, "c1", "arm64"));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     /// Gate: the pool keeps its floor after the writes; exactly at the floor passes. Break: no check passes a short pool -> red.
