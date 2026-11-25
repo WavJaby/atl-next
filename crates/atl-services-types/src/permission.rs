@@ -104,20 +104,39 @@ impl Definition {
 /// The permission registry by name.
 pub type Registry = std::collections::BTreeMap<String, Definition>;
 
+/// The definition `owner` gives at protection `level` (base and flags split).
+fn definition(owner: &str, level: u32) -> Definition {
+    Definition {
+        owner: owner.to_owned(),
+        base: level & PROTECTION_MASK_BASE,
+        flags: level & !PROTECTION_MASK_BASE,
+    }
+}
+
 /// One definition into `registry`: the first definer wins (PMS keeps the first, so a later one, or a non-system redefinition, is ignored). True when `name` is newly defined.
 pub fn define(registry: &mut Registry, owner: &str, name: &str, level: u32) -> bool {
     if registry.contains_key(name) {
         return false;
     }
-    registry.insert(
-        name.to_owned(),
-        Definition {
-            owner: owner.to_owned(),
-            base: level & PROTECTION_MASK_BASE,
-            flags: level & !PROTECTION_MASK_BASE,
-        },
-    );
+    registry.insert(name.to_owned(), definition(owner, level));
     true
+}
+
+/// `owner`'s own definition again, on an update (addPermissions, same owner: AppIdPermissionPolicy.kt :482-551): a changed level replaces the entry and returns the old definition.
+/// Another owner's entry is kept (first definer wins, see [`define`]).
+pub fn redefine(
+    registry: &mut Registry,
+    owner: &str,
+    name: &str,
+    level: u32,
+) -> Option<Definition> {
+    let next = definition(owner, level);
+    let old = registry
+        .get(name)
+        .filter(|d| d.owner == owner && **d != next)?
+        .clone();
+    registry.insert(name.to_owned(), next);
+    Some(old)
 }
 
 /// The permission registry: `definitions` = the platform's (framework-res) then each installed package's, as (defining package, name, protectionLevel); the first definition wins.

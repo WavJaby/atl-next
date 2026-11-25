@@ -277,6 +277,7 @@ impl Installer {
                 ),
             ));
         }
+        // Gap (PM 2026-11-26): a rotated key is refused; AOSP takes it by its signing lineage (SigningDetails.checkCapability :625), not modelled. Counted under UPDATE_INCOMPATIBLE.
         if !same_signers(
             old.info.signing_info.as_ref(),
             parsed.info.signing_info.as_ref(),

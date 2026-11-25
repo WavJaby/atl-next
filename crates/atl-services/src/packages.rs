@@ -564,8 +564,10 @@ impl Permissions {
     }
 
     /// The install-order step of a batch: `names` are the batch's packages, already in `next`; one lock for the whole step.
-    /// (1) their definitions, first definer wins; (2) each one's initial states into its app id, pooled as [`Permissions::new`] pools them.
-    /// (3) each newly defined permission that a package outside the batch requests gets its initial state there, except a NORMAL one for a non-system package: AOSP marks it INSTALL_REVOKED.
+    /// (1) their definitions (addPermissions :442-598, trimPermissions :600): a new name is defined, first definer wins; a batch member's own changed definition replaces the old one;
+    /// a definition no longer declared, or one that becomes runtime, drops every app id's state of it. (2) each one's initial states into its app id, pooled as [`Permissions::new`] pools
+    /// them; a kept request keeps its state (grant and flags). (3) per batch app id: trimPermissionStates (:682), and a REVIEW_REQUIRED grant is not kept by a targetSdk >= M update (:1103).
+    /// (4) each permission the batch defined or changed that a package outside the batch requests gets its initial state there, except a NORMAL one for a non-system package: AOSP marks it INSTALL_REVOKED.
     /// One batch of every package equals `new` over `next` (boot's start-with-all).
     pub fn packages_added(&self, next: &Packages, names: &[String]) {
         let mut table = self.table();
@@ -576,11 +578,32 @@ impl Permissions {
             .partition(|p| names.iter().any(|n| n == p.name()));
         let mut defined = BTreeSet::new();
         for &p in &batch {
+            // trimPermissions (:600): this package's definitions it no longer declares go, and with them every app id's state of them
+            let declared: BTreeSet<&str> = p
+                .permission_decls()
+                .filter_map(|d| d.item.name.as_deref())
+                .collect();
+            let gone: Vec<String> = registry
+                .iter()
+                .filter(|(name, d)| d.owner == p.name() && !declared.contains(name.as_str()))
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in &gone {
+                registry.remove(name);
+                drop_states(states, name);
+            }
             for d in p.permission_decls() {
                 let Some(name) = d.item.name.as_deref() else {
                     continue;
                 };
-                if permission::define(registry, p.name(), name, d.protection_level as u32) {
+                let level = d.protection_level as u32;
+                if permission::define(registry, p.name(), name, level) {
+                    defined.insert(name);
+                } else if let Some(old) = permission::redefine(registry, p.name(), name, level) {
+                    // addPermissions :520-551: a definition that becomes runtime drops every app id's state of it (the requesters are re-evaluated below)
+                    if !old.is_runtime() && registry.get(name).is_some_and(|def| def.is_runtime()) {
+                        drop_states(states, name);
+                    }
                     defined.insert(name);
                 }
             }
@@ -594,6 +617,35 @@ impl Permissions {
                 registry,
             ) {
                 uid_states.entry(s.name.clone()).or_insert(s);
+            }
+        }
+        // trimPermissionStates (:682): a state of a permission no package of the app id requests goes. evaluatePermissionState's modern branch (:1103-1110): a REVIEW_REQUIRED grant
+        // (API view of LEGACY_GRANTED + IMPLICIT) is not kept when every requester is targetSdk >= M; a plain legacy grant (the app's own permission) is kept
+        let batch_ids: BTreeSet<u32> = batch.iter().map(|p| permission::app_id(p.uid)).collect();
+        for app_id in batch_ids {
+            let members: Vec<&PackageRecord> = next.by_app_id(app_id).collect();
+            let Some(uid_states) = states.get_mut(&app_id) else {
+                continue;
+            };
+            let requested =
+                |p: &PackageRecord, name: &str| p.requested_permissions().any(|r| r == name);
+            uid_states.retain(|name, _| members.iter().any(|p| requested(p, name.as_str())));
+            for s in uid_states.values_mut() {
+                let modern = members
+                    .iter()
+                    .filter(|p| requested(p, s.name.as_str()))
+                    .all(|p| {
+                        p.app().target_sdk_version >= permission::TARGET_SDK_RUNTIME_PERMISSIONS
+                    });
+                if s.runtime
+                    && s.granted
+                    && (s.flags & permission::FLAG_PERMISSION_REVIEW_REQUIRED) != 0
+                    && modern
+                {
+                    s.granted = false;
+                    s.flags &= !(permission::FLAG_PERMISSION_REVIEW_REQUIRED
+                        | permission::FLAG_PERMISSION_REVOKED_COMPAT);
+                }
             }
         }
         for p in others {
@@ -717,6 +769,13 @@ impl Permissions {
     /// `permission::holds` of one permission against `uid`'s grants; a null permission is not held.
     pub fn check(&self, uid: u32, p: Option<&str>) -> bool {
         p.is_some_and(|p| self.holds(uid, &[p], false))
+    }
+}
+
+/// `name`'s state at every app id: setPermissionFlags(appId, userId, name, 0) for each app id (AppIdPermissionPolicy.kt :511-515, :548, :655-660).
+fn drop_states(states: &mut BTreeMap<u32, BTreeMap<String, PermissionState>>, name: &str) {
+    for uid_states in states.values_mut() {
+        uid_states.remove(name);
     }
 }
 
@@ -1376,6 +1435,130 @@ mod tests {
         assert_eq!(view(&table, 1000, "org.m"), (true, 0, None));
         assert_eq!(view(&table, 10_001, "org.m"), (false, 0, None));
         assert_eq!(view(&table, 10_002, "org.d"), (false, 0, Some(false)));
+    }
+
+    /// An update keeps the runtime grants its requests still have (a kept request keeps its state, flags included). A guard: it passes before the change; a rebuild of the states from
+    /// initial_states fails it.
+    #[test]
+    fn an_update_keeps_runtime_grants() {
+        let v1 = pkg("org.a", 10_001, 30, false, &[("org.d", 1)], &["org.d"]);
+        let v2 = pkg("org.a", 10_001, 30, false, &[("org.d", 1)], &["org.d"]);
+        let p = Permissions::new(
+            &Packages::new(vec![v1.clone()], BTreeMap::new()),
+            &platform_decls(),
+        );
+        p.grant_runtime(&v1, "org.d").expect("requested");
+        p.packages_added(
+            &Packages::new(vec![v2], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_001, "org.d"), (true, 0, Some(true)));
+    }
+
+    /// An update that stops requesting a runtime permission drops its state at the app id (trimPermissionStates, AOSP AppIdPermissionPolicy.kt :682): the grant goes with it.
+    #[test]
+    fn a_dropped_request_loses_its_grant() {
+        let v1 = pkg(
+            "org.a",
+            10_001,
+            30,
+            false,
+            &[("org.d", 1)],
+            &["org.d", "org.p0"],
+        );
+        let v2 = pkg("org.a", 10_001, 30, false, &[("org.d", 1)], &["org.p0"]);
+        let p = Permissions::new(
+            &Packages::new(vec![v1.clone()], BTreeMap::new()),
+            &platform_decls(),
+        );
+        p.grant_runtime(&v1, "org.d").expect("requested");
+        p.packages_added(
+            &Packages::new(vec![v2], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_001, "org.d"), (false, 0, None));
+        assert_eq!(view(&p, 10_001, "org.p0"), (true, 0, None));
+    }
+
+    /// A package that stops declaring its permission takes its state from every app id (trimPermissions :600-662): another app's grant of it goes too.
+    #[test]
+    fn a_removed_definition_drops_every_state() {
+        let a1 = pkg("org.a", 10_001, 30, false, &[("org.d", 1)], &["org.d"]);
+        let b = pkg("org.b", 10_002, 30, false, &[], &["org.d"]);
+        let a2 = pkg("org.a", 10_001, 30, false, &[], &[]);
+        let p = Permissions::new(
+            &Packages::new(vec![a1.clone(), b.clone()], BTreeMap::new()),
+            &platform_decls(),
+        );
+        p.grant_runtime(&a1, "org.d").expect("requested");
+        p.grant_runtime(&b, "org.d").expect("requested");
+        p.packages_added(
+            &Packages::new(vec![a2, b], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_001, "org.d"), (false, 0, None));
+        assert_eq!(view(&p, 10_002, "org.d"), (false, 0, None));
+        assert!(!p.is_runtime_or_app_op("org.d"));
+    }
+
+    /// A definition that becomes runtime drops every app id's state of it (addPermissions :520-551); its requesters then hold the state of a new runtime permission: not granted.
+    #[test]
+    fn a_definition_that_becomes_dangerous_drops_every_state() {
+        let a1 = pkg("org.a", 10_001, 30, false, &[("org.n", 0)], &["org.n"]);
+        let b = pkg("org.b", 10_002, 30, false, &[], &["org.n"]);
+        let a2 = pkg("org.a", 10_001, 30, false, &[("org.n", 1)], &["org.n"]);
+        let p = Permissions::new(
+            &Packages::new(vec![a1, b.clone()], BTreeMap::new()),
+            &platform_decls(),
+        );
+        assert_eq!(view(&p, 10_002, "org.n"), (true, 0, None));
+        p.packages_added(
+            &Packages::new(vec![a2, b], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_001, "org.n"), (false, 0, Some(false)));
+        assert_eq!(view(&p, 10_002, "org.n"), (false, 0, Some(false)));
+    }
+
+    /// A legacy app's runtime grant of a platform permission carries REVIEW_REQUIRED (AOSP's LEGACY_GRANTED + IMPLICIT, API view). A targetSdk >= M update does not keep that grant
+    /// (evaluatePermissionState :1103-1110); a grant of the app's own permission (no flags) is kept.
+    #[test]
+    fn a_review_required_grant_does_not_carry_into_a_modern_update() {
+        let platform = [
+            PermissionDecl {
+                name: "org.p0".into(),
+                protection_level: 0,
+            },
+            PermissionDecl {
+                name: "org.pd".into(),
+                protection_level: 1,
+            },
+        ];
+        let v1 = pkg(
+            "org.a",
+            10_001,
+            22,
+            false,
+            &[("org.d", 1)],
+            &["org.pd", "org.d"],
+        );
+        let v2 = pkg(
+            "org.a",
+            10_001,
+            36,
+            false,
+            &[("org.d", 1)],
+            &["org.pd", "org.d"],
+        );
+        let p = Permissions::new(&Packages::new(vec![v1], BTreeMap::new()), &platform);
+        assert_eq!(view(&p, 10_001, "org.pd"), (true, 0x48, Some(true)));
+        assert_eq!(view(&p, 10_001, "org.d"), (true, 0, Some(true)));
+        p.packages_added(
+            &Packages::new(vec![v2], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_001, "org.pd"), (false, 0, Some(false)));
+        assert_eq!(view(&p, 10_001, "org.d"), (true, 0, Some(true)));
     }
 
     /// targetSdk >= M: the runtime permission starts denied and grantRuntimePermission grants it; the install permission is granted and not changeable; grantRuntimePermissionInternal's refusals
