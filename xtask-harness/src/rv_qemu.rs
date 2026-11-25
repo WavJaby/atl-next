@@ -10,10 +10,11 @@
 //! 2. zlib (testdata/rv-qemu/zlib_tier.c, `<out>/device/libz`): adler32 against RFC 1950's definition and a compress/uncompress round trip; the tier zlib took (its own AT_HWCAP probe) equals the probe's, and QEMU's translation log holds V instructions exactly when V=1 (adler32_simd.c is the only V code in the process: isa-tiers.toml).
 //! 3. unwind (testdata/rv-qemu/unwind_vlenb.cpp, `<out>/device/libunwindstack`): an unwind from a signal's ucontext, as ART's fatal-signal dump starts one, stores the probed vlenb (0 without V: libunwindstack patch 0002) and reaches `main`.
 //! 4. units: the lib unit tests of [`UNIT_CRATES`] cross-built for the host's Rust target (`cross::cargo_target`) and run under the model.
+//! 5. engine: the translator's code generator for this host (testdata/rv-qemu/tcg_neon.c, an arm64 guest program, under the host's `qemu-aarch64`: the PIC build whose objects the engine `.so` links): NEON results equal scalar ones. QEMU takes its vector path only where V is probed, so the V models are the ones that exercise it; the log control is check 2's (V instructions exactly with V).
 //!
 //! `--break baseline`: QEMU's default `rv64` replaces the derived baseline; check 1 must turn red (extensions past the row).
-//! Needs: `cargo xtask native --host riscv64 --for rv-qemu`; the `qemu-user` deps row; the host row's sysroot and compilers.
-//! Default: mutating (builds the fixtures into `<out>/rv-qemu`, links the runtime libraries there, cross-builds the unit tests into the checkout's target dir).
+//! Needs: `cargo xtask native --host riscv64 --for rv-qemu`; the `qemu-user` deps row; the host row's sysroot and compilers; the NDK.
+//! Default: mutating (builds the fixtures into `<out>/rv-qemu`, links the runtime libraries there, cross-builds the unit tests into the checkout's target dir, builds the host's `qemu-aarch64` into `<out>/qemu`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,8 @@ use std::process::{Command, ExitCode, Output};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::{arches, cross, deps, verdict};
+use crate::ndk::NdkTarget;
+use crate::{arches, cross, deps, qemu, verdict};
 
 const CMD: &str = "rv-qemu";
 const FIXTURES: &str = "xtask-harness/testdata/rv-qemu";
@@ -32,6 +34,8 @@ const QEMU_ROW: &str = "qemu-user";
 const V_MODELS: [&str; 2] = ["rva23u64,vlen=128", "rva23u64,vlen=256"];
 /// Crates holding `target_arch = "riscv64"` code whose lib unit tests run in one user process. Not atl-broker: its seccomp and namespace tests need the kernel (qemu-user answers seccomp with ENOSYS) and its closure test reads the loader at the build machine's /lib.
 const UNIT_CRATES: [&str; 2] = ["atl-property-service", "atl-native-bridge"];
+/// The guest of check 5: the translated ISA whose engine the riscv64 gates run.
+const GUEST: &str = "arm64";
 /// SIGILL: how a core without V answers the probe's vsetvli.
 const SIGILL: i32 = 4;
 
@@ -150,6 +154,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
     )?;
     let units = unit_tests(root, &args.host)?;
+    let engine = qemu::plan_on(root, GUEST, Some(&args.host), args.out.as_deref(), true)?;
+    let engine = qemu::execute(root, &engine)?;
+    let ndk = crate::ndk::default_ndk(root)?;
+    let neon = NdkTarget::new(root, &ndk, GUEST, qemu::GUEST_API)?
+        .static_exe(&[&fx.join("tcg_neon.c")], &work.join("tcg_neon"))?;
 
     let baseline_cpu = match args.r#break.as_deref() {
         Some("baseline") => "rv64".to_owned(),
@@ -202,6 +211,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             tiers.push((model.baseline, p.v));
             check("zlib", run.zlib(model, &zlib, &work, p.v)?);
             check("unwind", run.unwind(model, &unwind, p.vlenb)?);
+            check("engine", run.engine(model, &engine, &neon, &work, p.v)?);
         }
         for (name, exe) in &units {
             check(&format!("units {name}"), run.units(model, exe)?);
@@ -476,6 +486,22 @@ impl Runner {
         Ok(unwind_result(&output, vlenb.unwrap_or(0)))
     }
 
+    fn engine(
+        &self,
+        model: &Model,
+        engine: &Path,
+        guest: &Path,
+        work: &Path,
+        v: bool,
+    ) -> Result<Result<String, String>> {
+        let log = work.join(format!("engine-{}.asm", model.cpu.replace([',', '='], "-")));
+        let mut cmd = self.command(model, Some(&log));
+        cmd.arg(engine).arg(guest);
+        let output = self.output(cmd, "the engine check")?;
+        let asm = std::fs::read_to_string(&log).unwrap_or_default();
+        Ok(engine_result(&output, &asm, v))
+    }
+
     fn units(&self, model: &Model, exe: &Path) -> Result<Result<String, String>> {
         let mut cmd = self.command(model, None);
         cmd.arg(exe).arg("-q");
@@ -576,6 +602,33 @@ fn zlib_result(output: &Output, asm: &str, v: bool) -> Result<String, String> {
                 .filter(|l| l.ends_with(" ok"))
                 .collect::<Vec<_>>()
                 .join(", ")
+        )),
+    }
+}
+
+/// Check 5: every fixture line `ok`, and the engine's generated code holds V instructions exactly when V=1 (`in_asm` logs the blocks the outer QEMU translates, the inner one's generated code among them).
+fn engine_result(output: &Output, asm: &str, v: bool) -> Result<String, String> {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (ok, bad): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.ends_with(" ok"));
+    if !output.status.success() || !bad.is_empty() || ok.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} of {} checks ok; {} ({}) {}",
+            ok.len(),
+            ok.len() + bad.len(),
+            bad.join(", "),
+            output.status,
+            stderr.lines().last().unwrap_or_default()
+        ));
+    }
+    match (v, v_instructions(asm)) {
+        (true, 0) => {
+            Err("V probed, but no V instruction ran: the vector path was not taken".to_owned())
+        }
+        (false, n) if n > 0 => Err(format!("no V, yet {n} V instructions translated")),
+        (_, n) => Ok(format!(
+            "{} checks ok, {n} V instructions translated",
+            ok.len()
         )),
     }
 }
@@ -690,6 +743,37 @@ mod tests {
                 .contains("no V instruction")
         );
         assert!(zlib_result(&ok, asm, false).is_err());
+    }
+
+    #[test]
+    fn engine_needs_every_check_and_v_code_exactly_with_v() {
+        let exit = |code: i32| ExitStatus::from_raw(code << 8);
+        let asm = "0x10:  0c0072d7          vsetvli                 t0,zero,e8,m1,ta,ma
+";
+        let good = out(
+            "orr.8h ok
+strrchr ok
+",
+            exit(0),
+        );
+        assert!(engine_result(&good, asm, true).is_ok());
+        assert!(engine_result(&good, "", false).is_ok());
+        assert!(engine_result(&good, "", true).is_err());
+        assert!(engine_result(&good, asm, false).is_err());
+        // the unpatched backend on a core with V
+        let wrong = out(
+            "orr.8h wrong
+strrchr ok
+",
+            exit(1),
+        );
+        assert!(
+            engine_result(&wrong, asm, true)
+                .unwrap_err()
+                .contains("orr.8h wrong")
+        );
+        // died before its first line
+        assert!(engine_result(&out("", exit(0)), asm, true).is_err());
     }
 
     #[test]

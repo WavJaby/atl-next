@@ -321,7 +321,7 @@ enum Test {
     /// A starved wait (burners at CPUWeight 10000) must be `undecided`; a silent, asleep, crashed, wrong, self-starved or late worker must FAIL with its own cause; equal-weight load inside the bound must pass.
     /// `--break burner-start` (burners refused) must turn the gate red. Needs a user systemd that makes scopes with CPUWeight (`systemd-run --user --scope`), and `taskset`.
     HostLoad(host_load::Args),
-    /// The riscv64 host's CPU-side checks under qemu-user, once per CPU model: the host row's derived baseline and V models (default RVA23U64 at VLEN 128 and 256). Per model: AT_HWCAP/hwprobe probe with a V instruction (SIGILL without V), libz's V tier against an independent adler32, libunwindstack's vlenb in a ucontext unwind, the riscv64 unit tests. One verdict line per model, then the gate's. `--break baseline` must turn it red. Needs `native --host riscv64 --for rv-qemu` and the `qemu-user` deps row.
+    /// The riscv64 host's CPU-side checks under qemu-user, once per CPU model: the host row's derived baseline and V models (default RVA23U64 at VLEN 128 and 256). Per model: AT_HWCAP/hwprobe probe with a V instruction (SIGILL without V), libz's V tier against an independent adler32, libunwindstack's vlenb in a ucontext unwind, the riscv64 unit tests, the translator's generated code (an arm64 NEON program under the host's qemu-aarch64). One verdict line per model, then the gate's. `--break baseline` must turn it red. Needs `native --host riscv64 --for rv-qemu` and the `qemu-user` deps row.
     RvQemu(rv_qemu::Args),
 }
 

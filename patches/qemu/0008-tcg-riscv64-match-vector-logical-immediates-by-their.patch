@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 25 Nov 2026 22:02:33 +0800
+Subject: [PATCH] tcg/riscv64: match vector logical immediates by their
+ replication
+
+tcg_gen_{and,or,xor}_vec emit their opcode with vece 0 whatever the
+element size, so tcg_target_const_match tested only the top byte of
+the constant: 0x0001 per halfword matched as 0 and was emitted as a
+5-bit immediate under whatever SEW was current. Guest vectors came
+out wrong on every host with V (aarch64 ORR/BIC immediate, USHL,
+[US]RSHR, SLI/SRI by a multiple of 8, and the guest libc's strrchr).
+
+Take a constant only if it is replicated by the opcode's vece, and
+set SEW to that vece for a logical operation with an immediate.
+
+Upstream-Status: Pending
+Patch-Reason: the wrong code is emitted by QEMU's own backend on hosts with V; no launcher, loader or environment can change it short of hiding V from the engine.
+---
+SPDX-License-Identifier: MIT
+ tcg/riscv64/tcg-target.c.inc | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/tcg/riscv64/tcg-target.c.inc b/tcg/riscv64/tcg-target.c.inc
+index 9e9c1e9622dbec492e80912e8d177f95ea4c6f74..05546497ff7a56bd1407dd7e3a7427c5fbf0aae4 100644
+--- a/tcg/riscv64/tcg-target.c.inc
++++ b/tcg/riscv64/tcg-target.c.inc
+@@ -385,7 +385,14 @@ static bool tcg_target_const_match(int64_t val, int ct,
+         return 1;
+     }
+     if (type >= TCG_TYPE_V64) {
+-        /* Val is replicated by VECE; extract the highest element. */
++        /*
++         * The logical opcodes carry VECE == MO_8 whatever the element size
++         * of the operation, so VAL need not be replicated by VECE.
++         */
++        if (val != dup_const(vece, val)) {
++            return 0;
++        }
++        /* Extract the highest element. */
+         val >>= (-8 << vece) & 63;
+     }
+     /*
+@@ -747,6 +754,17 @@ static void set_vtype_len_sew(TCGContext *s, TCGType type, MemOp vsew)
+     }
+ }
+ 
++/* Logical operations depend on the element size only via an immediate. */
++static void set_vtype_logical(TCGContext *s, TCGType type, MemOp vsew,
++                              bool imm)
++{
++    if (imm) {
++        set_vtype_len_sew(s, type, vsew);
++    } else {
++        set_vtype_len(s, type);
++    }
++}
++
+ /*
+  * TCG intrinsics
+  */
+@@ -2686,15 +2704,15 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
+         }
+         break;
+     case INDEX_op_and_vec:
+-        set_vtype_len(s, type);
++        set_vtype_logical(s, type, vece, c2);
+         tcg_out_opc_vv_vi(s, OPC_VAND_VV, OPC_VAND_VI, a0, a1, a2, c2);
+         break;
+     case INDEX_op_or_vec:
+-        set_vtype_len(s, type);
++        set_vtype_logical(s, type, vece, c2);
+         tcg_out_opc_vv_vi(s, OPC_VOR_VV, OPC_VOR_VI, a0, a1, a2, c2);
+         break;
+     case INDEX_op_xor_vec:
+-        set_vtype_len(s, type);
++        set_vtype_logical(s, type, vece, c2);
+         tcg_out_opc_vv_vi(s, OPC_VXOR_VV, OPC_VXOR_VI, a0, a1, a2, c2);
+         break;
+     case INDEX_op_not_vec:
