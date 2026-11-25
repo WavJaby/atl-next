@@ -17,15 +17,15 @@ use crate::qemu_linker;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
-const PACKAGE: &str = "atl-native-bridge";
-const TEST: &str = "sles_bridge";
+pub(crate) const PACKAGE: &str = "atl-native-bridge";
+pub(crate) const TEST: &str = "sles_bridge";
 pub(crate) const RECORDER: &str = "sles_recorder";
 const TESTDATA: &str = "xtask-harness/testdata/sles-bridge";
 /// The prefix of the test's check lines (`sles-bridge: (<c>) ok`).
 const PREFIX: &str = "sles-bridge";
 const CHECKS: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 /// (break, the check it must turn red): opensl-es plan O1 break column.
-const BREAKS: [(&str, char); 3] = [
+pub(crate) const BREAKS: [(&str, char); 3] = [
     ("sles_raw_sink", 'c'),
     ("sles_no_dedup", 'e'),
     ("sles_var_skip", 'f'),
@@ -118,20 +118,21 @@ fn one(
     brk: Option<(&str, char)>,
     name: &str,
 ) -> Result<()> {
+    // the test executable of this run's break (gate_build.rs `test_bin`, built by check's prebuild), run from the package dir as `cargo test` ran it
+    let exe = crate::gate_build::test_bin(root, PACKAGE, TEST, brk.map(|(b, _)| b))?;
     let mut cmd = Command::new("timeout");
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())
         .args(wrap)
-        .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["test", "--locked", "-p", PACKAGE, "--test", TEST])
+        .arg(exe)
         .envs(env.iter().map(|(k, v)| (*k, v)))
-        .current_dir(root);
+        .current_dir(root.join("crates").join(PACKAGE));
     match brk {
         Some((b, _)) => cmd.env("ATL_NB_BREAK", b),
         None => cmd.env_remove("ATL_NB_BREAK"),
     };
-    let run =
-        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
+    let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
+        .context("running the sles-bridge test")?;
     let log = dir.join(format!("{name}.log"));
     std::fs::write(
         &log,

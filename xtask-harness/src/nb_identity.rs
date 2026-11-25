@@ -17,9 +17,9 @@ use crate::out;
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{Failure, Verdict};
 
-const PACKAGE: &str = "atl-native-bridge";
+pub(crate) const PACKAGE: &str = "atl-native-bridge";
 /// The identity gates: harness-less test targets of [`PACKAGE`], no feature.
-const GATES: [&str; 5] = ["g1", "g2", "g3", "g4", "g5"];
+pub(crate) const GATES: [&str; 5] = ["g1", "g2", "g3", "g4", "g5"];
 /// The arches.toml row whose NB build and guest libraries this runs (the identity guest is the host arch).
 pub(crate) const ARCH: &str = "x86_64";
 
@@ -86,14 +86,14 @@ pub(crate) fn identity_env(
     ])
 }
 
-/// One gate: its cargo test under `env`, log to `dir/<gate>.log`; a nonzero exit fails it.
+/// One gate: its test executable (gate_build.rs `test_bin`, built by check's prebuild) run under `env` from the package dir, as `cargo test` runs it; log to `dir/<gate>.log`; a nonzero exit fails it.
 fn gate_run(root: &Path, dir: &Path, env: &[(&'static str, OsString)], gate: &str) -> Result<()> {
-    let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args(["test", "--locked", "-p", PACKAGE, "--test", gate])
-        .envs(env.iter().map(|(k, v)| (*k, v)))
-        .current_dir(root);
+    let exe = crate::gate_build::test_bin(root, PACKAGE, gate, None)?;
+    let mut cmd = Command::new(exe);
+    cmd.envs(env.iter().map(|(k, v)| (*k, v)))
+        .current_dir(root.join("crates").join(PACKAGE));
     let run =
-        unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
+        unit_use::run(&mut cmd, Units::Plain, Echo::Nothing).context("running the gate's test")?;
     let log = dir.join(format!("{gate}.log"));
     std::fs::write(
         &log,

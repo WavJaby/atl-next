@@ -546,7 +546,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     } else {
         &[]
     };
-    let built = build_client_with(root, "gate", breaks)?;
+    // a plain client is the prebuild's (gate_build.rs `client`); a break build is by hand only
+    let built = if breaks.is_empty() {
+        crate::gate_build::client(root)?
+    } else {
+        build_client_with(root, "gate", breaks)?
+    };
     let out_dir = match &args.keep {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;

@@ -139,12 +139,14 @@ pub fn java_tools(root: &Path, java_out: &Path) -> Result<(PathBuf, PathBuf)> {
 
 impl HostArt {
     /// Stages the converter's ART of build dir `out` into `<out>/<stage>` and checks every input exists; `java_out` = the Java pipeline build dir (default: this checkout's build dir, see `xtask out`).
+    /// `property_service` = the built atl-property-service (`build_property_service`, or the gate build record); HostArt builds nothing itself.
     pub fn new(
         root: &Path,
         host: &str,
         java_out: Option<&Path>,
         out: &Path,
         stage: &str,
+        property_service: &Path,
         verbose: bool,
     ) -> Result<Self> {
         let arches = arches::load(root)?;
@@ -163,9 +165,7 @@ impl HostArt {
             art,
             lib_path,
             launcher: packages::bin(root, out, LAUNCHER, LAUNCHER)?,
-            property_service: crate::timing::phase("host art: property service", || {
-                build_property_service(root, &out.join("cargo"))
-            })?,
+            property_service: property_service.to_owned(),
             build_prop: out.join(BUILD_PROP),
             boot: boot_jars(&java_out)?,
             javac_boot: javac_boot(&java_out),

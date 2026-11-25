@@ -1070,12 +1070,14 @@ pub fn install_fixture(
     manifest_text: &str,
 ) -> Result<PathBuf> {
     let java_out = out::out_dir(root, None)?;
+    let property_service = crate::gate_build::property_service(root, out)?;
     let host = HostArt::new(
         root,
         host_arch,
         Some(&java_out),
         out,
         "installer-art",
+        &property_service,
         false,
     )?;
     let tools = ApkTools::new(root, host_arch, out, &java_out)?;
@@ -1123,12 +1125,14 @@ fn build_probe(root: &Path, out: &Path) -> Result<PathBuf> {
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, CMD)?;
     let java_out = out::out_dir(root, args.java_out.as_deref())?;
+    let property_service = crate::gate_build::property_service(root, &out)?;
     let host = HostArt::new(
         root,
         &args.host,
         Some(&java_out),
         &out,
         "installer-art",
+        &property_service,
         args.verbose,
     )?;
     let tools = ApkTools::new(root, &args.host, &out, &java_out)?;

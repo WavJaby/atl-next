@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Instant;
@@ -463,19 +463,28 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     let logs = out.join("check-gates");
     std::fs::create_dir_all(&logs).with_context(|| logs.display().to_string())?;
     let out_arg = out.to_str().context("build dir path is not UTF-8")?;
-    // every cargo product a row runs, built and staged once before any row starts (gate_build.rs), under a cargo grant released before the rows take theirs; rows then find them current
-    let (products, waited, took) = {
+    // every cargo product a row runs, built once before any row starts (gate_build.rs `Group::ALL`), under a cargo grant released before the rows take theirs. The rows read them from the
+    // record (`test --prebuilt`) and run no cargo: the guard (`guard_dir`) refuses any cargo call they or their processes make
+    let (built, waited, took) = {
         let grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
         let started = Instant::now();
-        let files = gate_build::ensure(root, out, &Group::ALL)?.files();
-        (files, grant.waited, started.elapsed())
+        let built = gate_build::ensure(root, out, &Group::ALL)?;
+        (built, grant.waited, started.elapsed())
     };
+    let record_file = logs.join(RECORD_FILE);
+    built.record().write(&record_file)?;
+    let products = built.files();
     let snapshot = Snapshot::take(&products);
+    let guard = guard_dir(&logs)?;
+    let path_env = std::env::join_paths(std::iter::once(guard.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?;
     eprintln!(
-        "gates: prebuild {:.1}s (pool wait {:.1}s, {} products)",
+        "gates: prebuild {:.1}s (pool wait {:.1}s, {} products, {} record entries)",
         took.as_secs_f64(),
         waited.as_secs_f64(),
-        products.len()
+        products.len(),
+        built.record().entries()
     );
     let moved = Mutex::new(Moved::default());
     let run = red_logs::run_id();
@@ -489,6 +498,9 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         run: &run,
         host,
         out: out_arg,
+        record: &record_file,
+        guard: &guard,
+        path: &path_env,
     };
     // after a row's process ended: a product it (or a row beside it) re-linked or re-staged is named now, with this row
     let note_moved = |row: &Row| {
@@ -566,6 +578,16 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         eprintln!("{line}");
     }
     // a moved product fails the step as a red row does: a running row may have bound or mapped the file it replaced
+    // a cargo call that reached the guard fails the step, whichever row (or process of a row's tree) made it: the rows' own verdicts name the call too
+    let calls = std::fs::read_to_string(guard.join(REFUSED_LOG)).unwrap_or_default();
+    let calls: Vec<&str> = calls.lines().collect();
+    eprintln!("gates: cargo calls from the rows: {}", calls.len());
+    if let Some(first) = calls.first() {
+        failed.push(format!(
+            "{} cargo call(s) from the gate rows, first: {first}",
+            calls.len()
+        ));
+    }
     failed.extend(moved);
     if failed.is_empty() {
         return Ok(undecided);
@@ -733,6 +755,11 @@ struct RowRun<'a> {
     run: &'a str,
     host: &'a str,
     out: &'a str,
+    /// the record check's prebuild wrote (`test --prebuilt`)
+    record: &'a Path,
+    /// the guard dir (`guard_dir`): `CARGO` and the row's first PATH entry
+    guard: &'a Path,
+    path: &'a std::ffi::OsStr,
 }
 
 impl RowRun<'_> {
@@ -745,10 +772,15 @@ impl RowRun<'_> {
         let started = Instant::now();
         let mut cmd = Command::new(self.exe);
         xtask::grant_jobs(&mut cmd);
+        // the products are the prebuild's (`--prebuilt`); cargo is the guard's: a cargo call from the row or its tree is refused (refuse_cargo)
         let mut child = cmd
             .current_dir(self.root)
             .arg("test")
+            .arg("--prebuilt")
+            .arg(self.record)
             .args(&argv)
+            .env("CARGO", self.guard.join("cargo"))
+            .env("PATH", self.path)
             .stdout(file.try_clone()?)
             .stderr(file)
             .spawn()
@@ -771,7 +803,13 @@ impl RowRun<'_> {
             seen.stall_pct
                 .map_or("unknown".to_owned(), |p| format!("{p:.0}%")),
         );
-        let outcome = Outcome::of_exit(status.code());
+        // a refused cargo call fails the row whatever its exit status: the row ran cargo, which no row may
+        let refused = refused_calls(&text);
+        let outcome = if refused.is_empty() {
+            Outcome::of_exit(status.code())
+        } else {
+            Outcome::Fail
+        };
         // the undecided verdict's ruling, typed: the gate printed it as a `starvation-verdict:` line (harness `undecided_verdict`)
         let verdict = match outcome {
             Outcome::Undecided => undecided_verdict(&text)?,
@@ -783,6 +821,11 @@ impl RowRun<'_> {
             Outcome::Pass | Outcome::Fail => verdict_line(&text, row.cmd()),
         }
         .unwrap_or("no verdict line");
+        let shown = if refused.is_empty() {
+            shown.to_owned()
+        } else {
+            format!("ran cargo: {}", refused.join("; "))
+        };
         let kept = keep_unless_pass(self.task, self.run, row, &log, outcome);
         let at = kept.as_ref().unwrap_or(&log);
         let kept_note = kept
@@ -821,6 +864,63 @@ impl RowRun<'_> {
             waits: gate_need::wait_samples(&text),
         })
     }
+}
+
+/// The record check's prebuild writes (`out/check-gates/`), read by each row as `test --prebuilt`.
+pub const RECORD_FILE: &str = "build-record.tsv";
+/// The guard's log in its dir: one line per refused cargo call (`refuse_cargo`).
+pub const REFUSED_LOG: &str = "refused.tsv";
+/// Printed by the guard on the row's stderr (a row's log keeps it): `refused_calls` finds the row by it.
+const REFUSAL: &str = "gate-no-cargo: refused";
+
+/// check's guard, no cargo in a gate row: a dir with this harness binary as `cargo` (a hard link, else a copy), first on each row's PATH and set as its `CARGO`.
+/// Run under that name, the binary refuses the call (`refuse_cargo`). `refused.tsv` is emptied here.
+fn guard_dir(logs: &Path) -> Result<PathBuf> {
+    let dir = logs.join("guard");
+    std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+    let exe = std::env::current_exe().context("the harness's own path")?;
+    let link = dir.join("cargo");
+    let _ = std::fs::remove_file(&link);
+    if std::fs::hard_link(&exe, &link).is_err() {
+        std::fs::copy(&exe, &link)
+            .with_context(|| format!("copying {} to {}", exe.display(), link.display()))?;
+    }
+    let log = dir.join(REFUSED_LOG);
+    std::fs::write(&log, "").with_context(|| log.display().to_string())?;
+    Ok(dir)
+}
+
+/// The guard's behaviour when run as `cargo` (main.rs): the call is logged beside it and fails (exit 97) with a line the row's log keeps.
+pub fn refuse_cargo() -> ExitCode {
+    let call = format!(
+        "cargo {}",
+        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+    );
+    let log = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(REFUSED_LOG)))
+        .and_then(|log| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(log)
+                .ok()
+        });
+    if let Some(mut f) = log {
+        let _ = std::io::Write::write_all(&mut f, format!("{call}\n").as_bytes());
+    }
+    eprintln!(
+        "{REFUSAL} `{call}`: a gate row runs no cargo; its products come from check's prebuilt record"
+    );
+    ExitCode::from(97)
+}
+
+/// The refused calls a row's log holds (`refuse_cargo` lines).
+fn refused_calls(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.contains(REFUSAL))
+        .map(|l| l.trim().to_owned())
+        .collect()
 }
 
 /// A window row's phases (window.rs `PHASES_LINE`): the `key=value` fields for the gates line, and the word naming what ended its watch.

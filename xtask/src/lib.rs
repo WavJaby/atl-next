@@ -96,6 +96,7 @@ pub mod workspace;
 pub mod ws_config;
 
 pub mod cli;
+pub mod prebuilt;
 
 use std::path::{Path, PathBuf};
 

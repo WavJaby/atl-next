@@ -871,8 +871,17 @@ impl Runtime {
             (java_out, _) => out::out_dir(root, java_out)?,
         };
         let stage = format!("{key}-art");
+        let property_service = crate::gate_build::property_service(root, &out)?;
         let art = xtask::timing::phase("runtime: host art", || {
-            HostArt::new(root, host, Some(&java_out), &out, &stage, verbose)
+            HostArt::new(
+                root,
+                host,
+                Some(&java_out),
+                &out,
+                &stage,
+                &property_service,
+                verbose,
+            )
         })?;
         let servicemanager = out.join("device/servicemanager/servicemanager");
         ensure!(

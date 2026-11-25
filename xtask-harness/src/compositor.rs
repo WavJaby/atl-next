@@ -64,12 +64,14 @@ const CASES: [&str; 9] = [
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "compositor")?;
+    let property_service = crate::gate_build::property_service(root, &out)?;
     let art = HostArt::new(
         root,
         &args.host,
         args.java_out.as_deref(),
         &out,
         "compositor-art",
+        &property_service,
         args.verbose,
     )?;
     let lib = crate::packages::target_dir(&out)

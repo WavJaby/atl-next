@@ -692,6 +692,11 @@ impl<'a> Selection<'a> {
 
 /// Builds every package of `root` whose converter modules `out`'s graph.json holds (printing the others with the module they lack) and checks their executables; what was built.
 pub fn build(root: &Path, out: &Path) -> Result<Vec<Built>> {
+    // a gate row's converter products are the prebuild's (prebuilt.rs): a build here would be a cargo call inside a row
+    ensure!(
+        crate::prebuilt::installed().is_none(),
+        "converter build inside a gate row: check's prebuild builds it (gate_build.rs `Group::Converter`)"
+    );
     let packages = crate::timing::phase("packages::metadata", || workspace_packages(root))?;
     let sel = crate::timing::phase("packages::select", || Selection::new(root, out, &packages))?;
     for (p, m) in &sel.skipped {
@@ -765,6 +770,9 @@ pub fn check(root: &Path, out: &Path) -> Result<Vec<String>> {
 
 /// Executable `bin` of `package`, built as `build` builds it; fails when the graph lacks the package's modules.
 pub fn bin(root: &Path, out: &Path, package: &str, bin: &str) -> Result<PathBuf> {
+    if let Some(path) = crate::prebuilt::lookup(&format!("converter/{package}/{bin}"))? {
+        return Ok(path);
+    }
     crate::timing::phase("packages::bin", || build(root, out))?
         .into_iter()
         .find(|b| b.package == package)
@@ -789,6 +797,10 @@ pub fn build_with_breaks(
     package: &str,
     features: &[String],
 ) -> Result<PathBuf> {
+    ensure!(
+        crate::prebuilt::installed().is_none(),
+        "a faulted converter build inside a gate row: not in the prebuilt record"
+    );
     ensure!(
         !features.is_empty(),
         "a faulted build names its breaks: use `bin` for the shipped one"

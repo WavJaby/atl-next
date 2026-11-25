@@ -552,12 +552,14 @@ impl Env {
         let layout = Layout::of(root)?;
         let out =
             crate::build_state::gate_out(root, args.out.as_deref(), &args.host, "native-load")?;
+        let property_service = crate::gate_build::property_service(root, &out)?;
         let mut host = HostArt::new(
             root,
             &args.host,
             args.java_out.as_deref(),
             &out,
             "native-load-art",
+            &property_service,
             args.verbose,
         )?;
         if args.break_linear_tier {

@@ -51,8 +51,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         Some(o) => o.clone(),
         None => xtask::out::family_dir(root, xtask::out::FAMILIES[0])?,
     };
-    let driver = crate::cdylib::stage(root, &out, PACKAGE, "vk", DRIVER_FILE)?.join(DRIVER_FILE);
-    let probe = build_probe(root, &out.join("cargo"))?;
+    let (driver, probe) = crate::gate_build::vk(root, &out)?;
     let node = match &args.node {
         Some(n) => n.clone(),
         None => first_render_node()?,
@@ -165,6 +164,13 @@ fn control(name: &str, r: &Run, text: &str, mark: &str) -> Result<()> {
             bail!("vk-driver: FAILED control: break {name} passed")
         }
     }
+}
+
+/// The driver staged in `family`'s `vk/` and the probe built in `family/cargo`: (driver, probe). Called by gate_build.rs `vk` (the record's in a row).
+pub(crate) fn build(root: &Path, family: &Path) -> Result<(PathBuf, PathBuf)> {
+    let driver = crate::cdylib::stage(root, family, PACKAGE, "vk", DRIVER_FILE)?.join(DRIVER_FILE);
+    let probe = build_probe(root, &family.join("cargo"))?;
+    Ok((driver, probe))
 }
 
 fn build_probe(root: &Path, target: &Path) -> Result<PathBuf> {

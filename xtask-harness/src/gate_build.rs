@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure as check};
 
+use xtask::prebuilt::{self, Record};
+
 use crate::{cargo_command, cdylib, unit_use};
 
 /// The release binaries (`<out>/cargo/release/<name>`, package = bin name): the broker's helpers and atld (atld_run), binderd and the stub (binder.rs), the gates' probes.
@@ -74,26 +76,56 @@ fn staged() -> [(&'static str, &'static str, String); 7] {
 }
 
 /// One cargo invocation of [`ensure`]; groups use separate target roots or manifests, so building one never changes another's artifacts.
+/// check's prebuild runs [`Group::ALL`] once and writes the record; each gate row reads its products from that record (`test --prebuilt`) and runs no cargo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
-    /// [`BINS`] + the staged cdylibs, release, `<out>/cargo` (a cross host's out dir: that host's).
+    /// [`BINS`] + the staged cdylibs, release, `<out>/cargo` (a cross host's out dir: that host's). Key `release/dir`.
     Release,
-    /// The gl-dispatch probe: its own workspace (`gl_dispatch::PROBE`), release, `<out>/cargo`; build machine only.
+    /// The gl-dispatch probe: its own workspace (`gl_dispatch::PROBE`), release, `<out>/cargo`; build machine only. Key `gl-dispatch`.
     GlDispatch,
-    /// atl-native-bridge's `sles_recorder` example, debug, cargo's default target dir (`CARGO_TARGET_DIR`, else `<root>/target`), `ATL_NB_BREAK` unset; build machine only.
+    /// atl-native-bridge's `sles_recorder` example, debug, cargo's default target dir (`CARGO_TARGET_DIR`, else `<root>/target`), `ATL_NB_BREAK` unset; build machine only. Key `recorder`.
     Recorder,
+    /// The converter packages of the graph (`packages::build`: metadata, clippy, build, cdylib installs). Keys `converter/<package>/<file>`.
+    Converter,
+    /// atl-property-service, release, `<out>/cargo`. Key `property-service`.
+    PropertyService,
+    /// The identity gates' and sles-bridge's test executables, plain and per break (`test_key`).
+    Tests,
+    /// The vk-driver's cdylib (staged in its family dir) and probe (`vk/driver`, `vk/probe`).
+    Vk,
+    /// atl-platform-ui's plain `gate` client (`client/gate/exe`, `client/gate/module-dir`).
+    Client,
 }
 
 impl Group {
-    pub const ALL: [Group; 3] = [Group::Release, Group::GlDispatch, Group::Recorder];
+    pub const ALL: [Group; 8] = [
+        Group::Release,
+        Group::GlDispatch,
+        Group::Recorder,
+        Group::Converter,
+        Group::PropertyService,
+        Group::Tests,
+        Group::Vk,
+        Group::Client,
+    ];
+
+    /// The key a row checks is in the record when it asks for this group ([`ensure`]); None: read by its own lookup.
+    fn sentinel(self) -> Option<&'static str> {
+        match self {
+            Group::Release => Some("release/dir"),
+            Group::GlDispatch => Some("gl-dispatch"),
+            Group::Recorder => Some("recorder"),
+            Group::PropertyService => Some("property-service"),
+            Group::Converter | Group::Tests | Group::Vk | Group::Client => None,
+        }
+    }
 }
 
-/// Where [`ensure`] put the products of the groups it was asked for.
+/// Where [`ensure`] put the products of the groups it was asked for, and each product's key ([`Record`]: check writes it for the rows).
 pub struct Products {
     release: PathBuf,
     out: PathBuf,
-    gl_dispatch: Option<PathBuf>,
-    recorder: Option<PathBuf>,
+    record: Record,
 }
 
 impl Products {
@@ -108,27 +140,33 @@ impl Products {
         self.out.join(dir)
     }
 
+    fn key(&self, key: &str, group: &str) -> Result<&Path> {
+        self.record.get(key).with_context(|| {
+            format!("{key} not built: {group} (by hand), or check's prebuild (rows)")
+        })
+    }
+
     pub fn gl_dispatch(&self) -> Result<&Path> {
-        self.gl_dispatch
-            .as_deref()
-            .context("gl-dispatch probe not built: ensure(Group::GlDispatch)")
+        self.key("gl-dispatch", "ensure(Group::GlDispatch)")
     }
 
     pub fn recorder(&self) -> Result<&Path> {
-        self.recorder
-            .as_deref()
-            .context("sles recorder not built: ensure(Group::Recorder)")
+        self.key("recorder", "ensure(Group::Recorder)")
     }
 
-    /// Every file a group built or staged, cargo's outputs and the staged copies.
+    /// Every product's key and path, as built or read here.
+    pub fn record(&self) -> &Record {
+        &self.record
+    }
+
+    /// Every file a group built or staged: cargo's outputs, the staged copies and the record's files.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut f: Vec<PathBuf> = BINS.iter().map(|b| self.release.join(b)).collect();
         for (package, dir, name) in staged() {
             f.push(self.release.join(lib_file(package)));
             f.push(self.out.join(dir).join(name));
         }
-        f.extend(self.gl_dispatch.clone());
-        f.extend(self.recorder.clone());
+        f.extend(self.record.files());
         f.sort();
         f.dedup();
         f
@@ -150,28 +188,45 @@ fn packages(staged: &[(&'static str, &'static str, String)]) -> Vec<&'static str
     packages
 }
 
-/// Builds `groups` on build dir `out` and stages the cdylibs; a group already current costs one no-op cargo run and no copy.
+/// Builds `groups` on build dir `out` and stages the cdylibs; a group already current costs one no-op cargo run and no copy. Every product is recorded ([`Products::record`]).
+/// A process with an installed record (`test --prebuilt`, prebuilt.rs) builds nothing: the products are the record's, and a requested group the record lacks is an error.
 pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
+    if let Some(record) = prebuilt::installed() {
+        for key in groups.iter().filter_map(|g| g.sentinel()) {
+            check!(record.get(key).is_some(), "{}", prebuilt::missing(key));
+        }
+        return Ok(Products {
+            release: record
+                .get("release/dir")
+                .map(Path::to_owned)
+                .unwrap_or_default(),
+            out: out.to_owned(),
+            record: record.clone(),
+        });
+    }
     let staged = staged();
     let packages = packages(&staged);
     let (mut cmd, release) = cdylib::release_build(root, out, &packages)?;
-    let mut products = Products {
-        release,
-        out: out.to_owned(),
-        gl_dispatch: None,
-        recorder: None,
-    };
+    let mut record = Record::default();
+    if groups.contains(&Group::Converter) {
+        for built in xtask::packages::build(root, out)? {
+            for bin in &built.bins {
+                let file = bin
+                    .file_name()
+                    .context("a converter bin without a file name")?;
+                let key = format!("converter/{}/{}", built.package, file.to_string_lossy());
+                record.insert(key, bin);
+            }
+        }
+    }
     if groups.contains(&Group::Release) {
         xtask::timing::phase("gate build: release", || {
             unit_use::exec(cmd.arg("--locked"), "cargo build (gate products)")
         })?;
         for (package, dir, name) in &staged {
-            install(
-                &products.release.join(lib_file(package)),
-                &out.join(dir),
-                name,
-            )?;
+            install(&release.join(lib_file(package)), &out.join(dir), name)?;
         }
+        record.insert("release/dir", &release);
     }
     if groups.contains(&Group::GlDispatch) {
         let target = out.join("cargo");
@@ -184,7 +239,10 @@ pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
                 .arg(&target),
             "cargo build (gl-dispatch probe)",
         )?;
-        products.gl_dispatch = Some(built(target.join("release/gl-dispatch-probe"))?);
+        record.insert(
+            "gl-dispatch",
+            built(target.join("release/gl-dispatch-probe"))?,
+        );
     }
     if groups.contains(&Group::Recorder) {
         let example = crate::sles_bridge::RECORDER;
@@ -204,11 +262,135 @@ pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
         )?;
         let target =
             std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-        products.recorder = Some(built(
-            target.join(format!("debug/examples/lib{example}.so")),
-        )?);
+        record.insert(
+            "recorder",
+            built(target.join(format!("debug/examples/lib{example}.so")))?,
+        );
     }
-    Ok(products)
+    if groups.contains(&Group::PropertyService) {
+        let path = crate::host_art::build_property_service(root, &out.join("cargo"))?;
+        record.insert("property-service", path);
+    }
+    if groups.contains(&Group::Tests) {
+        for (package, test, brk) in test_builds() {
+            // cargo names a test executable by its metadata, not by the break cfg: a break build relinks the plain one's file, so each build is copied apart before the next
+            let exe = test_build(root, package, test, brk)?;
+            let name = match brk {
+                Some(b) => format!("{package}-{test}@{b}"),
+                None => format!("{package}-{test}"),
+            };
+            install(&exe, &out.join("test-bins"), &name)?;
+            record.insert(
+                test_key(package, test, brk),
+                out.join("test-bins").join(name),
+            );
+        }
+    }
+    if groups.contains(&Group::Vk) {
+        let family = xtask::out::family_dir(root, xtask::out::FAMILIES[0])?;
+        let (driver, probe) = vk(root, &family)?;
+        record.insert("vk/driver", driver);
+        record.insert("vk/probe", probe);
+    }
+    if groups.contains(&Group::Client) {
+        let client = client(root)?;
+        record.insert("client/gate/exe", client.exe);
+        record.insert("client/gate/module-dir", client.module_dir);
+    }
+    Ok(Products {
+        release,
+        out: out.to_owned(),
+        record,
+    })
+}
+
+/// atl-property-service's release binary in `out`: the record's in a row, else built here.
+pub fn property_service(root: &Path, out: &Path) -> Result<PathBuf> {
+    let products = ensure(root, out, &[Group::PropertyService])?;
+    Ok(products
+        .key("property-service", "ensure(Group::PropertyService)")?
+        .to_owned())
+}
+
+/// The test executable of `cargo test --locked -p <package> --test <test>` (`ATL_NB_BREAK=<brk>` when given): the record's in a row, else built.
+pub fn test_bin(root: &Path, package: &str, test: &str, brk: Option<&str>) -> Result<PathBuf> {
+    match prebuilt::lookup(&test_key(package, test, brk))? {
+        Some(path) => Ok(path),
+        None => test_build(root, package, test, brk),
+    }
+}
+
+fn test_key(package: &str, test: &str, brk: Option<&str>) -> String {
+    match brk {
+        Some(b) => format!("test/{package}/{test}@{b}"),
+        None => format!("test/{package}/{test}"),
+    }
+}
+
+/// What [`Group::Tests`] builds: nb-identity's gates and sles-bridge's test, plain; sles-bridge once more per break (a break changes the library's cfgs at build time: its own build).
+fn test_builds() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+    let mut all: Vec<(&'static str, &'static str, Option<&'static str>)> =
+        crate::nb_identity::GATES
+            .iter()
+            .map(|g| (crate::nb_identity::PACKAGE, *g, None))
+            .collect();
+    all.push((crate::sles_bridge::PACKAGE, crate::sles_bridge::TEST, None));
+    all.extend(crate::sles_bridge::BREAKS.iter().map(|(b, _)| {
+        (
+            crate::sles_bridge::PACKAGE,
+            crate::sles_bridge::TEST,
+            Some(*b),
+        )
+    }));
+    all
+}
+
+/// `cargo test --no-run --locked -p <package> --test <test>` (`ATL_NB_BREAK=<brk>` when given, else unset): the executable cargo built.
+fn test_build(root: &Path, package: &str, test: &str, brk: Option<&str>) -> Result<PathBuf> {
+    let mut cmd = cargo_command();
+    cmd.current_dir(root).args([
+        "test", "--no-run", "--locked", "-p", package, "--test", test,
+    ]);
+    match brk {
+        Some(b) => cmd.env("ATL_NB_BREAK", b),
+        None => cmd.env_remove("ATL_NB_BREAK"),
+    };
+    let run = unit_use::run(&mut cmd, unit_use::Units::Recorded, unit_use::Echo::Nothing)?;
+    check!(
+        run.status.success(),
+        "building the {test} test of {package} failed"
+    );
+    run.messages
+        .iter()
+        .filter(|m| {
+            m["reason"] == "compiler-artifact"
+                && m["profile"]["test"] == true
+                && m["target"]["name"] == test
+        })
+        .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .with_context(|| format!("cargo reported no {test} test executable"))
+}
+
+/// The vk-driver's cdylib (staged in `family`'s `vk/`) and probe (in `family/cargo`): the record's in a row, else built.
+pub fn vk(root: &Path, family: &Path) -> Result<(PathBuf, PathBuf)> {
+    match (
+        prebuilt::lookup("vk/driver")?,
+        prebuilt::lookup("vk/probe")?,
+    ) {
+        (Some(driver), Some(probe)) => Ok((driver, probe)),
+        _ => crate::vk_driver::build(root, family),
+    }
+}
+
+/// atl-platform-ui's plain `gate` client: the record's in a row, else built.
+pub fn client(root: &Path) -> Result<crate::platform_ui::Built> {
+    match (
+        prebuilt::lookup("client/gate/exe")?,
+        prebuilt::lookup("client/gate/module-dir")?,
+    ) {
+        (Some(exe), Some(module_dir)) => Ok(crate::platform_ui::Built { exe, module_dir }),
+        _ => crate::platform_ui::build_client(root, "gate"),
+    }
 }
 
 fn built(path: PathBuf) -> Result<PathBuf> {

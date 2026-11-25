@@ -367,12 +367,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         println!("parcel: pass probe (round trip, and the size check fires on a wrong size)");
     }
 
+    let property_service = crate::gate_build::property_service(root, &out)?;
     let art = HostArt::new(
         root,
         &args.host,
         args.java_out.as_deref(),
         &out,
         "parcel-art",
+        &property_service,
         args.verbose,
     )?;
     let lib = packages::target_dir(&out).join("release").join(TRUTH_LIB);

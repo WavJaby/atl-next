@@ -48,12 +48,14 @@ pub struct Args {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = crate::build_state::gate_out(root, args.out.as_deref(), &args.host, CMD)?;
+    let property_service = crate::gate_build::property_service(root, &out)?;
     let mut host = HostArt::new(
         root,
         &args.host,
         args.java_out.as_deref(),
         &out,
         "nb-isa-art",
+        &property_service,
         args.verbose,
     )?;
     let nb_dir = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?

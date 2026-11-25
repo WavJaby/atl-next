@@ -101,6 +101,9 @@ use xtask::{
 #[derive(Parser)]
 #[command(name = "xtask", bin_name = "xtask")]
 struct Cli {
+    /// check's prebuilt record (check_gates.rs): a `test` gate reads its products from it and runs no cargo (prebuilt.rs); without it (by hand) every product is built here.
+    #[arg(long, global = true, value_name = "RECORD")]
+    prebuilt: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -326,7 +329,22 @@ enum Test {
 }
 
 fn main() -> Result<ExitCode> {
+    // check's guard (check_gates.rs `guard_dir`): this binary run under the name `cargo` refuses the call
+    if std::env::args_os().next().is_some_and(|a| {
+        std::path::Path::new(&a)
+            .file_name()
+            .is_some_and(|n| n == "cargo")
+    }) {
+        return Ok(check_gates::refuse_cargo());
+    }
     let cli = Cli::parse();
+    if let Some(file) = &cli.prebuilt {
+        anyhow::ensure!(
+            matches!(cli.command, Command::Test { .. }),
+            "--prebuilt is for `test` gates"
+        );
+        xtask::prebuilt::install(file)?;
+    }
     // the target-side commands run from a bundle, where no checkout exists
     match &cli.command {
         Command::WindowLive(args) => return window::agent(args),
