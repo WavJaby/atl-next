@@ -7,6 +7,7 @@
 //! One user (0): a userId other than 0 is a user that does not exist. `sharedLibraryFiles` is always filled (ActivityManagerService's STOCK_PM_FLAGS asks for it on every app path).
 
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use crate::package_state::{
     COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED,
 };
 use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions};
+use crate::shell_command::run_package;
 use atl_services_types::packages::LibraryNode;
 use atl_services_types::permission;
 
@@ -598,7 +600,25 @@ impl PackageManager {
     }
 }
 
-impl Interface for PackageManager {}
+impl Interface for PackageManager {
+    /// `cmd package` through the shell-command hook (AOSP's binary as shell uid 2000): `list packages` from this table (shell_command.rs).
+    fn shell_command(
+        &self,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+        args: &[&CStr],
+    ) -> std::result::Result<i32, binder::StatusCode> {
+        let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+        let args: Vec<&str> = args.iter().map(|a| &**a).collect();
+        Ok(run_package(
+            &self.packages,
+            ThreadState::get_calling_uid(),
+            &args,
+            out,
+            err,
+        ))
+    }
+}
 
 impl IPackageManager for PackageManager {
     fn r#enforce_permission(

@@ -116,6 +116,8 @@ pub mod registry_service;
 #[cfg(feature = "converter")]
 pub mod sensor_wire;
 #[cfg(feature = "converter")]
+pub mod shell_command;
+#[cfg(feature = "converter")]
 pub mod shortcut;
 #[cfg(feature = "converter")]
 pub mod storage;

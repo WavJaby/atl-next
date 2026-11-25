@@ -9,6 +9,7 @@
 //! 4. Java nullability through a C++ client: AOSP `service call` (shell uid) sends a null String (int32 -1, Parcel.writeString(null)) to hasSystemFeature and getApplicationInfo; the Rust
 //!    server takes it as None (before aidl --rust_java_nullability it failed the transaction with UNEXPECTED_NULL) and getApplicationInfo answers null (parcelable flag 0).
 //! 5. The services' counter lines: the unimplemented calls of 2 and 3 were counted.
+//! 6. AOSP `cmd package list packages` as shell (uid 2000) through the package service's shell-command hook: exit 0 and the test package's `package:` line.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -130,6 +131,18 @@ fn verdict(app: &Run, system: &Run, feature: &Run, info: &Run, services_log: &st
     fails
 }
 
+/// `cmd package list packages`: exit 0 and the fixture's `package:` line. Without the hook libbinder answers AOSP's default text with exit 0, which fails here.
+fn list_verdict(list: &Run) -> Vec<String> {
+    let want = format!("package:{APP}");
+    if list.0 && list.1.lines().any(|l| l == want) {
+        return Vec::new();
+    }
+    vec![format!(
+        "cmd package list packages: want exit 0 and `{want}`, got {}",
+        list.1.trim()
+    )]
+}
+
 /// Runs the stage; the passes are printed, the failures returned. `host_arch`: the arches.toml `[host]` row the services run on; the device ABIs the services get are its rows (atld_run::device_abis).
 /// `break_install`: `Install` is answered with atld's installer-exit error; the stage then passes only if the services exit unsuccessfully before `ready` and log no installed package.
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +153,7 @@ pub fn stage(
     b: &Broker,
     env: &[(String, String)],
     service: &Path,
+    cmd_bin: &Path,
     test_root: &Path,
     break_install: bool,
 ) -> Result<Vec<String>> {
@@ -380,6 +394,18 @@ pub fn stage(
             &["i32", "-1", "i64", "0", "i32", "0"],
             "service-info.log",
         )?;
+        // AOSP's `cmd` as shell: the package service answers it through the shell-command hook (PackageManagerShellCommand.runListPackages)
+        let mut list_cmd = Command::new(cmd_bin);
+        list_cmd
+            .envs(env.iter().cloned())
+            .args(["package", "list", "packages"]);
+        let list = run(
+            b,
+            list_cmd,
+            (AID_SHELL, atl_sepolicy::domains::SHELL),
+            &test_root.join("cmd-list.log"),
+            CLIENT_LIMIT,
+        )?;
 
         // the services' end of the control socket closes with them, which ends the handler's loop (the scope waits for it)
         let _ = services.kill();
@@ -393,10 +419,11 @@ pub fn stage(
         {
             println!("binder: services {}", l.trim_start_matches("client: "));
         }
-        let fails = verdict(&app, &system, &feature, &info, &log);
+        let mut fails = verdict(&app, &system, &feature, &info, &log);
+        fails.extend(list_verdict(&list));
         if fails.is_empty() {
             println!(
-                "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted)"
+                "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted; `cmd package list packages` lists the package)"
             );
         }
         Ok(fails)
@@ -448,6 +475,17 @@ mod tests {
             )
             .as_deref(),
             Some("105")
+        );
+    }
+
+    /// The list check fires on a failed exit, on the default text of an unhooked service, and passes on the fixture's line.
+    #[test]
+    fn list_names_the_fixture() {
+        assert!(list_verdict(&(true, format!("package:{APP}\n"))).is_empty());
+        assert_eq!(list_verdict(&(false, format!("package:{APP}\n"))).len(), 1);
+        assert_eq!(
+            list_verdict(&(true, "No shell command implementation.\n".into())).len(),
+            1
         );
     }
 }

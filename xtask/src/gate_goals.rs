@@ -213,6 +213,7 @@ fn binder() -> Goals {
     Goals::host(&[
         "servicemanager",
         "service",
+        "cmd",
         "atl-aidl-stubs-rust",
         "libbinder_rs",
         "libatl_parcelables",

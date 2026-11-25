@@ -458,10 +458,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let device = out.join("device");
     let servicemanager = device.join("servicemanager/servicemanager");
     let service = device.join("service/service");
-    for b in [&servicemanager, &service] {
+    let cmd_bin = device.join("cmd/cmd");
+    for b in [&servicemanager, &service, &cmd_bin] {
         ensure!(
             b.is_file(),
-            "{} missing: cargo xtask native --host {} --out {} servicemanager service",
+            "{} missing: cargo xtask native --host {} --out {} servicemanager service cmd",
             b.display(),
             args.host,
             out.display()
@@ -496,6 +497,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         &b,
         &env,
         &service,
+        &cmd_bin,
         &test_root,
         args.break_install,
     )?;

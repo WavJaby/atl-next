@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Wed, 25 Nov 2026 15:28:07 +0800
+Subject: [PATCH] libbinder_rs: shell command callback
+
+Interface::shell_command (default: Binder.java text, status 0) and
+Remotable::on_shell_command, registered in InterfaceClass::new beside
+on_dump. ibinder.cpp then answers `cmd <service>`: a positive status
+reaches IResultReceiver, which cmd exits with; a negative one fails the
+transaction, as AOSP already does for NDK handlers.
+
+Upstream-Status: Pending
+Patch-Reason: AIBinder_Class_setHandleShellCommand is set on the class libbinder_rs creates in InterfaceClass::new; nothing outside the crate can register the hook for a Rust service.
+---
+SPDX-License-Identifier: Apache-2.0
+ libs/binder/rust/src/binder.rs | 45 ++++++++++++++++++++
+ libs/binder/rust/src/native.rs | 77 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+)
+
+diff --git a/libs/binder/rust/src/binder.rs b/libs/binder/rust/src/binder.rs
+index 771c65bf9200855764dba8e1c6f68acf351425f5..d35a259b55699407385688fa543f8d7af60fd155 100644
+--- a/libs/binder/rust/src/binder.rs
++++ b/libs/binder/rust/src/binder.rs
+@@ -65,6 +65,20 @@ pub trait Interface: Send + Sync + DowncastSync {
+     fn dump(&self, _writer: &mut dyn Write, _args: &[&CStr]) -> Result<()> {
+         Ok(())
+     }
++
++    /// Shell command handler for this Binder object (`cmd <service> <args>`).
++    ///
++    /// Default is Binder.java `handleShellCommand`: `No shell command implementation.` on `err`,
++    /// status 0. `in` is not passed: no command reads it yet. `out` and `err` are not owned.
++    fn shell_command(
++        &self,
++        _out: &mut dyn Write,
++        err: &mut dyn Write,
++        _args: &[&CStr],
++    ) -> Result<i32> {
++        writeln!(err, "No shell command implementation.").map_err(|_| StatusCode::UNKNOWN_ERROR)?;
++        Ok(0)
++    }
+ }
+ 
+ impl_downcast!(sync Interface);
+@@ -192,6 +206,15 @@ pub trait Remotable: Send + Sync + 'static {
+     /// object.
+     fn on_dump(&self, file: &mut dyn Write, args: &[&CStr]) -> Result<()>;
+ 
++    /// Handle a request to invoke the shell command transaction on this
++    /// object.
++    fn on_shell_command(
++        &self,
++        out: &mut dyn Write,
++        err: &mut dyn Write,
++        args: &[&CStr],
++    ) -> Result<i32>;
++
+     /// Retrieve the class of this remote object.
+     ///
+     /// This method should always return the same InterfaceClass for the same
+@@ -348,6 +371,7 @@ impl InterfaceClass {
+                 panic!("Expected non-null class pointer from AIBinder_Class_define!");
+             }
+             sys::AIBinder_Class_setOnDump(class, Some(I::on_dump));
++            sys::AIBinder_Class_setHandleShellCommand(class, Some(I::on_shell_command));
+             class
+         };
+         InterfaceClass(ptr)
+@@ -643,6 +667,23 @@ pub trait InterfaceClassMethods {
+         args: *mut *const c_char,
+         num_args: u32,
+     ) -> status_t;
++
++    /// Called to handle the `shellCommand` transaction.
++    ///
++    /// # Safety
++    ///
++    /// Must be called with a non-null, valid pointer to a local `AIBinder` that
++    /// contains a `T` pointer in its user data. `out` and `err` should be
++    /// non-owned file descriptors (`in_` is unused), and args must be an array
++    /// of null-terminated string pointers with length num_args.
++    unsafe extern "C" fn on_shell_command(
++        binder: *mut sys::AIBinder,
++        in_: i32,
++        out: i32,
++        err: i32,
++        args: *mut *const c_char,
++        num_args: u32,
++    ) -> status_t;
+ }
+ 
+ /// Interface for transforming a generic SpIBinder into a specific remote
+@@ -968,6 +1009,10 @@ macro_rules! declare_binder_interface {
+                 self.0.dump(writer, args)
+             }
+ 
++            fn on_shell_command(&self, out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, args: &[&std::ffi::CStr]) -> std::result::Result<i32, $crate::StatusCode> {
++                self.0.shell_command(out, err, args)
++            }
++
+             fn get_class() -> $crate::binder_impl::InterfaceClass {
+                 static CLASS_INIT: std::sync::Once = std::sync::Once::new();
+                 static mut CLASS: Option<$crate::binder_impl::InterfaceClass> = None;
+diff --git a/libs/binder/rust/src/native.rs b/libs/binder/rust/src/native.rs
+index 9e1cfd6b8f4b378c0f8df935b4e10aeebeb73a25..10e45bf0625d87f475fa3fd6318266365c61d490 100644
+--- a/libs/binder/rust/src/native.rs
++++ b/libs/binder/rust/src/native.rs
+@@ -402,6 +402,74 @@ impl<T: Remotable> InterfaceClassMethods for Binder<T> {
+         // because we do not have a uniform way of writing to handles
+         StatusCode::INVALID_OPERATION as status_t
+     }
++
++    /// Called to handle the `shellCommand` transaction.
++    ///
++    /// # Safety
++    ///
++    /// Must be called with a non-null, valid pointer to a local `AIBinder` that
++    /// contains a `T` pointer in its user data. `out` and `err` should be
++    /// non-owned file descriptors (`in_` is not used), and args must be an array
++    /// of null-terminated string pointers with length num_args.
++    #[cfg(not(trusty))]
++    unsafe extern "C" fn on_shell_command(
++        binder: *mut sys::AIBinder,
++        _in_: i32,
++        out: i32,
++        err: i32,
++        args: *mut *const c_char,
++        num_args: u32,
++    ) -> status_t {
++        if out < 0 || err < 0 {
++            return StatusCode::UNEXPECTED_NULL as status_t;
++        }
++        if args.is_null() && num_args != 0 {
++            return StatusCode::UNEXPECTED_NULL as status_t;
++        }
++        use std::os::fd::FromRawFd;
++        // Safety: Our caller promised that out and err are file descriptors we
++        // do not own, so they are wrapped in ManuallyDrop and never closed.
++        let mut out_file = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(out)) };
++        let mut err_file = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(err)) };
++
++        let args = if args.is_null() || num_args == 0 {
++            vec![]
++        } else {
++            // Safety: Our caller promised that `args` is an array of
++            // null-terminated string pointers with length `num_args`.
++            unsafe {
++                std::slice::from_raw_parts(args, num_args as usize)
++                    .iter()
++                    .map(|s| CStr::from_ptr(*s))
++                    .collect()
++            }
++        };
++
++        // Safety: Our caller promised that `binder` is a non-null, valid
++        // pointer to a local `AIBinder`.
++        let object = unsafe { sys::AIBinder_getUserData(binder) };
++        // Safety: Our caller promised that the binder has a `T` pointer in its
++        // user data.
++        let binder: &T = unsafe { &*(object as *const T) };
++        match binder.on_shell_command(&mut *out_file, &mut *err_file, &args) {
++            Ok(code) => code,
++            Err(e) => e as status_t,
++        }
++    }
++
++    /// Called to handle the `shellCommand` transaction.
++    #[cfg(trusty)]
++    unsafe extern "C" fn on_shell_command(
++        _binder: *mut sys::AIBinder,
++        _in_: i32,
++        _out: i32,
++        _err: i32,
++        _args: *mut *const c_char,
++        _num_args: u32,
++    ) -> status_t {
++        // This operation is not supported on Trusty right now
++        StatusCode::INVALID_OPERATION as status_t
++    }
+ }
+ 
+ impl<T: Remotable> Drop for Binder<T> {
+@@ -498,6 +566,15 @@ impl Remotable for () {
+         Ok(())
+     }
+ 
++    fn on_shell_command(
++        &self,
++        out: &mut dyn Write,
++        err: &mut dyn Write,
++        args: &[&CStr],
++    ) -> Result<i32> {
++        self.shell_command(out, err, args)
++    }
++
+     binder_fn_get_class!(Binder::<Self>);
+ }
+ 
