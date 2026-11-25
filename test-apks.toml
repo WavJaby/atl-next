@@ -7,6 +7,7 @@
 #   version_name  the APK's own versionName: run-apk checks it against the manifest. A github-release url's tag need not equal it.
 #   version_code  integer. run-apk checks it against the manifest. fdroid: the url's file name must be `<package>_<version_code>.apk`.
 #   signer_sha256 64 lowercase hex digits of the signing certificate's SHA-256: the first certificate of the first signer of the v2 signing block (v3 when there is no v2), apksigner's `Signer #1 certificate SHA-256 digest`. Checked against every file of the row.
+#   min_frames    optional positive integer. Minimum frames presented from the last resume through the hold. Absent: frames not judged beyond the required first present.
 #   source        fdroid | github-release | google-play. Decides the other fields.
 # url rows (fdroid, github-release):
 #   url           https. fdroid: https://f-droid.org/repo/<package>_<version_code>.apk. github-release: https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>.apk

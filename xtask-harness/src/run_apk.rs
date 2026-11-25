@@ -7,6 +7,7 @@
 //! are settled (`services: activity settled`: no launch, start or lifecycle step unacknowledged), so a Splash that starts Main is judged on Main. Pass: that resume is the last one, a frame is
 //! presented after it (`atl-composer: ui: present`), and no fault in the app log within the watch after it (window::fault_after). The run ends once all of that holds and the watch is over
 //! (--hold: the hold); a run that ends before its watch is over fails.
+//! A row with `min_frames` also requires the sum of `composer: fps presented=` counts stamped at or after the last resume. The resume boundary is approximate to one FPS window (1 s). A type-2 window add is reported on either verdict.
 //! Sound: with --hold (the user's launch) the session's routing, as a desktop launch; headless, every stream plays into a null sink of the run's own (audio_pcm.rs Routing), never the session's sink.
 //! `remote run-apk` is muted the same way unless `--audible`: the target makes the run's own null sink (audio_pcm.rs `holder_sh`). Both driven paths judge the route (`audio-route:`, audio_pcm.rs
 //! `stream_routes` over `pw-dump` samples taken during the run): red when an app stream was linked into any node but the run's sink.
@@ -630,6 +631,7 @@ pub(crate) fn run_on(
     let read = atl_diag::logfiles::read;
     let hold_ms = args.hold.map(|s| s * MS_PER_S);
     let watch_ms = hold_ms.unwrap_or(window::WINDOW_MS);
+    let min_frames = pin.and_then(|row| row.min_frames);
     // a pointer script runs from the first present: the run lasts at least its waits plus the watch, and faults count from the last resume to the run's end
     let script_ms = args.pointer.as_deref().map_or(0, script_wait_ms);
     let started = Instant::now();
@@ -765,7 +767,7 @@ pub(crate) fn run_on(
     }
     let leak = route.as_ref().and_then(|r| r.as_ref().err().cloned());
     let outcome = check_delivery(foreign, &m.name, &app)
-        .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted))
+        .and_then(|()| judge_ending(&services, &app, &ending, watch_ms, scripted, min_frames))
         .and_then(|ok| {
             render_path_check(&read(&run.atld_log()), &app).map(|p| format!("{ok}; {p}"))
         })
@@ -788,6 +790,7 @@ pub(crate) fn run_on(
         &services,
         &run.atld_log(),
         &run.root.join("log"),
+        min_frames,
     );
     Ok(Ran {
         ok,
@@ -1005,6 +1008,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         )),
     };
     let watch_ms = a.hold * MS_PER_S;
+    let min_frames = pin.as_ref().and_then(|row| row.min_frames);
     let app_log = run.log(&m.name);
     let services_log = run.log("services");
     let read = atl_diag::logfiles::read;
@@ -1019,7 +1023,14 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
             app_end: app_end(&services, &read(&run.scratch.join("atld.log"))),
         };
         check_delivery(foreign.as_ref(), &m.name, &app)?;
-        judge_ending(&services, &app, &ending, watch_ms, a.pointer.is_some())
+        judge_ending(
+            &services,
+            &app,
+            &ending,
+            watch_ms,
+            a.pointer.is_some(),
+            min_frames,
+        )
     });
     let outcome = outcome.and_then(|ok| {
         display_node_check(&read(&run.scratch.join("atld.log"))).map(|gpu| format!("{ok}; {gpu}"))
@@ -1039,6 +1050,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         &services,
         &logs.join("atld.log"),
         &logs,
+        min_frames,
     ))
 }
 
@@ -1449,6 +1461,7 @@ fn judge_ending(
     ending: &Ending,
     watch_ms: u64,
     scripted: bool,
+    min_frames: Option<u64>,
 ) -> Result<String, String> {
     let fault_ms = match (scripted, last_resumed(services)) {
         (true, Some(r)) => watch_ms.max(ending.end_ms.saturating_sub(r.ms)),
@@ -1461,6 +1474,7 @@ fn judge_ending(
         ending.atld_exited,
         fault_ms,
         ending.app_end,
+        min_frames,
     )
 }
 
@@ -1544,6 +1558,40 @@ fn is_summary_line(line: &str) -> bool {
         .is_some_and(|word| word == "summary" || word.ends_with("-summary"))
 }
 
+/// Verdict with type-2 add lines in log order. Keep repeated titles: each line records a distinct add.
+fn verdict_line(
+    outcome: &Result<String, String>,
+    services: &str,
+    min_frames: Option<u64>,
+) -> String {
+    let mut verdict = match outcome {
+        Ok(s) if min_frames.is_none() => format!("run-apk: ok {s}; frames not judged"),
+        Ok(s) => format!("run-apk: ok {s}"),
+        Err(s) => format!("run-apk: FAILED {s}"),
+    };
+    let titles: Vec<_> = services
+        .lines()
+        .filter_map(|line| {
+            let add = line.strip_prefix("services: window add ")?;
+            let (title, attrs) = add.rsplit_once(" type ")?;
+            let title = if title.is_empty() {
+                "<untitled>"
+            } else {
+                title
+            };
+            attrs.starts_with("2 attrs ").then_some(title)
+        })
+        .collect();
+    if !titles.is_empty() {
+        verdict.push_str(&format!(
+            "; dialog windows added: {} ({})",
+            titles.len(),
+            titles.join(", ")
+        ));
+    }
+    verdict
+}
+
 /// The run's printed verdict: the pass line, or the failure with the app's and the services' log tails. Then atld's end lines and its summary block, and where the logs are.
 fn finish(
     outcome: Result<String, String>,
@@ -1551,17 +1599,15 @@ fn finish(
     services: &str,
     atld_log: &Path,
     log_dir: &Path,
+    min_frames: Option<u64>,
 ) -> ExitCode {
-    match &outcome {
-        Ok(s) => println!("run-apk: ok {s}"),
-        Err(s) => {
-            println!("run-apk: FAILED {s}");
-            println!("---- app log tail\n{}", window::tail(app, window::TAIL));
-            println!(
-                "---- services log tail\n{}",
-                window::tail(services, window::TAIL)
-            );
-        }
+    println!("{}", verdict_line(&outcome, services, min_frames));
+    if outcome.is_err() {
+        println!("---- app log tail\n{}", window::tail(app, window::TAIL));
+        println!(
+            "---- services log tail\n{}",
+            window::tail(services, window::TAIL)
+        );
     }
     // the app's end as its parent saw it (a signal leaves no line of its own in the app's or the services' log), then every block of atld's ranked outcomes (atld main.rs print_summary)
     for line in std::fs::read_to_string(atld_log)
@@ -1703,6 +1749,20 @@ fn presented_since(app_log: &str, from_ms: u64) -> usize {
         .count()
 }
 
+/// Sum completed FPS windows stamped at or after resume. One window (1 s) can straddle resume, and an unclosed final window has no line. None: no usable FPS sample in that span.
+fn fps_presented_since(app: &str, resume_ms: u64) -> Option<u64> {
+    app.lines()
+        .filter(|line| line.contains(FPS_LINE))
+        .filter_map(|line| {
+            let stamp = parse_stamp(line.split_whitespace().next()?)?;
+            if stamp < resume_ms {
+                return None;
+            }
+            crate::composer::field(line, "presented")
+        })
+        .reduce(u64::saturating_add)
+}
+
 /// Where the frames stopped, from the composer's last counters line: buffers latched from the app, scenes published, and scenes the window took (each take is one present line).
 /// Buffers without scenes = the clock never composed; scenes without takes = the window's frame clock never took one (unmapped, or not ticking).
 fn scene_counts(app: &str) -> String {
@@ -1730,6 +1790,7 @@ fn judge(
     atld_exited: bool,
     watch_ms: u64,
     app_end: Option<&str>,
+    min_frames: Option<u64>,
 ) -> Result<String, String> {
     let no_self_kill;
     let (app, atld_exited) = match app_end {
@@ -1764,17 +1825,34 @@ fn judge(
             last.class
         ));
     }
-    let frames = presented_since(app, last.ms);
-    if frames == 0 {
-        return Err(format!(
-            "no frame presented after {} resumed: the app log has no `{PRESENT_LINE}` line after it; {}",
-            last.class,
-            scene_counts(app)
-        ));
-    }
+    let presented = if let Some(minimum) = min_frames {
+        let Some(reported) = fps_presented_since(app, last.ms) else {
+            return Err(format!(
+                "frames in the hold >= {minimum} required: 0 reported by fps (no fps lines after {} resumed)",
+                last.class
+            ));
+        };
+        let evidence = format!("{reported} reported by fps; resume boundary ±1 FPS window (1 s)");
+        if reported < minimum {
+            return Err(format!(
+                "frames in the hold >= {minimum} required: {evidence}"
+            ));
+        }
+        format!("frames in the hold >= {minimum} ({evidence})")
+    } else {
+        let frames = presented_since(app, last.ms);
+        if frames == 0 {
+            return Err(format!(
+                "no frame presented after {} resumed: the app log has no `{PRESENT_LINE}` line after it; {}",
+                last.class,
+                scene_counts(app)
+            ));
+        }
+        format!("{frames} frame(s) presented after it")
+    };
     let ended = app_end.map_or_else(String::new, |e| format!("; ended: {e}"));
     Ok(format!(
-        "onResume of {} at {}, {frames} frame(s) presented after it, settled, no fault in the {watch_ms} ms after it{ended}",
+        "onResume of {} at {}, {presented}, settled, no fault in the {watch_ms} ms after it{ended}",
         last.class,
         window::stamp_text(last.ms)
     ))
@@ -2017,6 +2095,112 @@ mod tests {
     const RESUME: &str =
         "services: activity resumed org.x.Main at=100.000\nservices: activity settled at=100.001\n";
     const PRESENT: &str = "100.900 D atl-composer: ui: present n=1 time_ns=1\n";
+    const FPS_AT_RESUME: &str =
+        "100.000 I composer: fps presented=3 taken=5 buffer=447x745 window=480x800\n";
+    const FPS_AFTER_RESUME: &str =
+        "101.100 I composer: fps presented=4 taken=6 buffer=447x745 window=480x800\n";
+    const MAIN_WINDOW: &str = "services: window add org.x/org.x.Main type 1 attrs -1x-1 gravity 0x11 at 0,0 flags 0x0 dim 0 surface_insets Rect { left: 0, top: 0, right: 0, bottom: 0 } task 0,0 480x800\n";
+    const DIALOG_WINDOWS: &str = "\
+services: window add org.x/org.x.Main type 2 attrs -2x-2 gravity 0x11 at 0,0 flags 0x820002 dim 0.6 surface_insets Rect { left: 0, top: 0, right: 0, bottom: 0 } task 0,0 480x800\n\
+services: window add org.x/org.x.Consent type 2 attrs -2x-2 gravity 0x11 at 0,0 flags 0x820002 dim 0.6 surface_insets Rect { left: 0, top: 0, right: 0, bottom: 0 } task 0,0 480x800\n";
+
+    // Break: skip the minimum check, or count taken instead of presented (5 takes, 3 presents).
+    #[test]
+    fn judge_fails_below_min_frames() {
+        let err = judge(RESUME, FPS_AT_RESUME, true, false, 2_000, None, Some(4)).unwrap_err();
+        assert!(
+            err.contains("3 reported by fps") && err.contains(">= 4 required"),
+            "{err}"
+        );
+    }
+
+    // Break: require more than the minimum, or exclude a sample stamped exactly at resume.
+    #[test]
+    fn judge_passes_at_min_frames_including_the_resume_stamp() {
+        let ok = judge(RESUME, FPS_AT_RESUME, true, false, 2_000, None, Some(3)).unwrap();
+        assert!(
+            ok.contains("frames in the hold >= 3") && ok.contains("3 reported by fps"),
+            "{ok}"
+        );
+    }
+
+    // Break: require exactly the minimum.
+    #[test]
+    fn judge_passes_above_min_frames() {
+        let ok = judge(RESUME, FPS_AT_RESUME, true, false, 2_000, None, Some(2)).unwrap();
+        assert!(
+            ok.contains("frames in the hold >= 2") && ok.contains("3 reported by fps"),
+            "{ok}"
+        );
+    }
+
+    // Break: include fps from the earlier resume (3 presents + 4 presents would reach 4).
+    #[test]
+    fn judge_excludes_fps_before_the_last_resume() {
+        let services = format!("services: activity resumed org.x.Splash at=99.000\n{RESUME}");
+        let earlier = FPS_AFTER_RESUME.replace("101.100", "99.999");
+        let app = format!("{earlier}{FPS_AT_RESUME}");
+        let err = judge(&services, &app, true, false, 2_000, None, Some(4)).unwrap_err();
+        assert!(err.contains("3 reported by fps"), "{err}");
+    }
+
+    // Break: take one sample, or count reports instead of summing 3 + 4 presents.
+    #[test]
+    fn judge_sums_fps_samples_after_the_last_resume() {
+        let app = format!("{FPS_AT_RESUME}{FPS_AFTER_RESUME}");
+        let ok = judge(RESUME, &app, true, false, 2_000, None, Some(7)).unwrap();
+        assert!(ok.contains("7 reported by fps"), "{ok}");
+    }
+
+    // Break: fall back to a throttled present report for a row that requires fps samples.
+    #[test]
+    fn judge_requires_fps_lines_when_min_frames_is_set() {
+        let err = judge(RESUME, PRESENT, true, false, 2_000, None, Some(1)).unwrap_err();
+        assert!(
+            err.contains("no fps lines")
+                && err.contains("0 reported by fps")
+                && err.contains(">= 1 required"),
+            "{err}"
+        );
+    }
+
+    // Break: require fps for an unconfigured row, or omit the status from the printed verdict.
+    #[test]
+    fn verdict_says_frames_not_judged_without_min_frames() {
+        let outcome = judge(RESUME, PRESENT, true, false, 2_000, None, None);
+        let line = verdict_line(&outcome, RESUME, None);
+        assert!(
+            line.starts_with("run-apk: ok ") && line.ends_with("frames not judged"),
+            "{line}"
+        );
+    }
+
+    // Break: stop at the first type-2 add, deduplicate by package, or omit the note on failure.
+    #[test]
+    fn verdict_lists_two_dialog_adds_on_pass_and_failure() {
+        let services = format!("{RESUME}{MAIN_WINDOW}{DIALOG_WINDOWS}");
+        for (outcome, prefix) in [
+            (Ok("settled".to_owned()), "run-apk: ok settled"),
+            (
+                Err("ended before".to_owned()),
+                "run-apk: FAILED ended before",
+            ),
+        ] {
+            let line = verdict_line(&outcome, &services, None);
+            assert!(line.starts_with(prefix), "{line}");
+            assert!(
+                line.ends_with("dialog windows added: 2 (org.x/org.x.Main, org.x/org.x.Consent)"),
+                "{line}"
+            );
+        }
+    }
+
+    // Break: treat every window add as a dialog.
+    #[test]
+    fn verdict_ignores_type_1_window_adds() {
+        let line = verdict_line(&Ok("settled".to_owned()), MAIN_WINDOW, None);
+        assert_eq!(line, "run-apk: ok settled; frames not judged");
+    }
 
     /// Present lines at 1, 2, 4, 8 and fps lines of 5 + 6 frames: the total is the larger bound, 11; before the fps lines, the last power of two.
     #[test]
@@ -2033,13 +2217,13 @@ mod tests {
     #[test]
     fn judge_passes_a_resumed_presenting_app() {
         let app = format!("100.500 I tag: onCreate\n{PRESENT}");
-        assert!(judge(RESUME, &app, true, false, 2_000, None).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000, None, None).is_ok());
     }
 
     #[test]
     fn judge_fails_each_missing_or_broken_part() {
         let err = |services: &str, app: &str, complete: bool, atld_exited: bool| {
-            judge(services, app, complete, atld_exited, 2_000, None).unwrap_err()
+            judge(services, app, complete, atld_exited, 2_000, None, None).unwrap_err()
         };
         assert!(err("", PRESENT, true, false).contains("no activity resumed"));
         assert!(err(RESUME, "100.500 I tag: x\n", true, false).contains("no frame presented"));
@@ -2060,7 +2244,7 @@ mod tests {
                         services: activity settled at=1793887598.644\n";
         let app = "1793887559.900 D atl-composer: ui: present n=1 time_ns=1\n\
                    1793887598.710 E AndroidRuntime: FATAL EXCEPTION: main\n";
-        let err = judge(services, app, true, false, 2_000, None).unwrap_err();
+        let err = judge(services, app, true, false, 2_000, None, None).unwrap_err();
         assert!(
             err.contains("FATAL EXCEPTION") && err.contains("MainActivity"),
             "{err}"
@@ -2074,7 +2258,7 @@ mod tests {
                         services: activity unsettled at=103.000\n\
                         services: activity resumed org.x.Main at=103.500\n\
                         services: activity settled at=103.501\n";
-        let err = judge(services, PRESENT, true, false, 2_000, None).unwrap_err();
+        let err = judge(services, PRESENT, true, false, 2_000, None, None).unwrap_err();
         assert!(err.contains("no frame presented after org.x.Main"), "{err}");
     }
 
@@ -2082,12 +2266,12 @@ mod tests {
     #[test]
     fn no_frame_failure_names_the_composer_scene_counts() {
         let app = "100.900  INFO composer: counters ticks=9 buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161 presents_refused=0\n";
-        let err = judge(RESUME, app, true, false, 2_000, None).unwrap_err();
+        let err = judge(RESUME, app, true, false, 2_000, None, None).unwrap_err();
         assert!(
             err.contains("buffers_acquired=90159 scenes=90163 scenes_taken=0 scenes_dropped=90161"),
             "{err}"
         );
-        let err = judge(RESUME, "100.500 I tag: x\n", true, false, 2_000, None).unwrap_err();
+        let err = judge(RESUME, "100.500 I tag: x\n", true, false, 2_000, None, None).unwrap_err();
         assert!(err.contains("no `composer: counters` line"), "{err}");
     }
 
@@ -2100,7 +2284,7 @@ mod tests {
     #[test]
     fn judge_ignores_a_fault_after_the_watch() {
         let app = format!("{PRESENT}102.500 E AndroidRuntime: FATAL EXCEPTION: main\n");
-        assert!(judge(RESUME, &app, true, false, 2_000, None).is_ok());
+        assert!(judge(RESUME, &app, true, false, 2_000, None, None).is_ok());
     }
 
     /// A remote run's watch is complete when the target's end came `watch_ms` after the resume (both on the target's clock): RESUME's resume is at 100 000 ms, so a 2 s watch is over at 102 000 ms.
@@ -2129,8 +2313,8 @@ mod tests {
             end_ms,
             app_end: None,
         };
-        assert!(judge_ending(RESUME, PRESENT, &ending(102_000), 2_000, false).is_ok());
-        let err = judge_ending(RESUME, PRESENT, &ending(101_000), 2_000, false).unwrap_err();
+        assert!(judge_ending(RESUME, PRESENT, &ending(102_000), 2_000, false, None).is_ok());
+        let err = judge_ending(RESUME, PRESENT, &ending(101_000), 2_000, false, None).unwrap_err();
         assert!(err.contains("ended before"), "{err}");
     }
 
@@ -2142,7 +2326,7 @@ mod tests {
             end_ms: 0,
             app_end: app_end(services, atld_log),
         };
-        judge_ending(services, app, &ending, 14_400_000, false)
+        judge_ending(services, app, &ending, 14_400_000, false, None)
     }
 
     const AB2_UP: &str = "services: activity resumed com.rovio.abba.vkquality.VkQualityActivity at=1794924856.299\n\

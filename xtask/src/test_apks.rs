@@ -36,6 +36,7 @@ pub struct Row {
     pub version_name: String,
     pub version_code: u32,
     pub signer_sha256: String,
+    pub min_frames: Option<u64>,
     pub source: Source,
 }
 
@@ -75,6 +76,7 @@ struct RawRow {
     version_name: String,
     version_code: u32,
     signer_sha256: String,
+    min_frames: Option<u64>,
     source: RawSource,
     url: Option<String>,
     sha256: Option<String>,
@@ -133,6 +135,7 @@ fn check_row(name: &str, raw: RawRow) -> Result<Row> {
     );
     ensure!(!raw.version_name.trim().is_empty(), "version_name is empty");
     ensure!(raw.version_code > 0, "version_code must be positive");
+    ensure!(raw.min_frames != Some(0), "min_frames must be positive");
     ensure!(
         is_sha256(&raw.signer_sha256),
         "signer_sha256 must be 64 lowercase hex digits"
@@ -146,6 +149,7 @@ fn check_row(name: &str, raw: RawRow) -> Result<Row> {
         version_name: raw.version_name,
         version_code: raw.version_code,
         signer_sha256: raw.signer_sha256,
+        min_frames: raw.min_frames,
         source,
     })
 }
@@ -840,6 +844,16 @@ mod tests {
                 "wechat"
             ]
         );
+    }
+
+    // Break: require min_frames, drop it from Row, or allow zero.
+    #[test]
+    fn min_frames_is_optional_and_positive() {
+        assert_eq!(row().min_frames, None);
+        let text = format!("{VALID}min_frames = 1\n");
+        assert_eq!(parse(&text).unwrap()["fossify-notes"].min_frames, Some(1));
+        assert!(err(&format!("{VALID}min_frames = 0\n")).contains("min_frames must be positive"));
+        assert!(parse(&format!("{VALID}min_frames = -1\n")).is_err());
     }
 
     #[test]
