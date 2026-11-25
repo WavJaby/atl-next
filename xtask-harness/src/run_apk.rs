@@ -142,7 +142,7 @@ pub struct Args {
     user_data: bool,
 }
 
-/// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's desktop. `--hold` is required: the window is the target's, on its Wayland session, not a headless one.
+/// `xtask remote run-apk` (remote.rs `Remote::RunApk`): the same run on a target's display. `--hold` is required: the window is watched, on the target's Wayland session, or on the run's own headless labwc when the target has no session (`--view`).
 #[derive(clap::Args)]
 pub struct RemoteArgs {
     /// A row of test-apks.toml, or an APK file path, as for `run-apk`.
@@ -154,7 +154,7 @@ pub struct RemoteArgs {
     /// ssh alias from WSL `~/.ssh/config` (its `Host` name), or `local:<absolute dir>` (a directory standing in for the target).
     #[arg(long)]
     host: String,
-    /// Keeps the app up this many seconds after its resume, the window open on the target's desktop.
+    /// Keeps the app up this many seconds after its resume, its window open on the target's display: the session's, or with no session the run's own headless labwc (`--view` shows it).
     #[arg(long, value_name = "SECONDS")]
     hold: u64,
     /// atld `--declare-display WxH` (dp): the apps see a display of this size on the target's monitor's density. Omitted: the target's own monitor is the display, read by atld on the target's desktop.
@@ -204,6 +204,10 @@ pub struct RemoteArgs {
     /// Shots of the app's window, ms after its first present, comma-separated (`5000,20000`): `grim -g` of the window's rect only, never the desktop. Implies `--observe`.
     #[arg(long, value_name = "MS", value_delimiter = ',')]
     shot: Vec<u64>,
+    /// Serves the run's own headless labwc over VNC for the run: wayvnc on the target's loopback at PORT (default 5900), its tunnel line printed. Only a target with no session (the run's own
+    /// labwc); refused by name when wayvnc is not on the target's PATH. Installs nothing.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "5900")]
+    view: Option<u16>,
 }
 
 impl Args {
@@ -800,6 +804,11 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         a.shot
     );
     let observe_on = a.observe || !shots.is_empty();
+    ensure!(
+        a.view.is_none_or(|p| p >= 1024),
+        "--view {}: a port of 1024 or more (wayvnc runs unprivileged)",
+        a.view.unwrap_or_default()
+    );
     let (pin, files) = source(root, &a.target)?;
     let args = Args {
         target: a.target.clone(),
@@ -893,6 +902,11 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         } else {
             println!("observe: off (--observe or --shot turns it on)");
         }
+        if let Some(port) = a.view {
+            println!(
+                "view: on, port {port}: --apply serves the run's own labwc (wayvnc on the target) when the target has no session, and prints the tunnel line"
+            );
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let (pushed, problems) = target.deliver("run-apk")?;
@@ -913,6 +927,20 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         "remote run-apk: the target has no display for the window: {why}"
     );
     println!("remote run-apk: display: {why}");
+    if let Some(port) = a.view {
+        ensure!(
+            display == remote::Display::NestedHeadless,
+            "remote run-apk --view: the window is on the target's session or an X11 nest; --view serves only the run's own headless labwc (a target with no session)"
+        );
+        target.check_view()?;
+        println!(
+            "remote run-apk: view: wayvnc on the target's loopback 127.0.0.1:{port} for this run; the tunnel, in another shell and kept open: ssh -N -L {port}:127.0.0.1:{port} {}",
+            a.host
+        );
+        println!(
+            "remote run-apk: view: connect a VNC client to localhost:{port} while the tunnel is up (no password: only the target's loopback serves it)"
+        );
+    }
     // muted unless a human asked to hear it: the target's own null sink for the run, named by this run
     let audio = remote::RunAudio {
         sink: (!a.audible).then(|| format!("atl-run-apk-{}", std::process::id())),
@@ -936,7 +964,8 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     let rt = rt.with_site(
         target
             .run_site(&pushed, limit, logs.join("transcript.log"), display)?
-            .with_audio(audio.clone()),
+            .with_audio(audio.clone())
+            .with_view(a.view),
     );
     // before the transfer: the run's root is cleared on the target then, so a present line the watch reads is this run's
     let mut watch = if observe_on {
