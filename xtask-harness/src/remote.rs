@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use atl_labwc_setup::{READY_LINE, REFUSED_EXIT};
-use sha2::{Digest, Sha256};
 
+use crate::test_apks::sha256_hex;
 use crate::{arches, gate_goals, gl_probe, nested_wayland, out, provided_gate, verdict};
 
 /// rsync's flags for the bundle: archive, the staged hard links kept (`-H`: one source = one file on the target, see the module doc), stale entries deleted -- except the run lock, which a
@@ -2364,14 +2364,6 @@ impl Bundle {
         std::fs::write(&marker, "").with_context(|| format!("writing {}", marker.display()))?;
         Ok(Pushed(sha))
     }
-}
-
-/// Lowercase hex SHA-256, as `sha256sum` prints it.
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// A path the target takes unquoted (the target's directory name, via [`valid_name`]): `[A-Za-z0-9._+/-]`, no `..` component.

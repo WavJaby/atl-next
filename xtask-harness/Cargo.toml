@@ -37,7 +37,6 @@ roxmltree.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 toml.workspace = true
 xtask = { path = "../xtask" }
 # the notification gate's fake desktop service on a private bus (session_bus.rs); `service` = the interface macro
