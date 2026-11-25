@@ -2,7 +2,7 @@
 //! The source state a native out dir was built from, so a runtime gate refuses artifacts from another tree (a rebase without `xtask native` once cost a whole round).
 //!
 //! The state is the checkout's tracked files as they are on disk, hashed through a scratch index: `git add -u` into a copy of the index, `git write-tree`.
-//! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash.
+//! Tracked only: `add -A` stored every untracked, unignored file (stray build outputs included) as a blob in `.git`; a new source file counts once it is `git add`ed. The top-level entries listed in [`GATE_SIDE`] are left out of the hash; the gate code native judges with ([`GATE_CODE`]) is a word of its own, so a stricter gate makes the record stale without any artifact being.
 //! `native` deletes the record when it starts and writes it after its gates (the state taken before the build, so an edit during the build reads as a mismatch); a gate compares it with the checkout's state now.
 //! A record of goals means: this graph was built from this state and every native gate passed. A red run leaves [`RED`] and the failed gates' names instead, which no reader takes as built: `check` does not run native's gates and land skips a current build dir, so the record is their only sight of a red one.
 //! Each graph (the host's, each foreign guest's `nb-graph-<arch>`) holds its own verdict; a dir is current when its record and those of the foreign graphs in it are ([`ensure_current`]).
@@ -21,10 +21,33 @@ use crate::verdict::Failure;
 const RECORD: &str = "built-from";
 /// First word of a red run's record: `red <state>`, then one failed gate per line. A reader that does not know it sees another state, so it refuses too.
 const RED: &str = "red ";
-/// Top-level entries native's artifacts do not come from: `xtask/` and `xtask-harness/` are the gate side (gate code and the fixtures each gate builds itself), so editing a gate needs no native run.
+/// Top-level entries native's artifacts do not come from: `xtask/` and `xtask-harness/` are the gate side (gate code and the fixtures each gate builds itself), so editing a runtime gate or a fixture needs no native run. Native's own gates do count, through [`GATE_CODE`].
 /// `test-apks.toml` feeds only `run-apk`, `fetch --test-apks` and the `tables` check: a row or pin change needs no native run.
 /// Trade-off: native's own code (xtask/src/native.rs, the converter driver) is in it too; a change there reaches the build dir only through a native run anyway.
 const GATE_SIDE: &[&str] = &["xtask", "xtask-harness", "test-apks.toml"];
+/// The code native's gates judge with: native_gates.rs (which calls them) and the modules the verdict comes from. A run's record names its hash, so a build gated by other gate code reads as stale: one native run, no compile.
+/// Not all of `xtask/`: every edit there would cost a native run. Modules that only shape artifacts or parse a table already in the state are the test's `GATE_SHARED`; the test holds this list to what the files reference.
+/// Trade-off: native.rs (the order of work) is not here: a change that drops its call to `native_gates::run` is not seen.
+const GATE_CODE: &[&str] = &[
+    "xtask/src/aosp.rs",
+    "xtask/src/isa_gate.rs",
+    "xtask/src/isa_tiers.rs",
+    "xtask/src/licence_gate.rs",
+    "xtask/src/licenses.rs",
+    "xtask/src/native_gates.rs",
+    "xtask/src/ndk_surface.rs",
+    "xtask/src/ninja_deps.rs",
+    "xtask/src/none_gate.rs",
+    "xtask/src/notice.rs",
+    "xtask/src/provided_gate.rs",
+    "xtask/src/providers.rs",
+    "xtask/src/runpath_gate.rs",
+    "xtask/src/selfbind_gate.rs",
+    "xtask/src/spdx.rs",
+    "xtask/src/triage.rs",
+];
+/// Starts the state's last word: the hash of [`GATE_CODE`].
+const GATES: &str = " gates=";
 /// The root manifest: it enters the state as [`native_manifest`], not as the file.
 const MANIFEST: &str = "Cargo.toml";
 /// The cargo profile native builds crates with (`cargo cinstall --profile`, native.rs build_crates); no other profile reaches its outputs.
@@ -70,8 +93,11 @@ pub fn tracked_tree(root: &Path) -> Result<String> {
 
 /// The checkout's source state: the hash of its top-level tree entries ([`tracked_tree`]), [`GATE_SIDE`] left out, the root manifest as [`native_manifest`].
 pub fn of_checkout(root: &Path) -> Result<String> {
-    let tree = tracked_tree(root)?;
-    let listing = git(root, &["ls-tree", &tree], None)?;
+    of_tree(root, &tracked_tree(root)?)
+}
+
+fn of_tree(root: &Path, tree: &str) -> Result<String> {
+    let listing = git(root, &["ls-tree", tree], None)?;
     let mut kept = Vec::new();
     for line in listing.lines() {
         match line.split_once('\t') {
@@ -92,6 +118,14 @@ pub fn of_checkout(root: &Path) -> Result<String> {
         &["mktree", "--missing"],
         &format!("{}\n", kept.join("\n")),
     )
+}
+
+/// The hash of [`GATE_CODE`]'s entries in `tree`, the tracked tree of `root`.
+fn gate_code(root: &Path, tree: &str) -> Result<String> {
+    let mut args = vec!["ls-tree", tree, "--"];
+    args.extend(GATE_CODE);
+    let listing = git(root, &args, None)?;
+    git_stdin(root, &["hash-object", "--stdin"], &listing)
 }
 
 /// A parsed record: the state, and what the run from it came to.
@@ -209,16 +243,20 @@ pub fn foreign_out(root: &Path, out: &Path, host: &str, isa: &str, gate: &str) -
     Ok(dir)
 }
 
-/// What a native build reads: the checkout's state, then each AOSP task copy bound over `src/aosp` (tree::overlays) as ` <project>=<its state>`, so a plain and a task build of one checkout differ.
+/// What a native build reads: the checkout's state, then each AOSP task copy bound over `src/aosp` (tree::overlays) as ` <project>=<its state>`, so a plain and a task build of one checkout differ; last the gate code it is judged by ([`GATE_CODE`]).
 pub fn of_build(root: &Path) -> Result<String> {
     with_overlays(root, &crate::tree::overlays_of(root)?)
 }
 
 fn with_overlays(root: &Path, overlays: &[crate::tree::Overlay]) -> Result<String> {
-    let mut s = of_checkout(root)?;
+    // one tree for both parts: a tracked_tree is a full `git add -u`
+    let tree = tracked_tree(root)?;
+    let mut s = of_tree(root, &tree)?;
     for o in overlays {
         s.push_str(&format!(" {}={}", o.project, of_checkout(&o.copy)?));
     }
+    s.push_str(GATES);
+    s.push_str(&gate_code(root, &tree)?);
     Ok(s)
 }
 
@@ -243,6 +281,12 @@ pub(crate) fn ensure_matches(now: &str, out: &Path) -> Result<()> {
             out.display()
         )
     };
+    let source = |s: &str| s.rsplit_once(GATES).map_or(s, |(s, _)| s).to_owned();
+    ensure!(
+        state == now || source(&state) != source(now),
+        "{} was gated by other gate code ({state}, the checkout is {now}): run `cargo xtask native`: nothing recompiles, its gates rerun",
+        out.display()
+    );
     ensure!(
         state == now,
         "{} was built from another source state ({state}, the checkout is {now}): run `cargo xtask native`",
@@ -305,14 +349,19 @@ fn git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Two of [`GATE_CODE`], in the fixture repo.
+    const LISTED: [&str; 2] = ["xtask/src/native_gates.rs", "xtask/src/licenses.rs"];
+
     fn repo(name: &str) -> PathBuf {
         let d =
             std::env::temp_dir().join(format!("xtask-build-state-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("crates")).unwrap();
-        std::fs::create_dir_all(d.join("xtask")).unwrap();
+        std::fs::create_dir_all(d.join("xtask/src")).unwrap();
         std::fs::write(d.join("crates/a.rs"), "a").unwrap();
-        std::fs::write(d.join("xtask/g.rs"), "g").unwrap();
+        for f in ["xtask/g.rs", "xtask/src/out.rs", LISTED[0], LISTED[1]] {
+            std::fs::write(d.join(f), "g").unwrap();
+        }
         std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\n").unwrap();
         std::fs::write(d.join(MANIFEST), "[workspace]\n").unwrap();
         git(&d, &["init", "-q"], None).unwrap();
@@ -345,7 +394,7 @@ mod tests {
         let ensure_current = |d: &Path, out: &Path| ensure_matches(&with_overlays(d, &[])?, out);
         let e = ensure_current(&d, &out).expect_err("no record");
         assert!(format!("{e}").contains("run `cargo xtask native`"), "{e}");
-        let state = of_checkout(&d).unwrap();
+        let state = with_overlays(&d, &[]).unwrap();
         assert!(forget(&out, &state).unwrap().is_empty());
         let goals: BTreeSet<String> = ["a".to_owned()].into();
         record(&out, &state, &goals, &[]).unwrap();
@@ -366,6 +415,8 @@ mod tests {
         assert!(format!("{e}").contains(" p="), "{e}");
         let _ = std::fs::remove_dir_all(&copy);
         std::fs::write(d.join("xtask/g.rs"), "gate edit").unwrap();
+        std::fs::write(d.join("xtask/src/out.rs"), "unlisted edit").unwrap();
+        std::fs::write(d.join("xtask/src/x.rs"), "untracked").unwrap();
         ensure_current(&d, &out).expect("gate side is not native input");
         std::fs::write(d.join("test-apks.toml"), "[fossify-notes]\nsize = 1\n").unwrap();
         ensure_current(&d, &out).expect("test APK table is not native input");
@@ -395,6 +446,157 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A listed file's edit refuses with the gate-code text and no goal survives it; a source edit, alone or with one, keeps the source-state text; a record without the gates word is refused.
+    #[test]
+    fn gate_code_is_part_of_the_state() {
+        let d = repo("gates");
+        let out = d.with_extension("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let now = || with_overlays(&d, &[]).unwrap();
+        let refusal = || format!("{}", ensure_matches(&now(), &out).expect_err("refused"));
+        let goals: BTreeSet<String> = ["a".to_owned()].into();
+        let base = now();
+        for file in LISTED {
+            record(&out, &base, &goals, &[]).unwrap();
+            ensure_matches(&now(), &out).expect("gated by this code");
+            std::fs::write(d.join(file), "stricter").unwrap();
+            let e = refusal();
+            assert!(e.contains("was gated by other gate code"), "{file}: {e}");
+            assert!(e.contains("run `cargo xtask native`"), "{e}");
+            assert!(!e.contains("another source state"), "{e}");
+            assert!(forget(&out, &now()).unwrap().is_empty(), "{file}");
+            std::fs::write(d.join(file), "g").unwrap();
+        }
+        // a record from before the word
+        record(&out, &of_checkout(&d).unwrap(), &goals, &[]).unwrap();
+        refusal();
+        record(&out, &base, &goals, &[]).unwrap();
+        std::fs::write(d.join("crates/a.rs"), "edited").unwrap();
+        for gate in ["g", "stricter"] {
+            std::fs::write(d.join(LISTED[0]), gate).unwrap();
+            let e = refusal();
+            assert!(e.contains("built from another source state"), "{e}");
+            assert!(!e.contains("gate code"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Modules [`GATE_CODE`] references that are not in it, each with why a change there changes no verdict on unchanged artifacts, or reaches it through the state.
+    const GATE_SHARED: &[(&str, &str)] = &[
+        ("arches", "parses arches.toml, in the state"),
+        ("cross", "cross toolchain flags: shape artifacts"),
+        (
+            "deps",
+            "parses deps.toml, in the state, and finds host tools",
+        ),
+        ("fetch", "makes checkouts"),
+        ("git", "runs git"),
+        ("native", "the order of work: artifact and report paths"),
+        ("out", "build dir paths"),
+        ("packages", "the cargo target dir's name"),
+        ("par", "runs jobs in parallel"),
+        ("sources", "parses sources.toml, in the state"),
+        ("tree", "the tree's path"),
+        ("upstream", "provider build recipes: shape artifacts"),
+        ("verdict", "the verdict line's text"),
+    ];
+
+    /// A source file up to its test module.
+    fn product_part(text: &str) -> &str {
+        text.split_once("\n#[cfg(test)]\nmod tests")
+            .map_or(text, |(code, _)| code)
+    }
+
+    /// The top-level names after each `crate::` of `text`, use lists (`crate::{a, b::{c}}`) included.
+    fn crate_refs(text: &str) -> BTreeSet<String> {
+        let ident = |s: &str| -> String {
+            s.trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect()
+        };
+        let mut refs = BTreeSet::new();
+        for (at, word) in text.match_indices("crate::") {
+            let rest = &text[at + word.len()..];
+            let Some(list) = rest.strip_prefix('{') else {
+                refs.insert(ident(rest));
+                continue;
+            };
+            refs.insert(ident(list));
+            let mut depth = 0;
+            for (i, c) in list.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        refs.insert(ident(&list[i + 1..]));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        refs.remove("");
+        refs
+    }
+
+    #[test]
+    fn crate_refs_reads_use_lists() {
+        let refs = crate_refs("use crate::{\n    a, b::{self, c},\n    d,\n};\ncrate::e::f()");
+        assert_eq!(refs, ["a", "b", "d", "e"].map(str::to_owned).into());
+    }
+
+    /// The list holds every module its files judge with; each path is tracked (`ls-tree` prints nothing for a missing one, so a renamed file would leave the hash silently), no GATE_SHARED entry is unused.
+    #[test]
+    fn gate_code_lists_what_its_files_use() {
+        let root = crate::test_root();
+        let listed = git(&root, &[&["ls-files", "--"], GATE_CODE].concat(), None).unwrap();
+        assert_eq!(listed.lines().count(), GATE_CODE.len(), "tracked: {listed}");
+        let mut unknown = Vec::new();
+        let mut used = BTreeSet::new();
+        for file in GATE_CODE {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            for module in crate_refs(product_part(&text)) {
+                let gate = GATE_CODE.contains(&format!("xtask/src/{module}.rs").as_str());
+                if !gate && !GATE_SHARED.iter().any(|(m, _)| *m == module) {
+                    unknown.push(format!("{file}: {module}"));
+                }
+                used.insert(module);
+            }
+        }
+        assert!(
+            unknown.is_empty(),
+            "in neither GATE_CODE nor GATE_SHARED: {unknown:?}"
+        );
+        for (m, why) in GATE_SHARED {
+            assert!(used.contains(*m), "GATE_SHARED `{m}` ({why}): unused");
+        }
+    }
+
+    /// native.rs names no failed gate itself: one added there would judge outside [`GATE_CODE`].
+    #[test]
+    fn native_fails_gates_only_in_the_hashed_file() {
+        let text = std::fs::read_to_string(crate::test_root().join("xtask/src/native.rs")).unwrap();
+        let code = product_part(&text);
+        let steps: Vec<&str> = code
+            .split("Failure::step(")
+            .skip(1)
+            .map(str::trim_start)
+            .collect();
+        let known = ["\"ninja\"", "&format!(\"native-bridge {arch} graph\")"];
+        for step in &steps {
+            assert!(
+                known.iter().any(|k| step.starts_with(k)),
+                "a gate in native.rs: {}",
+                step.lines().next().unwrap_or_default()
+            );
+        }
+        assert_eq!(steps.len(), known.len());
+        assert!(!code.contains("Failure::gate("));
+        assert!(!code.contains("Failure {"));
     }
 
     /// A red run is no built state: the same source state is refused by the failed gates' names (not as another state) and keeps no goal; a passing run after it is accepted; a red run of an older state reads as stale.
