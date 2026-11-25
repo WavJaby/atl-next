@@ -9,7 +9,7 @@
 //! 4. Java nullability through a C++ client: AOSP `service call` (shell uid) sends a null String (int32 -1, Parcel.writeString(null)) to hasSystemFeature and getApplicationInfo; the Rust
 //!    server takes it as None (before aidl --rust_java_nullability it failed the transaction with UNEXPECTED_NULL) and getApplicationInfo answers null (parcelable flag 0).
 //! 5. The services' counter lines: the unimplemented calls of 2 and 3 were counted.
-//! 6. AOSP `cmd package list packages` as shell (uid 2000) through the package service's shell-command hook: exit 0 and the test package's `package:` line.
+//! 6. AOSP `cmd package list packages` as shell (uid 2000) through the package service's shell-command hook: exit 0 and the test package's `package:` line. As an app uid, AOSP's shell check refuses it: exit non-zero, no package line.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -140,6 +140,18 @@ fn list_verdict(list: &Run) -> Vec<String> {
     vec![format!(
         "cmd package list packages: want exit 0 and `{want}`, got {}",
         list.1.trim()
+    )]
+}
+
+/// The same command as an app uid: AOSP's shell check refuses it (`Failure calling service package` from cmd, exit non-zero) and no `package:` line is printed.
+fn refusal_verdict(refused: &Run) -> Vec<String> {
+    let listed = refused.1.lines().any(|l| l.starts_with("package:"));
+    if !refused.0 && !listed && refused.1.contains("Failure calling service package") {
+        return Vec::new();
+    }
+    vec![format!(
+        "cmd package list packages as an app uid: want a refusal (exit non-zero, `Failure calling service package`, no package line), got {}",
+        refused.1.trim()
     )]
 }
 
@@ -395,15 +407,25 @@ pub fn stage(
             "service-info.log",
         )?;
         // AOSP's `cmd` as shell: the package service answers it through the shell-command hook (PackageManagerShellCommand.runListPackages)
-        let mut list_cmd = Command::new(cmd_bin);
-        list_cmd
-            .envs(env.iter().cloned())
-            .args(["package", "list", "packages"]);
+        let list_cmd = || {
+            let mut c = Command::new(cmd_bin);
+            c.envs(env.iter().cloned())
+                .args(["package", "list", "packages"]);
+            c
+        };
         let list = run(
             b,
-            list_cmd,
+            list_cmd(),
             (AID_SHELL, atl_sepolicy::domains::SHELL),
             &test_root.join("cmd-list.log"),
+            CLIENT_LIMIT,
+        )?;
+        // the same command as an app uid: AOSP's ibinder.cpp refuses any caller but root and shell before the hook runs
+        let refused = run(
+            b,
+            list_cmd(),
+            (APP_UID, atl_sepolicy::domains::UNTRUSTED_APP),
+            &test_root.join("cmd-list-app.log"),
             CLIENT_LIMIT,
         )?;
 
@@ -421,9 +443,10 @@ pub fn stage(
         }
         let mut fails = verdict(&app, &system, &feature, &info, &log);
         fails.extend(list_verdict(&list));
+        fails.extend(refusal_verdict(&refused));
         if fails.is_empty() {
             println!(
-                "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted; `cmd package list packages` lists the package)"
+                "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted; `cmd package list packages` lists the package, and an app uid is refused)"
             );
         }
         Ok(fails)
@@ -485,6 +508,24 @@ mod tests {
         assert_eq!(list_verdict(&(false, format!("package:{APP}\n"))).len(), 1);
         assert_eq!(
             list_verdict(&(true, "No shell command implementation.\n".into())).len(),
+            1
+        );
+    }
+
+    /// The refusal check passes only on a failed exit, cmd's shell-check line and no package line.
+    #[test]
+    fn refusal_names_the_shell_check() {
+        let refusal = (
+            false,
+            "cmd: Failure calling service package: Operation not permitted (1)\n".to_owned(),
+        );
+        assert!(refusal_verdict(&refusal).is_empty());
+        assert_eq!(
+            refusal_verdict(&(true, format!("package:{APP}\n"))).len(),
+            1
+        );
+        assert_eq!(
+            refusal_verdict(&(false, format!("package:{APP}\n"))).len(),
             1
         );
     }
