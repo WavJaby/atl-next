@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask test qemu-jni`: guest JNI calls under the QEMU crossing, integer lanes only, on the real arm64 NB images (QEMU bridge plan Q6-2). The fixture's JNI calls reach a fake host JNIEnv; GetJavaVM, a special, routes to its own thunk. Then each break must turn its run red.
+//! `xtask test qemu-jni`: guest JNI calls under the QEMU crossing, on the real arm64 NB images (QEMU bridge plan Q6-2). The fixture's JNI calls reach a fake host JNIEnv; GetJavaVM, a special, routes to its own thunk. Then each break must turn its run red.
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask-harness/testdata/qemu-jni/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`), built as for `test qemu-linker`.

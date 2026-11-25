@@ -57,7 +57,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// The first `<activity>` that handles MAIN + LAUNCHER (aliases not modelled: the installer's parse is the product's answer).
+    /// The first `<activity>` that handles MAIN + LAUNCHER; an enabled launcher alias counts as its target (`parse`).
     pub fn launch_activity(&self) -> Option<&ActivityDecl> {
         self.activities.iter().find(|a| a.launcher)
     }

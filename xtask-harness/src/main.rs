@@ -298,7 +298,7 @@ enum Test {
     ///
     /// Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-thread/`.
     QemuThread(qemu_thread::Args),
-    /// Guest JNI calls under the QEMU crossing, integer lanes (QEMU bridge plan Q6-2): a fixture's JNI calls reach a fake host JNIEnv, GetJavaVM routes to its own thunk; the `jni_guest_env` and `jni_swap` breaks must turn it red. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-jni/`.
+    /// Guest JNI calls under the QEMU crossing (QEMU bridge plan Q6-2): a fixture's JNI calls reach a fake host JNIEnv, GetJavaVM routes to its own thunk; the `jni_guest_env` and `jni_swap` breaks must turn it red. Builds first (as `xtask qemu --pic --execute`); needs the arm64 NB build (as `test qemu-linker`) and `--nb` pointing at its `<out>/nb-graph-arm64/nb/arm64`. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-jni/`.
     QemuJni(qemu_jni::Args),
     /// The engine ABI (QEMU bridge plan Q6-1), both directions: a guest host call's integer lanes, FP lanes and stack words reach the host, and the host's FP answer returns in the guest's v0; `call_ex` puts the host's lanes in the guest's registers and stack, and returns the callee's FP result. The `qa_stack_off`, `qa_v_lane`, `qa_x_lane`, `call-stack` and `call-v` breaks must each turn it red. Builds first (as `xtask qemu --pic --execute`); needs no NB images. Logs in `<out>/qemu/<target>-linux-user-pic/qemu-abi/`.
     QemuAbi(qemu_abi::Args),
