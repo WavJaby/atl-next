@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 
 use crate::Profile;
-use crate::control::Response;
+use crate::control::{MAX_ERROR_TEXT, Response, keep_tail};
 use crate::seccomp::death;
 
 /// The head of a failed run's text: `atl-installer exited <status>`. The billing harness (xtask-harness billing.rs) finds a run's first error by it.
@@ -46,7 +46,7 @@ impl InstallerEnd {
         if status.code() == Some(1)
             && let Some(line) = stderr.lines().find(|l| is_verdict(l))
         {
-            return InstallerEnd::Refused(line.trim().to_owned());
+            return InstallerEnd::Refused(keep_tail(line.trim(), MAX_ERROR_TEXT));
         }
         let why = match death(Profile::Installer, status) {
             Some(line) => line,
@@ -56,7 +56,10 @@ impl InstallerEnd {
             ),
             None => "no parse verdict".to_owned(),
         };
-        InstallerEnd::Failed(format!("{}: {why}\n{stderr}", head(status)))
+        // the head and the reason stay whole; the stderr's end fills the rest of the bound (its last lines carry the failure)
+        let first = format!("{}: {why}", head(status));
+        let room = MAX_ERROR_TEXT.saturating_sub(first.len() + "\n".len());
+        InstallerEnd::Failed(format!("{first}\n{}", keep_tail(stderr, room)))
     }
 
     /// The answer to a scan of `dir` (control `Scan`): the frames file at `frames` when parsed, the verdict as `Refused`, else an error naming the package and the end.
@@ -99,6 +102,31 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    /// A killed run's stderr beyond the bound is cut at its start, its end kept, and the reply that carries the text fits a packet.
+    #[test]
+    fn a_long_stderr_is_cut_to_fit_a_reply() {
+        let (status, stderr) =
+            ended("head -c 100000 /dev/zero | tr '\\0' x >&2; kill -s KILL $$");
+        let InstallerEnd::Failed(text) =
+            InstallerEnd::of(&status, &stderr, Path::new("/x/atl-installer"))
+        else {
+            panic!("a killed run fails");
+        };
+        assert!(text.starts_with(HEAD), "{:.60}", text);
+        assert!(text.contains(" bytes cut] "), "{:.80}", text);
+        assert!(text.ends_with('x'), "the end of the stderr is kept");
+        let packet = serde_json::to_vec(&crate::control::Envelope {
+            id: u64::MAX,
+            body: &Response::Error { message: text },
+        })
+        .expect("encode");
+        assert!(
+            packet.len() <= crate::control::MAX_MESSAGE,
+            "{} bytes",
+            packet.len()
+        );
     }
 
     fn of(script: &str) -> InstallerEnd {

@@ -238,7 +238,7 @@ mod tests {
         )
         .expect("socketpair");
         let server = std::thread::spawn(move || {
-            control::serve(&theirs, |r| match r {
+            let answer = |r: Request| match r {
                 Request::Start(s) if s == request() => Response::Started { pid: 77 },
                 Request::Start(_) => Response::Error {
                     message: "unexpected start".into(),
@@ -251,8 +251,8 @@ mod tests {
                 other => Response::Error {
                     message: format!("unexpected {other:?}"),
                 },
-            })
-            .expect("serve");
+            };
+            control::serve_lanes(theirs, answer, answer).expect("serve_lanes");
         });
         let pc = ControlSocket::new(ours);
         assert_eq!(pc.start(&request()).expect("start"), 77);

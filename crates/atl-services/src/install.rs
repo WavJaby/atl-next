@@ -434,8 +434,9 @@ mod tests {
             kept_frames.to_string_lossy().into_owned(),
         );
         let server = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            control::serve(&theirs, |r| {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = std::sync::Arc::clone(&seen);
+            let answer = move |r: Request| {
                 let answer = match &r {
                     Request::Install { session: 0, .. } => Response::Staged { frames: sf.clone() },
                     Request::Reinstate {
@@ -452,7 +453,7 @@ mod tests {
                         message: format!("unexpected {other:?}"),
                     },
                 };
-                seen.push(
+                record.lock().expect("seen").push(
                     format!("{r:?}")
                         .split([' ', '{', '('])
                         .next()
@@ -460,9 +461,12 @@ mod tests {
                         .to_owned(),
                 );
                 answer
-            })
-            .expect("serve");
-            seen
+            };
+            control::serve_lanes(theirs, answer.clone(), answer).expect("serve_lanes");
+            std::sync::Arc::try_unwrap(seen)
+                .expect("serve_lanes dropped its handlers")
+                .into_inner()
+                .expect("seen")
         });
         let control = ControlSocket::new(ours);
         let config = Config {
@@ -524,7 +528,7 @@ mod tests {
         .expect("socketpair");
         let (script, frames) = (script.to_owned(), frames.to_owned());
         let server = std::thread::spawn(move || {
-            control::serve(&theirs, |r| match r {
+            let answer = move |r: Request| match r {
                 Request::Scan { dir } => {
                     let out = std::process::Command::new("/bin/sh")
                         .args(["-c", &script])
@@ -537,8 +541,8 @@ mod tests {
                 other => Response::Error {
                     message: format!("unexpected {other:?}"),
                 },
-            })
-            .expect("serve");
+            };
+            control::serve_lanes(theirs, answer.clone(), answer).expect("serve_lanes");
         });
         let control = ControlSocket::new(ours);
         let config = Config {

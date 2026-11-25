@@ -371,8 +371,8 @@ const READY: Duration = Duration::from_secs(20);
 /// What each install session adds to the services' start (they install before registering): the installer measured 0.8-5.1 s cold (inst-m3/m5) plus staging copies of up to ~600 MB (an asset-pack split)
 /// at a slow disk's ~10 MB/s; a loaded machine's margin.
 const INSTALL_READY: Duration = Duration::from_secs(120);
-/// [`Args::stop_grace_ms`]'s default. A stop writes one line per counter key (tens) and exits: milliseconds; 2 s is a loaded machine's margin. The system processes stop in parallel, then binderd,
-/// so a stop takes at most 2 graces: 4 s, inside `xtask remote run-apk`'s KILL_GRACE (10 s after the limit's TERM) and the harness's STOP_WAIT (10 s after `stop`).
+/// [`Args::stop_grace_ms`]'s default. A stop writes one line per counter key (tens) and exits: milliseconds; 2 s is a loaded machine's margin. The system processes stop in parallel, then the installer lane (one grace at most), then binderd,
+/// so a stop takes at most 3 graces: 6 s, inside `xtask remote run-apk`'s KILL_GRACE (10 s after the limit's TERM) and the harness's STOP_WAIT (10 s after `stop`).
 const STOP_GRACE_MS: u64 = 2_000;
 /// What atl-system-services prints once registered.
 const READY_LINE: &str = "services: ready";
@@ -1237,15 +1237,18 @@ impl Host {
             valid_package_name(package),
             "{package:?}: not a package name"
         );
+        // the tables are checked and updated under their locks, the file work between them under none. Only the lane writes them, one item at a time: no other commit or scan runs
+        // between this check and the insert. A start reads `committed` on the serving thread and sees the package only after the insert, when its files and data dirs are in place
         let i = &self.installd;
-        let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
-        let in_place = match staged.get(&session) {
+        let in_place = match i.staged.lock().unwrap_or_else(|e| e.into_inner()).get(&session) {
             Some(s) if s.uid == uid => s.in_place.clone(),
             _ => bail!("session {session}: not staged for uid {uid}"),
         };
-        let mut committed = i.committed.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
-            !committed.contains_key(package),
+            !i.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(package),
             "{package}: already installed"
         );
         match in_place {
@@ -1275,8 +1278,14 @@ impl Host {
             }
         }
         self.create_app_data(package)?;
-        staged.remove(&session);
-        committed.insert(package.to_owned(), Committed { uid, system: false });
+        i.staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
+        i.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(package.to_owned(), Committed { uid, system: false });
         log(format_args!("installed {package}: uid {uid}"));
         Ok(())
     }
@@ -1357,13 +1366,19 @@ impl Host {
                 .remove(dir),
             "{dir}: not scanned"
         );
-        let mut committed = i.committed.lock().unwrap_or_else(|e| e.into_inner());
+        // the same split as `commit`: the lane is the only writer of `committed`
         ensure!(
-            !committed.contains_key(package),
+            !i.committed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(package),
             "{package}: already installed"
         );
         self.create_app_data(package)?;
-        committed.insert(package.to_owned(), Committed { uid, system: true });
+        i.committed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(package.to_owned(), Committed { uid, system: true });
         log(format_args!("scanned {package}: uid {uid}, code {dir}"));
         Ok(())
     }
@@ -3091,11 +3106,16 @@ fn run(a: &Args) -> Result<ExitCode> {
         },
     });
     // the control server answers from the moment the services exist: a start request may come with their first breath (--launch)
+    // the connection ends with the services (their end closes): the teardown waits for its serving side and lane within the stop grace
+    let (control_ended, control_done) = std::sync::mpsc::channel::<()>();
     {
         let host = Arc::clone(&host);
         std::thread::Builder::new()
             .name("process-control".into())
-            .spawn(move || serve_control(host, control_ours))?;
+            .spawn(move || {
+                serve_control(host, control_ours);
+                let _ = control_ended.send(());
+            })?;
     }
     // the services install the sessions at their start (atl_services::install): the files through the control socket, the rest by argument
     let mut services_args: Vec<OsString> = session_args;
@@ -3316,6 +3336,13 @@ fn run(a: &Args) -> Result<ExitCode> {
             s.spawn(move || stop_system(name, p, grace));
         }
     });
+    // the lane's item in progress finishes within the grace; queued items are not run once the connection has ended (serve_lanes)
+    match control_done.recv_timeout(grace) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => log(format_args!(
+            "process control: the installer lane did not finish within {grace:?}: its item is cut at exit"
+        )),
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+    }
     for (name, status) in &died {
         log(format_args!(
             "verdict: system process {name} died during the run: {status}"

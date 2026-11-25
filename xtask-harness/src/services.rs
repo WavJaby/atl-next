@@ -229,7 +229,7 @@ pub fn stage(
     let client_log = test_root.join("client-app.log");
     // the harness is atld for this stage: what the services start, it spawns; it kills nothing (the client ends by itself)
     let serve = |tx: Sender<Process>| {
-        let result = control::serve(&control_ours, |request| match request {
+        let handle = |request: Request| match request {
             Request::Start(start) => {
                 let Some(seq) = start
                     .args
@@ -293,8 +293,9 @@ pub fn stage(
                     "the services stage holds session 0 for uid {APP_UID} only ({other:?})"
                 ),
             },
-        });
+        };
         // the services ending their end of the socket is how the loop stops; any other error is theirs to report
+        let result = control::serve_lanes(control_ours, handle, handle);
         drop(result);
     };
     std::thread::scope(|scope| -> Result<Vec<String>> {
