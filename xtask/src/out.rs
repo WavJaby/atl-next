@@ -53,7 +53,7 @@ pub fn family_dir(root: &Path, family: &str) -> Result<PathBuf> {
 /// `out` subcommands.
 #[derive(clap::Subcommand)]
 pub enum Out {
-    /// This checkout's build dir, its base, its `target/` link, its run dir, and the pool: free space, bases, every build dir.
+    /// This checkout's build dir, its base, its `target/` link, its run dir, and the pool: free space, bases, arch parts (size, and whether `out prune` keeps each), every build dir.
     Show {
         /// Print only this checkout's run dir (out_run.rs: app data roots and bulky regenerable run data, never cited by a report), making it when missing.
         #[arg(long)]
@@ -1247,6 +1247,57 @@ fn stale_parts(
     stale
 }
 
+/// The `.part` stamp of a publish: the part's commit, arch and lower base, and its apparent size ([`part_size`] reads it back).
+fn part_stamp(commit: &str, arch: &str, base: &str, size: u64) -> String {
+    format!("commit={commit}\narch={arch}\nbase={base}\nsize={size}\n")
+}
+
+/// The `size=` of the `.part` stamp in `part` (an arch subtree, [`part_of`]); None when the stamp has none (a publish before it was stamped).
+fn part_size(part: &Path) -> Result<Option<u64>> {
+    let stamp = std::fs::read_to_string(part.join(PART_FILE))
+        .with_context(|| format!("reading {}", part.join(PART_FILE).display()))?;
+    Ok(stamp
+        .lines()
+        .find_map(|l| l.strip_prefix("size="))
+        .and_then(|v| v.parse().ok()))
+}
+
+/// `out show`'s arch part lines: per arch the complete parts newest first, then the partial ones. The keep rule is `out prune`'s own ([`stale_parts`] over `named`), so each line says what prune does with its part.
+fn part_lines(ws: &Path, named: &BTreeSet<(String, String)>) -> Result<Vec<String>> {
+    let (mut newest, mut partial) = (BTreeMap::new(), BTreeMap::new());
+    for arch in part_arches(ws)? {
+        let (complete, rest) = parts_of(ws, &arch)?;
+        partial.insert(arch.clone(), rest);
+        newest.insert(arch, complete);
+    }
+    let stale = stale_parts(&newest, named, KEEP_PARTS);
+    let mut lines = Vec::new();
+    for (arch, commits) in &newest {
+        for (i, commit) in commits.iter().enumerate() {
+            let size = match part_size(&part_of(ws, arch, commit))? {
+                Some(bytes) => format!("{:.2} GiB", gib(bytes)),
+                None => "size unknown (no size= in its .part)".to_owned(),
+            };
+            let keep = if stale.contains(&(arch.clone(), commit.clone())) {
+                format!("out prune removes it (past the newest {KEEP_PARTS}, named by no record)")
+            } else if i < KEEP_PARTS {
+                format!("kept: newest {KEEP_PARTS}")
+            } else {
+                "kept: named by a record".to_owned()
+            };
+            lines.push(format!("part {arch}@{commit}: {size}, {keep}"));
+        }
+    }
+    for (arch, commits) in &partial {
+        for commit in commits {
+            lines.push(format!(
+                "part {arch}@{commit}: partial (no .part), out prune removes it"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
 /// Facts `publish_part` judges: each false one refuses, named.
 struct PartFacts {
     /// `<arch>` is a `[host]` row other than the build machine (`native::cross_host_of`).
@@ -1391,7 +1442,9 @@ fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
             .success(),
         "the arch unit prune of {arch} failed (its lines are above): nothing published"
     );
-    let writes = if rec.is_some() { tree_bytes(&src)? } else { 0 };
+    // the part's apparent size goes into its `.part` stamp: `out show` reads it back without a tree walk
+    let size = tree_bytes(&src)?;
+    let writes = if rec.is_some() { size } else { 0 };
     let cfg = crate::ws_config::load(ws)?;
     part_space(
         free_bytes(&pool(ws))?,
@@ -1418,7 +1471,7 @@ fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
     let parent = dst.parent().context("part has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let _bases = crate::delta::bases_lock(ws)?;
-    let stamp = format!("commit={head}\narch={arch}\nbase={lower_base}\n");
+    let stamp = part_stamp(&head, arch, &lower_base, size);
     let finish = |tmp: &Path| {
         std::fs::write(tmp.join(PART_FILE), &stamp)
             .with_context(|| format!("writing {}", tmp.join(PART_FILE).display()))
@@ -2091,6 +2144,9 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             for c in bases(&ws)? {
                 println!("base/{c}: {}", age(&base_of(&ws, &c)));
             }
+            for line in part_lines(&ws, &named_parts(&ws)?)? {
+                println!("{line}");
+            }
             for (id, path) in build_dirs(&ws)? {
                 let state = if live.contains(&id) { "live" } else { "orphan" };
                 let tier = if path.join(crate::delta::RECORD).exists() {
@@ -2599,6 +2655,51 @@ mod tests {
         let named = BTreeSet::from([riscv("c1")]);
         assert_eq!(stale_parts(&newest, &named, KEEP_PARTS), [riscv("c2")]);
         assert!(stale_parts(&newest, &none, 3).is_empty());
+    }
+
+    /// `out show`'s part lines on a fixture: each complete part's size from its `.part` stamp, and the keep rule `out prune` applies (the newest and the named parts stay). A stamp without size and a partial publish say so.
+    /// Break: named parts ignored, so c2 reads as removed.
+    #[test]
+    fn part_lines_name_size_and_keep_rule() {
+        let ws = scratch("part-lines");
+        // created oldest first, so c3 is the newest by publish mtime
+        for (commit, stamp) in [
+            ("c1", "commit=c1\narch=riscv64\nbase=b0\n"),
+            ("c2", "commit=c2\narch=riscv64\nbase=b0\nsize=2147483648\n"),
+            ("c3", "commit=c3\narch=riscv64\nbase=b0\nsize=3221225472\n"),
+        ] {
+            let sub = part_of(&ws, "riscv64", commit);
+            std::fs::create_dir_all(&sub).expect("part");
+            std::fs::write(sub.join(PART_FILE), stamp).expect("stamp");
+        }
+        // a partial publish: its arch subtree has no .part
+        std::fs::create_dir_all(part_of(&ws, "riscv64", "c0")).expect("partial");
+        let named = BTreeSet::from([("riscv64".to_owned(), "c2".to_owned())]);
+        assert_eq!(
+            part_lines(&ws, &named).expect("lines"),
+            [
+                "part riscv64@c3: 3.00 GiB, kept: newest 1",
+                "part riscv64@c2: 2.00 GiB, kept: named by a record",
+                "part riscv64@c1: size unknown (no size= in its .part), out prune removes it (past the newest 1, named by no record)",
+                "part riscv64@c0: partial (no .part), out prune removes it",
+            ]
+        );
+    }
+
+    /// The stamp a publish writes carries the size `out show` reads back; a stamp without one reads as none.
+    /// Break: the stamp writes size 0.
+    #[test]
+    fn part_stamp_carries_the_size_show_reads() {
+        let dir = scratch("part-stamp");
+        std::fs::write(
+            dir.join(PART_FILE),
+            part_stamp("c1", "riscv64", "b0", 3 << 30),
+        )
+        .expect("stamp");
+        assert_eq!(part_size(&dir).expect("size"), Some(3 << 30));
+        std::fs::write(dir.join(PART_FILE), "commit=c1\narch=riscv64\nbase=b0\n")
+            .expect("old stamp");
+        assert_eq!(part_size(&dir).expect("size"), None);
     }
 
     /// Complete parts (a `<arch>/.part`) newest first by publish mtime; a commit without the record is partial; a `.`-prefixed temp is neither.
