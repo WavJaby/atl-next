@@ -1524,6 +1524,18 @@ impl Inner {
         if let Some(uid) = st.open_tasks.remove(&task) {
             let at = st.uids.on_task_removed(uid, self.now_ms());
             self.arm_settle(uid, at);
+            self.uid_gone_locked(st, uid);
+        }
+    }
+
+    /// Clears `uid`'s foreground settle once no attached process of `uid` remains (AppOpsUidStateTrackerImpl.updateUidProcState :242-243, commitUidPendingState :402-405).
+    fn uid_gone_locked(&self, st: &mut State, uid: u32) {
+        if !st
+            .processes
+            .iter()
+            .any(|r| r.uid == uid && r.attached.is_some())
+        {
+            st.uids.on_uid_gone(uid);
         }
     }
 
@@ -1941,6 +1953,7 @@ impl Inner {
                 if let Some(task) = rec.task {
                     self.task_gone_locked(st, task);
                 }
+                self.uid_gone_locked(st, rec.uid);
                 self.touch_all_locked(st);
             }
             if let Some(instr) = rec.instr.take() {
@@ -2023,6 +2036,7 @@ impl Inner {
         }
         self.broadcasts_died_locked(st, rec.pid);
         self.services_died(st, rec.pid, allow_restart);
+        self.uid_gone_locked(st, rec.uid);
         self.touch_all_locked(st);
         let lost = Self::remove_providers_of_process(st, &rec.package, &rec.process_name, |_| true);
         (lost, last_app)
@@ -3783,10 +3797,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
+    use atl_services_types::app_ops;
     use atl_services_types::display_model::Declaration;
     use binder::{BinderFeatures, Interface, StatusCode};
 
     use super::*;
+    use crate::appops;
     use crate::packages::fixture;
 
     /// A process control that starts nothing: the broadcast tests below send to no receiver.
@@ -4467,5 +4483,149 @@ mod tests {
         assert_eq!(under_policy(back, RootBack::Close), Back::Finish);
         assert_eq!(under_policy(Back::Finish, RootBack::Minimize), Back::Finish);
         assert_eq!(under_policy(Back::Finish, RootBack::Close), Back::Finish);
+    }
+
+    /// AppOpsManager.OP_TAKE_AUDIO_FOCUS: MODE_FOREGROUND by default, no capability.
+    const OP_TAKE_AUDIO_FOCUS: i32 = 32;
+
+    /// An attached ProcessRecord for foreground-settle tests; tests call `app_died` / `force_stop_package` directly so no binder death link is registered.
+    fn attached_process(uid: u32, pid: i32, task: Option<TaskId>) -> ProcessRecord {
+        let (thread, _) = waiting_caller();
+        ProcessRecord {
+            package: "com.example.app".into(),
+            process_name: "com.example.app".into(),
+            uid,
+            start_seq: i64::from(pid),
+            pid,
+            attached: Some(Attached {
+                thread,
+                program_pid: Some(pid),
+                _death: DeathRecipient::new(|| {}),
+            }),
+            launch_activity: task.is_some(),
+            task,
+            instr: None,
+            attach_finished: true,
+            touched: 0,
+            kill_reason: None,
+        }
+    }
+
+    /// Pins that once a uid's Task ends and its last process dies (or is force-stopped), a new process restarting 1 s later gets no 5 s foreground settle (AppOpsUidStateTrackerImpl.updateUidProcState :242-248, commitUidPendingState :402-405); break: omitting `process_out_locked` in `app_died` or `force_stop_package_locked`.
+    #[test]
+    fn last_process_death_ends_foreground_settle() {
+        const UID: u32 = 10_401;
+        let am = no_app_manager();
+        let task = TaskId::from_raw(1).expect("task id");
+        let t = am.inner.now_ms();
+        {
+            let mut st = am.inner.state();
+            st.open_tasks.insert(task, UID);
+            st.uids.on_task_added(UID, t);
+            st.processes.push(attached_process(UID, 41, Some(task)));
+        }
+        am.inner.task_gone(task);
+        am.inner.app_died(41);
+        am.inner
+            .state()
+            .processes
+            .push(attached_process(UID, 42, None));
+        let mut view = am.uid_view(UID);
+        view.now = view.restricted_since.unwrap_or(t) + 1_000;
+        assert_eq!(view.state, Some(ProcessState::CachedEmpty));
+        assert_eq!(view.restricted_since, None);
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &view),
+            app_ops::IGNORED
+        );
+        let task2 = TaskId::from_raw(2).expect("task id");
+        let t2 = am.inner.now_ms();
+        {
+            let mut st = am.inner.state();
+            st.open_tasks.insert(task2, UID);
+            st.uids.on_task_added(UID, t2);
+        }
+        am.inner.task_gone(task2);
+        am.force_stop_package("com.example.app");
+        am.inner
+            .state()
+            .processes
+            .push(attached_process(UID, 43, None));
+        let mut view = am.uid_view(UID);
+        view.now = view.restricted_since.unwrap_or(t2) + 1_000;
+        assert_eq!(view.restricted_since, None);
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &view),
+            app_ops::IGNORED
+        );
+    }
+
+    /// Pins that a uid whose Task ends while its process stays alive keeps the 5 s foreground settle (AppOpsUidStateTrackerImpl.updateUidProcState :262-277); break: clearing `restricted_since` in `task_gone_locked` while a live process remains.
+    #[test]
+    fn surviving_process_keeps_foreground_settle() {
+        const UID: u32 = 10_402;
+        let am = no_app_manager();
+        let task = TaskId::from_raw(1).expect("task id");
+        let t = am.inner.now_ms();
+        {
+            let mut st = am.inner.state();
+            st.open_tasks.insert(task, UID);
+            st.uids.on_task_added(UID, t);
+            st.processes.push(attached_process(UID, 51, Some(task)));
+        }
+        am.inner.task_gone(task);
+        let view = am.uid_view(UID);
+        assert_eq!(view.state, Some(ProcessState::CachedEmpty));
+        let since = view.restricted_since.expect("live process keeps settle");
+        let at = |now| UidView { now, ..view };
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &at(since + 4_999)),
+            app_ops::ALLOWED
+        );
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &at(since + 5_000)),
+            app_ops::IGNORED
+        );
+    }
+
+    /// Pins that when one of a uid's two attached processes dies with its Task, the surviving process keeps the 5 s foreground settle until it also dies (AppOpsUidStateTrackerImpl.updateUidProcState :242-243, :262-277); break: calling `on_uid_gone` on any process death without checking for another attached process of the uid.
+    #[test]
+    fn one_of_two_processes_dying_keeps_foreground_settle() {
+        const UID: u32 = 10_403;
+        let am = no_app_manager();
+        let task = TaskId::from_raw(1).expect("task id");
+        let t = am.inner.now_ms();
+        {
+            let mut st = am.inner.state();
+            st.open_tasks.insert(task, UID);
+            st.uids.on_task_added(UID, t);
+            st.processes.push(attached_process(UID, 61, Some(task)));
+            st.processes.push(attached_process(UID, 62, None));
+        }
+        am.inner.app_died(61);
+        let view = am.uid_view(UID);
+        assert_eq!(view.state, Some(ProcessState::CachedEmpty));
+        let since = view.restricted_since.expect("second process keeps settle");
+        let at = |now| UidView { now, ..view };
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &at(since + 1_000)),
+            app_ops::ALLOWED
+        );
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &at(since + 5_000)),
+            app_ops::IGNORED
+        );
+        am.inner.app_died(62);
+        am.inner
+            .state()
+            .processes
+            .push(attached_process(UID, 63, None));
+        let mut view = am.uid_view(UID);
+        assert_eq!(view.restricted_since, None);
+        view.now = since + 1_000;
+        assert_eq!(
+            appops::eval_mode(OP_TAKE_AUDIO_FOCUS, app_ops::FOREGROUND, &view),
+            app_ops::IGNORED
+        );
     }
 }

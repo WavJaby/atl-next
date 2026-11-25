@@ -2,7 +2,7 @@
 //! Per-uid state (AOSP UidRecord): the idle flag, the background clock and its settle sweep, the temp allowlist; and the answers that read them: start mode, FGS start from background, process state, the headless end rule.
 //! AOSP references (android-16.0.0_r1, services/core/java/com/android/server/am/ unless named): UidRecord.java :187 (new uid idle), OomAdjuster.java :1585-1631 (background clock, cleared while active), :3984-4043 (idleUids sweep),
 //! ActivityManagerService.java :6360-6436 (getAppStartModeLOSP, isOnDeviceIdleAllowlistLOSP), :8109-8112 (isUidActiveLOSP), :15746-15767 (tempAllowlistUidLocked), FgsTempAllowList.java :76-127, ActiveServices.java :1036-1054 and :8954-8985 (FGS start gate), ProcessStateEnum.aidl :36-95.
-//! Pure rules, no clock or binder. `now` is elapsed ms. A call that starts a countdown returns the absolute deadline for am_handler (S1); the caller reports back with `settle` / `on_temp_expired` when it fires. A process death needs no call: uid reasons are Tasks, FGS and temp grants, which the caller removes itself.
+//! Pure rules, no clock or binder. `now` is elapsed ms. A call that starts a countdown returns the absolute deadline for am_handler (S1); the caller reports back with `settle` / `on_temp_expired` when it fires. The last process leaving calls `on_uid_gone` to clear the app-ops foreground settle (`restricted_since`); uid active reasons (Tasks, FGS, temp grants) are removed by the caller itself.
 //! Not modelled: isPendingTopUid (AMS :6362), the legacy restricted-bucket and battery branch (:6288-6296), the background allowlist (:6338), instant apps (:6378), strict background (forcedStandby), app ops other than the default.
 
 use std::collections::BTreeMap;
@@ -202,7 +202,7 @@ struct Uid {
     fgs_until: Option<u64>,
     /// When the uid last turned TOP (its first Task appeared): the uid observer's foreground event ShortcutService records (UidView::top_since).
     top_since: Option<u64>,
-    /// When the uid's last Task and FGS ended, while neither holds again (UidView::restricted_since).
+    /// When the uid's last Task and FGS ended, while neither holds again and a process of the uid stays alive (UidView::restricted_since).
     restricted_since: Option<u64>,
 }
 
@@ -289,9 +289,16 @@ impl Uids {
         self.uids.get(&uid).and_then(|u| u.top_since)
     }
 
-    /// When `uid` lost its last Task and FGS; None while one holds or before either ever did.
+    /// When `uid` lost its last Task and FGS; None while one holds, before either ever did, or after `on_uid_gone`.
     pub fn restricted_since(&self, uid: u32) -> Option<u64> {
         self.uids.get(&uid).and_then(|u| u.restricted_since)
+    }
+
+    /// No live process of `uid` remains (UID_STATE_NONEXISTENT): clears `restricted_since` so a later process gets no settle time from before (AppOpsUidStateTrackerImpl.updateUidProcState :242-243, commitUidPendingState :402-405).
+    pub fn on_uid_gone(&mut self, uid: u32) {
+        if let Some(u) = self.uids.get_mut(&uid) {
+            u.restricted_since = None;
+        }
     }
 
     /// A temp allowlist grant (AMS tempAllowlistUidLocked :15746-15767; `fgs` for the FGS-allowed type). Returns the expiry to arm for `on_temp_expired`.
@@ -820,5 +827,20 @@ mod tests {
         uids.on_task_added(APP_UID, 600);
         assert_eq!(uids.restricted_since(APP_UID), None);
         assert_eq!(uids.top_since(APP_UID), Some(600));
+    }
+
+    /// Pins that `on_uid_gone` clears `restricted_since` while keeping `top_since` and the AMS idle state (AppOpsUidStateTrackerImpl.updateUidProcState :242-243, commitUidPendingState :402-405); break: omitting the clear in `on_uid_gone`.
+    #[test]
+    fn uid_gone_clears_restricted_since() {
+        let mut uids = Uids::default();
+        uids.on_task_added(APP_UID, 100);
+        assert_eq!(uids.on_task_removed(APP_UID, 500), Some(60_500));
+        assert_eq!(uids.restricted_since(APP_UID), Some(500));
+        uids.on_uid_gone(APP_UID);
+        assert_eq!(uids.restricted_since(APP_UID), None);
+        assert_eq!(uids.top_since(APP_UID), Some(100));
+        assert!(!uids.is_idle(APP_UID));
+        uids.on_uid_gone(APP_UID + 1);
+        assert_eq!(uids.restricted_since(APP_UID + 1), None);
     }
 }
