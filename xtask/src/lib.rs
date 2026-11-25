@@ -55,6 +55,7 @@ pub mod licence_gate;
 pub mod licenses;
 pub mod modules;
 pub mod native;
+pub mod native_gates;
 pub mod ndk;
 pub mod ndk_surface;
 pub mod ninja_deps;
