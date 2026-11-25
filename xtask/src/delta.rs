@@ -1124,11 +1124,24 @@ fn end_holders(ws: &Path, id: &str, lock: &Path, except: u32) -> Result<usize> {
     Ok(first.len())
 }
 
+/// Why ram dir `rec` of checkout `id` has no intact upper (upper or work missing); None = intact. The test `lost` and [`pins`] share.
+pub fn lost_upper(id: &str, rec: &Record) -> Option<String> {
+    let sd = rec.dir(id);
+    (!sd.join("upper").is_dir() || !sd.join("work").is_dir())
+        .then(|| format!("no upper in {}", sd.display()))
+}
+
+/// Whether ram dir `rec` of checkout `id` still pins its base (`out prune`): no intact upper, no claim.
+/// A store that is not a usable RAM store proves nothing about its uppers (the mount may be invisible in this namespace), so the pin stands.
+/// Base presence is `lost`'s other half, not here.
+pub fn pins(id: &str, rec: &Record, store_usable: bool) -> bool {
+    !store_usable || lost_upper(id, rec).is_none()
+}
+
 /// Why ram dir `rec` cannot be mounted (its upper or base is gone, e.g. a WSL restart emptied the store); None = intact.
 fn lost(ws: &Path, id: &str, rec: &Record) -> Result<Option<String>> {
-    let sd = rec.dir(id);
-    if !sd.join("upper").is_dir() || !sd.join("work").is_dir() {
-        return Ok(Some(format!("no upper in {}", sd.display())));
+    if let Some(why) = lost_upper(id, rec) {
+        return Ok(Some(why));
     }
     if !out::base_of(ws, &rec.base).is_dir() {
         return Ok(Some(format!("base/{} is gone", rec.base)));
@@ -2129,6 +2142,27 @@ mod tests {
             let s = probe(Path::new("/dev/shm"), &cfg).unwrap().unwrap();
             assert_eq!((s.backing, s.ratio_milli), (Backing::Tmpfs, 1000));
         }
+    }
+
+    /// `pins`: a missing upper or work is no claim, on a usable store only; otherwise the pin stands whatever the dirs hold.
+    #[test]
+    fn pins_follow_the_upper_only_on_a_usable_store() {
+        let pid = std::process::id();
+        let store = std::env::temp_dir().join(format!("xtask-delta-pins-{pid}"));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).unwrap();
+        let rec = Record {
+            base: "b".into(),
+            store: store.clone(),
+        };
+        assert!(!pins("c", &rec, true), "no upper: no claim");
+        assert!(pins("c", &rec, false), "unusable store: the pin stands");
+        std::fs::create_dir_all(rec.dir("c").join("upper")).unwrap();
+        assert!(!pins("c", &rec, true), "upper without work: no claim");
+        std::fs::create_dir_all(rec.dir("c").join("work")).unwrap();
+        assert!(pins("c", &rec, true), "upper and work: pinned");
+        assert_eq!(lost_upper("c", &rec), None);
+        std::fs::remove_dir_all(&store).unwrap();
     }
 
     #[test]

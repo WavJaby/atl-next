@@ -1454,14 +1454,25 @@ fn build_dirs(ws: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// `(id, path)` of build dirs.
 type Dirs = Vec<(String, PathBuf)>;
 
-/// What `out prune` deletes: build dirs whose id no live checkout has (temp leftovers included) and bases beyond the newest [`KEEP_BASES`] that no live ram dir lays its delta over (delta.rs: a lower must not vanish under an upper). Also returns the pinned bases.
+/// What `out prune` deletes: build dirs whose id no live checkout has (temp leftovers included) and bases beyond the newest [`KEEP_BASES`] that no live ram dir pins ([`crate::delta::pins`]).
+/// A lower must not vanish under an upper (delta.rs: a delta lies over its base). Also returns the pinned bases.
 fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BTreeSet<String>)> {
     let (dirs, kept): (Dirs, Dirs) = build_dirs(ws)?
         .into_iter()
         .partition(|(id, _)| !live.contains(id));
+    // each store probed once, inside prune's bases lock; no config or a failed probe: not usable, so the pin stands
+    let cfg = crate::ws_config::load(ws).ok().map(|c| c.delta);
+    let mut usable: BTreeMap<PathBuf, bool> = BTreeMap::new();
     let mut pinned = BTreeSet::new();
-    for (_, path) in &kept {
-        if let Some(rec) = crate::delta::record(path)? {
+    for (id, path) in &kept {
+        let Some(rec) = crate::delta::record(path)? else {
+            continue;
+        };
+        let ok = *usable.entry(rec.store.clone()).or_insert_with(|| {
+            cfg.as_ref()
+                .is_some_and(|c| matches!(crate::delta::probe(&rec.store, c), Ok(Ok(_))))
+        });
+        if crate::delta::pins(id, &rec, ok) {
             pinned.insert(rec.base);
         }
     }
@@ -1482,6 +1493,31 @@ fn orphans(ws: &Path, live: &BTreeSet<String>) -> Result<(Dirs, Vec<PathBuf>, BT
         );
     }
     Ok((dirs, old, pinned))
+}
+
+/// `base/<c>: not pinned by ws/<id>` lines: a lost ram delta released base `c` (no other record pins it) and the keep rule now lists it in `old`. Read-only; prune counts `delta-lost-pin` per line under --execute.
+fn released_pins(
+    ws: &Path,
+    live: &BTreeSet<String>,
+    pinned: &BTreeSet<String>,
+    old: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for (id, path) in build_dirs(ws)?.iter().filter(|(id, _)| live.contains(id)) {
+        let Some(rec) = crate::delta::record(path)? else {
+            continue;
+        };
+        let Some(why) = crate::delta::lost_upper(id, &rec) else {
+            continue;
+        };
+        if !pinned.contains(&rec.base) && old.contains(&base_of(ws, &rec.base)) {
+            lines.push(format!(
+                "base/{}: not pinned by ws/{id}: its ram delta is lost ({why})",
+                rec.base
+            ));
+        }
+    }
+    Ok(lines)
 }
 
 /// Boot targets ([`boot_of`]) whose id no live checkout has. Nothing else frees them: once a worktree's build dir exists its `target` is moved there, so a boot dir left behind is a checkout gone before its first build or one whose link was replaced.
@@ -1862,6 +1898,12 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
     let (mut dirs, mut old, pinned) = orphans(ws, live)?;
     for c in &pinned {
         println!("base/{c}: kept: a ram delta lies over it");
+    }
+    for line in released_pins(ws, live, &pinned, &old)? {
+        println!("{line}");
+        if execute {
+            count(ws, "delta-lost-pin");
+        }
     }
     let counts = if rows.iter().any(|(_, short)| *short) {
         println!(
@@ -2702,6 +2744,109 @@ mod tests {
         assert!(old.is_empty(), "{old:?}");
         assert_eq!(pinned, BTreeSet::from(["c1".to_owned()]));
         std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Live checkout `live` with a record over `c1` (the oldest of three bases) in `store`; the caller lays out the store.
+    fn lost_pin_ws(name: &str, store: &Path) -> PathBuf {
+        let ws = scratch(name);
+        std::fs::create_dir_all(dir_of(&ws, "live")).expect("dir");
+        for (i, c) in ["c1", "c2", "c3"].iter().enumerate() {
+            let b = base_of(&ws, c);
+            std::fs::create_dir_all(&b).expect("base");
+            let t =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000 + i as u64);
+            std::fs::File::open(&b)
+                .expect("open")
+                .set_modified(t)
+                .expect("mtime");
+        }
+        let rec = dir_of(&ws, "live").join(crate::delta::RECORD);
+        let text = format!("base=c1\nstore={}\n", store.display());
+        std::fs::write(rec, text).expect("record");
+        ws
+    }
+
+    /// Whether [`crate::delta::probe`] reads `store` as a usable (RAM-backed) store: the premise of each test below.
+    fn probes_usable(store: &Path) -> bool {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        matches!(crate::delta::probe(store, &cfg), Ok(Ok(_)))
+    }
+
+    /// A fresh tmpfs store under /dev/shm (RAM-backed).
+    fn shm_store(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let store = Path::new("/dev/shm").join(format!("xtask-lost-pin-{pid}-{tag}"));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).expect("store");
+        store
+    }
+
+    /// A usable store without the checkout's upper: its record pins nothing, c1 is old, and the prune says why.
+    #[test]
+    fn lost_ram_delta_pins_no_base() {
+        let store = shm_store("lost");
+        assert!(
+            probes_usable(&store),
+            "premise: {} is a usable store",
+            store.display()
+        );
+        let ws = lost_pin_ws("lost-pin", &store);
+        let live = BTreeSet::from(["live".to_owned()]);
+        let (dirs, old, pinned) = orphans(&ws, &live).expect("orphans");
+        assert!(dirs.is_empty(), "{dirs:?}");
+        assert_eq!(old, vec![base_of(&ws, "c1")]);
+        assert!(pinned.is_empty(), "{pinned:?}");
+        let lines = released_pins(&ws, &live, &pinned, &old).expect("released");
+        let want = "base/c1: not pinned by ws/live: its ram delta is lost (no upper in ";
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(want), "{lines:?}");
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+        std::fs::remove_dir_all(&store).expect("cleanup");
+    }
+
+    /// The same usable store with the checkout's upper and work: its record pins c1, which the prune keeps.
+    #[test]
+    fn intact_ram_delta_pins_its_base() {
+        let store = shm_store("intact");
+        assert!(
+            probes_usable(&store),
+            "premise: {} is a usable store",
+            store.display()
+        );
+        std::fs::create_dir_all(store.join("live/upper")).expect("upper");
+        std::fs::create_dir_all(store.join("live/work")).expect("work");
+        let ws = lost_pin_ws("intact-pin", &store);
+        let live = BTreeSet::from(["live".to_owned()]);
+        let (_, old, pinned) = orphans(&ws, &live).expect("orphans");
+        assert!(old.is_empty(), "{old:?}");
+        assert_eq!(pinned, BTreeSet::from(["c1".to_owned()]));
+        let lines = released_pins(&ws, &live, &pinned, &old).expect("released");
+        assert!(lines.is_empty(), "{lines:?}");
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+        std::fs::remove_dir_all(&store).expect("cleanup");
+    }
+
+    /// A disk store (/var/tmp; /tmp is tmpfs on some hosts) proves nothing about the upper it lacks: the pin stands.
+    #[test]
+    fn unprobed_store_pins_its_base() {
+        let pid = std::process::id();
+        let store = Path::new("/var/tmp").join(format!("xtask-lost-pin-{pid}-disk"));
+        let _ = std::fs::remove_dir_all(&store);
+        std::fs::create_dir_all(&store).expect("store");
+        assert!(
+            !probes_usable(&store),
+            "premise: {} is not RAM-backed here",
+            store.display()
+        );
+        let ws = lost_pin_ws("disk-pin", &store);
+        let live = BTreeSet::from(["live".to_owned()]);
+        let (_, old, pinned) = orphans(&ws, &live).expect("orphans");
+        assert!(old.is_empty(), "{old:?}");
+        assert_eq!(pinned, BTreeSet::from(["c1".to_owned()]));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+        std::fs::remove_dir_all(&store).expect("cleanup");
     }
 
     #[test]
