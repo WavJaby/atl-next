@@ -104,15 +104,27 @@ impl Definition {
 /// The permission registry by name.
 pub type Registry = std::collections::BTreeMap<String, Definition>;
 
-/// The permission registry: `definitions` = the platform's (framework-res) then each installed package's, as (defining package, name, protectionLevel); the first definition wins (PMS keeps the first).
-pub fn registry<'a>(definitions: impl IntoIterator<Item = (&'a str, &'a str, u32)>) -> Registry {
-    let mut defined = Registry::new();
-    for (owner, name, level) in definitions {
-        defined.entry(name.to_owned()).or_insert(Definition {
+/// One definition into `registry`: the first definer wins (PMS keeps the first, so a later one, or a non-system redefinition, is ignored). True when `name` is newly defined.
+pub fn define(registry: &mut Registry, owner: &str, name: &str, level: u32) -> bool {
+    if registry.contains_key(name) {
+        return false;
+    }
+    registry.insert(
+        name.to_owned(),
+        Definition {
             owner: owner.to_owned(),
             base: level & PROTECTION_MASK_BASE,
             flags: level & !PROTECTION_MASK_BASE,
-        });
+        },
+    );
+    true
+}
+
+/// The permission registry: `definitions` = the platform's (framework-res) then each installed package's, as (defining package, name, protectionLevel); the first definition wins.
+pub fn registry<'a>(definitions: impl IntoIterator<Item = (&'a str, &'a str, u32)>) -> Registry {
+    let mut defined = Registry::new();
+    for (owner, name, level) in definitions {
+        define(&mut defined, owner, name, level);
     }
     defined
 }

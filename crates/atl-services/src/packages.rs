@@ -497,10 +497,16 @@ impl std::fmt::Display for GrantError {
 
 /// The permission state every service consults (PermissionManagerServiceImpl's registry + UidPermissionState): the registry of definitions, and each app id's permission states, first
 /// `permission::initial_states` of its packages (a shared uid's packages pool theirs, as PMS's shared user does), then changed by runtime grants. One user (0); not persisted (plan S6).
+/// Registry and states sit under one lock: a batch of installs changes both at once ([`Permissions::packages_added`]).
 pub struct Permissions {
+    table: Mutex<Table>,
+}
+
+/// What [`Permissions`] guards together.
+struct Table {
     registry: permission::Registry,
     /// app id -> its permission states, by name
-    states: Mutex<BTreeMap<u32, BTreeMap<String, PermissionState>>>,
+    states: BTreeMap<u32, BTreeMap<String, PermissionState>>,
 }
 
 impl Permissions {
@@ -535,19 +541,69 @@ impl Permissions {
             }
         }
         Permissions {
-            registry,
-            states: Mutex::new(states),
+            table: Mutex::new(Table { registry, states }),
         }
     }
 
-    fn states(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<u32, BTreeMap<String, PermissionState>>> {
-        self.states.lock().unwrap_or_else(|e| e.into_inner())
+    /// The install-order step of a batch: `names` are the batch's packages, already in `next`; one lock for the whole step.
+    /// (1) their definitions, first definer wins; (2) each one's initial states into its app id, pooled as [`Permissions::new`] pools them.
+    /// (3) each newly defined permission that a package outside the batch requests gets its initial state there, except a NORMAL one for a non-system package: AOSP marks it INSTALL_REVOKED.
+    /// One batch of every package equals `new` over `next` (boot's start-with-all).
+    pub fn packages_added(&self, next: &Packages, names: &[String]) {
+        let mut table = self.table();
+        let Table { registry, states } = &mut *table;
+        let (batch, others): (Vec<&PackageRecord>, Vec<&PackageRecord>) = next
+            .all()
+            .iter()
+            .partition(|p| names.iter().any(|n| n == p.name()));
+        let mut defined = BTreeSet::new();
+        for &p in &batch {
+            for d in p.permission_decls() {
+                let Some(name) = d.item.name.as_deref() else {
+                    continue;
+                };
+                if permission::define(registry, p.name(), name, d.protection_level as u32) {
+                    defined.insert(name);
+                }
+            }
+        }
+        for &p in &batch {
+            let uid_states = states.entry(permission::app_id(p.uid)).or_default();
+            for s in permission::initial_states(
+                p.name(),
+                p.app().target_sdk_version,
+                p.requested_permissions(),
+                registry,
+            ) {
+                uid_states.entry(s.name.clone()).or_insert(s);
+            }
+        }
+        for p in others {
+            let wanted: Vec<&str> = p
+                .requested_permissions()
+                .filter(|r| defined.contains(r))
+                .collect();
+            let system = p.app().flags & FLAG_SYSTEM != 0;
+            let uid_states = states.entry(permission::app_id(p.uid)).or_default();
+            for s in
+                permission::initial_states(p.name(), p.app().target_sdk_version, wanted, registry)
+            {
+                if s.granted && !s.runtime && !system {
+                    continue;
+                }
+                uid_states.entry(s.name.clone()).or_insert(s);
+            }
+        }
+    }
+
+    /// The table's lock; a poisoned one is taken anyway (plain data, no invariant a panic can break).
+    fn table(&self) -> std::sync::MutexGuard<'_, Table> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn state(&self, uid: u32, p: &str) -> Option<PermissionState> {
-        self.states()
+        self.table()
+            .states
             .get(&permission::app_id(uid))
             .and_then(|s| s.get(p))
             .cloned()
@@ -560,7 +616,8 @@ impl Permissions {
 
     /// The names `uid` holds now (the broker's sandbox rights read them at process start).
     pub fn granted_names(&self, uid: u32) -> Vec<String> {
-        self.states()
+        self.table()
+            .states
             .get(&permission::app_id(uid))
             .map(|s| {
                 s.values()
@@ -579,8 +636,9 @@ impl Permissions {
     /// grantRuntimePermissionInternal after the caller and package checks: the permission must be defined and runtime (role and development permissions are not modelled) and requested by
     /// `package` (or already in its uid's state); a legacy app's runtime permission is left as it is (granted, with its review flag), as AOSP returns early for targetSdk < M.
     pub fn grant_runtime(&self, package: &PackageRecord, p: &str) -> Result<(), GrantError> {
-        let definition = self
-            .registry
+        let mut table = self.table();
+        let Table { registry, states } = &mut *table;
+        let definition = registry
             .get(p)
             .ok_or_else(|| GrantError::UnknownPermission(p.to_owned()))?;
         if !definition.is_runtime() {
@@ -589,7 +647,6 @@ impl Permissions {
                 package: package.name().to_owned(),
             });
         }
-        let mut states = self.states();
         let uid_states = states.entry(permission::app_id(package.uid)).or_default();
         if !uid_states.contains_key(p) && !package.requested_permissions().any(|r| r == p) {
             return Err(GrantError::NotRequested {
@@ -619,7 +676,8 @@ impl Permissions {
 
     /// The registered definition is runtime or an app-op permission (AppOpsService.shouldCollectNotes' test); an undefined one is neither.
     pub fn is_runtime_or_app_op(&self, p: &str) -> bool {
-        self.registry
+        self.table()
+            .registry
             .get(p)
             .is_some_and(|d| d.is_runtime() || d.is_app_op())
     }
@@ -631,9 +689,10 @@ impl Permissions {
 
     /// BroadcastSkipPolicy.isSignaturePerm (:680-705): null is false; every permission must be defined and signature-only (an empty list is vacuously true).
     pub fn is_signature_only(&self, perms: Option<&[String]>) -> bool {
+        let table = self.table();
         perms.is_some_and(|list| {
             list.iter()
-                .all(|p| self.registry.get(p).is_some_and(|d| d.is_signature_only()))
+                .all(|p| table.registry.get(p).is_some_and(|d| d.is_signature_only()))
         })
     }
 
@@ -1195,6 +1254,110 @@ mod tests {
             });
         let packages = Arc::new(Packages::new(vec![r.clone()], BTreeMap::new()));
         (Permissions::new(&packages, &platform), r)
+    }
+
+    /// A package of the install-order tests: uid, targetSdk, FLAG_SYSTEM when `system`, its `<permission>`s (name, protectionLevel) and its `<uses-permission>`s.
+    fn pkg(
+        name: &str,
+        uid: u32,
+        sdk: i32,
+        system: bool,
+        defines: &[(&str, i32)],
+        requests: &[&str],
+    ) -> PackageRecord {
+        let mut r = record(name);
+        r.uid = uid;
+        r.info.requested_permissions =
+            Some(requests.iter().map(|p| Some((*p).to_owned())).collect());
+        r.info.permissions = Some(
+            defines
+                .iter()
+                .map(|&(n, level)| {
+                    Some(PermissionInfo {
+                        item: PackageItemInfo {
+                            name: Some(n.to_owned()),
+                            ..Default::default()
+                        },
+                        protection_level: level,
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+        );
+        if let Some(a) = r.info.application_info.as_mut() {
+            a.target_sdk_version = sdk;
+            if system {
+                a.flags |= FLAG_SYSTEM;
+            }
+        }
+        r
+    }
+
+    /// S (uid 1000, system) defines normal `org.n` and requests normal `org.m`; A (10001) defines dangerous `org.d` and requests `org.m`; B (10002) defines normal `org.m` and requests
+    /// dangerous `org.d`. targetSdk 30 for all: no literal below depends on S's.
+    fn install_order_set() -> [PackageRecord; 3] {
+        [
+            pkg("org.s", 1000, 30, true, &[("org.n", 0)], &["org.m"]),
+            pkg("org.a", 10_001, 30, false, &[("org.d", 1)], &["org.m"]),
+            pkg("org.b", 10_002, 30, false, &[("org.m", 0)], &["org.d"]),
+        ]
+    }
+
+    /// framework-res's one permission in these tests: `org.p0`, normal.
+    fn platform_decls() -> [PermissionDecl; 1] {
+        [PermissionDecl {
+            name: "org.p0".into(),
+            protection_level: 0,
+        }]
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// (granted, flags, runtime_grant) of `name` for `uid` as the services read it; no state reads as (false, 0, None).
+    fn view(p: &Permissions, uid: u32, name: &str) -> (bool, u32, Option<bool>) {
+        (
+            p.granted(uid, name),
+            p.flags(uid, name),
+            p.runtime_grant(uid, name),
+        )
+    }
+
+    /// One batch of all three on an empty table equals the start-with-all `Permissions::new` of the same list: same definitions, same states, and the literal states. Step 3 never
+    /// runs here (no package outside the batch); `a_definition_after_its_requester_is_not_granted` covers it.
+    #[test]
+    fn packages_added_equals_a_start_with_all() {
+        let all = Packages::new(install_order_set().to_vec(), BTreeMap::new());
+        let start = Permissions::new(&all, &platform_decls());
+        let batch = Permissions::new(&Packages::new(vec![], BTreeMap::new()), &platform_decls());
+        batch.packages_added(&all, &names(&["org.s", "org.a", "org.b"]));
+        assert_eq!(batch.table().states, start.table().states);
+        assert_eq!(batch.table().registry, start.table().registry);
+        assert_eq!(view(&batch, 1000, "org.n"), (false, 0, None));
+        assert_eq!(view(&batch, 1000, "org.m"), (true, 0, None));
+        assert_eq!(view(&batch, 1000, "org.d"), (false, 0, None));
+        assert_eq!(view(&batch, 10_001, "org.n"), (false, 0, None));
+        assert_eq!(view(&batch, 10_001, "org.m"), (true, 0, None));
+        assert_eq!(view(&batch, 10_001, "org.d"), (false, 0, None));
+        assert_eq!(view(&batch, 10_002, "org.n"), (false, 0, None));
+        assert_eq!(view(&batch, 10_002, "org.m"), (false, 0, None));
+        assert_eq!(view(&batch, 10_002, "org.d"), (false, 0, Some(false)));
+    }
+
+    /// A permission defined after its requester was installed: batch 1 is S and A (`org.m` not yet defined), batch 2 is B, which defines it. The system requester gets the normal
+    /// permission; the non-system one does not (AOSP's INSTALL_REVOKED); B's own dangerous request is denied as a start denies it.
+    #[test]
+    fn a_definition_after_its_requester_is_not_granted() {
+        let [s, a, b] = install_order_set();
+        let table = Permissions::new(&Packages::new(vec![], BTreeMap::new()), &platform_decls());
+        let first = Packages::new(vec![s.clone(), a.clone()], BTreeMap::new());
+        table.packages_added(&first, &names(&["org.s", "org.a"]));
+        let second = Packages::new(vec![s, a, b], BTreeMap::new());
+        table.packages_added(&second, &names(&["org.b"]));
+        assert_eq!(view(&table, 1000, "org.m"), (true, 0, None));
+        assert_eq!(view(&table, 10_001, "org.m"), (false, 0, None));
+        assert_eq!(view(&table, 10_002, "org.d"), (false, 0, Some(false)));
     }
 
     /// targetSdk >= M: the runtime permission starts denied and grantRuntimePermission grants it; the install permission is granted and not changeable; grantRuntimePermissionInternal's refusals
