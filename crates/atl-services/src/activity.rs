@@ -4263,7 +4263,14 @@ mod tests {
             let control = Arc::new(RecordingProcesses::default());
             let am = provider_manager(Arc::clone(&control));
             let racer = am.clone();
-            let start = std::thread::spawn(move || start_provider_process(&racer).is_ok());
+            // both sides leave the barrier together, so the start and the freeze contend for the state lock
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let racing = Arc::clone(&gate);
+            let start = std::thread::spawn(move || {
+                racing.wait();
+                start_provider_process(&racer).is_ok()
+            });
+            gate.wait();
             let frozen = am.freeze_package(PROVIDER_PACKAGE);
             let started = start.join().expect("the racing start");
             let killed = control.kills.lock().expect("kills").len();
