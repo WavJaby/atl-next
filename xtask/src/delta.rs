@@ -450,15 +450,24 @@ pub fn judge(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> V
     Verdict::Admit { need }
 }
 
-/// The class of a build command (cli.rs).
-pub fn class_for_native(root: &Path, host: &str) -> Result<Class> {
+/// The class and cross flag of `native --host <host>` in the checkout at `root` (cli.rs). The build machine's host: Native, not cross.
+/// Another host is cross (its own dir `upper/<host>`): Native when its part is laid or would be laid (capability, not host identity), else Cross (a build from zero).
+pub fn class_for_native(root: &Path, host: &str) -> Result<(Class, bool)> {
     let arches = crate::arches::load(root)?;
     let (build, _) = crate::arches::build_machine(root, &arches)?;
-    Ok(if host == build {
-        Class::Native
-    } else {
-        Class::Cross
-    })
+    if host == build {
+        return Ok((Class::Native, false));
+    }
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let id = out::checkout_id(root)?;
+    let laid = match record(&out::dir_of(&ws, &id))? {
+        Some(rec) if rec.parts.contains_key(host) => true,
+        Some(rec) => {
+            !upper_host_exists(&rec.dir(&id), host) && out::pick_part(root, &ws, host)?.is_some()
+        }
+        None => out::pick_part(root, &ws, host)?.is_some(),
+    };
+    Ok((if laid { Class::Native } else { Class::Cross }, true))
 }
 
 fn lock_dir(ws: &Path) -> PathBuf {
@@ -1014,7 +1023,7 @@ pub fn refresh(
 }
 
 /// Bytes of upper `upper` that a build of `class` grows, allocated (`st_blocks * 512`, each inode once; a missing upper is 0).
-/// Cross = `upper/<cross_host>` only. Other build classes = all of `upper` but the cross host dirs `cross_dirs`: a cross host's outputs are not credited across arches (rhs2-rv-20: 14.4 GiB of x86 upper, its first riscv64 build still grew 10.32).
+/// A cross host = `upper/<cross_host>` only, whatever the class (a part-laid cross build is Native). Other builds = all of `upper` but the cross host dirs `cross_dirs`: a cross host's outputs are not credited across arches (rhs2-rv-20: 14.4 GiB of x86 upper, its first riscv64 build still grew 10.32).
 /// Run dirs grow from an empty root: 0. A cross command without a host dir (`cross`: cargo writes `target/<triple>`): 0, so its growth is reserved whole and not sampled.
 pub fn own_bytes(
     upper: &Path,
@@ -1024,7 +1033,8 @@ pub fn own_bytes(
 ) -> Result<u64> {
     let (top, skip): (PathBuf, Vec<PathBuf>) = match (class, cross_host) {
         (Class::Run, _) | (Class::Cross, None) => return Ok(0),
-        (Class::Cross, Some(host)) => (upper.join(host), Vec::new()),
+        // the cross host's dir whatever the class: a part laid under it makes the build Native, its growth is still that dir
+        (_, Some(host)) => (upper.join(host), Vec::new()),
         _ => (
             upper.to_owned(),
             cross_dirs.iter().map(|d| upper.join(d)).collect(),
@@ -1170,6 +1180,13 @@ pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Opti
             Flock::take(open_lock(&lock_path)?, Mode::Exclusive)?
         }
     };
+    // a cross host's part, laid under the mount lock (no mount of this upper runs now) and before unshare; the record is re-read: make_ram / lost above may have rewritten it
+    if let Some(host) = cross_host {
+        let mut rec = record(&dir)?.context("ram dir has no record after its make")?;
+        if let Some(line) = lay_part(root, &ws, &id, &mut rec, host)? {
+            println!("{line}");
+        }
+    }
     // every process of the namespace inherits the fd, and the lock is never unlocked by hand: it lives while any of them does (crate::flock's unlock-on-drop would free it for all)
     let mut lock = std::mem::ManuallyDrop::new(lock);
     rustix::io::fcntl_setfd(&*lock.file(), rustix::io::FdFlags::empty())
@@ -1372,7 +1389,8 @@ pub fn pins(id: &str, rec: &Record, store_usable: bool) -> bool {
     !store_usable || lost_upper(id, rec).is_none()
 }
 
-/// Why ram dir `rec` cannot be mounted (its upper or base is gone, e.g. a WSL restart emptied the store); None = intact.
+/// Why ram dir `rec` cannot be mounted (its upper or base is gone, e.g. a WSL restart emptied the store, or a laid part is gone under an arch dir the upper built over it); None = intact.
+/// A gone part with no `upper/<arch>` is no loss: [`lay_part`] drops its line and lays the newest part again.
 fn lost(ws: &Path, id: &str, rec: &Record) -> Result<Option<String>> {
     if let Some(why) = lost_upper(id, rec) {
         return Ok(Some(why));
@@ -1380,7 +1398,62 @@ fn lost(ws: &Path, id: &str, rec: &Record) -> Result<Option<String>> {
     if !out::base_of(ws, &rec.base).is_dir() {
         return Ok(Some(format!("base/{} is gone", rec.base)));
     }
+    let sd = rec.dir(id);
+    for (arch, commit) in &rec.parts {
+        if !out::part_root(ws, arch).join(commit).is_dir() && upper_host_exists(&sd, arch) {
+            return Ok(Some(format!(
+                "part {arch}@{commit} is gone under the upper's {arch}/"
+            )));
+        }
+    }
     Ok(None)
+}
+
+/// Whether `upper/<host>` exists in any form (dir, whiteout, link): an arch dir there shadows a part laid under it.
+fn upper_host_exists(sd: &Path, host: &str) -> bool {
+    std::fs::symlink_metadata(sd.join("upper").join(host)).is_ok()
+}
+
+/// Lays the newest part of `host` under ram dir `rec` (`enter` calls it under the mount lock, before unshare, after make_ram's restore).
+/// Drops recorded parts whose dir is gone (lost() took those with an `upper/<arch>`). Lays only when no part is recorded for `host` and no `upper/<host>` exists: a part under an arch dir would be shadowed.
+/// Order: touch (paths differing from the part get now), then record: a crash between them leaves no record, so the next run touches again. Returns the line; None = nothing laid.
+fn lay_part(
+    root: &Path,
+    ws: &Path,
+    id: &str,
+    rec: &mut Record,
+    host: &str,
+) -> Result<Option<String>> {
+    let _pin = bases_lock(ws)?;
+    let sd = rec.dir(id);
+    let before = rec.parts.len();
+    rec.parts
+        .retain(|arch, commit| out::part_root(ws, arch).join(commit).is_dir());
+    let dropped = rec.parts.len() != before;
+    let mut line = None;
+    if !rec.parts.contains_key(host)
+        && !upper_host_exists(&sd, host)
+        && let Some(part) = out::pick_part(root, ws, host)?
+    {
+        if part != rec.base {
+            crate::checkout_stamps::touch_changed_since(root, &part)?;
+        }
+        rec.parts.insert(host.to_owned(), part.clone());
+        out::count(ws, "delta-part");
+        line = Some(format!("out: ws/{id} part {host}@{part} laid"));
+    }
+    if dropped || line.is_some() {
+        write_record(&out::dir_of(ws, id), rec)?;
+    }
+    Ok(line)
+}
+
+/// Rewrites the record of ram dir `dir` (temp + rename: a crash keeps the old text). Called only outside the namespace, under the mount lock.
+fn write_record(dir: &Path, rec: &Record) -> Result<()> {
+    let tmp = dir.join(format!("{RECORD}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, rec.text()).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, dir.join(RECORD))
+        .with_context(|| format!("renaming {} over the record", tmp.display()))
 }
 
 /// The overlay mount options of ram dir `rec` of checkout `id`. Overlay splits options at `,` and lowerdir at `:`, which a path may not hold.
@@ -1388,16 +1461,24 @@ pub fn mount_options(ws: &Path, id: &str, rec: &Record) -> Result<String> {
     let sd = rec.dir(id);
     let lower = out::base_of(ws, &rec.base);
     let (upper, work) = (sd.join("upper"), sd.join("work"));
-    for p in [&lower, &upper, &work] {
+    // each recorded part's commit dir (`pool/part/<arch>/<commit>`) is a lower after the base: trees are disjoint, so order has no effect
+    let parts: Vec<PathBuf> = rec
+        .parts
+        .iter()
+        .map(|(arch, commit)| out::part_root(ws, arch).join(commit))
+        .collect();
+    for p in [&lower, &upper, &work].into_iter().chain(parts.iter()) {
         let s = p.to_string_lossy();
         ensure!(
             !s.contains(',') && !s.contains(':'),
             "{s}: an overlay path may not contain ',' or ':'"
         );
     }
+    let mut lowers = vec![lower.display().to_string()];
+    lowers.extend(parts.iter().map(|p| p.display().to_string()));
     Ok(format!(
         "lowerdir={},upperdir={},workdir={},userxattr",
-        lower.display(),
+        lowers.join(":"),
         upper.display(),
         work.display()
     ))
@@ -2762,6 +2843,212 @@ mod tests {
         std::fs::remove_dir_all(&store).unwrap();
     }
 
+    /// A scratch workspace dir named `name` for this process, emptied first.
+    fn scratch_ws(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = remove_tree(&d);
+        d
+    }
+
+    /// Runs git in `dir` with a test identity; its trimmed stdout.
+    fn git_t(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Sets `path`'s mtime to unix time `epoch`.
+    fn touch_at(path: &Path, epoch: &str) {
+        let ok = std::process::Command::new("touch")
+            .args(["-d", &format!("@{epoch}")])
+            .arg(path)
+            .status()
+            .expect("touch")
+            .success();
+        assert!(ok, "touch {}", path.display());
+    }
+
+    /// A complete part `commit` of `arch` under `ws`: `<arch>/.part`, the subtree's mtime `epoch` (publish order, out.rs parts_of).
+    fn make_part(ws: &Path, arch: &str, commit: &str, epoch: &str) {
+        let sub = out::part_root(ws, arch).join(commit).join(arch);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".part"), format!("commit={commit}\narch={arch}\n")).unwrap();
+        touch_at(&sub, epoch);
+    }
+
+    /// A repo at `root`, `main` = c1 (a.txt "1", b.txt "b") -> c2 (a.txt "2"): returns (c1, c2).
+    fn two_commit_repo(root: &Path) -> (String, String) {
+        std::fs::create_dir_all(root).unwrap();
+        git_t(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "1").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        git_t(root, &["add", "."]);
+        git_t(root, &["commit", "-q", "-m", "c1"]);
+        let c1 = git_t(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("a.txt"), "2").unwrap();
+        git_t(root, &["commit", "-q", "-am", "c2"]);
+        (c1, git_t(root, &["rev-parse", "HEAD"]))
+    }
+
+    /// `pick_part`: the newest complete part that is an ancestor of HEAD. A newer part on a sibling branch is not picked.
+    /// Break: pick the newest complete part regardless of ancestry -> the side branch's s1 -> red.
+    #[test]
+    fn pick_is_the_newest_ancestor_part() {
+        let ws = scratch_ws("xtask-delta-pick");
+        let root = ws.join("repo");
+        let (c1, _c2) = two_commit_repo(&root);
+        git_t(&root, &["checkout", "-q", "-b", "side", &c1]);
+        std::fs::write(root.join("a.txt"), "s").unwrap();
+        git_t(&root, &["commit", "-q", "-am", "s1"]);
+        let s1 = git_t(&root, &["rev-parse", "HEAD"]);
+        git_t(&root, &["checkout", "-q", "main"]);
+        make_part(&ws, "riscv64", &c1, "1000000000");
+        make_part(&ws, "riscv64", &s1, "2000000000");
+        assert_eq!(
+            out::pick_part(&root, &ws, "riscv64").unwrap(),
+            Some(c1.clone())
+        );
+        assert_eq!(out::pick_part(&root, &ws, "x86_64").unwrap(), None);
+        remove_tree(&ws).unwrap();
+    }
+
+    /// `lay_part` refuses an upper that holds the arch, as a dir or a link (a whiteout is one of these too): a part under it would be shadowed.
+    /// Break: drop the `upper_host_exists` check -> the part is recorded -> red.
+    #[test]
+    fn lay_refuses_an_upper_that_holds_the_arch() {
+        let ws = scratch_ws("xtask-delta-lay-refuse");
+        let root = ws.join("repo");
+        let (c1, _) = two_commit_repo(&root);
+        make_part(&ws, "riscv64", &c1, "1000000000");
+        std::fs::create_dir_all(lock_dir(&ws)).unwrap();
+        std::fs::create_dir_all(out::dir_of(&ws, "k")).unwrap();
+        let mut rec = Record {
+            base: "b1".into(),
+            store: ws.join("store"),
+            parts: BTreeMap::new(),
+        };
+        let sd = rec.dir("k");
+        std::fs::create_dir_all(sd.join("upper/riscv64")).unwrap();
+        std::fs::create_dir_all(sd.join("work")).unwrap();
+        assert_eq!(
+            lay_part(&root, &ws, "k", &mut rec, "riscv64").unwrap(),
+            None
+        );
+        assert!(rec.parts.is_empty(), "an arch dir in the upper: no part");
+        std::fs::remove_dir_all(sd.join("upper/riscv64")).unwrap();
+        std::os::unix::fs::symlink("nowhere", sd.join("upper/riscv64")).unwrap();
+        assert_eq!(
+            lay_part(&root, &ws, "k", &mut rec, "riscv64").unwrap(),
+            None
+        );
+        assert!(rec.parts.is_empty(), "a link there: no part");
+        remove_tree(&ws).unwrap();
+    }
+
+    /// `lay_part` records the newest ancestor part and touches the paths that differ from it; the record is written after the touch.
+    /// Break: skip the touch -> a.txt keeps its 2001 mtime -> red. b.txt (equal in part and HEAD) keeps 2001 either way.
+    #[test]
+    fn lay_records_the_part_and_touches_what_differs() {
+        let ws = scratch_ws("xtask-delta-lay-touch");
+        let root = ws.join("repo");
+        let (c1, c2) = two_commit_repo(&root);
+        make_part(&ws, "riscv64", &c1, "1000000000");
+        std::fs::create_dir_all(lock_dir(&ws)).unwrap();
+        for f in ["a.txt", "b.txt"] {
+            touch_at(&root.join(f), "981154800");
+        }
+        let dir = out::dir_of(&ws, "k");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rec = Record {
+            base: c2.clone(),
+            store: ws.join("store"),
+            parts: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(rec.dir("k").join("upper")).unwrap();
+        std::fs::create_dir_all(rec.dir("k").join("work")).unwrap();
+        let line = lay_part(&root, &ws, "k", &mut rec, "riscv64").unwrap();
+        assert_eq!(line, Some(format!("out: ws/k part riscv64@{c1} laid")));
+        assert_eq!(rec.parts.get("riscv64"), Some(&c1));
+        assert_eq!(record(&dir).unwrap().unwrap().parts, rec.parts);
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(981_154_800);
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        assert!(mtime(&root.join("a.txt")) > old, "a.txt differs: touched");
+        assert_eq!(mtime(&root.join("b.txt")), old, "b.txt equal: kept");
+        remove_tree(&ws).unwrap();
+    }
+
+    /// The overlay [`mount_options`] makes for a laid part, mounted as stage mount does (uid 0 in a user + mount namespace): base and part merge; a delete under the arch dir whites out the part's file; a fresh upper without the arch dir shows the part again.
+    /// Break: leave the part out of lowerdir -> `riscv64/rv.o` is missing -> red.
+    #[test]
+    fn laid_part_merges_under_the_base_and_whiteouts_hide_it() {
+        let ws = scratch_ws("xtask-delta-part-mount");
+        let base = out::base_of(&ws, "b1");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("base.txt"), "x86").unwrap();
+        let part = out::part_root(&ws, "riscv64").join("p1");
+        std::fs::create_dir_all(part.join("riscv64")).unwrap();
+        std::fs::write(part.join("riscv64/rv.o"), "rv").unwrap();
+        std::fs::write(part.join(".part"), "commit=p1\narch=riscv64\n").unwrap();
+        let parts = BTreeMap::from([("riscv64".to_owned(), "p1".to_owned())]);
+        let store = ws.join("store");
+        let merged = out::dir_of(&ws, "k");
+        std::fs::create_dir_all(&merged).unwrap();
+        let opts = |id: &str| {
+            let rec = Record {
+                base: "b1".into(),
+                store: store.clone(),
+                parts: parts.clone(),
+            };
+            std::fs::create_dir_all(rec.dir(id).join("upper")).unwrap();
+            std::fs::create_dir_all(rec.dir(id).join("work")).unwrap();
+            mount_options(&ws, id, &rec).unwrap()
+        };
+        let (o1, o2) = (opts("k"), opts("k2"));
+        let m = merged.display();
+        let script = format!(
+            "set -e\n\
+             mount -t overlay overlay -o '{o1}' '{m}'\n\
+             test -f '{m}/base.txt'\n\
+             test -f '{m}/riscv64/rv.o'\n\
+             rm '{m}/riscv64/rv.o'\n\
+             test ! -e '{m}/riscv64/rv.o'\n\
+             umount '{m}'\n\
+             mount -t overlay overlay -o '{o2}' '{m}'\n\
+             test -f '{m}/riscv64/rv.o'\n\
+             umount '{m}'\n\
+             echo merged-ok\n"
+        );
+        let out = std::process::Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ])
+            .output()
+            .expect("unshare");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("merged-ok"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        remove_tree(&ws).unwrap();
+    }
+
     /// Part lines: 0, 1 and 2 parts round-trip; text without part lines (an older xtask's record) parses to none; a line without `@` is refused.
     #[test]
     fn record_parts_round_trip() {
@@ -2809,7 +3096,8 @@ mod tests {
         let d = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
-        assert_eq!(Class::Cross.peak(&d), 20 * GIB);
+        // cross 12 GiB: measured riscv64 upper 10.32 GiB raw + 16 % (manager 2026-11-25)
+        assert_eq!(Class::Cross.peak(&d), 12 * GIB);
         // run default = the larger measured WeChat clean install + launch window (ws_config DEFAULT_PEAK_MIB[4]), rounded up
         assert_eq!(
             Class::Run.peak(&d),

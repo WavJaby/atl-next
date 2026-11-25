@@ -277,6 +277,15 @@ pub(crate) fn pick_base(root: &Path, ws: &Path) -> Result<Option<String>> {
     Ok(pick.cloned())
 }
 
+/// The part of `arch` a ram dir of the checkout at `root` lays: the newest complete part whose commit is an ancestor of HEAD ([`parts_of`] order); None without one.
+/// A newer part on a sibling branch is not picked.
+pub(crate) fn pick_part(root: &Path, ws: &Path, arch: &str) -> Result<Option<String>> {
+    let (complete, _) = parts_of(ws, arch)?;
+    Ok(complete
+        .into_iter()
+        .find(|c| git(Some(root), &["merge-base", "--is-ancestor", c, "HEAD"]).is_ok()))
+}
+
 /// Refuses a ram dir (delta.rs) seen outside its namespace: there it is the empty mount point, and a build would write the pool under the overlay's place.
 fn unmounted_ram(dir: &Path, id: &str) -> Result<()> {
     unmounted_ram_at(dir, id, crate::delta::stage().is_some())
@@ -1998,6 +2007,12 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                     rec.base,
                     rec.dir(&id).join("upper").display()
                 );
+                for (arch, commit) in &rec.parts {
+                    println!(
+                        "out: ws/{id} part {arch}@{commit} laid ({})",
+                        part_root(&ws, arch).join(commit).display()
+                    );
+                }
                 let boot = boot_of(&target_of(&dir)).unwrap_or_default();
                 println!(
                     "target: {}",
