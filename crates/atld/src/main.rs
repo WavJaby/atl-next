@@ -71,6 +71,7 @@ use signal_hook::iterator::Signals;
 
 mod applog;
 mod cacerts;
+mod code_swap;
 mod host_layout;
 mod host_props;
 mod installed_code;
@@ -1035,6 +1036,32 @@ fn staging_name(session: u32) -> String {
     format!("vmdl{session}.tmp")
 }
 
+/// Removes the staging dirs a killed run left in `app` (device/data/app): `vmdl<sessionId>.tmp`, as PackageInstallerService.reconcileStagesLocked (:419). Returns how many went.
+fn remove_stale_stages(app: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(app) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // only a session's own name (staging_name): a package may be called vmdl<word>.tmp
+        if name
+            .strip_prefix("vmdl")
+            .and_then(|n| n.strip_suffix(".tmp"))
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let path = entry.path();
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing the stage {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 impl Host {
     /// Request `Install`: stages session `session` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
     /// A session equal to an installed package's code (installed_code.rs) is not staged: the installer runs over that code dir where it lies, its native-library root the package's own, with
@@ -1067,10 +1094,6 @@ impl Host {
             None => {
                 let name = staging_name(session);
                 let host_dir = self.root.data().join("app").join(&name);
-                // a dir a killed run left under this session name (the device outlives runs): the session's files must be the only ones here
-                if host_dir.exists() {
-                    std::fs::remove_dir_all(&host_dir)?;
-                }
                 std::fs::create_dir_all(&host_dir)?;
                 (host_dir, Path::new(DATA_APP).join(name))
             }
@@ -1227,17 +1250,9 @@ impl Host {
     }
 
     /// Request `Commit`: session `session` becomes `/data/app/<package>` as uid `uid` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
+    /// The swap ([`code_swap::replace`]) is the commit point. An error before it leaves the installed code, the table and the permissions as they were: the staging dir and the staged entry go.
+    /// An update waits until every process of the package is reaped (`Processes::wait_gone`): a `Kill` only signals.
     fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<()> {
-        ensure!(
-            valid_package_name(package),
-            "{package:?}: not a package name"
-        );
-        ensure!(
-            uid > INSTALLER_UID,
-            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
-        );
-        // the tables are checked and updated under their locks, the file work between them under none. Only the lane writes them, one item at a time: no other commit or scan runs
-        // between this check and the insert. A start reads `committed` on the serving thread and sees the package only after the insert, when its files and data dirs are in place
         let i = &self.installd;
         let in_place = match i
             .staged
@@ -1248,44 +1263,78 @@ impl Host {
             Some(s) => s.in_place.clone(),
             None => bail!("session {session}: not staged"),
         };
-        ensure!(
-            !i.committed
+        let staged_dir = self.root.data().join("app").join(staging_name(session));
+        let swap = (|| -> Result<bool> {
+            ensure!(
+                valid_package_name(package),
+                "{package:?}: not a package name"
+            );
+            ensure!(
+                uid > INSTALLER_UID,
+                "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
+            );
+            // the tables are checked and updated under their locks, the file work between them under none. Only the lane writes them, one item at a time: no other commit or scan runs
+            // between this check and the insert. A start reads `committed` on the serving thread and sees the package only after the insert, when its files and data dirs are in place
+            let installed = i
+                .committed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains_key(package),
-            "{package}: already installed"
-        );
-        match in_place {
-            // the installed code is the parse's: its files already carry the AOSP names the parse gives
-            Some(p) => {
-                ensure!(
-                    p == package,
-                    "session {session}: equals {p}'s code but parsed as {package}"
-                );
-                ensure!(
-                    names.iter().all(|n| n.staged == n.name),
-                    "session {session}: {package}'s installed names differ from the parse's"
-                );
-            }
-            None => {
-                let code = self.root.package(package, host_layout::Item::Apk);
-                let staged_dir = self.root.data().join("app").join(staging_name(session));
-                rename_staged(&staged_dir, names)?;
-                // the data root keeps the code across runs: the new code replaces an earlier install's, as an update does (the data dirs are its siblings and stay)
-                if code.exists() {
-                    std::fs::remove_dir_all(&code)?;
+                .get(package)
+                .copied();
+            // an update: the same package at the same uid, not a system package (P4c decides which updates are accepted)
+            ensure!(
+                installed.is_none_or(|c| c.uid == uid && !c.system),
+                "{package}: already installed"
+            );
+            match in_place.as_deref() {
+                // the installed code is the parse's: its files already carry the AOSP names the parse gives
+                Some(p) => {
+                    ensure!(
+                        p == package,
+                        "session {session}: equals {p}'s code but parsed as {package}"
+                    );
+                    ensure!(
+                        names.iter().all(|n| n.staged == n.name),
+                        "session {session}: {package}'s installed names differ from the parse's"
+                    );
+                    self.create_app_data(package)?;
+                    Ok(false)
                 }
-                let parent = code.parent().context("package dir has no parent")?;
-                std::fs::create_dir_all(parent)?;
-                std::fs::rename(&staged_dir, &code)
-                    .with_context(|| format!("moving session {session} to {}", code.display()))?;
+                None => {
+                    self.processes.wait_gone(package, REAP_WAIT)?;
+                    rename_staged(&staged_dir, names)?;
+                    self.create_app_data(package)?;
+                    // the data root keeps the code across runs: the new code replaces an earlier install's, and the old code goes to the staging dir in the same syscall
+                    code_swap::replace(
+                        &staged_dir,
+                        &self.root.package(package, host_layout::Item::Apk),
+                    )
+                }
             }
-        }
-        self.create_app_data(package)?;
+        })();
         i.staged
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session);
+        let replaced = match swap {
+            Ok(replaced) => replaced,
+            Err(e) => {
+                // an installed package's code (in place) stays: only a staging dir is this session's own
+                if in_place.is_none() {
+                    let _ = std::fs::remove_dir_all(&staged_dir);
+                }
+                return Err(e);
+            }
+        };
+        // the swap is done: the replaced code, if there was any, is at the staging dir
+        if replaced {
+            std::fs::remove_dir_all(&staged_dir).unwrap_or_else(|e| {
+                log(format_args!(
+                    "installed {package}: the replaced code at {} is not removed: {e}",
+                    staged_dir.display()
+                ));
+            });
+        }
         i.committed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1868,21 +1917,21 @@ impl Host {
     }
 
     /// Starts `spawn`; a thread reaps it. `held`: the process's security contexts ([`Host::app_spawn`]), held until the process is reaped, so the compositor and PipeWire serve its sockets exactly while it lives.
-    /// `main`: the `--run-class` command, whose end is the run's (`done`).
+    /// `main`: the `--run-class` command, whose end is the run's (`done`). `package`: the app whose process the services control ([`Processes`]); None for the run command.
     fn start(
         self: &Arc<Self>,
         spawn: Spawn,
         held: Held,
         main: bool,
-        controlled: bool,
+        package: Option<&str>,
     ) -> Result<i32> {
         let Process {
             mut child,
             host_pid,
             ..
         } = self.broker.spawn(spawn)?;
-        if controlled {
-            self.processes.started(host_pid);
+        if let Some(package) = package {
+            self.processes.started(host_pid, package);
         }
         let host = Arc::clone(self);
         std::thread::Builder::new()
@@ -1965,7 +2014,7 @@ impl Host {
             });
         }
         spawn.rights = req.rights.clone();
-        let pid = self.start(spawn, held, false, true)?;
+        let pid = self.start(spawn, held, false, Some(&req.package))?;
         let _ = self.first_app_ms.set(wall_ms());
         log(format_args!(
             "started {} (package {}): uid {}, host pid {pid}",
@@ -2016,7 +2065,7 @@ impl Host {
         let spawned = std::thread::Builder::new()
             .name(format!("last-app-{pid}"))
             .spawn(move || {
-                let deadline = Instant::now() + LAST_APP_EXIT_WAIT;
+                let deadline = Instant::now() + REAP_WAIT;
                 let status = loop {
                     let seen = host
                         .exits
@@ -2040,7 +2089,7 @@ impl Host {
                         "last app ended (pid {pid}, {s}): not a normal end, the run goes on"
                     )),
                     None => log(format_args!(
-                        "last app ended (pid {pid}): no exit status within {LAST_APP_EXIT_WAIT:?}, the run goes on"
+                        "last app ended (pid {pid}): no exit status within {REAP_WAIT:?}, the run goes on"
                     )),
                 }
             });
@@ -2050,9 +2099,9 @@ impl Host {
     }
 }
 
-/// How long a `LastAppEnded` of a live app waits for its process's exit status: the services see the death when its binder fd closes, at its exit; bwrap reports the status a moment
-/// later. 2 s is a loaded machine's margin.
-const LAST_APP_EXIT_WAIT: Duration = Duration::from_secs(2);
+/// How long a death may take to be reaped: a `LastAppEnded` waits this long for the process's exit status (the services see the death when its binder fd closes, at its exit;
+/// bwrap reports the status a moment later), and `Commit` for the processes of an updated package ([`Processes::wait_gone`]). 2 s is a loaded machine's margin.
+const REAP_WAIT: Duration = Duration::from_secs(2);
 
 impl Host {
     /// The control command `start <package>/<class>`: atl-am as the shell uid (AID_SHELL), a startActivity with no caller app; waits for it. Its reply line, `ok <am line>` or `error <why>`.
@@ -2380,6 +2429,11 @@ fn run(a: &Args) -> Result<ExitCode> {
     }
     let r = Root { root, data_root };
     std::fs::create_dir_all(r.root.join("log"))?;
+    // a staging dir a killed run left is no install's: the device data outlives the run, so they go before any service starts
+    let stale = remove_stale_stages(&r.data().join("app"))?;
+    log(format_args!(
+        "install stages from a killed run: {stale} removed"
+    ));
     let tier = LinearTier::probe();
     log(format_args!("linear allocator tier {}", tier.name()));
     // the host's own vendor props, applied over the bundled ones in property_area; a refused line is logged, the rest stands
@@ -3250,7 +3304,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             &a.run_args,
             &[],
         )?;
-        let pid = host.start(spawn, held, true, false)?;
+        let pid = host.start(spawn, held, true, None)?;
         log(format_args!("{name}: uid {uid}, host pid {pid}: {class}"));
     }
     // the control socket is up once everything above is: a `start` reaches running services
@@ -3698,6 +3752,32 @@ mod tests {
             staged: staged.into(),
             name: name.into(),
         }
+    }
+
+    /// A killed run's staging dir is swept at start; a package dir in the same place is not.
+    #[test]
+    fn a_killed_runs_stage_is_removed_and_nothing_else() {
+        let app = std::env::temp_dir().join(format!("atld-stale-stages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&app);
+        std::fs::create_dir_all(app.join("vmdl7.tmp")).expect("a killed run's stage");
+        std::fs::write(app.join("vmdl7.tmp/base.apk"), "x").expect("its file");
+        std::fs::create_dir_all(app.join("com.example.kept")).expect("a package dir");
+        std::fs::create_dir_all(app.join("vmdltools.tmp")).expect("a package of a like name");
+        assert_eq!(
+            remove_stale_stages(&app).expect("the sweep"),
+            1,
+            "one stage is left by the killed run"
+        );
+        assert!(!app.join("vmdl7.tmp").exists(), "the stage is gone");
+        assert!(
+            app.join("com.example.kept").is_dir(),
+            "the package dir stays"
+        );
+        assert!(
+            app.join("vmdltools.tmp").is_dir(),
+            "a name that is no session's stays"
+        );
+        std::fs::remove_dir_all(&app).expect("cleanup");
     }
 
     /// Files staged under source names, one of which already carries another file's target name: each ends under its parsed name with its own bytes.
