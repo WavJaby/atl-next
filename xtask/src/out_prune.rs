@@ -304,28 +304,62 @@ pub fn prune_dir(ws: &Path, id: &str, cutoff: u64, now: u64, execute: bool) -> R
         cutoff,
         need_record: false,
     };
-    prune_dir_in(ws, id, scope, now, execute)
+    prune_dir_in(ws, id, scope, now, execute, None)
 }
 
 /// Land's prune of ws/land before Publish ([`LAND_PRUNE_DAYS`]): run inside the dir's namespace when it is a ram delta (outside, its mount point is empty and every tree would read as absent). A tree with no use record plans nothing; an unreadable one refuses the dir. Prints the tree lines; returns the summary line.
 /// `inside`: this process runs in ws/land's delta namespace (`delta::stage`).
 pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<String> {
-    let id = out::LAND_ID;
+    prune_window(
+        ws,
+        out::LAND_ID,
+        None,
+        "land unit prune",
+        now,
+        execute,
+        inside,
+    )
+}
+
+/// [`prune_land`]'s rule on arch dir `<arch>`'s roots of build dir `id` (out.rs `part`, before it publishes the arch part): the units no recorded build used for [`LAND_PRUNE_DAYS`].
+pub fn prune_part_roots(
+    ws: &Path,
+    id: &str,
+    arch: &str,
+    now: u64,
+    execute: bool,
+    inside: bool,
+) -> Result<String> {
+    prune_window(ws, id, Some(arch), "part unit prune", now, execute, inside)
+}
+
+/// The window prune of `label` over build dir `id` (or its `only_arch` roots): inside its namespace when a ram delta.
+fn prune_window(
+    ws: &Path,
+    id: &str,
+    only_arch: Option<&str>,
+    label: &str,
+    now: u64,
+    execute: bool,
+    inside: bool,
+) -> Result<String> {
     out::unmounted_ram_at(&out::dir_of(ws, id), id, inside)?;
     let window = LAND_PRUNE_DAYS;
     let scope = Scope::Everything {
         cutoff: window * SECS_PER_DAY,
         need_record: true,
     };
-    let plans = match prune_dir_in(ws, id, scope, now, execute)? {
+    let what = match only_arch {
+        Some(arch) => format!("ws/{id}/{arch}"),
+        None => format!("ws/{id}"),
+    };
+    let plans = match prune_dir_in(ws, id, scope, now, execute, only_arch)? {
         Outcome::NotBuilt => {
-            return Ok(format!(
-                "land unit prune: ws/{id}: not built, nothing pruned"
-            ));
+            return Ok(format!("{label}: {what}: not built, nothing pruned"));
         }
         Outcome::Busy => {
             return Ok(format!(
-                "land unit prune: ws/{id}: busy, nothing pruned: a process holds it"
+                "{label}: {what}: busy, nothing pruned: a process holds it"
             ));
         }
         Outcome::Done(plans) => plans,
@@ -341,7 +375,7 @@ pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<St
         "dry run, would remove"
     };
     Ok(format!(
-        "land unit prune: ws/{id}: {verb} {} units, {} incremental dirs and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned){}",
+        "{label}: {what}: {verb} {} units, {} incremental dirs and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned){}",
         total.units,
         total.incremental,
         total.sessions,
@@ -353,10 +387,18 @@ pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<St
 
 /// The end of a build in build dir `id` (`out::after_build`): removes its stale incremental sessions, never units. Busy while any process holds the dir, so the caller drops its own shared hold first.
 pub fn prune_sessions(ws: &Path, id: &str, now: u64) -> Result<Outcome> {
-    prune_dir_in(ws, id, Scope::SessionsOnly, now, true)
+    prune_dir_in(ws, id, Scope::SessionsOnly, now, true, None)
 }
 
-fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> Result<Outcome> {
+/// `only_arch` Some: just that arch dir's roots ([`arch_roots`]); None: every root of the build dir.
+fn prune_dir_in(
+    ws: &Path,
+    id: &str,
+    scope: Scope,
+    now: u64,
+    execute: bool,
+    only_arch: Option<&str>,
+) -> Result<Outcome> {
     let dir = out::dir_of(ws, id);
     let Some(real) = checked_dir(&dir)? else {
         return Ok(Outcome::NotBuilt);
@@ -364,8 +406,25 @@ fn prune_dir_in(ws: &Path, id: &str, scope: Scope, now: u64, execute: bool) -> R
     let Some(_lock) = build_pool::try_lock_dir(ws, id)? else {
         return Ok(Outcome::Busy);
     };
-    let found = trees_under(&dir_roots(&real)?)?;
+    let roots = match only_arch {
+        Some(arch) => arch_roots(&real, arch),
+        None => dir_roots(&real, &host_arches(ws)?)?,
+    };
+    let found = trees_under(&roots)?;
     Ok(Outcome::Done(prune_trees(ws, &found, scope, now, execute)?))
+}
+
+/// The arch rows (`[host]`) of workspace `ws`'s main checkout: the arch dirs a build dir may hold a cross part in ([`dir_roots`]). No arches.toml, none.
+fn host_arches(ws: &Path) -> Result<Vec<String>> {
+    let root = ws.join(out::MAIN_ID);
+    if !root.join(crate::arches::FILE).is_file() {
+        return Ok(Vec::new());
+    }
+    Ok(crate::arches::load(&root)?
+        .into_iter()
+        .filter(|(_, row)| row.host.is_some())
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// The trees no build dir owns: a real `repo/target` (a main checkout not yet on its build dir). Each is busy-checked by its own `.cargo-lock`.
@@ -410,13 +469,27 @@ fn checked_dir(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(dir.to_owned()))
 }
 
-/// The roots of build dir `dir`: [`DIR_ROOTS`], `gl/cargo*` and each driver probe family's `cargo*` (`out::FAMILIES`).
-fn dir_roots(dir: &Path) -> Result<Vec<PathBuf>> {
+/// The roots of build dir `dir`: [`DIR_ROOTS`], `gl/cargo*`, each driver probe family's `cargo*` (`out::FAMILIES`), and for each `arches` row present its [`arch_roots`] (a cross part's cargo, out.rs `part`).
+/// Only the named arch dirs: a same-named dir that is no `[host]` row is not a root.
+fn dir_roots(dir: &Path, arches: &[String]) -> Result<Vec<PathBuf>> {
     let mut roots: Vec<PathBuf> = DIR_ROOTS.iter().map(|name| dir.join(name)).collect();
     for sub in std::iter::once(GL_DIR).chain(out::FAMILIES) {
         roots.extend(prefixed(&dir.join(sub), CARGO_ROOT)?);
     }
+    for arch in arches {
+        if dir.join(arch).is_dir() {
+            roots.extend(arch_roots(dir, arch));
+        }
+    }
     Ok(roots)
+}
+
+/// The [`DIR_ROOTS`] under arch dir `dir/<arch>`: a cross part's own cargo roots (`riscv64/cargo*`), which the x86 roots never reach.
+fn arch_roots(dir: &Path, arch: &str) -> Vec<PathBuf> {
+    DIR_ROOTS
+        .iter()
+        .map(|name| dir.join(arch).join(name))
+        .collect()
 }
 
 /// The roots no build dir owns: the main checkout's `target` while it is a real dir (once linked it is its build dir's).
@@ -1528,7 +1601,7 @@ mod tests {
         sized(&dir.join("gl/other/debug/.fingerprint/x/y"), 1);
         sized(&dir.join("cargo/cxxbridge/somecrate/src/lib.rs"), 1);
         sized(&dir.join("cargo/tmp/file"), 1);
-        let mut found: Vec<String> = trees_under(&dir_roots(&dir).expect("roots"))
+        let mut found: Vec<String> = trees_under(&dir_roots(&dir, &[]).expect("roots"))
             .expect("trees")
             .iter()
             .map(|f| relative(&ws, &f.dir))
@@ -1547,6 +1620,31 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
+    /// Gate: an arch row's dir gets its own [`DIR_ROOTS`] roots (`riscv64/cargo-converter`); a same-named dir that is no row (`foo/`) is no root; a row with no dir adds nothing.
+    #[test]
+    fn dir_roots_finds_the_host_rows_arch_roots_only() {
+        let ws = scratch("arch-roots");
+        let dir = ws.join("out/pool/ws/c");
+        fs::create_dir_all(dir.join("riscv64/cargo-converter/release")).expect("arch");
+        fs::create_dir_all(dir.join("foo/cargo/release")).expect("not a row");
+        let names = |arches: &[&str]| -> Vec<String> {
+            let arches: Vec<String> = arches.iter().map(|a| (*a).to_owned()).collect();
+            dir_roots(&dir, &arches)
+                .expect("roots")
+                .iter()
+                .map(|p| relative(&dir, p))
+                .collect()
+        };
+        let with = names(&["riscv64"]);
+        assert!(
+            with.contains(&"riscv64/cargo-converter".to_owned()),
+            "{with:?}"
+        );
+        assert!(!with.iter().any(|n| n.starts_with("foo")), "{with:?}");
+        assert!(!names(&["arm64"]).iter().any(|n| n.starts_with("arm64")));
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
     /// The root names of a build dir: the target names xtask gives cargo (build, converter build, its faulted build, test, lint and the bootstrap gate), the checkout's `target`, and the `cargo*` probes under `gl/` and the driver probe dirs.
     #[test]
     fn dir_roots_are_the_target_names_and_the_cargo_probes() {
@@ -1558,7 +1656,7 @@ mod tests {
         fs::create_dir_all(dir.join("vk-driver/cargo")).expect("vk");
         fs::create_dir_all(dir.join("vk-driver/vk")).expect("vk");
         fs::create_dir_all(dir.join("egl-driver/cargo")).expect("egl");
-        let mut names: Vec<String> = dir_roots(&dir)
+        let mut names: Vec<String> = dir_roots(&dir, &[])
             .expect("roots")
             .iter()
             .map(|p| relative(&dir, p))

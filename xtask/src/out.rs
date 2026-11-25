@@ -32,6 +32,10 @@ pub const MAIN_ID: &str = "repo";
 pub const LAND_ID: &str = "land";
 /// Bases `out prune` keeps: the newest, plus the one a child may still be copying from.
 pub const KEEP_BASES: usize = 2;
+/// Complete arch parts `out prune` keeps per arch: the newest, plus every part a ram dir's record names (out.rs `part`).
+pub const KEEP_PARTS: usize = 1;
+/// In an arch part's subtree (`<arch>/`): its record, `commit=`, `arch=`, `base=`; written before the rename, so a complete part has it.
+const PART_FILE: &str = ".part";
 /// A checkout's cargo target dir: a link to its build dir's `target/`.
 const TARGET: &str = "target";
 /// In a build dir: the commit of the base it was copied from.
@@ -85,6 +89,20 @@ pub enum Out {
         /// Drop and remake (default: print the plan only).
         #[arg(long)]
         execute: bool,
+    },
+    /// Publishes this checkout's `<arch>/` subtree (a cross host's outputs, `native::host_out`) as arch part `pool/part/<arch>/<HEAD>/<arch>` (dry run unless --execute).
+    ///
+    /// Refused, each by name, unless: `<arch>` is a cross `[host]` row; HEAD is a base; `git status --porcelain` is empty; no task copy is bound; the arch dir's `built-from` is this source state; the dir's lower is base/HEAD. Before publishing, the arch dir's units no recorded build used for the land window are pruned (in the namespace for a ram dir).
+    Part {
+        /// The cross host: a `[host]` row other than the build machine.
+        #[arg(long)]
+        arch: String,
+        /// Publish (default: print the plan only).
+        #[arg(long)]
+        execute: bool,
+        /// Internal: the unit prune child of --arch, run in the checkout (`part_prune`).
+        #[arg(long, hide = true)]
+        prune_units: bool,
     },
 }
 
@@ -404,7 +422,7 @@ pub(crate) fn present(path: &Path) -> Result<bool> {
 }
 
 /// Base commits, newest first (by the base dir's mtime: publish order). Temp names (`.`-prefixed) are skipped.
-fn bases(ws: &Path) -> Result<Vec<String>> {
+pub(crate) fn bases(ws: &Path) -> Result<Vec<String>> {
     let dir = pool(ws).join("base");
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return Ok(Vec::new());
@@ -1121,10 +1139,11 @@ fn publish_ram(ws: &Path, rec: &crate::delta::Record, dst: &Path, stamps: &str) 
     let started = std::time::Instant::now();
     let file = crate::checkout_stamps::FILE;
     let (tier, done) =
-        crate::delta_publish::publish(&lower, &upper, dst, &[BOOTSTRAP_DIR], &|tmp| {
+        crate::delta_publish::publish(Some(&lower), Some(&upper), dst, &[BOOTSTRAP_DIR], &|tmp| {
             std::fs::write(tmp.join(file), stamps)
                 .with_context(|| format!("writing {}", tmp.join(file).display()))
         })?;
+    let tier = tier.context("a base's publish copies its lower")?;
     count_tier(ws, tier);
     count(ws, "publish-ram");
     Ok(format!(
@@ -1135,6 +1154,282 @@ fn publish_ram(ws: &Path, rec: &crate::delta::Record, dst: &Path, stamps: &str) 
         started.elapsed().as_secs_f64(),
         done.line()
     ))
+}
+
+/// The arch parts of `arch`: `pool/part/<arch>/<commit>/<arch>/`, a cross build's arch subtree over base `<commit>` (`.part` inside it). Not bases: `bases` never lists them.
+pub fn part_root(ws: &Path, arch: &str) -> PathBuf {
+    pool(ws).join("part").join(arch)
+}
+
+/// The arch subtree of part `commit` of `arch` ([`part_root`]).
+pub fn part_of(ws: &Path, arch: &str, commit: &str) -> PathBuf {
+    part_root(ws, arch).join(commit).join(arch)
+}
+
+/// The complete parts of `arch`, newest first by their subtree's mtime (publish order), and the partial ones (no `<arch>/.part`: a publish that did not finish). `.`-prefixed names are temps, neither.
+fn parts_of(ws: &Path, arch: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let Ok(rd) = std::fs::read_dir(part_root(ws, arch)) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let (mut complete, mut partial) = (Vec::new(), Vec::new());
+    for e in rd {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !e.file_type()?.is_dir() {
+            continue;
+        }
+        let sub = e.path().join(arch);
+        if sub.join(PART_FILE).is_file() {
+            complete.push((std::fs::metadata(&sub)?.modified()?, name));
+        } else {
+            partial.push(name);
+        }
+    }
+    complete.sort();
+    partial.sort();
+    Ok((
+        complete.into_iter().rev().map(|(_, n)| n).collect(),
+        partial,
+    ))
+}
+
+/// The arch names with a `pool/part/<arch>/` dir, sorted (not checked against arches.toml: a dir of an old arch is still a part to prune).
+fn part_arches(ws: &Path) -> Result<Vec<String>> {
+    let Ok(rd) = std::fs::read_dir(pool(ws).join("part")) else {
+        return Ok(Vec::new());
+    };
+    let mut arches = Vec::new();
+    for e in rd {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.') && e.file_type()?.is_dir() {
+            arches.push(name);
+        }
+    }
+    arches.sort();
+    Ok(arches)
+}
+
+/// The (arch, commit) parts the records of the build dirs under `ws` name (`Record.parts`).
+fn named_parts(ws: &Path) -> Result<BTreeSet<(String, String)>> {
+    let mut named = BTreeSet::new();
+    for (_, path) in build_dirs(ws)? {
+        if let Some(rec) = crate::delta::record(&path)? {
+            named.extend(rec.parts);
+        }
+    }
+    Ok(named)
+}
+
+/// The complete parts `out prune` deletes: per arch, every commit past the newest `keep` (`newest_first`) that no record names.
+fn stale_parts(
+    newest_first: &BTreeMap<String, Vec<String>>,
+    named: &BTreeSet<(String, String)>,
+    keep: usize,
+) -> Vec<(String, String)> {
+    let mut stale = Vec::new();
+    for (arch, commits) in newest_first {
+        for commit in commits.iter().skip(keep) {
+            if !named.contains(&(arch.clone(), commit.clone())) {
+                stale.push((arch.clone(), commit.clone()));
+            }
+        }
+    }
+    stale
+}
+
+/// Facts `publish_part` judges: each false one refuses, named.
+struct PartFacts {
+    /// `<arch>` is a `[host]` row other than the build machine (`native::cross_host_of`).
+    cross: bool,
+    /// HEAD is a base in `pool/base`.
+    head_base: bool,
+    /// `git status --porcelain` is empty.
+    clean: bool,
+    /// No task copy is bound (`tree::overlays_of`).
+    no_task_copies: bool,
+    /// The arch subtree's `built-from` is this source state (`build_state::ensure_matches`).
+    built_from: Result<()>,
+    /// The dir's lower is base/HEAD: a ram dir's record `base`, a pool dir's `.base`.
+    lower_is_head: bool,
+}
+
+/// Refuses on the first false fact. The stamps of the part are the base's relation to HEAD, so a lower other than HEAD's base is refused.
+fn part_judge(f: &PartFacts) -> Result<()> {
+    ensure!(
+        f.cross,
+        "refused: not a cross host's out dir (a `[host]` row other than the build machine)"
+    );
+    ensure!(
+        f.head_base,
+        "refused: HEAD is not a base in pool/base (land publishes one)"
+    );
+    ensure!(
+        f.clean,
+        "refused: git status --porcelain is not empty: commit or remove the changes"
+    );
+    ensure!(
+        f.no_task_copies,
+        "refused: task copies are bound (tree::overlays_of): a part is built from the shared tree only"
+    );
+    if let Err(e) = &f.built_from {
+        bail!("refused: the arch's built-from is not this source state: {e:#}");
+    }
+    ensure!(
+        f.lower_is_head,
+        "refused: the dir's lower is not base/HEAD (ram: record base; pool: .base)"
+    );
+    Ok(())
+}
+
+/// The pool's free bytes after a publish's writes must stay at or above the floor (`disk.pool_min_free`, GiB). A reflink writes metadata only (`writes` 0); a ram upper's copies write their bytes.
+fn part_space(free: u64, writes: u64, floor: u64) -> Result<()> {
+    let left = free.saturating_sub(writes);
+    ensure!(
+        left >= floor,
+        "refused: the build-dir pool has {:.2} GiB free, the part writes {:.2} GiB: {:.2} GiB left, under the {:.2} GiB floor (workspace.toml [disk] pool_min_free)",
+        gib(free),
+        gib(writes),
+        gib(left),
+        gib(floor)
+    );
+    Ok(())
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Bytes of the regular files under `path` (apparent size): what a publish writes from a ram upper.
+fn tree_bytes(path: &Path) -> Result<u64> {
+    let mut total = 0;
+    let mut todo = vec![path.to_owned()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let e = e?;
+            let meta = e.metadata()?;
+            if meta.is_dir() {
+                todo.push(e.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// `out part --arch <arch>` (see [`Out::Part`]): the arch dir's unit prune as a child in the checkout (`--prune-units`, entered there), then the publish.
+/// Dry run unless `execute`: prints the facts' verdict and the plan. The publish runs under the bases lock (prune judges parts under it) and, for a ram dir, the mount lock (its upper is stable only unmounted).
+fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
+    let id = checkout_id(root)?;
+    let dir = dir_of(ws, &id);
+    let head = git(Some(root), &["rev-parse", "HEAD"])?;
+    let rec = crate::delta::record(&dir)?;
+    let src = match &rec {
+        Some(r) => r.dir(&id).join("upper").join(arch),
+        None => dir.join(arch),
+    };
+    ensure!(
+        src.is_dir(),
+        "refused: {} has no {arch} outputs: nothing to publish",
+        src.display()
+    );
+    let state = crate::build_state::of_build(root)?;
+    let facts = PartFacts {
+        cross: crate::native::cross_host_of(root, &dir.join(arch))?.as_deref() == Some(arch),
+        head_base: bases(ws)?.contains(&head),
+        clean: git(Some(root), &["status", "--porcelain"])?.is_empty(),
+        no_task_copies: crate::tree::overlays_of(root)?.is_empty(),
+        built_from: crate::build_state::ensure_matches(&state, &src),
+        lower_is_head: match &rec {
+            Some(r) => r.base == head,
+            None => std::fs::read_to_string(dir.join(BASE_FILE)).is_ok_and(|b| b.trim() == head),
+        },
+    };
+    part_judge(&facts)?;
+    let mut prune = crate::cargo_command();
+    prune
+        .args(["xtask", "out", "part", "--arch", arch, "--prune-units"])
+        .current_dir(root);
+    if execute {
+        prune.arg("--execute");
+    }
+    ensure!(
+        prune
+            .status()
+            .context("running the arch unit prune")?
+            .success(),
+        "the arch unit prune of {arch} failed (its lines are above): nothing published"
+    );
+    let writes = if rec.is_some() { tree_bytes(&src)? } else { 0 };
+    let cfg = crate::ws_config::load(ws)?;
+    part_space(
+        free_bytes(&pool(ws))?,
+        writes,
+        cfg.disk.pool_min_free.value << 30,
+    )?;
+    let dst = part_of(ws, arch, &head);
+    if !execute {
+        println!(
+            "out part {arch}/{head} from ws/{id} ({}): dry run, would publish {:.2} GiB written; add --execute",
+            if rec.is_some() {
+                "ram upper"
+            } else {
+                "pool dir"
+            },
+            gib(writes)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if present(&dst)? {
+        println!("out: part {arch}/{head} exists, not published again");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let parent = dst.parent().context("part has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let _bases = crate::delta::bases_lock(ws)?;
+    let stamp = format!("commit={head}\narch={arch}\nbase={head}\n");
+    let finish = |tmp: &Path| {
+        std::fs::write(tmp.join(PART_FILE), &stamp)
+            .with_context(|| format!("writing {}", tmp.join(PART_FILE).display()))
+    };
+    let started = std::time::Instant::now();
+    let (tier, done) = match &rec {
+        Some(r) => {
+            let Some(_mounted) = crate::delta::try_mount_lock(ws, &id)? else {
+                bail!("ws/{id}'s ram delta is mounted by a running command: not published");
+            };
+            // a laid part is the lower; none is laid yet (slice 3 lays one): the upper is the whole arch subtree
+            let lower = r.parts.get(arch).map(|c| part_of(ws, arch, c));
+            crate::delta_publish::publish(lower.as_deref(), Some(&src), &dst, &[], &finish)?
+        }
+        None => crate::delta_publish::publish(Some(&src), None, &dst, &[], &finish)?,
+    };
+    if let Some(tier) = tier {
+        count_tier(ws, tier);
+    }
+    count(ws, "publish-part");
+    println!(
+        "out: part {arch}/{head} from ws/{id} ({}) in {:.1} s: {}",
+        tier.map_or("upper only", |t| t.name()),
+        started.elapsed().as_secs_f64(),
+        done.line()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The child of [`part`]: prunes `<arch>`'s units in the checkout's namespace (a ram dir is entered here) and prints the summary.
+fn part_prune(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
+    let id = checkout_id(root)?;
+    if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
+        return Ok(code);
+    }
+    let inside = crate::delta::stage().is_some();
+    println!(
+        "{}",
+        out_prune::prune_part_roots(ws, &id, arch, unit_use::now()?, execute, inside)?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Land's reset after a failed verify: `ws/land` laid again from the newest base that is an ancestor of the land worktree's HEAD ([`relay_land`]): no failed branch's outputs stay in the dir the next base comes from. Returns the line.
@@ -1794,6 +2089,17 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
             println!("run counts: {}", runs.join(", "));
         }
         Out::Tier { tier, execute } => return set_tier(root, &ws, tier == "ram", *execute),
+        Out::Part {
+            arch,
+            execute,
+            prune_units,
+        } => {
+            return if *prune_units {
+                part_prune(root, &ws, arch, *execute)
+            } else {
+                part(root, &ws, arch, *execute)
+            };
+        }
         Out::Prune {
             tasks: true,
             execute,
@@ -2006,6 +2312,39 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
             }
         }
     }
+    // arch parts: complete ones past the newest KEEP_PARTS that no record names, and partial publishes (no `.part`)
+    let named = named_parts(ws)?;
+    let mut newest = BTreeMap::new();
+    let mut parts: Vec<(String, String, bool)> = Vec::new();
+    for arch in part_arches(ws)? {
+        let (complete, partial) = parts_of(ws, &arch)?;
+        parts.extend(partial.into_iter().map(|c| (arch.clone(), c, false)));
+        newest.insert(arch, complete);
+    }
+    parts.extend(
+        stale_parts(&newest, &named, KEEP_PARTS)
+            .into_iter()
+            .map(|(arch, c)| (arch, c, true)),
+    );
+    for (arch, commit, complete) in &parts {
+        let label = if *complete {
+            "old part"
+        } else {
+            "partial part"
+        };
+        let path = part_root(ws, arch).join(commit);
+        if !execute {
+            println!("{label} {arch}/{commit}");
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => println!("{label} {arch}/{commit}: removed"),
+            Err(e) => {
+                failed += 1;
+                println!("{label} {arch}/{commit}: FAILED: {e}");
+            }
+        }
+    }
     let (kept_runs, kept_failed) = red_logs::prune(ws, live, execute)?;
     failed += kept_failed;
     let verb = if execute {
@@ -2028,6 +2367,131 @@ pub fn prune_dirs(ws: &Path, live: &BTreeSet<String>, execute: bool) -> Result<u
 mod tests {
     use super::*;
     use atl_exec_fixture::write_exe;
+
+    fn all_true() -> PartFacts {
+        PartFacts {
+            cross: true,
+            head_base: true,
+            clean: true,
+            no_task_copies: true,
+            built_from: Ok(()),
+            lower_is_head: true,
+        }
+    }
+
+    /// Gate: each refusal trips on its own false fact, by name; all true passes. Break: dropping a check passes its case -> red.
+    #[test]
+    fn part_refuses_each_fact_by_name() {
+        assert!(part_judge(&all_true()).is_ok());
+        let cases: [(PartFacts, &str); 6] = [
+            (
+                PartFacts {
+                    cross: false,
+                    ..all_true()
+                },
+                "cross host",
+            ),
+            (
+                PartFacts {
+                    head_base: false,
+                    ..all_true()
+                },
+                "not a base",
+            ),
+            (
+                PartFacts {
+                    clean: false,
+                    ..all_true()
+                },
+                "porcelain",
+            ),
+            (
+                PartFacts {
+                    no_task_copies: false,
+                    ..all_true()
+                },
+                "task copies",
+            ),
+            (
+                PartFacts {
+                    built_from: Err(anyhow::anyhow!("another source state")),
+                    ..all_true()
+                },
+                "built-from",
+            ),
+            (
+                PartFacts {
+                    lower_is_head: false,
+                    ..all_true()
+                },
+                "lower is not base/HEAD",
+            ),
+        ];
+        // every case reported, so a red run names each check it lost
+        let mut missed = Vec::new();
+        for (facts, phrase) in cases {
+            match part_judge(&facts) {
+                Err(e) if format!("{e:#}").contains(phrase) => {}
+                other => missed.push(format!("{phrase}: {other:?}")),
+            }
+        }
+        assert!(missed.is_empty(), "not refused by name: {missed:#?}");
+    }
+
+    /// Gate: the pool keeps its floor after the writes; exactly at the floor passes. Break: no check passes a short pool -> red.
+    #[test]
+    fn part_space_keeps_the_floor_after_the_writes() {
+        let g = 1u64 << 30;
+        assert!(part_space(10 * g, 4 * g, 5 * g).is_ok());
+        assert!(
+            part_space(10 * g, 5 * g, 5 * g).is_ok(),
+            "exactly the floor"
+        );
+        let err = part_space(10 * g, 6 * g, 5 * g).expect_err("4 GiB left under a 5 GiB floor");
+        assert!(format!("{err:#}").contains("4.00 GiB left"), "{err:#}");
+    }
+
+    /// Gate: per arch the newest `keep` are kept, the older listed; a commit a record names is kept whatever its age. Break: ignoring the records lists `c1` -> red.
+    #[test]
+    fn stale_parts_keep_the_newest_and_the_named() {
+        let commits = |v: &[&str]| v.iter().map(|c| (*c).to_owned()).collect::<Vec<String>>();
+        let newest = BTreeMap::from([
+            ("riscv64".to_owned(), commits(&["c3", "c2", "c1"])),
+            ("arm64".to_owned(), commits(&["a1"])),
+        ]);
+        let none = BTreeSet::new();
+        let riscv = |c: &str| ("riscv64".to_owned(), c.to_owned());
+        assert_eq!(
+            stale_parts(&newest, &none, KEEP_PARTS),
+            [riscv("c2"), riscv("c1")]
+        );
+        let named = BTreeSet::from([riscv("c1")]);
+        assert_eq!(stale_parts(&newest, &named, KEEP_PARTS), [riscv("c2")]);
+        assert!(stale_parts(&newest, &none, 3).is_empty());
+    }
+
+    /// Complete parts (a `<arch>/.part`) newest first by publish mtime; a commit without the record is partial; a `.`-prefixed temp is neither.
+    #[test]
+    fn parts_of_lists_complete_then_partial() {
+        let ws = scratch("parts");
+        for c in ["c1", "c2"] {
+            let p = part_of(&ws, "riscv64", c);
+            std::fs::create_dir_all(&p).expect("part");
+            std::fs::write(p.join(PART_FILE), "commit=x\n").expect("record");
+        }
+        // c2 published before c1
+        std::fs::File::open(part_of(&ws, "riscv64", "c2"))
+            .and_then(|d| {
+                d.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))
+            })
+            .expect("mtime");
+        std::fs::create_dir_all(part_of(&ws, "riscv64", "c3")).expect("partial");
+        std::fs::create_dir_all(part_root(&ws, "riscv64").join(".c4.pub-1")).expect("temp");
+        let (complete, partial) = parts_of(&ws, "riscv64").expect("parts");
+        assert_eq!(complete, ["c1", "c2"]);
+        assert_eq!(partial, ["c3"]);
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
 
     /// A scratch workspace whose delta store is absent (pool tier): a test never reaches the host's store, which every workspace shares by id (2026-11-21 and 2026-11-22: scratch runs wrote and deleted store dirs of live ids).
     fn scratch(name: &str) -> PathBuf {

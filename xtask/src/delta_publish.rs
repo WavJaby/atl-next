@@ -207,14 +207,15 @@ pub fn apply(upper: &Path, dst: &Path, classify: &Classify<'_>) -> Result<Applie
 }
 
 /// Publishes lower + upper as the absent dir `dst`: a copy of `lower` (out::copy_tree: reflink where the pool allows, top-level `skip` left out) under a temp name, `upper` applied ([`classify`]: `skip` and the build dir's `.base` left out), `finish` run on it (the caller's extra files), its mtime set to now (out::bases ranks bases by it), renamed into place last.
+/// `lower` None: no copy, the temp dir starts empty (the upper alone: its whiteouts delete nothing). `upper` None: the lower alone (a pool dir's subtree, no delta). Returns the copy's tier, None without a lower.
 /// So an interrupted publish leaves only a `.`-prefixed temp dir, which out::bases never takes for a base, and a `dst` that appeared meanwhile is never overwritten (rename onto a non-empty dir fails).
 pub fn publish(
-    lower: &Path,
-    upper: &Path,
+    lower: Option<&Path>,
+    upper: Option<&Path>,
     dst: &Path,
     skip: &[&str],
     finish: &dyn Fn(&Path) -> Result<()>,
-) -> Result<(crate::out::Tier, Applied)> {
+) -> Result<(Option<crate::out::Tier>, Applied)> {
     let parent = dst.parent().context("publish target has no parent")?;
     let name = dst
         .file_name()
@@ -225,8 +226,17 @@ pub fn publish(
     let mut leave_out = skip.to_vec();
     leave_out.push(crate::out::BASE_FILE);
     let made = (|| {
-        let tier = crate::out::copy_tree(lower, &tmp, None, skip)?;
-        let done = apply(upper, &tmp, &classify(&leave_out))?;
+        let tier = match lower {
+            Some(lower) => Some(crate::out::copy_tree(lower, &tmp, None, skip)?),
+            None => {
+                std::fs::create_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+                None
+            }
+        };
+        let done = match upper {
+            Some(upper) => apply(upper, &tmp, &classify(&leave_out))?,
+            None => Applied::default(),
+        };
         finish(&tmp)?;
         std::fs::File::open(&tmp)
             .and_then(|d| d.set_modified(std::time::SystemTime::now()))
@@ -486,7 +496,7 @@ touch -d 2003-01-01 newdir
             b"y"
         );
         let dst = f.root.join("published");
-        let (_, done) = publish(&f.lower, &f.upper, &dst, &[], &|_| Ok(())).unwrap();
+        let (_, done) = publish(Some(&f.lower), Some(&f.upper), &dst, &[], &|_| Ok(())).unwrap();
         // whiteouts: d/x, d/y (mv), gone, mvd (mv of a dir); opaque: rep, d/sub, f2d; links: newdir/hl
         assert!(
             done.whiteouts >= 4 && done.opaque >= 3 && done.links == 1,
@@ -513,13 +523,18 @@ touch -d 2003-01-01 newdir
 
     /// The kernel's merge of the fixture's layers read-only (lowerdir=upper:lower, nothing written): the oracle gate.sh uses on real builds.
     fn ro_listing(f: &Fixture) -> String {
+        ro_listing_over(f, &f.lower)
+    }
+
+    /// [`ro_listing`] over `lower` instead of the fixture's lower: an empty one gives the upper alone.
+    fn ro_listing_over(f: &Fixture, lower: &Path) -> String {
         let ro_mnt = f.root.join("ro");
         std::fs::create_dir_all(&ro_mnt).unwrap();
         let ro_list = f.root.join("ro.list");
         let opts = format!(
             "ro,lowerdir={}:{},userxattr",
             f.upper.display(),
-            f.lower.display()
+            lower.display()
         );
         in_userns(
             "set -e; mount -t overlay overlay -o \"$1\" \"$2\"; sh \"$4\" \"$2\" \"$3\"",
@@ -536,9 +551,28 @@ touch -d 2003-01-01 newdir
         let want = ro_listing(&f);
         assert!(want.contains("newdir/sock s "), "{want}");
         let dst = f.root.join("published");
-        let (_, done) = publish(&f.lower, &f.upper, &dst, &[], &|_| Ok(())).unwrap();
+        let (_, done) = publish(Some(&f.lower), Some(&f.upper), &dst, &[], &|_| Ok(())).unwrap();
         assert_eq!(done.nodes, 2, "the fifo and the socket: {done:?}");
         assert_eq!(listing(&f, &dst, "published.list"), want);
+    }
+
+    /// Gate: no lower publishes the upper alone = the kernel's merge of the upper over an empty lower (whiteouts delete nothing, an opaque dir replaces nothing). No copy, so no tier.
+    /// Break: a publish that requires a lower fails here.
+    #[test]
+    fn no_lower_publishes_the_upper_minus_whiteouts() {
+        let f = fixture("nolower");
+        let empty = f.root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let want = ro_listing_over(&f, &empty);
+        assert!(!want.contains("gone") && want.contains("rep/n"), "{want}");
+        let dst = f.root.join("published");
+        let (tier, done) = publish(None, Some(&f.upper), &dst, &[], &|_| Ok(())).unwrap();
+        assert_eq!(tier, None, "no copy without a lower");
+        assert!(
+            done.whiteouts >= 1 && done.opaque >= 1 && done.links == 1,
+            "{done:?}"
+        );
+        assert_eq!(listing(&f, &dst, "nolower.list"), want);
     }
 
     /// Red controls: the same gate with whiteouts ignored, or opaque dirs merged like plain dirs, goes red.

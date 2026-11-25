@@ -10,6 +10,7 @@
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
 //! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves the growth it adds to its own upper for its run ([`Need::of`]: its class's peak less what its upper already holds, floored at `delta.regrow_gib`), and others' reservations count against the store ([`judge`]). Waiters queue FIFO ([`admit_keeping`]): a new dir waits out others' reservations and otherwise takes the pool; an existing ram dir also waits out a full store and land's hold, and is refused only when it never fits or inside land's queue ([`fall_to_pool`]): admission never drops a dir.
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -101,15 +102,21 @@ impl Class {
 }
 
 /// A ram dir's record ([`RECORD`]).
+/// `parts`: arch -> commit of the arch part laid under the dir (`part=<arch>@<commit>` lines). Parsed so `out prune` keeps every part a record names; laying is out.rs `part`'s job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub base: String,
     pub store: PathBuf,
+    pub parts: BTreeMap<String, String>,
 }
 
 impl Record {
     fn text(&self) -> String {
-        format!("base={}\nstore={}\n", self.base, self.store.display())
+        let mut text = format!("base={}\nstore={}\n", self.base, self.store.display());
+        for (arch, commit) in &self.parts {
+            text.push_str(&format!("part={arch}@{commit}\n"));
+        }
+        text
     }
 
     fn parse(text: &str) -> Result<Record> {
@@ -118,9 +125,20 @@ impl Record {
                 .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
                 .with_context(|| format!("{RECORD} has no `{k}=` line: {text:?}"))
         };
+        let mut parts = BTreeMap::new();
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("part=") else {
+                continue;
+            };
+            let (arch, commit) = rest
+                .split_once('@')
+                .with_context(|| format!("{RECORD}: `{line}` is not `part=<arch>@<commit>`"))?;
+            parts.insert(arch.to_owned(), commit.to_owned());
+        }
         Ok(Record {
             base: field("base")?.to_owned(),
             store: PathBuf::from(field("store")?),
+            parts,
         })
     }
 
@@ -861,6 +879,7 @@ fn lay_ram(
     let rec = Record {
         base: base.clone(),
         store: store.to_owned(),
+        parts: BTreeMap::new(),
     };
     let sd = rec.dir(id);
     if out::present(&sd)? {
@@ -2146,6 +2165,7 @@ mod tests {
         let rec = Record {
             base: "c1".into(),
             store: store.clone(),
+            parts: BTreeMap::new(),
         };
         std::fs::create_dir_all(rec.dir("r").join("upper")).unwrap();
         std::fs::create_dir_all(rec.dir("r").join("work")).unwrap();
@@ -2242,6 +2262,7 @@ mod tests {
         let rec = Record {
             base: "b".into(),
             store: store.to_owned(),
+            parts: BTreeMap::new(),
         };
         let sd = rec.dir("c");
         std::fs::create_dir_all(sd.join("upper")).unwrap();
@@ -2729,6 +2750,7 @@ mod tests {
         let rec = Record {
             base: "b".into(),
             store: store.clone(),
+            parts: BTreeMap::new(),
         };
         assert!(!pins("c", &rec, true), "no upper: no claim");
         assert!(pins("c", &rec, false), "unusable store: the pin stands");
@@ -2740,13 +2762,37 @@ mod tests {
         std::fs::remove_dir_all(&store).unwrap();
     }
 
+    /// Part lines: 0, 1 and 2 parts round-trip; text without part lines (an older xtask's record) parses to none; a line without `@` is refused.
+    #[test]
+    fn record_parts_round_trip() {
+        let old = Record::parse("base=abc\nstore=/s\n").unwrap();
+        assert!(old.parts.is_empty());
+        let one = Record {
+            parts: BTreeMap::from([("riscv64".to_owned(), "c2".to_owned())]),
+            ..old.clone()
+        };
+        assert_eq!(one.text(), "base=abc\nstore=/s\npart=riscv64@c2\n");
+        assert_eq!(Record::parse(&one.text()).unwrap(), one);
+        let two = Record {
+            parts: BTreeMap::from([
+                ("arm64".to_owned(), "c3".to_owned()),
+                ("riscv64".to_owned(), "c2".to_owned()),
+            ]),
+            ..old
+        };
+        assert_eq!(Record::parse(&two.text()).unwrap(), two);
+        assert!(Record::parse("base=abc\nstore=/s\npart=riscv64\n").is_err());
+    }
+
     #[test]
     fn record_round_trip_and_keys() {
         let r = Record {
             base: "abc".into(),
             store: "/s".into(),
+            parts: BTreeMap::new(),
         };
         assert_eq!(Record::parse(&r.text()).unwrap(), r);
+        assert_eq!(r.text(), "base=abc\nstore=/s\n");
         assert_eq!(r.dir("x"), Path::new("/s/x"));
         assert_eq!(Class::from_key("peak_check_gib"), Some(Class::Check));
         assert_eq!(Class::from_key("peak_bogus_gib"), None);
