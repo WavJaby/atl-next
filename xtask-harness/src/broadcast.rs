@@ -178,7 +178,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             "broadcast: built {} ({}, {} receivers)",
             apk.display(),
             m.name,
-            m.receivers.len()
+            m.receiver_count
         );
         apk_paths.push(apk.clone());
         packages.push(Package::base(apk));

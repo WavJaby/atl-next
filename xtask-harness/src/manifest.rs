@@ -10,9 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use atl_services_types::packages::{
-    PermissionDecl, PlatformManifest, SCREEN_ORIENTATION_UNSPECIFIED,
-};
+use atl_services_types::packages::{PermissionDecl, PlatformManifest};
 
 use crate::host_art;
 
@@ -33,67 +31,11 @@ pub struct InstrumentationDecl {
     pub functional_test: bool,
 }
 
-/// `<activity>` as aapt2 prints it: class resolved, whether it handles MAIN + LAUNCHER, the attributes the gates expect values from.
+/// `<activity>` as aapt2 prints it, reduced to what the gates read: the class and whether it handles MAIN + LAUNCHER.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivityDecl {
     pub name: String,
     pub launcher: bool,
-    /// `android:theme` as a resource id; 0 = none written
-    pub theme: i32,
-    /// `android:configChanges` with the recreateOnConfigChanges rule (ParsedActivityUtils.getActivityConfigChanges)
-    pub config_changes: i32,
-    /// boolean attributes by name, only those written
-    pub booleans: BTreeMap<String, bool>,
-    pub launch_mode: i32,
-    pub task_affinity: Option<String>,
-    /// `android:process` resolved (`:name` -> `<package>:name`); None = the package's process
-    pub process: Option<String>,
-    pub meta_data: Vec<(String, MetaValue)>,
-    pub screen_orientation: i32,
-    /// `android:resizeableActivity` on the activity, else `<application>`, else resizable (PackageParser.setActivityResizeMode)
-    pub resizeable: bool,
-    pub min_aspect_ratio: Option<f32>,
-    pub max_aspect_ratio: Option<f32>,
-}
-
-/// `<intent-filter>` reduced: actions, categories, `<data android:scheme>`, `<data android:mimeType>`; None = the filter names none.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IntentFilterDecl {
-    pub actions: Vec<String>,
-    pub categories: Option<Vec<String>>,
-    pub schemes: Option<Vec<String>>,
-    pub types: Option<Vec<String>>,
-}
-
-/// `<receiver>` (ParsedActivityUtils.parseReceiver, reduced).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiverDecl {
-    pub name: String,
-    /// unwritten = whether it has an intent filter
-    pub exported: bool,
-    pub enabled: bool,
-    pub permission: Option<String>,
-    pub process: Option<String>,
-    pub filters: Vec<IntentFilterDecl>,
-}
-
-/// `<provider>` (ParsedProviderUtils.parseProvider, reduced).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderDecl {
-    pub name: String,
-    pub authority: Option<String>,
-    pub exported: bool,
-    pub enabled: bool,
-    pub process: Option<String>,
-    pub read_permission: Option<String>,
-    pub write_permission: Option<String>,
-    pub grant_uri_permissions: bool,
-    pub force_uri_permissions: bool,
-    pub multiprocess: bool,
-    pub init_order: i32,
-    pub syncable: bool,
-    pub direct_boot_aware: bool,
-    pub meta_data: Vec<(String, MetaValue)>,
 }
 
 /// What aapt2 shows of an APK's AndroidManifest.xml that the gates read.
@@ -104,17 +46,12 @@ pub struct Manifest {
     pub version_name: Option<String>,
     pub min_sdk: i32,
     pub target_sdk: i32,
-    pub process_name: Option<String>,
-    pub application_theme: i32,
-    pub application_class: Option<String>,
-    pub app_component_factory: Option<String>,
     pub application_meta_data: Vec<(String, MetaValue)>,
     pub application_booleans: BTreeMap<String, bool>,
     pub activities: Vec<ActivityDecl>,
-    pub receivers: Vec<ReceiverDecl>,
-    pub providers: Vec<ProviderDecl>,
-    pub requested_permissions: Vec<String>,
-    pub permissions: Vec<PermissionDecl>,
+    /// `<receiver>` / `<provider>` children of `<application>` that carry an `android:name`
+    pub receiver_count: usize,
+    pub provider_count: usize,
     pub libraries: Vec<UsesLibrary>,
     pub instrumentation: Vec<InstrumentationDecl>,
 }
@@ -251,21 +188,6 @@ fn booleans(element: &Element) -> BTreeMap<String, bool> {
         .collect()
 }
 
-/// `android:theme` of `element` as a resource id: aapt2 prints a reference `@0x01030128`. None written = 0 (ParsedActivityUtils: `getResourceId(theme, 0)`); a reference to the app's own or the framework's style reads alike.
-fn theme(element: &Element) -> Result<i32> {
-    let Some(value) = element.attr("theme") else {
-        return Ok(0);
-    };
-    let hex = value
-        .strip_prefix("@0x")
-        .with_context(|| format!("theme {value:?} is not a resource reference"))?;
-    let id = u32::from_str_radix(hex, 16).with_context(|| format!("theme {value:?}"))?;
-    Ok(id as i32)
-}
-
-/// ParsedActivityUtils.RECREATE_ON_CONFIG_CHANGES_MASK: ActivityInfo.CONFIG_MCC | CONFIG_MNC.
-const RECREATE_ON_CONFIG_CHANGES_MASK: u32 = 0x1 | 0x2;
-
 /// A flags attribute as aapt2 prints it (`0x00000d80`); unwritten = 0 (`sa.getInt(.., 0)`).
 fn flags_attr(element: &Element, name: &str) -> Result<u32> {
     let Some(value) = element.attr(name) else {
@@ -275,72 +197,6 @@ fn flags_attr(element: &Element, name: &str) -> Result<u32> {
         .strip_prefix("0x")
         .with_context(|| format!("{name} {value:?} is not a flags value"))?;
     u32::from_str_radix(hex, 16).with_context(|| format!("{name} {value:?}"))
-}
-
-/// ParsedActivityUtils.getActivityConfigChanges: `configChanges`, plus MCC and MNC unless `recreateOnConfigChanges` names them (an activity handles those two by default).
-fn config_changes(activity: &Element) -> Result<i32> {
-    let written = flags_attr(activity, "configChanges")?;
-    let recreate = flags_attr(activity, "recreateOnConfigChanges")?;
-    Ok((written | (!recreate & RECREATE_ON_CONFIG_CHANGES_MASK)) as i32)
-}
-
-/// `android:launchMode` as ActivityInfo.launchMode. aapt2's xmltree prints the enum's value as a decimal (`launchMode(0x0101001d)=2` for singleTask; checked on prebuilts/sdk/tools aapt2 with a
-/// manifest declaring singleTask / singleTop / none); `(type 0x10)0x<n>` is not what this aapt2 prints. Unwritten = 0 (LAUNCH_MULTIPLE, `standard`).
-fn launch_mode(element: &Element) -> Result<i32> {
-    let Some(value) = element.attr("launchMode") else {
-        return Ok(0);
-    };
-    value
-        .parse::<i32>()
-        .with_context(|| format!("launchMode {value:?} is not an enum value"))
-}
-
-/// `android:taskAffinity` as written; None = unwritten, the package name is the affinity (ActivityRecord's default).
-fn task_affinity(element: &Element) -> Option<String> {
-    element.attr("taskAffinity").map(str::to_owned)
-}
-
-/// `android:screenOrientation` as ActivityInfo.screenOrientation. aapt2 prints the enum in decimal, `-1` for unspecified (aapt2 2.19 on a probe manifest). Unwritten = SCREEN_ORIENTATION_UNSPECIFIED (PackageParser.java:4457-4459).
-fn screen_orientation(element: &Element) -> Result<i32> {
-    let Some(value) = element.attr("screenOrientation") else {
-        return Ok(SCREEN_ORIENTATION_UNSPECIFIED);
-    };
-    value
-        .parse::<i32>()
-        .with_context(|| format!("screenOrientation {value:?} is not an enum value"))
-}
-
-/// `android:resizeableActivity`: the activity's, else `<application>`'s, else true. PackageParser.setActivityResizeMode takes the activity's explicit value, then the application's explicit default, then the targetSdk default (PackageParser.java:4677-4715). That default is resizable in both branches (ActivityInfo.isResizeableMode, ActivityInfo.java:2073-2080), so targetSdk does not enter.
-fn resizeable(activity: &Element, application: Option<&Element>) -> bool {
-    let application = application.is_none_or(|a| a.bool_attr("resizeableActivity", true));
-    activity.bool_attr("resizeableActivity", application)
-}
-
-/// `android:minAspectRatio` (or `maxAspectRatio`): the activity's, else `<application>`'s (PackageParser.setMinAspectRatio / setMaxAspectRatio, PackageParser.java:4758-4768, :4721-4752). None = not declared.
-/// aapt2 prints a float in its shortest form (`1.86`, and `2` for 2.0). A value that does not parse is an error; AOSP ignores a non-float here (PackageParser.java:4472-4481).
-fn aspect_ratio(
-    element: &Element,
-    application: Option<&Element>,
-    name: &str,
-) -> Result<Option<f32>> {
-    let Some(value) = element
-        .attr(name)
-        .or_else(|| application.and_then(|a| a.attr(name)))
-    else {
-        return Ok(None);
-    };
-    value
-        .parse::<f32>()
-        .map(Some)
-        .with_context(|| format!("{name}={value:?} is not a float"))
-}
-
-/// `android:process` of an `<application>` or `<activity>` (ParsingUtils.buildProcessName: `:name` is private to the package); None = unwritten, the package's process.
-fn process_attr(element: &Element, package: &str) -> Option<String> {
-    element.attr("process").map(|p| match p.strip_prefix(':') {
-        Some(suffix) => format!("{package}:{suffix}"),
-        None => p.to_owned(),
-    })
 }
 
 /// A class name as ParsedComponent resolves it against the package: `.Foo` -> `<package>.Foo`, a bare `Foo` likewise, a dotted name as it is.
@@ -409,85 +265,13 @@ fn is_launcher(element: &Element) -> bool {
     })
 }
 
-/// An `<intent-filter>` (ParsedIntentInfoUtils.parseIntentInfo, reduced): `<action>`, `<category>`, `<data android:scheme / android:mimeType>`; a kind the filter does not write stays None (IntentFilter's null list).
-fn intent_filter(f: &Element) -> IntentFilterDecl {
-    let names = |kind: &str, attr: &str| -> Option<Vec<String>> {
-        let v: Vec<String> = f
-            .children(kind)
-            .filter_map(|e| e.attr(attr).map(str::to_owned))
-            .collect();
-        (!v.is_empty()).then_some(v)
-    };
-    IntentFilterDecl {
-        actions: names("action", "name").unwrap_or_default(),
-        categories: names("category", "name"),
-        schemes: names("data", "scheme"),
-        types: names("data", "mimeType"),
-    }
-}
-
-/// Every `<receiver>` of `application`, in manifest order (ParsedActivityUtils.parseReceiver): `exported` unwritten = it has an intent filter.
-fn receivers(application: Option<&Element>, package: &str) -> Vec<ReceiverDecl> {
-    application
-        .into_iter()
-        .flat_map(|a| a.children("receiver"))
-        .filter_map(|r| {
-            let filters: Vec<IntentFilterDecl> =
-                r.children("intent-filter").map(intent_filter).collect();
-            Some(ReceiverDecl {
-                name: resolve_class(package, r.attr("name")?),
-                exported: r.bool_attr("exported", !filters.is_empty()),
-                enabled: r.bool_attr("enabled", true),
-                permission: r.attr("permission").map(str::to_owned),
-                process: process_attr(r, package),
-                filters,
-            })
-        })
-        .collect()
-}
-
-/// Every `<provider>` of `application`, in manifest order (ParsedProviderUtils.parseProvider): `exported` unwritten = targetSdk < JELLY_BEAN_MR1; a read or write permission falls back to `android:permission`, then the application's.
-fn providers(
-    application: Option<&Element>,
-    package: &str,
-    target_sdk: i32,
-) -> Result<Vec<ProviderDecl>> {
-    /// Build.VERSION_CODES.JELLY_BEAN_MR1.
-    const JELLY_BEAN_MR1: i32 = 17;
-    let Some(application) = application else {
-        return Ok(vec![]);
-    };
-    application
-        .children("provider")
-        .filter(|p| p.attr("name").is_some())
-        .map(|p| {
-            let permission = |own: &str| {
-                p.attr(own)
-                    .or_else(|| p.attr("permission"))
-                    .or_else(|| application.attr("permission"))
-                    .map(str::to_owned)
-            };
-            let init_order = p.attr("initOrder").unwrap_or("0");
-            Ok(ProviderDecl {
-                name: resolve_class(package, p.attr("name").unwrap_or_default()),
-                authority: p.attr("authorities").map(str::to_owned),
-                exported: p.bool_attr("exported", target_sdk < JELLY_BEAN_MR1),
-                enabled: p.bool_attr("enabled", true),
-                process: process_attr(p, package),
-                read_permission: permission("readPermission"),
-                write_permission: permission("writePermission"),
-                grant_uri_permissions: p.bool_attr("grantUriPermissions", false),
-                force_uri_permissions: p.bool_attr("forceUriPermissions", false),
-                multiprocess: p.bool_attr("multiprocess", false),
-                init_order: init_order
-                    .parse()
-                    .with_context(|| format!("initOrder {init_order:?} is not an integer"))?,
-                syncable: p.bool_attr("syncable", false),
-                direct_boot_aware: p.bool_attr("directBootAware", false),
-                meta_data: meta_data(p)?,
-            })
-        })
-        .collect()
+/// `<kind>` children of `application` that carry an `android:name`: the count the gates read (nameless ones are not counted).
+fn named_components(application: Option<&Element>, kind: &str) -> usize {
+    application.map_or(0, |a| {
+        a.children(kind)
+            .filter(|c| c.attr("name").is_some())
+            .count()
+    })
 }
 
 pub fn parse(text: &str) -> Result<Manifest> {
@@ -516,34 +300,16 @@ pub fn parse(text: &str) -> Result<Manifest> {
         None => min_sdk,
     };
     let application = root.children("application").next();
-    let process_name = application.and_then(|a| process_attr(a, package));
-    // every `<activity>` in manifest order: its class, whether it handles MAIN + LAUNCHER, its boolean attributes (ParsedActivity's inputs)
+    // every `<activity>` in manifest order: its class and whether it handles MAIN + LAUNCHER
     let mut activities: Vec<ActivityDecl> = application
         .into_iter()
         .flat_map(|a| a.children("activity"))
-        .map(|activity| {
-            let Some(name) = activity.attr("name") else {
-                return Ok(None);
-            };
-            Ok(Some(ActivityDecl {
-                name: resolve_class(package, name),
+        .filter_map(|activity| {
+            Some(ActivityDecl {
+                name: resolve_class(package, activity.attr("name")?),
                 launcher: is_launcher(activity),
-                theme: theme(activity)?,
-                config_changes: config_changes(activity)?,
-                booleans: booleans(activity),
-                launch_mode: launch_mode(activity)?,
-                task_affinity: task_affinity(activity),
-                process: process_attr(activity, package),
-                meta_data: meta_data(activity)?,
-                screen_orientation: screen_orientation(activity)?,
-                resizeable: resizeable(activity, application),
-                min_aspect_ratio: aspect_ratio(activity, application, "minAspectRatio")?,
-                max_aspect_ratio: aspect_ratio(activity, application, "maxAspectRatio")?,
-            }))
+            })
         })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
         .collect();
     // an enabled `<activity-alias>` that is MAIN + LAUNCHER launches its target: PackageManager resolves the alias, and the record's real activity is the target (ActivityRecord.realActivity)
     for alias in application
@@ -562,17 +328,6 @@ pub fn parse(text: &str) -> Result<Manifest> {
             None => activities.push(ActivityDecl {
                 name: target,
                 launcher: true,
-                theme: theme(alias)?,
-                config_changes: config_changes(alias)?,
-                booleans: booleans(alias),
-                launch_mode: launch_mode(alias)?,
-                task_affinity: task_affinity(alias),
-                process: process_attr(alias, package),
-                meta_data: meta_data(alias)?,
-                screen_orientation: screen_orientation(alias)?,
-                resizeable: resizeable(alias, application),
-                min_aspect_ratio: aspect_ratio(alias, application, "minAspectRatio")?,
-                max_aspect_ratio: aspect_ratio(alias, application, "maxAspectRatio")?,
             }),
         }
     }
@@ -582,24 +337,11 @@ pub fn parse(text: &str) -> Result<Manifest> {
         version_name: root.attr("versionName").map(str::to_owned),
         min_sdk,
         target_sdk,
-        process_name,
-        application_theme: application.map_or(Ok(0), theme)?,
-        application_class: application
-            .and_then(|a| a.attr("name"))
-            .map(|n| resolve_class(package, n)),
-        app_component_factory: application
-            .and_then(|a| a.attr("appComponentFactory"))
-            .map(|n| resolve_class(package, n)),
         application_meta_data: application.map_or(Ok(vec![]), meta_data)?,
         application_booleans: application.map(booleans).unwrap_or_default(),
         activities,
-        permissions: permissions(&root)?,
-        receivers: receivers(application, package),
-        providers: providers(application, package, target_sdk)?,
-        requested_permissions: root
-            .children("uses-permission")
-            .filter_map(|e| e.attr("name").map(str::to_owned))
-            .collect(),
+        receiver_count: named_components(application, "receiver"),
+        provider_count: named_components(application, "provider"),
         libraries: application
             .into_iter()
             .flat_map(|a| a.children("uses-library"))
@@ -840,7 +582,6 @@ mod tests {
             (3, Some("1.0"))
         );
         assert_eq!((m.min_sdk, m.target_sdk), (21, 36));
-        assert_eq!(m.requested_permissions, ["android.permission.INTERNET"]);
         assert_eq!(
             m.libraries,
             [
@@ -868,160 +609,8 @@ mod tests {
                 functional_test: true,
             }]
         );
-        assert_eq!(m.process_name, None);
         assert!(m.activities.is_empty() && m.launch_activity().is_none());
         assert!(m.application_booleans.is_empty());
-    }
-
-    /// `android:configChanges` as aapt2 prints it. getActivityConfigChanges: unwritten -> MCC | MNC (0x3, the default handled pair); 0xd80 (screenSize, smallestScreenSize, orientation, screenLayout... as written) keeps them; recreateOnConfigChanges=mcc (0x1) drops MCC.
-    #[test]
-    /// `launchMode`, `taskAffinity` and `process` of an `<activity>` as ActivityDecl holds them; unwritten = standard (0), no affinity written (the package name applies), no process written.
-    fn launch_mode_affinity_and_process_follow_the_manifest() {
-        let text = |attrs: &str| {
-            format!(
-                r#"  E: manifest (line=3)
-    A: package="com.example.atltest" (Raw: "com.example.atltest")
-      E: application (line=7)
-          E: activity (line=8)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
-{attrs}
-"#
-            )
-        };
-        let written = text(
-            r#"            A: http://schemas.android.com/apk/res/android:launchMode(0x0101001d)=1
-            A: http://schemas.android.com/apk/res/android:taskAffinity(0x01010204)="com.example.tasks" (Raw: "com.example.tasks")
-            A: http://schemas.android.com/apk/res/android:process(0x01010584)=":remote" (Raw: ":remote")"#,
-        );
-        let a = &parse(&written).expect("parse").activities[0];
-        assert_eq!(
-            (
-                a.launch_mode,
-                a.task_affinity.as_deref(),
-                a.process.as_deref()
-            ),
-            (
-                1,
-                Some("com.example.tasks"),
-                Some("com.example.atltest:remote")
-            )
-        );
-        let plain = &parse(&text("")).expect("parse").activities[0];
-        assert_eq!(
-            (
-                plain.launch_mode,
-                plain.task_affinity.clone(),
-                plain.process.clone()
-            ),
-            (0, None, None)
-        );
-    }
-
-    /// `screenOrientation`, `resizeableActivity` and the aspect limits: the activity's own value, else the application's (PackageParser.setActivityResizeMode, setMinAspectRatio, setMaxAspectRatio).
-    #[test]
-    fn orientation_resizeable_and_aspect_follow_the_manifest() {
-        // targetSdk, the `<application>` attribute lines, the activity's attribute lines. aapt2 prints floats shortest (`1.86`, `2` for 2.0) and the enum in decimal.
-        let xml = |target: i32, application: &str, activity: &str| {
-            format!(
-                r#"  E: manifest (line=3)
-    A: package="com.example.atltest" (Raw: "com.example.atltest")
-      E: uses-sdk (line=4)
-        A: http://schemas.android.com/apk/res/android:targetSdkVersion(0x01010270)={target}
-      E: application (line=7)
-{application}
-          E: activity (line=8)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
-{activity}
-"#
-            )
-        };
-        let decl = |target: i32, application: &str, activity: &str| {
-            let a = parse(&xml(target, application, activity))
-                .expect("parse")
-                .activities
-                .remove(0);
-            (
-                a.screen_orientation,
-                a.resizeable,
-                a.min_aspect_ratio,
-                a.max_aspect_ratio,
-            )
-        };
-        // The activity's own values.
-        let own = r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=1
-            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=false
-            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=1.86
-            A: http://schemas.android.com/apk/res/android:minAspectRatio(0x0101059b)=0.5"#;
-        assert_eq!(decl(33, "", own), (1, false, Some(0.5), Some(1.86)));
-        // Unwritten on the activity: the application's values.
-        let app = r#"            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=false
-            A: http://schemas.android.com/apk/res/android:minAspectRatio(0x0101059b)=1.5
-            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=2"#;
-        assert_eq!(decl(33, app, ""), (-1, false, Some(1.5), Some(2.0)));
-        // The activity's own value wins over the application's.
-        let wins = r#"            A: http://schemas.android.com/apk/res/android:resizeableActivity(0x010104f6)=true
-            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=1.5"#;
-        assert_eq!(decl(33, app, wins), (-1, true, Some(1.5), Some(1.5)));
-        // Unwritten at both levels: resizable at either targetSdk (AOSP's SDK-24 default and its pre-N FORCE_RESIZABLE are both resizable).
-        assert_eq!(decl(23, "", ""), (-1, true, None, None));
-        assert_eq!(decl(33, "", ""), (-1, true, None, None));
-        // A landscape-family value (sensorLandscape = 6).
-        let sensor = r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=6"#;
-        assert_eq!(decl(33, "", sensor).0, 6);
-        // A value that is not a number of its kind is an error, not a silent default.
-        let bad = |activity: &str| parse(&xml(33, "", activity)).is_err();
-        assert!(bad(
-            r#"            A: http://schemas.android.com/apk/res/android:maxAspectRatio(0x01010560)=abc"#
-        ));
-        assert!(bad(
-            r#"            A: http://schemas.android.com/apk/res/android:screenOrientation(0x0101001e)=portrait"#
-        ));
-    }
-
-    #[test]
-    fn config_changes_follow_get_activity_config_changes() {
-        let text = |attrs: &str| {
-            format!(
-                r#"  E: manifest (line=3)
-    A: package="com.example.atltest" (Raw: "com.example.atltest")
-      E: application (line=7)
-          E: activity (line=8)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
-{attrs}
-"#
-            )
-        };
-        let changes = "            A: http://schemas.android.com/apk/res/android:configChanges(0x0101001f)=0x00000d80";
-        let recreate = "            A: http://schemas.android.com/apk/res/android:recreateOnConfigChanges(0x01010547)=0x00000001";
-        let value = |attrs: &str| parse(&text(attrs)).expect("parse").activities[0].config_changes;
-        assert_eq!(value(""), 0x3);
-        assert_eq!(value(changes), 0xd83);
-        assert_eq!(value(&format!("{changes}\n{recreate}")), 0xd82);
-        assert!(parse(&text("            A: http://schemas.android.com/apk/res/android:configChanges(0x0101001f)=\"x\" (Raw: \"x\")")).is_err());
-    }
-
-    /// `android:theme` as aapt2 prints it, on the application and on one activity; unwritten = 0; a theme that is no reference is refused.
-    #[test]
-    fn themes_are_resource_ids() {
-        let text = |value: &str| {
-            format!(
-                r#"  E: manifest (line=3)
-    A: package="com.example.atltest" (Raw: "com.example.atltest")
-      E: application (line=7)
-        A: http://schemas.android.com/apk/res/android:theme(0x01010000)=@0x7f0a0001
-          E: activity (line=8)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
-            A: http://schemas.android.com/apk/res/android:theme(0x01010000)={value}
-          E: activity (line=9)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".B" (Raw: ".B")
-"#
-            )
-        };
-        let m = parse(&text("@0x0103012a")).expect("parse");
-        assert_eq!(m.application_theme, 0x7f0a_0001);
-        assert_eq!(m.activities[0].theme, 0x0103_012a);
-        assert_eq!(m.activities[1].theme, 0);
-        assert!(parse(&text("\"x\" (Raw: \"x\")")).is_err());
     }
 
     /// A string and a bool reference resolve to their default-configuration values and type; one with no default value stays a reference, which meta_value drops. Values as CTR's `aapt2 dump resources` prints them.
@@ -1062,40 +651,24 @@ mod tests {
         );
     }
 
-    /// `<provider>`: no targetSdk written = 0 here, so `exported` unwritten is true (< 17, parseProvider); permission falls back own -> `android:permission` -> application; initOrder as `aapt2` prints it (decimal, CTR's manifest).
+    /// `<provider>`: the count is of the named ones; a nameless provider is not counted.
     #[test]
-    fn providers_follow_parse_provider() {
+    fn providers_counted_by_name() {
         let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
   E: manifest (line=3)
     A: package="com.example.p" (Raw: "com.example.p")
       E: application (line=7)
-        A: http://schemas.android.com/apk/res/android:permission(0x01010006)="p.App" (Raw: "p.App")
           E: provider (line=8)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)=".A" (Raw: ".A")
+          E: provider (line=9)
             A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="a;b" (Raw: "a;b")
-            A: http://schemas.android.com/apk/res/android:initOrder(0x0101001a)=100
-            A: http://schemas.android.com/apk/res/android:readPermission(0x01010007)="p.R" (Raw: "p.R")
-              E: meta-data (line=9)
-                A: http://schemas.android.com/apk/res/android:name(0x01010003)="k" (Raw: "k")
-                A: http://schemas.android.com/apk/res/android:value(0x01010024)="v" (Raw: "v")
 "#;
-        let m = parse(text).expect("parse");
-        let p = &m.providers[0];
-        assert_eq!(p.name, "com.example.p.A");
-        assert_eq!(p.authority.as_deref(), Some("a;b"));
-        assert_eq!(p.init_order, 100);
-        assert!(p.exported && p.enabled);
-        assert_eq!(p.read_permission.as_deref(), Some("p.R"));
-        assert_eq!(p.write_permission.as_deref(), Some("p.App"));
-        assert_eq!(
-            p.meta_data,
-            vec![("k".to_owned(), MetaValue::String("v".to_owned()))]
-        );
+        assert_eq!(parse(text).expect("parse").provider_count, 1);
     }
 
-    /// `<receiver>`: exported unwritten = has a filter (ParsedActivityUtils:495-507), written wins; permission, process, filter parts as written, unwritten kinds None.
+    /// `<receiver>`: the count is of the named ones; a nameless receiver is not counted.
     #[test]
-    fn receivers_follow_parse_receiver() {
+    fn receivers_counted_by_name() {
         let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
   E: manifest (line=3)
     A: package="com.example.r" (Raw: "com.example.r")
@@ -1103,47 +676,12 @@ mod tests {
           E: receiver (line=8)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Plain" (Raw: ".Plain")
           E: receiver (line=9)
-            A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Filtered" (Raw: ".Filtered")
-            A: http://schemas.android.com/apk/res/android:permission(0x01010006)="p.X" (Raw: "p.X")
-            A: http://schemas.android.com/apk/res/android:process(0x01010011)=":bg" (Raw: ":bg")
-              E: intent-filter (line=10)
-                  E: action (line=11)
-                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="a.B" (Raw: "a.B")
-                  E: data (line=12)
-                    A: http://schemas.android.com/apk/res/android:scheme(0x01010027)="package" (Raw: "package")
-          E: receiver (line=13)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Closed" (Raw: ".Closed")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
-              E: intent-filter (line=14)
-                  E: action (line=15)
-                    A: http://schemas.android.com/apk/res/android:name(0x01010003)="a.C" (Raw: "a.C")
+          E: receiver (line=10)
+            A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
 "#;
-        let m = parse(text).expect("parse");
-        let shape: Vec<(&str, bool)> = m
-            .receivers
-            .iter()
-            .map(|r| (r.name.as_str(), r.exported))
-            .collect();
-        assert_eq!(
-            shape,
-            [
-                ("com.example.r.Plain", false),
-                ("com.example.r.Filtered", true),
-                ("com.example.r.Closed", false)
-            ]
-        );
-        let f = &m.receivers[1];
-        assert_eq!(f.permission.as_deref(), Some("p.X"));
-        assert_eq!(f.process.as_deref(), Some("com.example.r:bg"));
-        assert_eq!(
-            f.filters,
-            [IntentFilterDecl {
-                actions: vec!["a.B".into()],
-                categories: None,
-                schemes: Some(vec!["package".into()]),
-                types: None,
-            }]
-        );
+        assert_eq!(parse(text).expect("parse").receiver_count, 2);
     }
 
     /// An enabled MAIN + LAUNCHER `<activity-alias>` makes its target the launcher (the Fossify Calculator's launcher icons: 18 disabled aliases, one enabled, all to SplashActivity); a disabled alias counts for nothing.
@@ -1195,14 +733,13 @@ mod tests {
         );
     }
 
-    /// A launcher activity named relative to the package, a private process, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
+    /// A launcher activity named relative to the package, a relative instrumentation name: the resolution rules ParsedComponent / ParsingUtils apply.
     #[test]
-    fn launcher_activity_and_process_resolution() {
+    fn launcher_activity_and_instrumentation_resolution() {
         let text = r#"N: android=http://schemas.android.com/apk/res/android (line=3)
   E: manifest (line=3)
     A: package="com.example.atltest" (Raw: "com.example.atltest")
       E: application (line=7)
-        A: http://schemas.android.com/apk/res/android:process(0x01010011)=":remote" (Raw: ":remote")
           E: activity (line=8)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)=".Other" (Raw: ".Other")
           E: activity (line=9)
@@ -1222,7 +759,7 @@ mod tests {
             m.launch_activity().map(|a| a.name.as_str()),
             Some("com.example.atltest.Main")
         );
-        // both activities, in order; only Main handles MAIN + LAUNCHER and it wrote no boolean
+        // both activities, in order; only Main handles MAIN + LAUNCHER
         let shape: Vec<(&str, bool)> = m
             .activities
             .iter()
@@ -1234,11 +771,6 @@ mod tests {
                 ("com.example.atltest.Other", false),
                 ("com.example.atltest.Main", true)
             ]
-        );
-        assert!(m.activities.iter().all(|a| a.booleans.is_empty()));
-        assert_eq!(
-            m.process_name.as_deref(),
-            Some("com.example.atltest:remote")
         );
         assert_eq!(m.instrumentation[0].name, "com.example.atltest.Runner");
         assert_eq!(m.instrumentation[0].target_processes.as_deref(), Some("*"));
@@ -1280,7 +812,7 @@ mod tests {
                     A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
 "#;
 
-    /// The window fixture's manifest: the launcher activity's booleans as written (`exported`, `hardwareAccelerated=false`), none on the application.
+    /// The window fixture's manifest: its launcher activity, and no boolean on the application.
     #[test]
     fn the_window_fixture_record() {
         let m = parse(WINDOW).expect("parse");
@@ -1289,13 +821,6 @@ mod tests {
         assert!(m.application_booleans.is_empty());
         let launch = m.launch_activity().expect("a launcher activity");
         assert_eq!(launch.name, "com.example.atlwindow.Main");
-        assert_eq!(
-            launch.booleans,
-            BTreeMap::from([
-                ("exported".to_owned(), true),
-                ("hardwareAccelerated".to_owned(), false)
-            ])
-        );
     }
 
     /// aapt2's `dump xmltree` of framework-res.apk (base b75bb52a, 2026-11-21), cut to two `<protected-broadcast>`s and one `<permission>`; core/res/AndroidManifest.xml:29, :69, :840. The full dump has 682

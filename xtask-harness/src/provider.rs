@@ -143,13 +143,13 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     println!(
         "provider: built {} ({} providers)",
         apk.display(),
-        m.providers.len()
+        m.provider_count
     );
     // the break's own gate: an APK that still declares providers would leave the control green
     ensure!(
-        !args.break_provider_list || m.providers.is_empty(),
+        !args.break_provider_list || m.provider_count == 0,
         "provider: break-provider-list: the built APK still declares {} providers",
-        m.providers.len()
+        m.provider_count
     );
     let package = m.name.clone();
     let run = Run {
