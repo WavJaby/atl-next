@@ -1873,15 +1873,20 @@ impl Inner {
         let mut fx = Effects::default();
         for mut rec in stopped {
             fx.pids.push(rec.pid);
-            if rec.attached.is_none() {
-                // no binder death comes for an unattached process: its end is the one shared with the start timeout (unattached_ended_locked)
-                fx.lost.extend(self.unattached_ended_locked(st, &rec));
-            } else {
-                self.broadcasts_died_locked(st, rec.pid);
-            }
             // forceStopPackageInternalLocked: killPackageProcessesLSP(allowRestart false) (AMS :4360-4361) -> cleanUpApplicationRecordLocked -> killServicesLocked(app, false):
-            // every hosted service is brought down, STICKY ones included (ActiveServices :7343-7345); none is restarted
-            self.services_died(st, rec.pid, false);
+            // every hosted service is brought down, STICKY ones included (ActiveServices :7343-7345); none is restarted. No LastAppEnded: the user did not close the app
+            if rec.attached.is_some() {
+                let (lost, _) = self.process_out_locked(st, &rec, false);
+                fx.lost.extend(lost);
+            } else {
+                // no binder death comes for an unattached process: its end is the one shared with the start timeout (unattached_ended_locked), whose providers are the unpublished ones only
+                fx.lost.extend(self.unattached_ended_locked(st, &rec));
+                self.services_died(st, rec.pid, false);
+                if let Some(task) = rec.task {
+                    self.task_gone_locked(st, task);
+                }
+                self.touch_all_locked(st);
+            }
             if let Some(instr) = rec.instr.take() {
                 // the process is being killed with its package: the same CANCELED a crash reports (no further force stop: the package's processes are all gone)
                 self.report_finished(instr, RESULT_CANCELED, Some(crash_info()));
@@ -1942,11 +1947,34 @@ impl Inner {
         self.force_stop_package_locked(st, &package)
     }
 
+    /// The death of an attached process, from its record's removal to the end of its providers, in app_died's order: its launch Task, its activities, its broadcasts, its services (`allow_restart`: STICKY restarts, false for a force stop), the grace of the processes left, and the providers it published (their waiters returned, told after the lock). A force stop runs it too (forceStopPackageInternalLocked = a death with no restart). Not for an unattached process: unattached_ended_locked.
+    fn process_out_locked(
+        &self,
+        st: &mut State,
+        rec: &ProcessRecord,
+        allow_restart: bool,
+    ) -> (Vec<LostWaiter>, Option<bool>) {
+        // WindowProcessController.destroy: its configuration listener goes
+        self.tasks.set_process_task(rec.pid, None);
+        // Some(finished): this death left no activity anywhere and the process had a Task (a launched app; SettingsProvider, WebView and other no-Task processes never count)
+        let last_app = rec
+            .attached
+            .as_ref()
+            .and_then(|a| self.atm.process_died(&a.thread.as_binder()))
+            .filter(|_| rec.task.is_some());
+        if let Some(task) = rec.task {
+            self.task_gone_locked(st, task);
+        }
+        self.broadcasts_died_locked(st, rec.pid);
+        self.services_died(st, rec.pid, allow_restart);
+        self.touch_all_locked(st);
+        let lost = Self::remove_providers_of_process(st, &rec.package, &rec.process_name, |_| true);
+        (lost, last_app)
+    }
+
     /// AppDeathRecipient.binderDied -> appDiedLocked -> handleAppDiedLocked (:3347-3367): the record leaves the table, and an instrumentation it ran ends CANCELED with "Process crashed.".
     fn app_died(&self, pid: i32) {
-        // Some(finished): this death left no activity anywhere and the process had a Task (a launched app; SettingsProvider, WebView and other no-Task processes never count)
-        let mut last_app = None;
-        let fx = {
+        let (fx, last_app) = {
             let mut st = self.state();
             let Some(i) = st
                 .processes
@@ -1956,26 +1984,9 @@ impl Inner {
                 return;
             };
             let mut rec = st.processes.remove(i);
-            // WindowProcessController.destroy: its configuration listener goes
-            self.tasks.set_process_task(pid, None);
-            if let Some(a) = &rec.attached {
-                last_app = self
-                    .atm
-                    .process_died(&a.thread.as_binder())
-                    .filter(|_| rec.task.is_some());
-            }
-            if let Some(task) = rec.task {
-                self.task_gone_locked(&mut st, task);
-            }
-            self.broadcasts_died_locked(&mut st, pid);
             let allow_restart = !(rec.kill_reason == Some(KillReason::WindowClosed)
                 && self.window_close_stops_services);
-            self.services_died(&mut st, pid, allow_restart);
-            self.touch_all_locked(&mut st);
-            let lost =
-                Self::remove_providers_of_process(&mut st, &rec.package, &rec.process_name, |_| {
-                    true
-                });
+            let (lost, finished) = self.process_out_locked(&mut st, &rec, allow_restart);
             log(format_args!(
                 "process {} (pid {pid}) died",
                 rec.process_name
@@ -1997,7 +2008,7 @@ impl Inner {
                 None => Effects::default(),
             };
             fx.lost.extend(lost);
-            fx
+            (fx, finished)
         };
         self.deliver(fx);
         if let Some(finished) = last_app {
@@ -4042,6 +4053,68 @@ mod tests {
         assert_eq!(*told.lock().expect("told"), [false]);
         assert!(am.inner.state().providers.is_empty());
         assert!(am.inner.state().processes.is_empty());
+    }
+
+    /// A force stop is a process death (forceStopPackageInternalLocked, AMS :4309): the attached process's launch Task, its activity and the providers it published
+    /// go with it, as they do when it dies (app_died). Red before process_out_locked: all three stayed in the table.
+    #[test]
+    fn force_stop_drops_the_providers_tasks_and_activities_of_an_attached_process() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let (caller, _) = waiting_caller();
+        ask_for_provider(&am, &caller).expect("a holder for the caller");
+        let (app, _) = waiting_caller();
+        let task = am.inner.tasks.new_task(
+            PROVIDER_UID,
+            PROVIDER_PACKAGE,
+            TaskSize {
+                width: 1080,
+                height: 1920,
+            },
+        );
+        let now = am.inner.now_ms();
+        let pid = {
+            let mut st = am.inner.state();
+            st.uids.on_task_added(PROVIDER_UID, now);
+            st.open_tasks.insert(task, PROVIDER_UID);
+            st.processes[0].attached = Some(Attached {
+                thread: app.clone(),
+                program_pid: None,
+                _death: DeathRecipient::new(|| {}),
+            });
+            st.processes[0].task = Some(task);
+            let pid = st.processes[0].pid;
+            // published: the provider's binder stands in for the app's IContentProvider; its waiters were told at publication
+            st.providers[0].provider = Some(app.as_binder());
+            st.providers[0].pid = Some(pid);
+            st.providers[0].waiters.clear();
+            pid
+        };
+        let decl = fixture::activity(PROVIDER_PACKAGE, PROVIDER_CLASS);
+        am.activity_tasks().launch_launcher(
+            app.clone(),
+            pid,
+            PROVIDER_UID,
+            PROVIDER_PACKAGE,
+            &decl,
+            task,
+        );
+        assert!(
+            am.activity_tasks().hosts_activity(&app.as_binder()),
+            "the activity is in the stack before the stop"
+        );
+        am.force_stop_package(PROVIDER_PACKAGE);
+        let activity = am.activity_tasks().hosts_activity(&app.as_binder());
+        let left = {
+            let st = am.inner.state();
+            (st.processes.len(), st.providers.len(), st.open_tasks.len())
+        };
+        assert_eq!(
+            (left, activity),
+            ((0, 0, 0), false),
+            "after the force stop: (processes, providers, launch Tasks) left, and the activity's presence"
+        );
+        assert_eq!(*control.kills.lock().expect("kills"), [pid]);
     }
 
     /// A process of (process, uid) that another package owns cannot publish this provider (publishContentProviders matches the publisher's package): the request gets
