@@ -308,7 +308,8 @@ impl Installer {
         f
     }
 
-    /// The batch becomes visible at once, under the install lock: its permission states, then the table, then each recorded version. Before this nothing of it was visible.
+    /// The batch becomes visible at once, under the install lock: its permission states, then the table, then each recorded version, its component overrides pruned, and the state
+    /// saved. Before the table publish nothing of it was visible.
     fn publish(&self, batch: Vec<Installed>) -> Vec<Reported> {
         if batch.is_empty() {
             return Vec::new();
@@ -326,10 +327,20 @@ impl Installer {
         let next = snapshot.with_records(records);
         self.permissions.packages_added(&next, &names);
         self.table.publish(next);
+        // restoreComponentSettings (IPH :590-596): an override of a component the new version no longer has goes
+        let published = self.table.snapshot();
         for r in &reports {
             self.state.set_version_code(&r.package, r.version);
+            if let Some(p) = published.by_name(&r.package) {
+                self.state
+                    .retain_components(&r.package, |c| p.has_component(c));
+            }
         }
-        // the freezes end last: a package starts again only once its version is recorded (D6)
+        // one save per publish (D6); a failed save is logged and the install stands (D7), as boot's save in system_services
+        if let Err(e) = self.state.save() {
+            log(format_args!("install: package state not saved: {e}"));
+        }
+        // the freezes end last: a package starts again only once its version is recorded and its state saved (D6)
         drop(frozen);
         reports
     }
@@ -668,10 +679,10 @@ mod tests {
 
     /// An installer output of `package` at `version`, its base at `dir`/base.apk; targetSdk 35, unsigned.
     fn frames_file(path: &Path, package: &str, version: i32, dir: &str) {
-        frames_file_with(path, package, version, dir, 35, None);
+        frames_file_with(path, package, version, dir, 35, None, &[]);
     }
 
-    /// `frames_file` with the targetSdk and one signing certificate (`cert`; None: no signing info).
+    /// `frames_file` with the targetSdk, one signing certificate (`cert`; None: no signing info) and the activities `classes` (`fixture::activity`).
     fn frames_file_with(
         path: &Path,
         package: &str,
@@ -679,6 +690,7 @@ mod tests {
         dir: &str,
         target_sdk: i32,
         cert: Option<&[u8]>,
+        classes: &[&str],
     ) {
         use atl_parcelables::codecs::android::content::pm::PackageInfo::{
             Signature, SigningDetails,
@@ -694,6 +706,12 @@ mod tests {
             package_name: Some(package.into()),
             version_code: version,
             application_info: Some(app),
+            activities: Some(
+                classes
+                    .iter()
+                    .map(|c| Some(crate::packages::fixture::activity(package, c)))
+                    .collect(),
+            ),
             signing_info: cert.map(|c| SigningDetails::Known {
                 signatures: Some(vec![Some(Signature {
                     bytes: Some(c.to_vec()),
@@ -954,7 +972,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("atl-install-{tag}-{}.frames", std::process::id()));
         let dir = format!("{DATA_APP}/{package}");
-        frames_file_with(&path, package, version, &dir, target_sdk, cert);
+        frames_file_with(&path, package, version, &dir, target_sdk, cert, &[]);
         let parsed = Parsed::read(&path.to_string_lossy()).expect("installed frames");
         let _ = std::fs::remove_file(&path);
         parsed.record(10_001, &dir, false, (flags, 0), &test_config())
@@ -987,6 +1005,7 @@ mod tests {
             &format!("{DATA_APP}/vmdl0.tmp"),
             target,
             cert,
+            &[],
         );
         let f0 = f0.to_string_lossy().into_owned();
         let state = Arc::new(PackageUserStates::default());
@@ -1273,6 +1292,114 @@ mod tests {
         drop(installer);
         drop(control);
         server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A running install's publish prunes the component overrides its new version no longer has (PackageSetting.restoreComponentSettings, IPH :590-596) and saves the state: a reload
+    /// holds the kept override only.
+    #[test]
+    fn components_gone_from_the_new_version_lose_their_override() {
+        use crate::package_state::{
+            COMPONENT_ENABLED_STATE_DEFAULT, COMPONENT_ENABLED_STATE_DISABLED,
+        };
+        let tmp = std::env::temp_dir().join(format!("atl-install-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let (v1, v2) = (tmp.join("v1.frames"), tmp.join("0.frames"));
+        let dir = format!("{DATA_APP}/com.example.app");
+        let cert = Some(&b"cert-a"[..]);
+        frames_file_with(
+            &v1,
+            "com.example.app",
+            1,
+            &dir,
+            35,
+            cert,
+            &[".Main", ".Gone"],
+        );
+        frames_file_with(
+            &v2,
+            "com.example.app",
+            2,
+            &format!("{DATA_APP}/vmdl0.tmp"),
+            35,
+            cert,
+            &[".Main"],
+        );
+        let record = Parsed::read(&v1.to_string_lossy())
+            .expect("v1 frames")
+            .record(10_001, &dir, false, (0, 0), &test_config());
+        let state = Arc::new(PackageUserStates::load(&tmp));
+        let table = table_with(&state, record, 1);
+        state.set_component("com.example.app", ".Main", COMPONENT_ENABLED_STATE_DISABLED);
+        state.set_component("com.example.app", ".Gone", COMPONENT_ENABLED_STATE_DISABLED);
+        let v2 = v2.to_string_lossy().into_owned();
+        let (control, server) = recording_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: v2.clone() },
+            Request::Commit { .. } => Response::Committed,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let installer = installer_over(&control, &table, &state);
+        let mut ids = AppIds::new();
+        ids.register(10_001);
+        let accepted = installer
+            .install_one(&mut ids, 0, Origin::Session, &[])
+            .expect("the update is accepted");
+        let reports = installer.publish(vec![accepted]);
+        drop(installer);
+        drop(control);
+        server.join().expect("server");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            state.component("com.example.app", ".Gone"),
+            COMPONENT_ENABLED_STATE_DEFAULT
+        );
+        assert_eq!(
+            state.component("com.example.app", ".Main"),
+            COMPONENT_ENABLED_STATE_DISABLED
+        );
+        let saved = PackageUserStates::load(&tmp);
+        assert_eq!(
+            saved.component("com.example.app", ".Main"),
+            COMPONENT_ENABLED_STATE_DISABLED,
+            "the publish saved the state"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A save the disk refuses is logged; the publish still answers and the install stands (D7: nothing after Commit's reply fails the install). A guard before the save: it passes
+    /// with or without the save, and a `save().expect` breaks it.
+    #[test]
+    fn a_failed_save_does_not_fail_the_install() {
+        let tmp = std::env::temp_dir().join(format!("atl-install-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        std::fs::write(tmp.join("blocker"), b"").expect("a file in the way");
+        let state = Arc::new(PackageUserStates::load(&tmp.join("blocker").join("state")));
+        let table = empty_table(&state);
+        let f0 = tmp.join("0.frames");
+        frames_file(&f0, "com.example.one", 1, &format!("{DATA_APP}/vmdl0.tmp"));
+        let f0 = f0.to_string_lossy().into_owned();
+        let (control, server) = recording_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Commit { .. } => Response::Committed,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let installer = installer_over(&control, &table, &state);
+        let mut ids = AppIds::new();
+        let accepted = installer
+            .install_one(&mut ids, 0, Origin::Session, &[])
+            .expect("the install is accepted");
+        let reports = installer.publish(vec![accepted]);
+        drop(installer);
+        drop(control);
+        server.join().expect("server");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(table.snapshot().all().len(), 1, "the install stands");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

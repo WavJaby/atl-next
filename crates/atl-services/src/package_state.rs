@@ -188,6 +188,18 @@ impl PackageUserStates {
         changed
     }
 
+    /// PackageSetting.restoreComponentSettings (:1246, IPH :590-596): an override of a component `package` no longer has (`has` false) goes; the others keep theirs.
+    pub fn retain_components(&self, package: &str, has: impl Fn(&str) -> bool) {
+        let mut packages = self.packages();
+        if let Some(o) = packages.get_mut(package) {
+            o.enabled.retain(|c| has(c));
+            o.disabled.retain(|c| has(c));
+            if o.is_empty() {
+                packages.remove(package);
+            }
+        }
+    }
+
     /// Writes the state (Settings.writePackageRestrictionsLPr's role) through [`state_file::save`]. AOSP defers the write unless SYNCHRONOUS; here every change is written before the call returns (one
     /// small file), which keeps SYNCHRONOUS's guarantee for every caller. In memory only (no file): nothing to do.
     pub fn save(&self) -> std::io::Result<()> {
