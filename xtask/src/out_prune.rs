@@ -2184,6 +2184,8 @@ mod tests {
         let tree = incr_fixture(&ws);
         owner(&tree, STALE, "atl_stale", Some(T_OLD));
         let dir = incr(&tree, "atl_stale", OLD_SESSION);
+        // an older finalized session (t = 1 micro) without a lock file: the session prune alone would plan it (a lock file would be held by this plan)
+        sized(&dir.join("s-1-z-svh0").join("q"), 1);
         let plan = land_dry(&ws);
         assert_eq!(dead_names(&plan), ["atl_stale-1abc"]);
         assert!(
@@ -2191,7 +2193,7 @@ mod tests {
             "its sessions planned twice: {:?}",
             plan.sessions
         );
-        assert_eq!(plan.incremental_bytes(), 100);
+        assert_eq!(plan.incremental_bytes(), 100 + 1);
         // the dry plan holds the dir's lock: an execute while it lives sees the dir as busy
         drop(plan);
         let line = prune_land(&ws, NOW, true, false).expect("land prune");
