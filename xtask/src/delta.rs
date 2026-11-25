@@ -810,6 +810,27 @@ fn admit_keeping(
     }
 }
 
+/// Admission of one command of [`enter`]. `Some(class)`: judged on the store as a build (reservation, waits, refusals, the FIFO queue; [`admit_keeping`]).
+/// `None` grows no upper: admitted at once, no reservation, never queued or refused. Do not judge a deletion as a build: the RAM margin refuses it on a full store (the land unit prune). Its whiteouts are inode metadata that nothing reserves.
+#[allow(clippy::too_many_arguments)]
+fn admit_command(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Option<Class>,
+    own: u64,
+    keep: bool,
+    store: Option<&Path>,
+    probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
+) -> Result<std::result::Result<Option<Admitted>, Verdict>> {
+    match class {
+        Some(class) => {
+            Ok(admit_keeping(ws, id, cfg, class, own, keep, store, probe_now)?.map(Some))
+        }
+        None => Ok(Ok(None)),
+    }
+}
+
 /// The store's deltas other than `me`, largest first: `<id> <GiB> GiB running|idle <min> min` (running = its mount lock is held; idle since its `used` stamp, [`USED`]). What the PM acts on while a build waits.
 fn held_by(ws: &Path, store: &Path, me: &str) -> String {
     let Ok(rd) = std::fs::read_dir(store) else {
@@ -1090,8 +1111,13 @@ fn growth(id: &str, before: u64, after: u64, reserved: u64) -> (String, bool) {
 }
 
 /// The outer side of every build command: decides the tier, admits, and for `ram` runs the rest of the command inside the mounted namespace. Some(code) = ran there; None = continue here (pool tier, or already inside).
+/// `class` None: a command that grows no upper (a prune deletes, a status read changes nothing). It enters an existing ram dir with no admission ([`admit_command`]): no reservation, never queued or refused. No record yet: nothing to enter, None.
 /// `cross_host`: the host a cross build writes (`upper/<host>`, [`own_bytes`]); None for every other command.
-pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Option<ExitCode>> {
+pub fn enter(
+    root: &Path,
+    class: Option<Class>,
+    cross_host: Option<&str>,
+) -> Result<Option<ExitCode>> {
     match stage() {
         Some(Stage::Mount(uid, gid)) => return mount_stage(root, uid, gid).map(Some),
         Some(Stage::In) => return Ok(None),
@@ -1123,12 +1149,14 @@ pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Opti
     // this checkout's own part of its upper (a new dir: none yet)
     let dirs = cross_dirs(root)?;
     let upper = store.join(&id).join("upper");
-    let own = if rec.is_some() {
-        own_bytes(&upper, class, cross_host, &dirs)?
-    } else {
-        0
+    let own = match class {
+        Some(class) if rec.is_some() => own_bytes(&upper, class, cross_host, &dirs)?,
+        _ => 0,
     };
-    let admitted = admit_keeping(
+    if class.is_none() && rec.is_none() {
+        return Ok(None);
+    }
+    let admitted = admit_command(
         &ws,
         &id,
         &cfg.delta,
@@ -1139,9 +1167,14 @@ pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Opti
         || probe(&store, &cfg.delta),
     )?;
     let (reservation, stats, need) = match admitted {
-        Ok(a) => a,
+        Ok(Some((reservation, stats, need))) => (Some(reservation), Some(stats), need),
+        Ok(None) => (None, None, Need::default()),
         Err(Verdict::Admit { .. }) => bail!("delta admission returned Admit as a refusal"),
-        Err(v) => return fall_to_pool(&ws, &id, class, rec.as_ref(), v),
+        Err(v) => match class {
+            Some(class) => return fall_to_pool(&ws, &id, class, rec.as_ref(), v),
+            // admit_command admits a command that grows nothing: no refusal reaches here
+            None => bail!("a command that grows nothing was refused: {}", v.reason()),
+        },
     };
     match rec {
         Some(r) => {
@@ -1158,14 +1191,20 @@ pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Opti
             }
         }
     }
-    println!(
-        "out: delta ram ({} build, {:.2} GiB RAM reserved (own {:.2} GiB counted); store {}: {})",
-        class.name(),
-        gib(need.ram),
-        gib(own),
-        store.display(),
-        stats.line()
-    );
+    match (class, &stats) {
+        (Some(class), Some(stats)) => println!(
+            "out: delta ram ({} build, {:.2} GiB RAM reserved (own {:.2} GiB counted); store {}: {})",
+            class.name(),
+            gib(need.ram),
+            gib(own),
+            store.display(),
+            stats.line()
+        ),
+        _ => println!(
+            "out: delta ram (no growth, not admitted; store {})",
+            store.display()
+        ),
+    }
     out::count(&ws, "delta-ram");
     let lock_path = mount_lock_path(&ws, &id);
     let lock = match try_mount_lock(&ws, &id)? {
@@ -1205,18 +1244,24 @@ pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Opti
     .arg(std::env::current_exe().context("finding xtask's executable")?)
     .args(std::env::args_os().skip(1))
     .env(ENV, format!("mount:{uid}:{gid}"));
-    // the growth sample: own part of the upper before and after, the reservation still held
-    let before = own_bytes(&upper, class, cross_host, &dirs)?;
+    // the growth sample: own part of the upper before and after, the reservation still held (a build only)
+    let before = class
+        .map(|c| own_bytes(&upper, c, cross_host, &dirs))
+        .transpose()?;
     let code = run(cmd, "unshare (delta mount namespace)")?;
     // the namespace's processes may still use the overlay (a daemon a build spawned: sccache server, gradle, ...); the mount ends with the command, so they do too
     end_holders(&ws, &id, &lock_path, std::process::id())?;
-    let after = own_bytes(&upper, class, cross_host, &dirs)?;
+    let after = class
+        .map(|c| own_bytes(&upper, c, cross_host, &dirs))
+        .transpose()?;
     // idle-since stamp for other checkouts' wait lines; a lost stamp only shows the upper's mtime
     let _ = std::fs::write(store.join(&id).join(USED), "");
-    let (line, over) = growth(&id, before, after, need.raw);
-    println!("{line}");
-    if over {
-        out::count(&ws, "delta-over");
+    if let (Some(before), Some(after)) = (before, after) {
+        let (line, over) = growth(&id, before, after, need.raw);
+        println!("{line}");
+        if over {
+            out::count(&ws, "delta-over");
+        }
     }
     drop(reservation);
     Ok(Some(code))
@@ -1969,6 +2014,50 @@ mod tests {
         );
         assert_eq!(count_of(&ws, "delta-land-hold"), 1);
         drop((land, queued));
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// A command that grows no upper (a prune) is admitted on a full store with no reservation. Judged as a small build it is refused there: 0.8 GiB RAM free, under the 1 GiB margin.
+    /// Break (the None arm judged as a small build, `keep` false: refused at once, no wait): red at the prune's assertion.
+    #[test]
+    fn a_command_that_grows_nothing_is_admitted_on_a_full_store() {
+        let ws = std::env::temp_dir().join(format!("xtask-delta-no-growth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(out::pool(&ws)).unwrap();
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let full = stats(10.0, 9.2, 1950);
+        let small = admit_once(&ws, "land", &cfg, Class::Small, 0, Ok(full.clone())).unwrap();
+        assert!(
+            matches!(small, Err(Verdict::Refuse(_))),
+            "a small build on the full store: {:?}",
+            small.as_ref().err()
+        );
+        let prune = admit_command(&ws, "land", &cfg, None, 0, true, None, || {
+            Ok(Ok(full.clone()))
+        })
+        .unwrap();
+        assert!(
+            matches!(prune, Ok(None)),
+            "a prune on the full store: {:?}",
+            prune.as_ref().err()
+        );
+        assert_eq!(
+            reserved(&ws).unwrap(),
+            (0, false),
+            "a prune reserves nothing"
+        );
+        let roomy = stats(10.0, 3.0, 1950);
+        let got = admit_command(&ws, "land", &cfg, None, 0, true, None, || {
+            Ok(Ok(roomy.clone()))
+        })
+        .unwrap();
+        assert!(
+            matches!(got, Ok(None)),
+            "a prune on a roomy store was judged (Admit reserves) or refused: {:?}",
+            got.as_ref().err()
+        );
         std::fs::remove_dir_all(&ws).unwrap();
     }
 

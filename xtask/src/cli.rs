@@ -170,7 +170,7 @@ pub fn main() -> Result<ExitCode> {
             Command::Cross(_) => (crate::delta::Class::Cross, None),
             _ => (crate::delta::Class::Small, None),
         };
-        if let Some(code) = crate::delta::enter(&root, class, cross_host)? {
+        if let Some(code) = crate::delta::enter(&root, Some(class), cross_host)? {
             if let Err(e) = crate::out::settle_target(&root) {
                 eprintln!("out: target: {e:#}");
             }

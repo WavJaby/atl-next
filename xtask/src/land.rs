@@ -187,8 +187,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.build_dir {
-        // the build record lies in the build dir: a ram dir shows it only inside its namespace
-        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
+        // the build record lies in the build dir: a ram dir shows it only inside its namespace; a read grows nothing, so it is not admitted
+        if let Some(code) = crate::delta::enter(root, None, None)? {
             return Ok(code);
         }
         match build_dir_staleness(root)? {
@@ -198,20 +198,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.prune_units {
-        // ws/land on ram shows its trees only inside its namespace (outside: the empty mount point)
-        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
-            return Ok(code);
-        }
-        let ws = Layout::of(root)?.workspace().to_owned();
-        let inside = crate::delta::stage().is_some();
-        println!(
-            "{}",
-            out_prune::prune_land(&ws, unit_use::now()?, !args.plan_only, inside)?
-        );
-        if !args.plan_only {
-            out::count(&ws, "land-unit-prune");
-        }
-        return Ok(ExitCode::SUCCESS);
+        // the publish's unit prune is non-fatal: a failure is this command's skip line, and it exits 0 (an Err would print the land's `FAILED` verdict in the land log)
+        return Ok(match prune_units(root, args.plan_only) {
+            Ok(code) => code.unwrap_or(ExitCode::SUCCESS),
+            Err(e) => {
+                println!("{}", prune_skipped(&e));
+                ExitCode::SUCCESS
+            }
+        });
     }
     let started = Instant::now();
     verdict::step("land:preflight");
@@ -1013,7 +1007,7 @@ fn publish_execute(land: &Path) -> Result<String> {
     verdict::step("land:unit-prune");
     match prune_units_child(land) {
         Ok(line) => println!("{line}"),
-        Err(e) => println!("{LAND_UNIT_PRUNE}FAILED: {e:#}"),
+        Err(e) => println!("{}", prune_skipped(&e)),
     }
     out::publish(land)
 }
@@ -1044,6 +1038,29 @@ fn prune_units_child(land: &Path) -> Result<String> {
         .find(|l| l.starts_with(LAND_UNIT_PRUNE))
         .map(str::to_owned)
         .context("the unit prune child printed no summary line")
+}
+
+/// ws/land's unit prune (`out_prune::prune_land`), in its namespace when ws/land is a ram dir. It deletes only, so it enters with no admission (`delta::enter` None). Some(code) = ran there.
+fn prune_units(root: &Path, plan_only: bool) -> Result<Option<ExitCode>> {
+    // ws/land on ram shows its trees only inside its namespace (outside: the empty mount point)
+    if let Some(code) = crate::delta::enter(root, None, None)? {
+        return Ok(Some(code));
+    }
+    let ws = Layout::of(root)?.workspace().to_owned();
+    let inside = crate::delta::stage().is_some();
+    println!(
+        "{}",
+        out_prune::prune_land(&ws, unit_use::now()?, !plan_only, inside)?
+    );
+    if !plan_only {
+        out::count(&ws, "land-unit-prune");
+    }
+    Ok(None)
+}
+
+/// The step line of a unit prune that did not finish: skipped, with its cause. Never FAILED: the land goes on, and its verdict is ok.
+fn prune_skipped(e: &anyhow::Error) -> String {
+    format!("{LAND_UNIT_PRUNE}skipped (non-fatal, the land goes on): {e:#}")
 }
 
 fn parse_build_dir(stdout: &str) -> Result<Option<String>> {
@@ -2386,6 +2403,16 @@ mod tests {
             Some(PathBuf::from("/a/wt/tasking"))
         );
         assert_eq!(find_worktree(list, "tas", land), None);
+    }
+
+    /// The unit prune's step line when it does not finish: skipped with its cause, never FAILED (the land's verdict stays ok). Break: the word FAILED.
+    #[test]
+    fn a_skipped_unit_prune_is_a_skip_not_a_failure() {
+        let line = prune_skipped(&anyhow::anyhow!("ws/land: refused"));
+        assert_eq!(
+            line,
+            "land unit prune: skipped (non-fatal, the land goes on): ws/land: refused"
+        );
     }
 
     #[test]

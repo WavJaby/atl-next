@@ -1451,7 +1451,8 @@ fn part(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
 /// The child of [`part`]: prunes `<arch>`'s units in the checkout's namespace (a ram dir is entered here) and prints the summary.
 fn part_prune(root: &Path, ws: &Path, arch: &str, execute: bool) -> Result<ExitCode> {
     let id = checkout_id(root)?;
-    if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
+    // deletes only: no admission (delta::enter None)
+    if let Some(code) = crate::delta::enter(root, None, None)? {
         return Ok(code);
     }
     let inside = crate::delta::stage().is_some();
