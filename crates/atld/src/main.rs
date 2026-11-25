@@ -74,6 +74,8 @@ mod cacerts;
 mod host_layout;
 mod host_props;
 mod installed_code;
+mod processes;
+use processes::Processes;
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -1456,8 +1458,8 @@ struct Host {
     no_media_player_service: bool,
     /// test only: each app's launcher gets `--break-mix` (the audio gate's third break)
     break_mix: bool,
-    /// the processes the services started and may kill: the host pids binderd tags them with
-    controlled: Mutex<BTreeSet<i32>>,
+    /// the processes the services started and may kill, by host pid (binderd tags them with it)
+    processes: Processes,
     /// each reaped process's exit status, by host pid: a `LastAppEnded` of a live app ends the run only when its process exited 0
     exits: Mutex<BTreeMap<i32, ExitStatus>>,
     /// `--exit-with-last-app`, resolved
@@ -1880,10 +1882,7 @@ impl Host {
             ..
         } = self.broker.spawn(spawn)?;
         if controlled {
-            self.controlled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(host_pid);
+            self.processes.started(host_pid);
         }
         let host = Arc::clone(self);
         std::thread::Builder::new()
@@ -1891,10 +1890,7 @@ impl Host {
             .spawn(move || {
                 let status = child.wait();
                 drop(held);
-                host.controlled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&host_pid);
+                host.processes.reaped(host_pid);
                 match status {
                     Ok(status) => {
                         // bwrap, the sandbox's pid 1, reports a child killed by signal N as exit 128 + N
@@ -1981,29 +1977,20 @@ impl Host {
     /// The services' kill request: only for a process they started.
     fn kill(&self, pid: i32) -> Result<()> {
         ensure!(
-            self.controlled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&pid),
+            self.processes.may_kill(pid),
             "pid {pid} is not a process the services started"
         );
         kill_sandbox(pid)?;
         log(format_args!("killed process {pid}"));
         // dying: bwrap reports it a moment later, and what is killed is not "left running" at the end of the run
-        self.controlled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&pid);
+        self.processes.killed(pid);
         Ok(())
     }
 
     /// The services' program-pid request: only for a process they started.
     fn program_pid(&self, pid: i32) -> Result<i32> {
         ensure!(
-            self.controlled
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&pid),
+            self.processes.may_kill(pid),
             "pid {pid} is not a process the services started"
         );
         Ok(atl_broker::program_pid(pid)?)
@@ -3022,7 +3009,7 @@ fn run(a: &Args) -> Result<ExitCode> {
         break_cblk: a.break_cblk,
         no_media_player_service: a.no_media_player_service,
         break_mix: a.break_mix,
-        controlled: Mutex::new(BTreeSet::new()),
+        processes: Processes::default(),
         exits: Mutex::new(BTreeMap::new()),
         exit_with_last_app: a.exit_with_last_app.unwrap_or(a.ui.is_some()),
         done: done_tx,
@@ -3317,13 +3304,7 @@ fn run(a: &Args) -> Result<ExitCode> {
     // what the services started dies with the run, SIGKILLed as AOSP kills an app process; then the system processes stop the Linux way (SIGTERM, the grace, SIGKILL; maintainer decision 3), each
     // writing its exit totals, and binderd last, by its admin connection, printing its own counters
     let grace = Duration::from_millis(a.stop_grace_ms);
-    let left: Vec<i32> = host
-        .controlled
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .copied()
-        .collect();
+    let left = host.processes.running();
     for pid in left {
         log(format_args!("left at the end: {pid}"));
         let _ = kill_sandbox(pid);
