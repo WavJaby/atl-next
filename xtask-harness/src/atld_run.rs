@@ -367,7 +367,7 @@ pub struct Runtime {
     /// atl-sandbox-join and the `flatpak-spawn` shim: atld's `--sandbox-join` / `--flatpak-spawn` (the apps' web-process channel, atl_broker::webspawn)
     sandbox_join: PathBuf,
     flatpak_spawn: PathBuf,
-    /// What a remote run starts beside its own labwc on the target (remote.rs `labwc_setup_script`); atld never sees it.
+    /// What a remote run starts beside its own labwc on the target (remote.rs `nested_headless_script`); atld never sees it.
     labwc_setup: PathBuf,
     /// Whether atld gets the two above; false only for the deliberate break that shows WebKit's abort without the channel.
     webspawn: bool,
@@ -2010,11 +2010,11 @@ impl Runtime {
             .context("starting atld")
     }
 
-    /// How a run's child ended: an error naming the transcript's last line when a remote transfer failed by itself (an exit code). A transfer the caller stopped at its limit has no code: its logs are the judge's to read, as on this host.
+    /// How a run's child ended: an error naming the transcript's last line when a remote transfer failed by itself (an exit code) or brought back no end record (the script stopped before atld's end). A transfer the caller stopped at its limit has no code: its logs are the judge's to read, as on this host.
     /// Also an error naming each system daemon atld saw die mid-run (its `verdict: system process` lines): a daemon crash right after registering otherwise leaves no trace in the checks.
     pub fn check_end(&self, end: ExitStatus, run: &Run) -> Result<()> {
         if let remote::Site::Remote(target) = &self.site
-            && end.code().is_some_and(|c| c != 0)
+            && remote::ended_early(end, &run.scratch)
         {
             return Err(target.failed(&run.root, end));
         }

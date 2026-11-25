@@ -51,8 +51,34 @@ fn probe() {
         Some("denied") => denied_probe(),
         Some("table-installer") => table_probe(Profile::Installer, |r| r.installer),
         Some("table-binderd") => table_probe(Profile::BinderDaemon, |r| r.binderd),
+        #[cfg(target_arch = "riscv64")]
+        Some("hwprobe-installer") => hwprobe_probe(Profile::Installer),
+        #[cfg(target_arch = "riscv64")]
+        Some("hwprobe-binderd") => hwprobe_probe(Profile::BinderDaemon),
         other => panic!("unknown probe mode {other:?}"),
     }
+}
+
+/// Under `profile`'s filter, riscv_hwprobe (258, uapi asm/unistd.h 244 + 14) for no key: 0 where it runs (kernel Documentation/arch/riscv/hwprobe.rst).
+#[cfg(target_arch = "riscv64")]
+fn hwprobe_probe(profile: Profile) -> ! {
+    apply(profile);
+    // SAFETY: no pairs and no cpu set: null pointers with zero counts, nothing is read or written
+    let rc = unsafe { libc::syscall(258, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64) };
+    finish(&format!("mode=hwprobe rc={rc}"))
+}
+
+/// Both kill-default lists run ld.so's riscv_hwprobe (gate for the 2026-11-25 kill: glibc 2.43, atl-sandbox-stub under binderd's filter).
+#[cfg(target_arch = "riscv64")]
+#[test]
+fn riscv_hwprobe_runs_under_the_binderd_filter() {
+    assert_eq!(probe_line("hwprobe-binderd", &[])["rc"], "0");
+}
+
+#[cfg(target_arch = "riscv64")]
+#[test]
+fn riscv_hwprobe_runs_under_the_installer_filter() {
+    assert_eq!(probe_line("hwprobe-installer", &[])["rc"], "0");
 }
 
 /// Under the installer filter, the stat family through every path that reaches it: Rust std (statx through glibc's statx wrapper first -- the laptop kill -- then glibc stat64/lstat64/fstat64

@@ -18,7 +18,7 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use atl_labwc_setup::READY_LINE;
+use atl_labwc_setup::{READY_LINE, REFUSED_EXIT};
 use sha2::{Digest, Sha256};
 
 use crate::{arches, gate_goals, gl_probe, nested_wayland, out, provided_gate, verdict};
@@ -75,10 +75,12 @@ const LIBUNWIND: &str = "lib/libunwind.so.1";
 /// atld and the labwc setup helper: the two programs a run starts by name, out of the gate products of the run's host (gate_build.rs `BINS`, one release dir). Each is a runtime input (atld_run.rs `runtime_inputs`), so a record names it; a record without one is refused ([`Bundle::of`]).
 pub const RUN_PROGRAMS: [&str; 2] = [ATLD, LABWC_SETUP];
 const ATLD: &str = "atld";
-/// A remote test run starts it beside its own labwc ([`labwc_setup_script`]).
+/// A remote test run starts it beside its own labwc ([`nested_headless_script`]).
 const LABWC_SETUP: &str = "atl-labwc-setup";
 /// The helper's log in a run's scratch dir: its lines come back with the run.
 const LABWC_SETUP_LOG: &str = "labwc-setup.log";
+/// A run's end record in its scratch dir: atld's exit code ([`ended_early`]).
+const ATLD_RC: &str = "atld.rc";
 /// Bundle names of a record's roots: the build dir, the java out and the AOSP tree.
 const ROOT_NAMES: [(&str, &str); 3] = [("out", "out"), ("java", "java"), ("tree", "src/aosp")];
 /// The target's directory for a build dir's bundle, relative to the host's home: `~/atl-next-run/<name>/`.
@@ -534,7 +536,7 @@ pub enum Display {
     Session,
     /// An X11 session without a Wayland socket: the run starts labwc nested in it ([`nested_script`]) and ends it after atld.
     NestedX11,
-    /// The run's own headless labwc ([`nested_headless_script`], as the local gates do, nested_wayland.rs), given its outputs and seat by the labwc setup helper ([`labwc_setup_script`]), ended after atld: a test run's answer wherever the target has labwc ([`probe_test_display`]),
+    /// The run's own headless labwc ([`nested_headless_script`], as the local gates do, nested_wayland.rs), given its outputs and seat by the labwc setup helper ([`nested_headless_script`]), ended after atld: a test run's answer wherever the target has labwc ([`probe_test_display`]),
     /// run-apk's where the session has no switch ([`probe_display`]). Nothing maps on the session.
     NestedHeadless,
 }
@@ -632,30 +634,118 @@ fn parse_probe(out: &str) -> Result<(Display, String)> {
 
 /// Starts labwc nested in the target's X11 session (`WLR_BACKENDS=x11`, its own empty config dir `cfg`, output to `log`) and waits for its Wayland socket: sets `WL` and `LW` (labwc's pid).
 /// Exit 5 when a Wayland socket already exists (the session's must be used, not shadowed), no X11 session is found, or labwc makes no socket within [`NESTED_WAIT_S`].
-fn nested_script(tag: &str, cfg: &str, log: &str) -> String {
+/// Then `logs` ([`tar_sh`]) comes back, if labwc was started.
+fn nested_script(tag: &str, cfg: &str, log: &str, logs: &str) -> String {
     let wl = wl_scan(SESSION_DIR);
     format!(
-        "{wl}[ \"$WL_N\" -eq 0 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 0 for a nested labwc\" >&2; exit 5; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"remote run {tag}: no X11 session to nest labwc in\" >&2; exit 5; }}\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" DISPLAY=\"$XD\" XAUTHORITY=\"$XA\" WLR_BACKENDS=x11 labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: nested labwc gave $WL_N Wayland sockets in $WL_DIR, want 1\" >&2; kill \"$LW\" 2>/dev/null; exit 5; }}\n"
+        "{wl}[ \"$WL_N\" -eq 0 ] || {{ echo \"remote run {tag}: $WL_N Wayland sockets in $WL_DIR, want 0 for a nested labwc\" >&2; exit 5; }}\n{X_SESSION}[ -n \"$XD\" ] || {{ echo \"remote run {tag}: no X11 session to nest labwc in\" >&2; exit 5; }}\nLABWC=$(command -v labwc) || {{ echo \"remote run {tag}: no labwc on PATH\" >&2; exit 5; }}\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$WL_DIR\" DISPLAY=\"$XD\" XAUTHORITY=\"$XA\" WLR_BACKENDS=x11 \"$LABWC\" -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: nested labwc gave $WL_N Wayland sockets in $WL_DIR, want 1\" >&2; kill \"$LW\" 2>/dev/null; {logs}; exit 5; }}\n"
     )
 }
 
 /// Starts the run's own labwc on wlroots' headless backend, its socket in a runtime dir of its own (`$WL_DIR/atl-nest-<pid>`: the session's scan never sees it, and every display name in the session's
-/// dir stays the session's). `WL` = the socket's absolute path (libwayland takes one as `WAYLAND_DISPLAY`), `LW` = labwc's pid. Both go with the run script: its normal end ([`Plan::script`]) and the EXIT trap.
-/// Exit 5 when labwc is missing or makes no socket within [`NESTED_WAIT_S`].
-fn nested_headless_script(tag: &str, cfg: &str, log: &str) -> String {
-    let wl = wl_scan(SESSION_DIR);
-    let env = labwc_words();
-    format!(
-        "{wl}command -v labwc >/dev/null 2>&1 || {{ echo \"remote run {tag}: no labwc on PATH\" >&2; exit 5; }}\nNEST_DIR=\"$WL_DIR/atl-nest-$$\"\nLW=\"\"\nnest_end() {{\n  [ -z \"$LW\" ] || kill -TERM \"$LW\" 2>/dev/null\n  rm -rf \"$NEST_DIR\"\n}}\ntrap nest_end EXIT\ntrap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 141' PIPE\ntrap 'exit 143' TERM\nmkdir -m 700 \"$NEST_DIR\" || exit 5\nmkdir -p {cfg}\nenv -i PATH=/usr/local/bin:/usr/bin:/bin HOME=\"$HOME\" XDG_RUNTIME_DIR=\"$NEST_DIR\"{env} labwc -C {cfg} < /dev/null > {log} 2>&1 &\nLW=$!\nWL_DIR=\"$NEST_DIR\"\ni=0\nwhile wl_scan; [ \"$WL_N\" -eq 0 ] && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$LW\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ \"$WL_N\" -eq 1 ] || {{ echo \"remote run {tag}: headless labwc gave $WL_N Wayland sockets, want 1\" >&2; exit 5; }}\nWL=\"$NEST_DIR/$WL\"\n"
-    )
+/// dir stays the session's), then the labwc setup helper (crate atl-labwc-setup's binary `bin`) on that socket, which gives it the gate output and the seat's pointer and keyboard and holds them until labwc ends.
+/// `WL` = the socket's absolute path (libwayland takes one as `WAYLAND_DISPLAY`), `LW` = labwc's pid, `HS` = the helper's. They go with the run script: its normal end ([`Plan::script`]) and the EXIT trap.
+/// labwc is the target's `labwc` on the script's own PATH, the one the probe found (WSL has a wrapper outside the fixed PATH labwc runs with).
+/// Rungs ([`LABWC_RUNGS`]): where the helper says the compositor refused the output ([`REFUSED_EXIT`]), labwc is started once more on the next rung. The transcript names the rung in use and each refusal; `log` and `setup_log` hold every rung's output, in order.
+/// Exit 5 when labwc is missing, makes no socket, or the helper is not ready (each within [`NESTED_WAIT_S`]), naming the refusals before it; `logs` ([`tar_sh`]) then comes back.
+fn nested_headless_script(
+    tag: &str,
+    dir: &str,
+    cfg: &str,
+    (log, setup_log): (&str, &str),
+    bin: &str,
+    logs: &str,
+) -> String {
+    const SCRIPT: &str = r#"@SCAN@LABWC=$(command -v labwc) || { echo "remote run @TAG@: no labwc on PATH" >&2; exit 5; }
+NEST_DIR="$WL_DIR/atl-nest-$$"
+LW=""
+nest_end() {
+  [ -z "$LW" ] || kill -TERM "$LW" 2>/dev/null
+  rm -rf "$NEST_DIR"
+}
+trap nest_end EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 141' PIPE
+trap 'exit 143' TERM
+mkdir -m 700 "$NEST_DIR" || exit 5
+mkdir -p @CFG@
+: > @LOG@
+: > @SETUP_LOG@
+nest_up() {
+  RUNG=$1
+  shift
+  echo "== labwc rung $RUNG" | tee -a @LOG@ >> @SETUP_LOG@
+  env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$HOME" XDG_RUNTIME_DIR="$NEST_DIR"@ENV@ "$@" "$LABWC" -C @CFG@ < /dev/null >> @LOG@ 2>&1 &
+  LW=$!
+  WL_DIR="$NEST_DIR"
+  i=0
+  while wl_scan; [ "$WL_N" -eq 0 ] && [ "$i" -lt @WAIT@ ]; do
+    kill -0 "$LW" 2>/dev/null || break
+    sleep 1
+    i=$((i + 1))
+  done
+  [ "$WL_N" -eq 1 ] || { echo "remote run @TAG@: headless labwc (rung $RUNG) gave $WL_N Wayland sockets, want 1" >&2; @LOGS@; exit 5; }
+  WL="$NEST_DIR/$WL"
+  @BIN@ "$WL" >> @SETUP_LOG@ 2>&1 < /dev/null &
+  HS=$!
+  i=0
+  while ! grep -qx @READY@ @SETUP_LOG@ && [ "$i" -lt @WAIT@ ]; do
+    kill -0 "$HS" 2>/dev/null || break
+    sleep 1
+    i=$((i + 1))
+  done
+  if grep -qx @READY@ @SETUP_LOG@; then
+    echo "remote run @TAG@: labwc rung $RUNG" >&2
+    return 0
+  fi
+  kill -TERM "$HS" 2>/dev/null
+  wait "$HS"
+  rc=$?
+  echo "remote run @TAG@: labwc setup not ready on rung $RUNG (see @SETUP_NAME@): $(tail -n 1 @SETUP_LOG@)" >&2
+  return $rc
+}
+nest_retry() {
+  [ "$1" -eq @REFUSED@ ] || return 1
+  kill -TERM "$LW" 2>/dev/null
+  wait "$LW"
+  rm -rf "$NEST_DIR"/*
+}
+@RUNGS@ || { @LOGS@; exit 5; }
+"#;
+    let rungs: Vec<String> = LABWC_RUNGS
+        .iter()
+        .map(|(name, words)| format!("nest_up {name}{words}"))
+        .collect();
+    SCRIPT
+        .replace("@RUNGS@", &rungs.join(" || { nest_retry $? && "))
+        .replace(
+            " || { @LOGS@; exit 5; }\n",
+            &format!(
+                "{} || {{ @LOGS@; exit 5; }}\n",
+                "; }".repeat(rungs.len() - 1)
+            ),
+        )
+        .replace("@SCAN@", &wl_scan(dir))
+        .replace("@CFG@", cfg)
+        .replace("@SETUP_LOG@", setup_log)
+        .replace("@LOG@", log)
+        .replace("@ENV@", &labwc_words())
+        .replace("@WAIT@", &NESTED_WAIT_S.to_string())
+        .replace("@BIN@", bin)
+        .replace("@READY@", &sh_quote(READY_LINE))
+        .replace("@SETUP_NAME@", LABWC_SETUP_LOG)
+        .replace("@REFUSED@", &REFUSED_EXIT.to_string())
+        .replace("@LOGS@", logs)
+        .replace("@TAG@", tag)
 }
 
-/// Starts the labwc setup helper (crate atl-labwc-setup's binary) on the run's labwc socket `$WL` and waits for its ready line, printed once the gate output and the seat's pointer and keyboard are set; the helper then holds them until labwc ends.
-/// Sets `HS` (its pid): the run's end stops it ([`Plan::script`]). Exit 5 when it exits first or is not ready within [`NESTED_WAIT_S`]; the last lines of its log go to the transcript (a failed run's logs do not come back).
-fn labwc_setup_script(tag: &str, bin: &str, log: &str) -> String {
-    let ready = sh_quote(READY_LINE);
+/// The command that sends `paths` (relative to the out dir) back as the run's tar, on stdout: once per run, at its end or where it stops before atld starts (without an [`ATLD_RC`]: [`ended_early`]).
+fn tar_sh(paths: &[String]) -> String {
+    let paths: Vec<String> = paths.iter().map(|p| sh_quote(p)).collect();
     format!(
-        "{bin} \"$WL\" > {log} 2>&1 < /dev/null &\nHS=$!\ni=0\nwhile ! grep -qx {ready} {log} 2>/dev/null && [ \"$i\" -lt {NESTED_WAIT_S} ]; do\n  kill -0 \"$HS\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\ngrep -qx {ready} {log} 2>/dev/null || {{ echo \"remote run {tag}: labwc setup not ready (see {LABWC_SETUP_LOG}):\" >&2; tail -n 5 {log} >&2; exit 5; }}\n"
+        "tar -c -C \"$BASE/out\" --ignore-failed-read {}",
+        paths.join(" ")
     )
 }
 
@@ -666,6 +756,11 @@ fn labwc_words() -> String {
         .map(|(k, v)| format!(" {k}={v}"))
         .collect()
 }
+
+/// The run's labwc, rung by rung: a name and the words added to [`labwc_words`]. The first is wlroots as it is.
+/// no-modifiers: an EGL that lists every dmabuf modifier as external-only (PowerVR BXM on k3, measured 2026-11-25) leaves wlroots 0.19's GLES renderer no format to render to (egl.c `init_dmabuf_formats`), and no output can be set up; without modifiers it renders to implicit and linear buffers.
+const LABWC_RUNGS: [(&str, &str); 2] =
+    [("default", ""), ("no-modifiers", " WLR_EGL_NO_MODIFIERS=1")];
 
 /// The host roots a runtime names, absolute on this host: the build dir, the java out and the AOSP tree (bundle names [`ROOT_NAMES`]), and the run's LLVM runtimes dir ([`llvm_lib_dir`], bundle name `lib`).
 pub struct Roots {
@@ -860,7 +955,7 @@ impl Plan {
         self.display == Display::Session && self.agent.as_ref().is_none_or(|a| a.proxy)
     }
 
-    /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, in the background so its process group can be ended after it; then its logs and end record (`atld.rc`: the exit code, `end.ms`: the end's time on the target's clock) as a tar on stdout. The script's exit is the tar's.
+    /// The script the target runs on stdin (`sh -s`): the run's directories made fresh and its files written, then atld under `env -i` with `timeout` and stdin closed, in the background so its process group can be ended after it; then its logs and end record (`atld.rc`: the exit code, `end.ms`: the end's time on the target's clock) as a tar on stdout. The script's exit is the tar's. A run that stops before atld starts sends only its display's logs and no end record.
     /// Control channel: the whole script is one `{ }` group, so the shell has read all of it before running any; what stays on stdin is the host's open control pipe (`spawn`). A watchdog reads it (fd 7):
     /// EOF while atld runs = the connection or the host is gone, and it TERMs atld, so the run ends the normal way (atld's orderly stop, the group kill, the sink holder) within atld's stop grace.
     fn script(&self, base: &str) -> String {
@@ -906,7 +1001,12 @@ impl Plan {
             self.tag,
             dq(&shown)
         ));
-        let labwc_log = format!("{}/labwc.log", self.scratch);
+        // the logs of the display's processes started so far: they come back wherever the run stops
+        let mut display_logs = Vec::new();
+        if self.display.nested() {
+            display_logs.push(format!("{}/labwc.log", self.scratch));
+        }
+        let labwc_log = word(&out_path(&format!("{}/labwc.log", self.scratch)));
         match self.display {
             Display::Headless => {}
             Display::Session => {
@@ -918,20 +1018,23 @@ impl Plan {
             Display::NestedX11 => s.push_str(&nested_script(
                 &self.tag,
                 &word(&out_path(&labwc_dir(&self.scratch))),
-                &word(&out_path(&labwc_log)),
+                &labwc_log,
+                &tar_sh(&display_logs),
             )),
             Display::NestedHeadless => {
-                s.push_str(&nested_headless_script(
-                    &self.tag,
-                    &word(&out_path(&labwc_dir(&self.scratch))),
-                    &word(&out_path(&labwc_log)),
-                ));
+                display_logs.push(format!("{}/{LABWC_SETUP_LOG}", self.scratch));
                 // atld's sibling: both come from one release dir ([`RUN_PROGRAMS`]), a cross host's under its triple
                 let dir = self.program.rsplit_once('/').map_or("", |(d, _)| d);
-                s.push_str(&labwc_setup_script(
+                s.push_str(&nested_headless_script(
                     &self.tag,
+                    SESSION_DIR,
+                    &word(&out_path(&labwc_dir(&self.scratch))),
+                    (
+                        &labwc_log,
+                        &word(&out_path(&format!("{}/{LABWC_SETUP_LOG}", self.scratch))),
+                    ),
                     &word(&format!("{dir}/{LABWC_SETUP}")),
-                    &word(&out_path(&format!("{}/{LABWC_SETUP_LOG}", self.scratch))),
+                    &tar_sh(&display_logs),
                 ));
             }
         }
@@ -981,9 +1084,12 @@ mkdir -p {pw_dir}
                 scratch_file(AGENT_LOG)
             ));
             if proxied {
+                let mut logs = display_logs.clone();
+                logs.push(format!("{}/{AGENT_LOG}", self.scratch));
                 s.push_str(&format!(
-                    "i=0\nwhile [ ! -S \"$GATE_SOCK\" ] && [ \"$i\" -lt {AGENT_WAIT_S} ]; do\n  kill -0 \"$AG\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ -S \"$GATE_SOCK\" ] || {{ echo \"remote run {}: the window agent made no proxy socket within {AGENT_WAIT_S} s (see {AGENT_LOG})\" >&2; kill \"$AG\" 2>/dev/null; exit 5; }}\n",
-                    self.tag
+                    "i=0\nwhile [ ! -S \"$GATE_SOCK\" ] && [ \"$i\" -lt {AGENT_WAIT_S} ]; do\n  kill -0 \"$AG\" 2>/dev/null || break\n  sleep 1\n  i=$((i + 1))\ndone\n[ -S \"$GATE_SOCK\" ] || {{ echo \"remote run {}: the window agent made no proxy socket within {AGENT_WAIT_S} s (see {AGENT_LOG})\" >&2; kill \"$AG\" 2>/dev/null; {}; exit 5; }}\n",
+                    self.tag,
+                    tar_sh(&logs)
                 ));
             }
         }
@@ -1066,7 +1172,7 @@ mkdir -p {pw_dir}
         }
         s.push_str(&format!(
             "printf '%s\\n' \"$rc\" > {}\n",
-            word(&out_path(&format!("{}/atld.rc", self.scratch)))
+            word(&out_path(&format!("{}/{ATLD_RC}", self.scratch)))
         ));
         s.push_str(&format!(
             "date +%s%3N > {}\n",
@@ -1088,36 +1194,21 @@ mkdir -p {pw_dir}
             word(&out_path(&format!("{}/{HOST_FACTS}", self.scratch))),
             word(&out_path(&format!("{}/{CPU_INFO}", self.scratch)))
         ));
-        s.push_str(&format!(
-            "tar -c -C \"$BASE/out\" --ignore-failed-read {} {} {} {} {} {}\n",
-            sh_quote(&format!("{}/log", self.root)),
-            sh_quote(&format!("{}/atld.log", self.scratch)),
-            sh_quote(&format!("{}/atld.rc", self.scratch)),
-            sh_quote(&format!("{}/end.ms", self.scratch)),
-            sh_quote(&format!("{}/{HOST_FACTS}", self.scratch)),
-            sh_quote(&format!("{}/{CPU_INFO}", self.scratch))
-        ));
-        // the tar line ends with its last path: labwc's log and the agent's files ride along
-        let mut extra = Vec::new();
-        if self.display.nested() {
-            extra.push(labwc_log);
-        }
-        if self.display == Display::NestedHeadless {
-            extra.push(format!("{}/{LABWC_SETUP_LOG}", self.scratch));
-        }
+        let mut logs = vec![format!("{}/log", self.root)];
+        logs.extend(
+            ["atld.log", ATLD_RC, "end.ms", HOST_FACTS, CPU_INFO]
+                .map(|f| format!("{}/{f}", self.scratch)),
+        );
+        // labwc's log and the agent's files ride along
+        logs.extend(display_logs);
         if self.audio.is_some() {
-            extra.push(format!("{}/{PW_SAMPLES}", self.scratch));
+            logs.push(format!("{}/{PW_SAMPLES}", self.scratch));
         }
         if self.agent.is_some() {
-            extra.extend([LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)));
+            logs.extend([LIVE_JSON, AGENT_RC, AGENT_LOG].map(|f| format!("{}/{f}", self.scratch)));
         }
-        if !extra.is_empty() {
-            s.pop();
-            for path in &extra {
-                s.push_str(&format!(" {}", sh_quote(path)));
-            }
-            s.push('\n');
-        }
+        s.push_str(&tar_sh(&logs));
+        s.push('\n');
         // exit inside the group: after it the shell would read stdin for more, and the control pipe stays open until the transfer ends
         s.push_str("exit\n}\n");
         s
@@ -1194,6 +1285,11 @@ impl RemoteRun {
             manifest_sha256: self.manifest_sha256.clone(),
             audio: self.audio.clone(),
         };
+        // the previous run's end record must not stand for this one's
+        let end = scratch.join(ATLD_RC);
+        if end.exists() {
+            std::fs::remove_file(&end).with_context(|| format!("removing {}", end.display()))?;
+        }
         let script = scratch.join(REMOTE_SCRIPT);
         let body = plan.script(&self.base);
         std::fs::write(&script, &body).with_context(|| format!("writing {}", script.display()))?;
@@ -1251,6 +1347,12 @@ impl RemoteRun {
             self.log.display()
         )
     }
+}
+
+/// Whether a run's transfer ended by itself (an exit code) without the run: it failed, or it brought back no end record, so the script stopped before atld's end and sent only the logs it had.
+pub(crate) fn ended_early(end: ExitStatus, scratch: &Path) -> bool {
+    end.code()
+        .is_some_and(|c| c != 0 || !scratch.join(ATLD_RC).is_file())
 }
 
 /// `path` relative to the out dir: the target keeps that layout. A path outside the out dir is refused.
@@ -2811,6 +2913,171 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// What [`run_rungs`]'s script did: its exit, its stderr, the rungs labwc was started on, the transfer's end and the run's scratch dir as it came back.
+    struct Rungs {
+        code: Option<i32>,
+        err: String,
+        starts: Vec<String>,
+        end: ExitStatus,
+        back: PathBuf,
+        _home: Scratch,
+    }
+
+    /// The headless labwc's script run whole, with a fake labwc (it links a live socket and notes whether the second rung's word reached it) and a fake helper that ends with `first` on the default rung and `second` on the other, `ready` standing for a helper that stays.
+    fn run_rungs(tag: &str, first: &str, second: &str) -> Rungs {
+        let home = Scratch::new(tag);
+        let dir = home.0.clone();
+        let scratch = dir.join("out/app/scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("rt")).unwrap();
+        let d = dir.display();
+        let _live = std::os::unix::net::UnixListener::bind(dir.join("sock")).unwrap();
+        let tool = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("bin").join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        tool(
+            "labwc",
+            &format!(
+                "echo \"${{WLR_EGL_NO_MODIFIERS:-default}}\" >> {d}/starts\necho no format\nln -s {d}/sock \"$XDG_RUNTIME_DIR/wayland-0\"\nexec sleep 30\n"
+            ),
+        );
+        let step = |what: &str| match what {
+            "ready" => "echo ready; exec sleep 30".to_owned(),
+            rc => format!("echo refused {rc}; exit {rc}"),
+        };
+        tool(
+            "helper",
+            &format!(
+                "if [ \"$(wc -l < {d}/starts)\" -eq 1 ]; then {}; else {}; fi\n",
+                step(first),
+                step(second)
+            ),
+        );
+        let logs = ["labwc.log", LABWC_SETUP_LOG].map(|f| format!("app/scratch/{f}"));
+        let script = format!(
+            "set -u\nBASE={}\n{}kill \"$HS\" \"$LW\"\n",
+            sh_quote(&d.to_string()),
+            nested_headless_script(
+                "app",
+                &sh_quote(&dir.join("rt").display().to_string()),
+                "\"$BASE/cfg\"",
+                (
+                    "\"$BASE/out/app/scratch/labwc.log\"",
+                    "\"$BASE/out/app/scratch/labwc-setup.log\"",
+                ),
+                &format!("{d}/bin/helper"),
+                &tar_sh(&logs),
+            )
+        );
+        let out = Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{d}/bin:/usr/bin:/bin"))
+            .output()
+            .unwrap();
+        let back = dir.join("back");
+        std::fs::create_dir_all(&back).unwrap();
+        let mut tar = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(&back)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        tar.stdin.take().unwrap().write_all(&out.stdout).unwrap();
+        let end = tar.wait().unwrap();
+        let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.join("rt")).unwrap().count(),
+            0,
+            "the nest dir stays"
+        );
+        Rungs {
+            code: out.status.code(),
+            err: String::from_utf8_lossy(&out.stderr).into_owned(),
+            starts: starts.lines().map(str::to_owned).collect(),
+            end,
+            back: back.join("app/scratch"),
+            _home: home,
+        }
+    }
+
+    /// The first rung's output is set up: one labwc, as it is, and the transcript says so.
+    #[test]
+    fn a_labwc_that_takes_the_output_stays_on_the_default_rung() {
+        let Rungs {
+            code, err, starts, ..
+        } = run_rungs("rung-default", "ready", "ready");
+        assert_eq!(code, Some(0), "{err}");
+        assert_eq!(starts, ["default"]);
+        assert!(
+            err.contains("remote run app: labwc rung default\n"),
+            "{err}"
+        );
+    }
+
+    /// A refused output (exit 3, atl-labwc-setup's help) restarts labwc once without modifiers.
+    #[test]
+    fn a_refused_output_restarts_labwc_without_modifiers() {
+        let Rungs {
+            code, err, starts, ..
+        } = run_rungs("rung-second", "3", "ready");
+        assert_eq!(code, Some(0), "{err}");
+        assert_eq!(starts, ["default", "1"]);
+        assert!(
+            err.contains("not ready on rung default (see labwc-setup.log): refused 3\n")
+                && err.contains("remote run app: labwc rung no-modifiers\n"),
+            "{err}"
+        );
+    }
+
+    /// Refused on both: the run stops with both answers, its logs come back whole, and without an end record it failed.
+    #[test]
+    fn an_output_refused_on_both_rungs_fails_with_both_answers_and_logs() {
+        let Rungs {
+            code,
+            err,
+            starts,
+            end,
+            back,
+            _home,
+        } = run_rungs("rung-none", "3", "3");
+        assert_eq!(code, Some(5), "{err}");
+        assert_eq!(starts, ["default", "1"]);
+        assert!(
+            err.contains("on rung default (see labwc-setup.log): refused 3\n")
+                && err.contains("on rung no-modifiers (see labwc-setup.log): refused 3\n"),
+            "{err}"
+        );
+        let read = |name: &str| std::fs::read_to_string(back.join(name)).unwrap();
+        assert_eq!(
+            read(LABWC_SETUP_LOG),
+            "== labwc rung default\nrefused 3\n== labwc rung no-modifiers\nrefused 3\n"
+        );
+        assert_eq!(
+            read("labwc.log"),
+            "== labwc rung default\nno format\n== labwc rung no-modifiers\nno format\n"
+        );
+        assert!(end.success());
+        assert!(ended_early(end, &back), "no end record, yet not a failure");
+        std::fs::write(back.join(ATLD_RC), "0\n").unwrap();
+        assert!(!ended_early(end, &back), "a whole run");
+    }
+
+    /// Any other failure of the helper is no answer about the renderer: no second rung.
+    #[test]
+    fn another_setup_failure_does_not_change_the_rung() {
+        let Rungs {
+            code, err, starts, ..
+        } = run_rungs("rung-other", "1", "ready");
+        assert_eq!(code, Some(5), "{err}");
+        assert_eq!(starts, ["default"]);
+    }
+
     /// The script's own message is the cause; the transfer's complaint follows it.
     #[test]
     fn failed_run_names_the_script_message_first() {
@@ -3251,7 +3518,7 @@ mod tests {
         };
         let x = at("for e in /proc/[0-9]*/environ; do");
         let start = at(
-            "WLR_BACKENDS=x11 labwc -C \"$BASE/out/app/scratch/labwc\" < /dev/null > \"$BASE/out/app/scratch/labwc.log\" 2>&1 &\nLW=$!\n",
+            "WLR_BACKENDS=x11 \"$LABWC\" -C \"$BASE/out/app/scratch/labwc\" < /dev/null > \"$BASE/out/app/scratch/labwc.log\" 2>&1 &\nLW=$!\n",
         );
         let wait = at("while wl_scan; [ \"$WL_N\" -eq 0 ]");
         let atld = at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout --foreground -k 10 60 ");
@@ -3615,10 +3882,11 @@ esac
         assert!(
             at("trap nest_end EXIT\n")
                 < at(
-                    "XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 labwc -C"
+                    "XDG_RUNTIME_DIR=\"$NEST_DIR\" WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 \"$@\" \"$LABWC\" -C"
                 )
-                && at("WLR_LIBINPUT_NO_DEVICES=1 labwc -C") < at("\nWL=\"$NEST_DIR/$WL\"\n")
-                && at("\nWL=\"$NEST_DIR/$WL\"\n") < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
+                && at("\"$LABWC\" -C") < at("\n  WL=\"$NEST_DIR/$WL\"\n")
+                && at("\n  WL=\"$NEST_DIR/$WL\"\n")
+                    < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                 && at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
                     < at("kill -TERM \"$LW\" 2>/dev/null || true"),
             "{s}"
@@ -3626,9 +3894,9 @@ esac
         assert!(s.contains(" 'app/scratch/labwc.log'"), "{s}");
         // the labwc setup helper: started on the run's socket once labwc listens, ready before atld, stopped before labwc ends; its log comes back with the run
         assert!(
-            at("\nWL=\"$NEST_DIR/$WL\"\n")
+            at("\n  WL=\"$NEST_DIR/$WL\"\n")
                 < at(
-                    "\"$BASE/out/cargo/release/atl-labwc-setup\" \"$WL\" > \"$BASE/out/app/scratch/labwc-setup.log\" 2>&1 < /dev/null &\nHS=$!\n"
+                    "\"$BASE/out/cargo/release/atl-labwc-setup\" \"$WL\" >> \"$BASE/out/app/scratch/labwc-setup.log\" 2>&1 < /dev/null &\n  HS=$!\n"
                 )
                 && at("HS=$!\n") < at("grep -qx ")
                 && at("grep -qx ") < at(" WAYLAND_DISPLAY=\"$WL\" setsid timeout ")
@@ -3643,7 +3911,7 @@ esac
         };
         assert!(
             cross.script("atl-next-run/x").contains(
-                "\"$BASE/out/cargo/riscv64gc-unknown-linux-gnu/release/atl-labwc-setup\" \"$WL\" > "
+                "\"$BASE/out/cargo/riscv64gc-unknown-linux-gnu/release/atl-labwc-setup\" \"$WL\" >> "
             ),
             "the helper is not beside the cross host's atld"
         );
@@ -3766,7 +4034,7 @@ esac
         );
         assert!(
             at("> \"$BASE/out/app/scratch/labwc/rc.xml\"")
-                < at("labwc -C \"$BASE/out/app/scratch/labwc\""),
+                < at("\"$LABWC\" -C \"$BASE/out/app/scratch/labwc\""),
             "{s}"
         );
     }

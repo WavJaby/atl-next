@@ -31,10 +31,22 @@ pub struct Row {
 const SYS_MAP_SHADOW_STACK: i64 = 453;
 const SYS_FCHMODAT2: i64 = 452;
 const SYS_MSEAL: i64 = 462;
+/// riscv64 uapi asm/unistd.h: __NR_riscv_hwprobe = __NR_arch_specific_syscall (244) + 14; another call (mkdirat) on x86_64.
+#[cfg(target_arch = "riscv64")]
+const SYS_RISCV_HWPROBE: i64 = 244 + 14;
 
 use Answer::{Allow, Enosys};
 
 pub const ROWS: &[Row] = &[
+    #[cfg(target_arch = "riscv64")]
+    Row {
+        call: SYS_RISCV_HWPROBE,
+        name: "riscv_hwprobe",
+        binderd: Allow,
+        installer: Allow,
+        caller: "glibc's ld.so at start-up, in every process (Ubuntu 26.04 glibc 2.43, kernel 6.18 kill of atl-sandbox-stub, audit record syscall=258, 2026-11-25; not glibc 2.39's)",
+        reason: "read-only CPU extension and speed data, as /proc/cpuinfo shows it; no file, memory or process of another is reached",
+    },
     Row {
         call: libc::SYS_statx,
         name: "statx",

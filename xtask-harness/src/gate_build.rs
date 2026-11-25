@@ -21,7 +21,7 @@ const BINS: [&str; 9] = [
     "atl-sandbox-probe",
     "atl-egl-probe",
     "atl-engine-cpuinfo",
-    // the labwc setup a remote test run starts on its target beside its labwc (remote.rs `labwc_setup_script`)
+    // the labwc setup a remote test run starts on its target beside its labwc (remote.rs `nested_headless_script`)
     "atl-labwc-setup",
 ];
 

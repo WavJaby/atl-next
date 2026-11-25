@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 #![forbid(unsafe_code)]
 //! `atl-labwc-setup <socket>`: gives a headless labwc its gate output and seat devices (the local gates' setup, `atl_labwc_setup::setup`), prints what it set, then holds the devices until labwc closes the socket.
-//! A remote test run starts it on the target beside the run's own labwc (remote.rs `labwc_setup_script`); the run waits for the `ready` line, and its end stops the helper.
-//! Stdout: one line per output, `seat: ...`, then `ready`, each flushed. A failure prints its cause to stderr and exits 1.
+//! A remote test run starts it on the target beside the run's own labwc (remote.rs `nested_headless_script`); the run waits for the `ready` line, and its end stops the helper.
+//! Stdout: one line per output, `seat: ...`, then `ready`, each flushed. A failure prints its cause to stderr and exits 1, or 3 when the compositor refused the output configuration.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -10,14 +10,14 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, ensure};
-use atl_labwc_setup::{GATE_OUTPUT, READY_LINE, setup};
+use atl_labwc_setup::{GATE_OUTPUT, READY_LINE, exit_status, setup};
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(std::io::stderr(), "atl-labwc-setup: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(exit_status(&e))
         }
     }
 }

@@ -2,13 +2,13 @@
 #![forbid(unsafe_code)]
 //! A headless labwc's test setup over its Wayland socket, shared by the local gates and the remote test runs: the outputs (`zwlr_output_manager_v1`: mode, rate, scale, transform, position) and the seat's pointer and keyboard (`zwlr_virtual_pointer_manager_v1`, `zwp_virtual_keyboard_manager_v1`).
 //! labwc 0.8 ignores rc.xml for output modes, and a seat with no input devices has no `wl_pointer` or `wl_keyboard`, so a client sends these requests. The devices live as long as the connection: [`setup`] returns the control that keeps it open.
-//! The binary `atl-labwc-setup` is this setup as a process: a remote test run starts it beside its labwc on the target (remote.rs `labwc_setup_script`) and waits for [`READY_LINE`].
+//! The binary `atl-labwc-setup` is this setup as a process: a remote test run starts it beside its labwc on the target (remote.rs `nested_headless_script`) and waits for [`READY_LINE`].
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use atl_services_types::display_model::DisplayModel;
 use atl_wayland_wire::{Arg, Client, fixed, op as wire_op, string, word, word_after_string};
 
@@ -73,7 +73,10 @@ mod op {
     pub const CONFIGURATION_ENABLE_HEAD: u16 = 0;
     pub const CONFIGURATION_DISABLE_HEAD: u16 = 1;
     pub const CONFIGURATION_APPLY: u16 = 2;
+    pub const CONFIGURATION_DESTROY: u16 = 4;
     pub const CONFIGURATION_SUCCEEDED: u16 = 0;
+    pub const CONFIGURATION_FAILED: u16 = 1;
+    pub const CONFIGURATION_CANCELLED: u16 = 2;
     pub const CONFIG_HEAD_SET_CUSTOM_MODE: u16 = 1;
     pub const CONFIG_HEAD_SET_POSITION: u16 = 2;
     pub const CONFIG_HEAD_SET_TRANSFORM: u16 = 3;
@@ -85,6 +88,41 @@ const VKEYBOARD_MANAGER: &str = "zwp_virtual_keyboard_manager_v1";
 const OUTPUT_MANAGER: &str = "zwlr_output_manager_v1";
 /// Version 2 has `set_custom_mode` and everything used here.
 const OUTPUT_MANAGER_VERSION: u32 = 2;
+/// How often one output configuration is sent: a `cancelled` one is redone from the new serial. Only bounds a compositor whose outputs never settle.
+const APPLY_ATTEMPTS: u32 = 3;
+
+/// The compositor's answer to one applied configuration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Succeeded,
+    Failed,
+    /// The configuration's serial was outdated: the outputs changed since its `done`.
+    Cancelled,
+}
+
+/// The compositor answered `failed` to an output configuration: the outputs it could not set up.
+#[derive(Debug)]
+pub struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the compositor answered `failed` to the output configuration [{}]: see its log",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The helper's exit status when the compositor refused its output configuration ([`Refused`]); any other failure is 1.
+pub const REFUSED_EXIT: u8 = 3;
+
+/// The helper's exit status for `e`.
+pub fn exit_status(e: &anyhow::Error) -> u8 {
+    if e.is::<Refused>() { REFUSED_EXIT } else { 1 }
+}
 
 /// The setup connection: it keeps the virtual pointer and keyboard alive and holds the output manager and its heads (ordered as the outputs), so the outputs can be changed later.
 struct Setup {
@@ -103,8 +141,48 @@ struct Setup {
 }
 
 impl Setup {
-    /// Applies one configuration: output i on (its mode, rate, scale, position) where `on[i]`, else off. Positions are left to right over all outputs, on or off, so an output keeps its place.
+    /// Applies one configuration ([`apply`](Self::apply)), redone while the compositor answers `cancelled`. `failed` is final: the compositor could not set the outputs up (its log has the cause), and the error names them.
     fn configure(&mut self, on: &[bool]) -> Result<()> {
+        for _ in 0..APPLY_ATTEMPTS {
+            match self.apply(on)? {
+                Answer::Succeeded => return Ok(()),
+                Answer::Failed => return Err(Refused(self.described(on)).into()),
+                Answer::Cancelled => {}
+            }
+        }
+        bail!(
+            "the compositor answered `cancelled` {APPLY_ATTEMPTS} times to the output configuration [{}]",
+            self.described(on)
+        )
+    }
+
+    /// One line per output, as [`OutputControl::describe`] returns them.
+    fn lines(&self) -> Vec<String> {
+        self.names
+            .iter()
+            .zip(&self.outputs)
+            .map(|(name, o)| {
+                format!(
+                    "output {name} {}x{}@{} scale {} transform {}",
+                    o.width, o.height, o.refresh_mhz, o.scale, o.transform
+                )
+            })
+            .collect()
+    }
+
+    /// The outputs of a configuration, for its error.
+    fn described(&self, on: &[bool]) -> String {
+        let lines: Vec<String> = self
+            .lines()
+            .iter()
+            .zip(on)
+            .map(|(line, on)| format!("{line} {}", if *on { "on" } else { "off" }))
+            .collect();
+        lines.join(", ")
+    }
+
+    /// Sends one configuration and reads its answer: output i on (its mode, rate, scale, position) where `on[i]`, else off. Positions are left to right over all outputs, on or off, so an output keeps its place.
+    fn apply(&mut self, on: &[bool]) -> Result<Answer> {
         ensure!(
             on.len() == self.heads.len(),
             "{} heads, {} switches",
@@ -147,14 +225,23 @@ impl Setup {
         c.send(config, op::CONFIGURATION_APPLY, &[]);
         let events = c.roundtrip()?;
         self.note_serial(&events)?;
-        ensure!(
-            events
-                .iter()
-                .any(|(o, opcode, _)| *o == config && *opcode == op::CONFIGURATION_SUCCEEDED),
-            "the compositor did not apply the output configuration {:?} on {on:?}",
-            self.outputs
-        );
-        Ok(())
+        let answer = events
+            .iter()
+            .filter(|(o, ..)| *o == config)
+            .find_map(|(_, opcode, _)| match *opcode {
+                op::CONFIGURATION_SUCCEEDED => Some(Answer::Succeeded),
+                op::CONFIGURATION_FAILED => Some(Answer::Failed),
+                op::CONFIGURATION_CANCELLED => Some(Answer::Cancelled),
+                _ => None,
+            })
+            .with_context(|| {
+                format!(
+                    "the compositor did not answer the output configuration [{}]",
+                    self.described(on)
+                )
+            })?;
+        self.client.send(config, op::CONFIGURATION_DESTROY, &[]);
+        Ok(answer)
     }
 
     fn note_serial(&mut self, events: &[(u32, u16, Vec<u8>)]) -> Result<()> {
@@ -225,17 +312,7 @@ impl OutputControl {
 
     /// One line per output, as the helper prints it: `output <head> <w>x<h>@<mHz> scale <s> transform <t>`.
     pub fn describe(&self) -> Result<Vec<String>> {
-        let s = self.lock()?;
-        Ok(s.names
-            .iter()
-            .zip(&s.outputs)
-            .map(|(name, o)| {
-                format!(
-                    "output {name} {}x{}@{} scale {} transform {}",
-                    o.width, o.height, o.refresh_mhz, o.scale, o.transform
-                )
-            })
-            .collect())
+        Ok(self.lock()?.lines())
     }
 
     /// Reads and drops the compositor's events until it closes the socket: the devices stay up for that long. The remote helper's whole life after setup.
@@ -328,4 +405,160 @@ pub fn setup(stream: UnixStream, outputs: &[Output]) -> Result<OutputControl> {
     };
     s.configure(&vec![true; outputs.len()])?;
     Ok(OutputControl(Arc::new(Mutex::new(s))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    /// The fake compositor's one head: a server-side object id (wayland.xml: 0xff000000 up).
+    const HEAD: u32 = 0xff00_0000;
+    const FIRST_SERIAL: u32 = 7;
+    /// How far a change of the outputs moves the serial.
+    const SERIAL_STEP: u32 = 10;
+
+    /// What the fake does with an `apply` whose serial is current.
+    #[derive(Clone, Copy)]
+    enum Then {
+        Succeed,
+        Fail,
+        Silent,
+    }
+
+    /// A compositor with one output: the globals [`setup`] binds, the head, and an answer to each `apply` by the protocol's rule (an outdated serial is `cancelled`), else `then`. Its outputs change at the first `changes` applies: a new `done`, so that configuration is outdated.
+    /// Ends when the client closes; the applies' serials.
+    fn compositor(mut s: UnixStream, changes: usize, then: Then) -> JoinHandle<Vec<u32>> {
+        std::thread::spawn(move || {
+            let mut serial = FIRST_SERIAL;
+            let mut applied = Vec::new();
+            let (mut om, mut configs) = (0, HashMap::new());
+            let mut head = [0u8; 8];
+            while s.read_exact(&mut head).is_ok() {
+                let object = word(&head, 0).expect("object");
+                let second = word(&head, 4).expect("size");
+                let mut body = vec![0u8; (second >> 16) as usize - 8];
+                s.read_exact(&mut body).expect("body");
+                let mut send = |object: u32, opcode: u16, body: &[u8]| {
+                    let size = 8 + body.len() as u32;
+                    let mut m = object.to_ne_bytes().to_vec();
+                    m.extend(((size << 16) | u32::from(opcode)).to_ne_bytes());
+                    m.extend(body);
+                    s.write_all(&m).expect("event");
+                };
+                let opcode = (second & 0xffff) as u16;
+                match (object, opcode) {
+                    // wl_display.sync -> wl_callback.done
+                    (1, 0) => send(word(&body, 0).expect("id"), 0, &[0; 4]),
+                    // wl_display.get_registry -> wl_registry.global
+                    (1, 1) => {
+                        let globals = [
+                            "wl_seat",
+                            VPOINTER_MANAGER,
+                            VKEYBOARD_MANAGER,
+                            OUTPUT_MANAGER,
+                        ];
+                        for (name, iface) in (1u32..).zip(globals) {
+                            let mut g = name.to_ne_bytes().to_vec();
+                            g.extend(text(iface));
+                            g.extend(OUTPUT_MANAGER_VERSION.to_ne_bytes());
+                            send(word(&body, 0).expect("id"), 0, &g);
+                        }
+                    }
+                    // wl_registry.bind: the registry is the client's first object, 2
+                    (2, 0) if string(&body, 4).expect("iface") == OUTPUT_MANAGER => {
+                        om = word(&body, body.len() - 4).expect("id");
+                        send(om, 0, &HEAD.to_ne_bytes());
+                        send(HEAD, 0, &text("HEADLESS-1"));
+                        send(om, 1, &serial.to_ne_bytes());
+                    }
+                    // zwlr_output_manager_v1.create_configuration
+                    (o, 0) if om != 0 && o == om => {
+                        let word = |at| word(&body, at).expect("argument");
+                        configs.insert(word(0), word(4));
+                    }
+                    // zwlr_output_configuration_v1.apply -> succeeded 0, failed 1, cancelled 2
+                    (o, 2) if configs.contains_key(&o) => {
+                        if applied.len() < changes {
+                            serial += SERIAL_STEP;
+                            send(om, 1, &serial.to_ne_bytes());
+                        }
+                        applied.push(configs[&o]);
+                        match then {
+                            _ if configs[&o] != serial => send(o, 2, &[]),
+                            Then::Succeed => send(o, 0, &[]),
+                            Then::Fail => send(o, 1, &[]),
+                            Then::Silent => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            applied
+        })
+    }
+
+    /// A string argument: length with the NUL, bytes, padding to 4.
+    fn text(s: &str) -> Vec<u8> {
+        let mut out = (s.len() as u32 + 1).to_ne_bytes().to_vec();
+        out.extend(s.as_bytes());
+        out.push(0);
+        out.resize(out.len().next_multiple_of(4), 0);
+        out
+    }
+
+    /// The setup against [`compositor`]: its result (the connection closed) and the applies' serials.
+    fn run(changes: usize, then: Then) -> (Result<()>, Vec<u32>) {
+        let (client, server) = UnixStream::pair().expect("pair");
+        let fake = compositor(server, changes, then);
+        let result = setup(client, &[GATE_OUTPUT]).map(drop);
+        (result, fake.join().expect("the fake compositor"))
+    }
+
+    /// The outputs changed under the first configuration: `cancelled`, redone with the new serial (7 + 10), `succeeded`.
+    #[test]
+    fn a_cancelled_configuration_is_redone_from_the_new_serial() {
+        let (result, applied) = run(1, Then::Succeed);
+        result.expect("the second configuration succeeds");
+        assert_eq!(applied, [7, 17]);
+    }
+
+    /// Outputs that never settle end the setup after 3 tries.
+    #[test]
+    fn cancelled_again_and_again_is_an_error() {
+        let (result, applied) = run(usize::MAX, Then::Succeed);
+        let e = result.expect_err("never applied");
+        assert_eq!(exit_status(&e), 1, "not a refusal");
+        let text = format!("{e:#}");
+        assert!(text.contains("`cancelled` 3 times"), "{text}");
+        assert_eq!(applied, [7, 17, 27]);
+    }
+
+    /// `failed` is final: one try, the error names the output, and the helper's status says refused (main.rs: 3).
+    #[test]
+    fn a_failed_configuration_names_its_output() {
+        let (result, applied) = run(0, Then::Fail);
+        let e = result.expect_err("failed");
+        assert_eq!(exit_status(&e), 3);
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("`failed`")
+                && text.contains("output HEADLESS-1 1920x1200@60000 scale 1 transform 0 on"),
+            "{text}"
+        );
+        assert_eq!(applied, [7]);
+    }
+
+    /// No answer is neither: it says so.
+    #[test]
+    fn no_answer_is_named() {
+        let (result, _) = run(0, Then::Silent);
+        let text = format!("{:#}", result.expect_err("no answer"));
+        assert!(
+            text.contains("did not answer") && text.contains("HEADLESS-1"),
+            "{text}"
+        );
+    }
 }
