@@ -2083,20 +2083,46 @@ mod tests {
         std::fs::remove_dir_all(&ws).unwrap();
     }
 
+    /// [`sleeper_on`]'s child: killed and reaped on drop, so a test that panics leaves no holder of a lock behind (a `sleep` holding a checkout's mount lock makes its next ram command wait until it exits). Derefs to the child: kill, wait, id.
+    struct Sleeper(std::process::Child);
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            // std's kill is a no-op once the child is waited: a test's own kill + wait before this is harmless
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    impl std::ops::Deref for Sleeper {
+        type Target = std::process::Child;
+        fn deref(&self) -> &std::process::Child {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Sleeper {
+        fn deref_mut(&mut self) -> &mut std::process::Child {
+            &mut self.0
+        }
+    }
+
     /// A `sleep 300` whose fd 9 is open on `path`, flocked exclusive when `lock`; returns once the fd is set up (the child says so on stdout).
     /// The child opens and locks the file itself: an inheritable fd in this test process would leak into children other tests spawn meanwhile.
-    fn sleeper_on(path: &Path, lock: bool) -> std::process::Child {
+    fn sleeper_on(path: &Path, lock: bool) -> Sleeper {
         let script = if lock {
             r#"exec 9<>"$1"; flock -nx 9 || exit 1; echo ready; exec sleep 300"#
         } else {
             r#"exec 9<>"$1"; echo ready; exec sleep 300"#
         };
-        let mut c = Command::new("sh")
-            .args(["-c", script, "sh"])
-            .arg(path)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut c = Sleeper(
+            Command::new("sh")
+                .args(["-c", script, "sh"])
+                .arg(path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
         let mut line = String::new();
         std::io::BufRead::read_line(
             &mut std::io::BufReader::new(c.stdout.take().unwrap()),
@@ -2114,11 +2140,35 @@ mod tests {
 
     /// Fixture of a lingering daemon: a process alone holding checkout `id`'s mount lock, as a daemon left by a build does after the outer command closed its fd.
     /// Plus a bystander that opened the file without locking it (a failed try of another command): never a holder.
-    fn lingering_holder(ws: &Path, id: &str) -> (std::process::Child, std::process::Child) {
+    fn lingering_holder(ws: &Path, id: &str) -> (Sleeper, Sleeper) {
         let p = mount_lock_path(ws, id);
         drop(open_lock(&p).unwrap());
         let bystander = sleeper_on(&p, false);
         (sleeper_on(&p, true), bystander)
+    }
+
+    /// A test that panics after [`sleeper_on`] leaves no `sleep` behind: the guard kills and reaps it while the panic unwinds.
+    /// Break (no guard): the sleep outlives the test; killed here, so the run leaves nothing.
+    #[test]
+    fn a_panicking_test_leaves_no_sleeper() {
+        let path = std::env::temp_dir().join(format!("xtask-delta-sleeper-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pid = std::cell::Cell::new(0u32);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sleeper = sleeper_on(&path, true);
+            pid.set(sleeper.id());
+            panic!("fixture: the test fails while its sleeper runs");
+        }));
+        assert!(caught.is_err());
+        let pid = pid.get();
+        let alive = Path::new(&format!("/proc/{pid}")).exists();
+        if alive {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(!alive, "sleeper {pid} outlived its panicking test");
     }
 
     #[test]
