@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::desktop_bounds::{ActivityInput, Rect, initial_bounds};
-use atl_services_types::display_model::{Declaration, DisplayModel};
+use atl_services_types::display_model::{DENSITY_DEFAULT, Declaration, DisplayModel};
 
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -122,6 +122,14 @@ impl<C> State<C> {
             in_touch_mode: DEFAULT_IN_TOUCH_MODE,
         }
     }
+
+    /// [`Tasks::full_display`] under the caller's lock.
+    fn full_display(&self) -> Option<TaskSize> {
+        self.declared.map(|_| TaskSize {
+            width: self.display.width,
+            height: self.display.height,
+        })
+    }
 }
 
 /// What a monitor report changed in the display (Tasks::set_monitor).
@@ -142,8 +150,8 @@ pub struct Tasks<C> {
     locale: Option<String>,
 }
 
-/// A new Task's size on `display`: AOSP's initial bounds of `activity` (desktop_bounds.rs), centred on the display. The origin is dropped: the compositor places the window.
-pub fn initial_size(display: &DisplayModel, activity: &ActivityInput) -> TaskSize {
+/// A new Task's size on an undeclared `display`: AOSP's initial bounds of `activity` (desktop_bounds.rs), centred on the display. The origin is dropped: the compositor places the window.
+fn initial_size(display: &DisplayModel, activity: &ActivityInput) -> TaskSize {
     let area = Rect {
         left: 0,
         top: 0,
@@ -154,6 +162,20 @@ pub fn initial_size(display: &DisplayModel, activity: &ActivityInput) -> TaskSiz
     TaskSize {
         width: bounds.width(),
         height: bounds.height(),
+    }
+}
+
+/// `size` (px at `old_dpi`) at `new_dpi`, the same dp size: what AOSP keeps of a window that moves to a display of another density (MultiDisplayDragMoveBoundsCalculator: widthDp / heightDp, then px of the new display).
+/// Whole dp first, as the window's content is whole desktop logical px (1 dp).
+fn same_dp(size: TaskSize, old_dpi: i32, new_dpi: i32) -> TaskSize {
+    let base = f64::from(DENSITY_DEFAULT);
+    let side = |px: i32| {
+        let dp = (f64::from(px) * base / f64::from(old_dpi)).round();
+        (dp * f64::from(new_dpi) / base).round() as i32
+    };
+    TaskSize {
+        width: side(size.width),
+        height: side(size.height),
     }
 }
 
@@ -180,6 +202,19 @@ impl<C: Clone + PartialEq> Tasks<C> {
     /// The display now: [`DisplayModel::of`] of the monitor and the declaration, unchanged by any window's size ([`Tasks::set_monitor`]). The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
         self.lock().display
+    }
+
+    /// The size of a Task on a declared display: the display's. AOSP's 3/4 rule is desktop windowing, which a device with config_isDesktopModeSupported false (config.xml's default) never enters;
+    /// a declared display is such a device's, and there a Task is the display. None: undeclared.
+    pub fn full_display(&self) -> Option<TaskSize> {
+        self.lock().full_display()
+    }
+
+    /// A new Task's size: the declared display's ([`Tasks::full_display`]), else AOSP's initial bounds of `activity`.
+    pub fn opening_size(&self, activity: &ActivityInput) -> TaskSize {
+        let st = self.lock();
+        st.full_display()
+            .unwrap_or_else(|| initial_size(&st.display, activity))
     }
 
     /// The display's touch mode now: the one owner, read by addToDisplayAsUser (ADD_FLAG_IN_TOUCH_MODE) and isInTouchMode, written by setInTouchMode.
@@ -274,7 +309,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
     }
 
     /// A window reported its monitor (REPORT_MONITOR): the display is recomputed from it. A size, density or rotation change renumbers every Task's configuration (config_seq) and lists
-    /// those Tasks; a refresh rate change is a display event only. A refused declaration leaves the state as it was. No Task's size changes: a window is resized only by SET_BOUNDS.
+    /// those Tasks; a refresh rate change is a display event only. A refused declaration leaves the state as it was. A density change keeps each Task's dp size ([`same_dp`]), as its window keeps its logical size; nothing else here resizes a Task.
     /// Returns the change with the display it made, read under the one lock: a concurrent report cannot pair its display with this change.
     pub fn set_monitor(
         &self,
@@ -294,6 +329,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
             .tasks
             .iter_mut()
             .map(|(id, record)| {
+                record.size = same_dp(record.size, old.dpi, display.dpi);
                 record.config_seq = next_config_seq(record.config_seq);
                 *id
             })
@@ -548,8 +584,8 @@ mod tests {
         assert_eq!(t.config_seq(task), 2);
     }
 
-    /// A monitor whose size, density or rotation changes renumbers every Task's override; the same monitor again changes nothing; a refresh rate alone renumbers none. No Task's size
-    /// follows the monitor: a window is resized only by SET_BOUNDS.
+    /// A monitor whose size, density or rotation changes renumbers every Task's override; the same monitor again changes nothing; a refresh rate alone renumbers none. Each Task keeps its dp:
+    /// at scale 2 (density 160 -> 320) its px double, 1000x700 -> 2000x1400 and 960x600 -> 1920x1200.
     #[test]
     fn set_monitor_renumbers_every_task_on_a_configuration_change_only() {
         let t = tasks();
@@ -563,8 +599,8 @@ mod tests {
         );
         assert_eq!(t.display(), monitor);
         assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
-        assert_eq!(t.size(sized), Some(size(1000, 700)));
-        assert_eq!(t.size(fresh), Some(three_quarters()));
+        assert_eq!(t.size(sized), Some(size(2000, 1400)));
+        assert_eq!(t.size(fresh), Some(size(1920, 1200)));
         assert_eq!(
             t.set_monitor(monitor),
             Ok((DisplayChange::Unchanged, monitor))
@@ -591,6 +627,34 @@ mod tests {
         let kept = t.display();
         assert_eq!(kept.width, 658);
         assert_eq!(t.set_monitor(laptop), Ok((DisplayChange::Unchanged, kept)));
+    }
+
+    /// A declared 411x914 dp display is its Task: 411x914 px at 160 dpi, 658x1462 at 256 (411 x 1.6 = 657.6, 914 x 1.6 = 1462.4), and back. A resized Task keeps its dp: 300x500 -> 480x800.
+    #[test]
+    fn a_task_on_a_declared_display_is_the_display_and_keeps_its_dp() {
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        let landscape = ActivityInput {
+            orientation: crate::desktop_bounds::ActivityOrientation::Landscape,
+            resizeable: true,
+            min_aspect: None,
+            max_aspect: None,
+        };
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
+        assert_eq!(t.opening_size(&landscape), size(411, 914));
+        let full = t.new_task(7, "com.example.app", t.opening_size(&landscape));
+        let resized = t.new_task(7, "com.example.app", size(300, 500));
+        t.set_monitor(at(1.6)).expect("in range");
+        assert_eq!(t.size(full), Some(size(658, 1462)));
+        assert_eq!(t.full_display(), Some(size(658, 1462)));
+        assert_eq!(t.size(resized), Some(size(480, 800)));
+        t.set_monitor(at(1.0)).expect("in range");
+        assert_eq!(t.size(full), Some(size(411, 914)));
+        assert_eq!(tasks().full_display(), None);
+        assert_eq!(tasks().opening_size(&landscape), three_quarters());
     }
 
     /// A Task that does not exist has no owner, no size, and takes no size.

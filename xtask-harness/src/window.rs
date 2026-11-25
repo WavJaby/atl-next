@@ -177,6 +177,9 @@ pub struct Args {
     /// Stage move only: the display declared in dp (atld `--declare-display`, display_model.rs `Declaration`), the apps see this size on each output's density; adds the `declared` sub-gate.
     #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
     declare_display: Option<Declaration>,
+    /// Stage move, undeclared only: the window is resized (a configure) before the move and must keep that dp size on the second output.
+    #[arg(long, conflicts_with = "declare_display")]
+    user_resize: bool,
     /// Stage move, with `--declare-display` only: the run is not given the declaration, so the declared sub-gate must fail (the gate's deliberate break, harness-side).
     #[arg(long, requires = "declare_display")]
     break_declare_display: bool,
@@ -2625,6 +2628,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         args.declare_display.is_none() || matches!(args.stage, Stage::Move),
         "--declare-display is for stage move only"
     );
+    ensure!(
+        !args.user_resize || matches!(args.stage, Stage::Move),
+        "--user-resize is for stage move only"
+    );
     let rt = match args.declare_display {
         Some(declared) if !args.break_declare_display => rt.with_declare_display(declared.to_arg()),
         _ => rt,
@@ -2968,6 +2975,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
         let seen = Arc::clone(&app_ids);
         let titles_seen = Arc::clone(&titles);
         let relaunch = (run.root.clone(), format!("{package}/{activity}"));
+        let user_resize = args.user_resize;
         std::thread::spawn(move || match (stage, outputs, fake_ime) {
             (Stage::Gtk | Stage::Hwui | Stage::Portrait | Stage::Tiled, _, _) => {
                 match &capture_probe {
@@ -3031,7 +3039,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
             (Stage::AuxProcess, _, _) => aux_process::drive(p, &log),
             (Stage::Splash, _, _) => splash::drive(p, &log),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
-            (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs),
+            (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs, user_resize),
             _ => drive(p, &log),
         })
     });
@@ -3283,6 +3291,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
                 display,
                 moved,
                 args.declare_display,
+                args.user_resize,
             ),
             None => vec![("outputs", Err("no nested compositor".to_owned()))],
         },

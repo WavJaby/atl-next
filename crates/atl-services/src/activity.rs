@@ -76,7 +76,7 @@ use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
-use crate::tasks::{TaskId, TaskSize, Tasks, initial_size};
+use crate::tasks::{TaskId, TaskSize, Tasks};
 use crate::ui_agents::{AppProcess, UiAgents};
 use crate::uid_state::{self, ProcessState, Settle, UidView};
 use atl_services_types::display_model::DisplayModel;
@@ -1699,7 +1699,7 @@ impl Inner {
             .launcher(p)
             .filter(|_| launch_activity)
             .map(|a| {
-                let size = initial_size(&self.tasks.display(), &crate::packages::bounds_input(a));
+                let size = self.tasks.opening_size(&crate::packages::bounds_input(a));
                 self.tasks.new_task(p.uid, p.name(), size)
             });
         let now = self.now_ms();
@@ -3456,6 +3456,14 @@ impl ActivityClientController {
         else {
             return;
         };
+        // a declared display: the Task is the display, whatever the request (tasks.rs full_display)
+        let (width, height) = inner
+            .tasks
+            .full_display()
+            .map_or((width, height), |s| (s.width, s.height));
+        if (width, height) == current {
+            return;
+        }
         log(format_args!(
             "orientation reshape task={} {}x{} -> {width}x{height} ({why})",
             task.raw(),

@@ -2,6 +2,7 @@
 //! Stage `move` of `xtask test window`: the window moves to an output of another density, and Android follows. The nested compositor has two outputs, [`GATE_OUTPUT`] and [`SCALED_OUTPUT`] to its right; only the first is on when the window opens (with both on, labwc opened it on the second). After its first draw the probe turns the second on and the first off in one configuration ([`OutputControl::only`]), so labwc moves the window to the second.
 //! The window reports its new monitor (Window::on_monitor), the composer submits it (TaskReports::submit_monitor -> registry REPORT_MONITOR), the services make it their display ([`checks`]) and answer with it, and the composer takes that answer as its display.
 //! Lifecycle, from AOSP: the move changes densityDpi (CONFIG_DENSITY) and screen size; the fixture declares no configChanges, so ActivityRecord.shouldRelaunchLocked (changes & ~info.getRealConfigChanged() != 0) relaunches the activity.
+//! The move keeps the window's dp size (sub-gate bounds), the opening size or the user's (`--user-resize`).
 //! Then rotation: once the relaunched instance has run its frames, the second output takes transform [`ROTATED_TRANSFORM`] in place. GDK reports no change for a half turn (same geometry), so only the platform layer's own
 //! wl_output listener (atl-platform-ui-linux outputs.rs) can see it; the services must take a second display, the same one at Surface.ROTATION_180. Only windowConfiguration changes, which is not a public
 //! config diff (ActivityRecord.getConfigurationChanges: `diffPublicOnly`), so there is no second relaunch.
@@ -33,6 +34,10 @@ pub const WITHHELD: [&str; 1] = ["zxdg_output_manager_v1"];
 pub const OUTPUTS: [Output; 2] = [GATE_OUTPUT, SCALED_OUTPUT];
 /// wl_output transform 180 (wayland.xml), given to the second output after the move: same size, so no GDK signal and no relaunch.
 pub const ROTATED_TRANSFORM: i32 = 2;
+/// `--user-resize`: the whole window the probe configures before the move, logical px: no opening size of any run (1440x900 px content, 411x914).
+const USER_RESIZE: (i32, i32) = (1000, 700);
+/// That configure's serial: above any the nested compositor reaches in a run.
+const USER_RESIZE_SERIAL: u32 = 0x7000_0001;
 /// How long the relaunched instance may take to run its frames after the move.
 const RELAUNCH_WAIT: Duration = Duration::from_secs(60);
 /// The fixture's density line (Main.java logDensity): `AtlWindow: density <created|changed> config=N metrics=N`.
@@ -43,6 +48,8 @@ const MONITOR_LINE: &str = "services: monitor ";
 const UNCHANGED: &str = " unchanged";
 /// The fixture's size line (testdata Main.java logDensity): `AtlWindow: size <created|changed> sw=N task_sw=N real=WxH`, at each onCreate and onConfigurationChanged.
 const SIZE_LINE: &str = "AtlWindow: size ";
+/// The fixture's layout line (testdata Main.java): `AtlWindow: size=WxH screenWidthDp=N window=WxH display=WxH orientation=N`, one per size change of the content view.
+const LAYOUT_LINE: &str = "AtlWindow: size=";
 /// The fixture's display line (testdata Main.java logDisplay): `AtlWindow: display <created|changed|settled> info=WxH@hz,dpi,rotation sf=WxH@hz,dpi`, what IDisplayManager.getDisplayInfo
 /// and SurfaceFlinger's active mode answer the app; `settled` after each instance's last frame callback, when a reply that relaunched it has reached the in-app compositor.
 const APP_DISPLAY_LINE: &str = "AtlWindow: display ";
@@ -52,7 +59,13 @@ const SETTLED: &str = "settled";
 const LAST_FRAME: &str = "AtlWindow: frame 31 ";
 
 /// The probe: once the window has drawn on the first output, the first output goes off.
-pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liveness, Miss> {
+/// `user_resize`: the window is first given [`USER_RESIZE`] (a configure, what a user's drag makes the compositor send).
+pub fn drive(
+    proxy: Proxy,
+    app_log: &Path,
+    outputs: OutputControl,
+    user_resize: bool,
+) -> Result<Liveness, Miss> {
     until(&Wait::event(
         "configure-ack",
         "the window never acked a configure",
@@ -68,6 +81,29 @@ pub fn drive(proxy: Proxy, app_log: &Path, outputs: OutputControl) -> Result<Liv
         &|t: &str| t.contains(DRAW_LINE),
     ))?;
     std::thread::sleep(INPUT_SETTLE);
+    if user_resize {
+        let (width, height) = USER_RESIZE;
+        let serial = USER_RESIZE_SERIAL;
+        proxy
+            .inject_configure(width, height, serial, &[])
+            .map_err(|e| e.to_string())?;
+        until(&Wait::event(
+            "user-resize-ack",
+            "the window never acked the user's resize",
+            ACK_WAIT,
+            &proxy.events,
+            &|e: &ProxyEvent| *e == ProxyEvent::Acked { serial },
+        ))?;
+        // the resize's layout before the move
+        until(&Wait::log(
+            "user-resize-layout",
+            "the content was never laid out at the user's size",
+            ACK_WAIT,
+            app_log,
+            &|t: &str| layouts(t).last().is_some_and(|l| l.0 == width),
+        ))?;
+        std::thread::sleep(INPUT_SETTLE);
+    }
     outputs.only(1).map_err(|e| format!("{e:#}"))?;
     // the relaunched (second) instance ran its frame callbacks: the move's configuration change is over
     until(&Wait::log(
@@ -105,6 +141,7 @@ pub fn checks(
     opened: DisplayModel,
     moved: DisplayModel,
     declared: Option<Declaration>,
+    user_resize: bool,
 ) -> Vec<Sub> {
     let mut subs = vec![
         (
@@ -130,6 +167,10 @@ pub fn checks(
         ("density", density_check(app, opened.dpi, moved.dpi)),
         ("relaunch", relaunch_check(app, services)),
         ("frames", frames_check(app)),
+        (
+            "bounds",
+            bounds_check(app, opened, moved, declared, user_resize),
+        ),
     ];
     if let Some(declared) = declared {
         subs.push(("declared", declared_check(app, declared, opened, moved)));
@@ -213,9 +254,9 @@ fn display_check(
     }
 }
 
-/// One instance's size line: the activity's smallest width (its Task's override, dp) and the display's real size (px). The application context's sw is logged, not read: in a freeform
-/// Task it is the process's configuration, which carries the Task's override (AOSP preBindApplication), not the global one (global_configuration, unit tested).
+/// One instance's size line: the process's smallest width (the application context's, dp: the Task's override, AOSP preBindApplication), the activity's and the display's real size (px).
 struct InstanceSize {
+    sw: i32,
     task_sw: i32,
     real: (i32, i32),
 }
@@ -228,11 +269,60 @@ fn sizes(app: &str) -> Vec<InstanceSize> {
             let field = |key: &str| rest.split_whitespace().find_map(|w| w.strip_prefix(key));
             let (w, h) = field("real=")?.split_once('x')?;
             Some(InstanceSize {
+                sw: field("sw=")?.parse().ok()?,
                 task_sw: field("task_sw=")?.parse().ok()?,
                 real: (w.parse().ok()?, h.parse().ok()?),
             })
         })
         .collect()
+}
+
+/// The window bounds (px) the content was laid out in, one per layout line, in order.
+fn layouts(app: &str) -> Vec<(i32, i32)> {
+    app.lines()
+        .filter(|l| l.contains(LAYOUT_LINE))
+        .filter_map(|l| {
+            let (w, h) = word(l, "window")?.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The window bounds before and after the move: the opening size -- the declared display, or 3/4 of the display (AOSP, [`super::opening_size_i32`]) -- or the user's resize after it, then the same dp size on the moved output and nothing else (AOSP keeps a moved window's widthDp / heightDp, MultiDisplayDragMoveBoundsCalculator; a Wayland compositor keeps its logical size).
+/// The height of the user's resize is what the window's chrome leaves of it: read from its layout; its width is [`USER_RESIZE`]'s.
+fn bounds_check(
+    app: &str,
+    opened: DisplayModel,
+    moved: DisplayModel,
+    declared: Option<Declaration>,
+    user_resize: bool,
+) -> Result<String, String> {
+    let relaunch = app
+        .match_indices(CREATE_LINE)
+        .nth(1)
+        .map_or(app.len(), |(at, _)| at);
+    let (before, after) = (layouts(&app[..relaunch]), layouts(&app[relaunch..]));
+    let opening = declared.map_or(super::opening_size_i32(opened), |d| {
+        (d.width_dp, d.height_dp)
+    });
+    // the first output is at density 160: 1 px = 1 dp
+    let last = *before.last().ok_or("no layout before the move")?;
+    let placed = if user_resize {
+        before.first() == Some(&opening) && last.0 == USER_RESIZE.0 && last != opening
+    } else {
+        before.iter().all(|b| *b == opening)
+    };
+    let px = |dp: i32| {
+        (f64::from(dp) * f64::from(moved.dpi) / f64::from(DENSITY_DEFAULT)).round() as i32
+    };
+    let want = (px(last.0), px(last.1));
+    if placed && !after.is_empty() && after.iter().all(|b| *b == want) {
+        Ok(format!("{before:?} then {want:?}"))
+    } else {
+        Err(format!(
+            "bounds {before:?} then {after:?}, want opening {opening:?} then {want:?} only"
+        ))
+    }
 }
 
 /// One display line of the app: its tag and what DisplayInfo (`info`) and SurfaceFlinger's active mode (`sf`: natural size, refresh rate, dpi) answered; an answer that failed to parse is None.
@@ -294,7 +384,7 @@ fn app_display_problem(line: Option<&AppDisplay>, at: &str, want: DisplayModel) 
 
 /// The declared display on the two outputs, as the app reads it. The real display size is the declared size in px at each output's density (px = dp x dpi / 160); what IDisplayManager.getDisplayInfo
 /// and SurfaceFlinger's active mode answer the app is that size at the output's dpi and rate, at open (the first instance's create) and after the move (the last `settled` line); the relaunched
-/// instance ran its frames. No app sw row: in a freeform Task the app's Configuration is its Task's (AOSP preBindApplication).
+/// instance ran its frames. The Task is the display (AOSP without desktop mode): the app's and the activity's sw are the declared smallest width at both outputs.
 fn declared_check(
     app: &str,
     declared: Declaration,
@@ -337,6 +427,15 @@ fn declared_check(
             want(moved).1
         ));
     }
+    let sw = declared.width_dp.min(declared.height_dp);
+    for (at, s) in [("at open", first), ("after the move", last)] {
+        if (s.sw, s.task_sw) != (sw, sw) {
+            problems.push(format!(
+                "sw {at}: app {}, activity {}, want {sw}",
+                s.sw, s.task_sw
+            ));
+        }
+    }
     if app.matches(LAST_FRAME).count() < 2 {
         problems.push("the relaunched instance ran no frame after the move".to_owned());
     }
@@ -348,13 +447,11 @@ fn declared_check(
         return Err(problems.join("; "));
     }
     Ok(format!(
-        "real {}x{} then {}x{}, task sw {} then {}, DisplayInfo = SurfaceFlinger {} then {}",
+        "real {}x{} then {}x{}, app sw {sw} at both, DisplayInfo = SurfaceFlinger {} then {}",
         want(opened).0,
         want(opened).1,
         want(moved).0,
         want(moved).1,
-        first.task_sw,
-        last.task_sw,
         shown(opened).to_arg(),
         shown(moved).to_arg()
     ))

@@ -488,7 +488,7 @@ impl ActivityTasks {
             orientation: decl.screen_orientation,
             bounds: crate::packages::bounds_input(decl),
         };
-        // the Task's size came from this root's orientation (initial_size): the base the first top change is compared with
+        // the Task's size came from this root's orientation (Tasks::opening_size): the base the first top change is compared with
         self.tasks
             .replace_top_orientation(task, decl.screen_orientation);
         let launch = Launch {

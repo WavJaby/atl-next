@@ -67,6 +67,8 @@ struct Shared {
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The window surface's scale (GdkSurface `scale`: wp_fractional_scale_v1's preferred scale once it arrived), None before realise: the monitor report's density scale ([`reported_monitor`]).
     surface_scale: Cell<Option<f64>>,
+    /// The opening size is not granted yet: until the first presented scene is painted with the window on a monitor, a scale change re-fits the window to the size asked for in physical pixels ([`fit_window`]). Afterwards the window keeps its logical size, the user's or the compositor's, at every scale (AOSP keeps a window's dp size across displays). A compositor sends the preferred fractional scale with the surface's enter, so it precedes that paint.
+    opening: Cell<bool>,
     /// The pointer's last position over the content (logical pixels): GTK's leave and scroll signals carry none.
     pointer_at: Cell<(f64, f64)>,
     /// Time (ms) of the last pointer event published: moves must come strictly after it (`input::motion_samples`).
@@ -122,6 +124,9 @@ impl Shared {
     fn painted(&self) {
         if !self.paint_pending.replace(false) {
             return;
+        }
+        if self.monitor.borrow().is_some() && self.opening.replace(false) {
+            tracing::info!("atl-platform-ui: opening size granted");
         }
         let retired = std::mem::take(&mut *self.retired.borrow_mut());
         let releases = retired
@@ -480,7 +485,7 @@ impl GtkWindow {
     }
 }
 
-/// Sizes the window to the content's wanted physical size at the surface's current scale, keeping the chrome around the content. Runs at each change of either: the window keeps its integer-scale size otherwise, when the fractional scale arrives after the first layout (Hyprland, 1.6).
+/// Sizes the window to the content's wanted physical size at the surface's current scale, keeping the chrome around the content. Runs at each change of the wanted size, and at each scale change until the opening size is granted (`Shared::opening`): the window keeps its integer-scale size otherwise, when the fractional scale arrives after the first layout (Hyprland, 1.6).
 fn fit_window(window: &gtk4::Window, view: &SceneView) {
     if !(window.is_mapped() && window.surface().is_some_and(|s| s.is_mapped())) {
         return;
@@ -575,6 +580,7 @@ impl Window for GtkWindow {
             on_close_requested: Slot::new(),
             monitor: RefCell::new(None),
             surface_scale: Cell::new(None),
+            opening: Cell::new(true),
             on_painted: Slot::new(),
             on_presented: Slot::new(),
             presentation: RefCell::new(None),
@@ -617,7 +623,9 @@ impl Window for GtkWindow {
                 surface.connect_scale_notify(move |s| {
                     tracing::info!("atl-platform-ui: surface scale {}", s.scale());
                     // the density follows the surface's scale: the monitor is reported again at it
+                    let mut opening = false;
                     if let Some(shared) = rescaled.upgrade() {
+                        opening = shared.opening.get();
                         shared.surface_scale.set(Some(s.scale()));
                         let monitor = shared.monitor.borrow().as_ref().map(|(m, _)| m.clone());
                         if let Some(m) = monitor {
@@ -630,7 +638,9 @@ impl Window for GtkWindow {
                         if let (Some(view), Some(window)) = (scaled.0.upgrade(), scaled.1.upgrade())
                         {
                             view.rescale();
-                            fit_window(&window, &view);
+                            if opening {
+                                fit_window(&window, &view);
+                            }
                         }
                     });
                 });
