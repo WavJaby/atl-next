@@ -28,9 +28,9 @@ pub enum ScanReply {
 
 /// The control socket's install half (installd's role): staging + the installer run, then the commit (the services' boot-time install, system_services.rs).
 impl ControlSocket {
-    /// Stages session `session` for `uid` and runs the installer: the frames file's host path.
-    pub fn install(&self, session: u32, uid: u32) -> io::Result<String> {
-        match self.call(&Request::Install { session, uid })? {
+    /// Stages session `session` and runs the installer: the frames file's host path.
+    pub fn install(&self, session: u32) -> io::Result<String> {
+        match self.call(&Request::Install { session })? {
             Response::Staged { frames } => Ok(frames),
             Response::Error { message } => Err(io::Error::other(message)),
             other => Err(io::Error::other(format!("install answered {other:?}"))),
@@ -71,14 +71,12 @@ impl ControlSocket {
         &self,
         session: u32,
         package: &str,
-        uid: u32,
         version: i64,
         installed: i64,
     ) -> io::Result<String> {
         match self.call(&Request::Reinstate {
             session,
             package: package.to_owned(),
-            uid,
             version,
             installed,
         })? {
@@ -281,10 +279,7 @@ mod tests {
                     .expect("release");
                 Response::Started { pid: 77 }
             }
-            Request::Install {
-                session: 1,
-                uid: 10_123,
-            } => {
+            Request::Install { session: 1 } => {
                 fake.install_seen
                     .lock()
                     .expect("seen")
@@ -342,7 +337,7 @@ mod tests {
         let (install_done, install_result) = mpsc::channel();
         let installing = Arc::clone(&pc);
         std::thread::spawn(move || {
-            install_done.send(installing.install(1, 10_123)).ok();
+            install_done.send(installing.install(1)).ok();
         });
         install_seen_rx
             .recv_timeout(Duration::from_secs(5))

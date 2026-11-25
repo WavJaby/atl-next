@@ -82,27 +82,25 @@ pub enum Request {
         pid: i32,
     },
     /// Stage session `session`'s files under their session names (the source file names, as `pm install-multiple` writes them: PackageManagerShellCommand.doWriteSplits) in `/data/app/vmdl<session>.tmp`
-    /// and run the installer over it (parse + native-library copy). `uid` (the package's future uid) must be above the installer's own ([`crate::INSTALLER_UID`]). Answered [`Response::Staged`]; a failed
-    /// installer run removes the staging dir and answers its stderr.
+    /// and run the installer over it (parse + native-library copy). Answered [`Response::Staged`]; a failed installer run removes the staging dir and answers its stderr.
     Install {
         session: u32,
-        uid: u32,
     },
     /// Rename each staged file to the name its parsed split gives (`names`: PackageInstallerSession's uniform naming, ApkLiteParseUtils.splitNameToFileName), then the staged dir to
     /// `/data/app/<package>`, and create the package's data dirs (installd createAppData): the services decoded the frames and accepted them. `names` covers every staged file once.
+    /// `uid` (the package's uid, chosen by the services after the parse) must be above the installer's own ([`crate::INSTALLER_UID`]).
     Commit {
         session: u32,
         package: String,
         uid: u32,
         names: Vec<StagedName>,
     },
-    /// The services refused staged session `session` (staged for `uid`) as INSTALL_FAILED_VERSION_DOWNGRADE (`version` below the installed `installed`): its staging dir goes and the installer
+    /// The services refused staged session `session` as INSTALL_FAILED_VERSION_DOWNGRADE (`version` below the installed `installed`): its staging dir goes and the installer
     /// parses `package`'s installed `/data/app/<package>` in place (as an unchanged session, `--installed`) under the same session, so the session's `Commit` registers the installed package as it
     /// is (PMS refuses that install only; the installed package stays and runs). atld says so in one line naming both versionCodes. Answered [`Response::Staged`]; a failed run answers its stderr.
     Reinstate {
         session: u32,
         package: String,
-        uid: u32,
         version: i64,
         installed: i64,
     },
@@ -764,13 +762,7 @@ mod tests {
             serve_lanes(server, |_| Response::Noted, |_| panic!("installer bug"))
         });
         let client = Arc::new(Client::new(client).expect("client"));
-        let install = call_within(
-            &client,
-            Request::Install {
-                session: 1,
-                uid: 10_001,
-            },
-        );
+        let install = call_within(&client, Request::Install { session: 1 });
         assert!(install.is_err(), "{install:?}");
         let later = call_within(&client, Request::Network);
         assert!(later.is_err(), "{later:?}");
@@ -807,10 +799,7 @@ mod tests {
             )
             .expect("serve_lanes");
         });
-        let install = |session| Request::Install {
-            session,
-            uid: 10_001,
-        };
+        let install = |session| Request::Install { session };
         let commit = Request::Commit {
             session: 3,
             package: "com.example".into(),
@@ -873,14 +862,10 @@ mod tests {
         });
         let client = Client::new(client).expect("client");
         let calls = vec![
-            Request::Install {
-                session: 1,
-                uid: 10_001,
-            },
+            Request::Install { session: 1 },
             Request::Reinstate {
                 session: 1,
                 package: "com.example".into(),
-                uid: 10_001,
                 version: 2,
                 installed: 3,
             },
@@ -922,13 +907,7 @@ mod tests {
             )
         });
         let client = Arc::new(Client::new(client).expect("client"));
-        let answer = call_within(
-            &client,
-            Request::Install {
-                session: 1,
-                uid: 10_001,
-            },
-        );
+        let answer = call_within(&client, Request::Install { session: 1 });
         assert!(matches!(answer, Ok(Response::Error { .. })), "{answer:?}");
         drop(client);
         server.join().expect("server thread").expect("serve_lanes");
@@ -975,13 +954,7 @@ mod tests {
             )
         });
         let client = Arc::new(Client::new(client).expect("client"));
-        let in_flight = call_async(
-            &client,
-            Request::Install {
-                session: 1,
-                uid: 10_001,
-            },
-        );
+        let in_flight = call_async(&client, Request::Install { session: 1 });
         running.recv_timeout(WAIT).expect("the installer runs");
         send(&raw, b"not json", SendFlags::empty()).expect("send");
         let failed = in_flight
@@ -1016,13 +989,7 @@ mod tests {
             )
         });
         let client = Arc::new(Client::new(client).expect("client"));
-        let in_flight = call_async(
-            &client,
-            Request::Install {
-                session: 1,
-                uid: 10_001,
-            },
-        );
+        let in_flight = call_async(&client, Request::Install { session: 1 });
         running.recv_timeout(WAIT).expect("the installer runs");
         let failed = call_within(&client, Request::Network);
         assert!(failed.is_err(), "{failed:?}");
@@ -1068,10 +1035,7 @@ mod tests {
             )
             .expect("serve_lanes");
         });
-        let install = Request::Install {
-            session: 1,
-            uid: 10_001,
-        };
+        let install = Request::Install { session: 1 };
         let requests = [
             install,
             Request::Start(start()),

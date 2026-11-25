@@ -45,7 +45,7 @@ pub fn install(
     for &session in sessions {
         let uid = ids.acquire().context("no application id left")?;
         let frames = control
-            .install(session, uid)
+            .install(session)
             .with_context(|| format!("installing session {session}"))?;
         let parsed = Parsed::read(&frames).with_context(|| format!("session {session}"))?;
         ensure!(
@@ -60,7 +60,7 @@ pub fn install(
             // PMS fails this install only (the installer's session result); the installed package stays as it was and runs: its code is parsed in place and committed unchanged
             Err(Downgrade { installed, .. }) => {
                 let frames = control
-                    .reinstate(session, &parsed.name, uid, version, installed)
+                    .reinstate(session, &parsed.name, version, installed)
                     .with_context(|| format!("keeping installed {}", parsed.name))?;
                 let kept =
                     Parsed::read(&frames).with_context(|| format!("installed {}", parsed.name))?;

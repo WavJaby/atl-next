@@ -971,10 +971,9 @@ struct Installd {
     committed: Mutex<BTreeMap<String, Committed>>,
 }
 
-/// One staged session: the uid it was staged for; `in_place`: the installed package whose code it equals (installed_code.rs), parsed where it lies instead of in a staging dir.
+/// One staged session; `in_place`: the installed package whose code it equals (installed_code.rs), parsed where it lies instead of in a staging dir.
 #[derive(Clone, PartialEq, Eq)]
 struct Staged {
-    uid: u32,
     in_place: Option<String>,
 }
 
@@ -1035,14 +1034,10 @@ fn staging_name(session: u32) -> String {
 }
 
 impl Host {
-    /// Request `Install`: stages session `session` for `uid` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
+    /// Request `Install`: stages session `session` (copies, AOSP names) and runs the installer over it in its profile; the frames file. A failed run removes the staging dir; its error carries the installer's stderr.
     /// A session equal to an installed package's code (installed_code.rs) is not staged: the installer runs over that code dir where it lies, its native-library root the package's own, with
     /// `--installed` (PMS's boot scan: parse, the install's ABI, no library copied). Log `install skipped: unchanged`.
-    fn install(&self, session: u32, uid: u32) -> Result<String> {
-        ensure!(
-            uid > INSTALLER_UID,
-            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
-        );
+    fn install(&self, session: u32) -> Result<String> {
         let i = &self.installd;
         let files = i
             .sessions
@@ -1091,7 +1086,7 @@ impl Host {
                 i.staged
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(session, Staged { uid, in_place });
+                    .insert(session, Staged { in_place });
                 Ok(frames)
             }
             Err(e) => {
@@ -1104,13 +1099,12 @@ impl Host {
         }
     }
 
-    /// Request `Reinstate`: session `session`, staged for `uid` in its staging dir, was refused as a downgrade (`version` below `installed`). The staging dir goes; the installer parses `package`'s
+    /// Request `Reinstate`: session `session`, staged in its staging dir, was refused as a downgrade (`version` below `installed`). The staging dir goes; the installer parses `package`'s
     /// installed code in place (as [`Host::install`]'s unchanged session) and the session is staged in place, so its commit registers the installed package unchanged. Logs the one user line.
     fn reinstate(
         &self,
         session: u32,
         package: &str,
-        uid: u32,
         version: i64,
         installed: i64,
     ) -> Result<String> {
@@ -1122,8 +1116,8 @@ impl Host {
         {
             let mut staged = i.staged.lock().unwrap_or_else(|e| e.into_inner());
             match staged.get(&session) {
-                Some(s) if s.uid == uid && s.in_place.is_none() => {}
-                _ => bail!("session {session}: not staged for uid {uid} in a staging dir"),
+                Some(s) if s.in_place.is_none() => {}
+                _ => bail!("session {session}: not staged in a staging dir"),
             }
             staged.remove(&session);
         }
@@ -1139,7 +1133,6 @@ impl Host {
         i.staged.lock().unwrap_or_else(|e| e.into_inner()).insert(
             session,
             Staged {
-                uid,
                 in_place: Some(package.to_owned()),
             },
         );
@@ -1231,11 +1224,15 @@ impl Host {
         }
     }
 
-    /// Request `Commit`: session `session` (staged for `uid`) becomes `/data/app/<package>` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
+    /// Request `Commit`: session `session` becomes `/data/app/<package>` as uid `uid` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
     fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<()> {
         ensure!(
             valid_package_name(package),
             "{package:?}: not a package name"
+        );
+        ensure!(
+            uid > INSTALLER_UID,
+            "uid {uid}: at or below the installer's ({INSTALLER_UID}); package uids start above it"
         );
         // the tables are checked and updated under their locks, the file work between them under none. Only the lane writes them, one item at a time: no other commit or scan runs
         // between this check and the insert. A start reads `committed` on the serving thread and sees the package only after the insert, when its files and data dirs are in place
@@ -1246,8 +1243,8 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .get(&session)
         {
-            Some(s) if s.uid == uid => s.in_place.clone(),
-            _ => bail!("session {session}: not staged for uid {uid}"),
+            Some(s) => s.in_place.clone(),
+            None => bail!("session {session}: not staged"),
         };
         ensure!(
             !i.committed
@@ -2269,8 +2266,8 @@ fn answerer(host: Arc<Host>) -> impl FnMut(Request) -> Response + Send + 'static
             Request::ProgramPid { pid } => host
                 .program_pid(pid)
                 .map(|pid| Response::ProgramPid { pid }),
-            Request::Install { session, uid } => host
-                .install(session, uid)
+            Request::Install { session } => host
+                .install(session)
                 .map(|frames| Response::Staged { frames }),
             Request::Commit {
                 session,
@@ -2283,11 +2280,10 @@ fn answerer(host: Arc<Host>) -> impl FnMut(Request) -> Response + Send + 'static
             Request::Reinstate {
                 session,
                 package,
-                uid,
                 version,
                 installed,
             } => host
-                .reinstate(session, &package, uid, version, installed)
+                .reinstate(session, &package, version, installed)
                 .map(|frames| Response::Staged { frames }),
             Request::Scan { dir } => host.scan(&dir),
             Request::ScanCommit { dir, package, uid } => host

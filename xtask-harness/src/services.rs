@@ -276,13 +276,11 @@ pub fn stage(
             },
             // session 0 was installed before the services started: its frames; no file moves (the client reads no package file)
             // atld's answer when atl-installer exits non-zero (atld main.rs, control Install)
-            Request::Install { session: 0, uid } if uid == APP_UID && break_install => {
-                Response::Error {
-                    message: "session 0: atl-installer exited exit status: 1: (break-install)"
-                        .to_owned(),
-                }
-            }
-            Request::Install { session: 0, uid } if uid == APP_UID => Response::Staged {
+            Request::Install { session: 0 } if break_install => Response::Error {
+                message: "session 0: atl-installer exited exit status: 1: (break-install)"
+                    .to_owned(),
+            },
+            Request::Install { session: 0 } => Response::Staged {
                 frames: frames.display().to_string(),
             },
             Request::Commit {
