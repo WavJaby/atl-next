@@ -14,7 +14,7 @@ use crate::aosp::{self, Manifest};
 use crate::git::{Ident, git, git_raw};
 use crate::licenses::{self, Licenses};
 use crate::sources::{self, Checkout, Pin, Sources};
-use crate::{par, patch, tree};
+use crate::{par, patch, prune, tree};
 
 /// The trunk as fetch compares against it: what `src/` holds.
 pub const MAIN_REF: &str = "origin/main";
@@ -457,7 +457,7 @@ fn drop_in(
     Ok(true)
 }
 
-/// Why checkout `dir` (under src/) must not be deleted, naming all it holds: a pinned checkout inside it, a task copy of it, a local branch or stash, a commit no ref holds, uncommitted changes. None = nothing a clone does not bring back.
+/// Why checkout `dir` (under src/) must not be deleted, naming all it holds: a pinned checkout inside it, a task copy of it, a local branch or stash, a commit no ref holds, uncommitted changes, untracked files not git-ignored and not xtask's prune marker. None = nothing a clone does not bring back.
 /// The one guard of every deletion (`--drop`, `--recreate`, an interrupted clone's re-clone): [`remove_checkout`] asks it, plans ask it early. `pinned`: sources.toml's checkouts.
 fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[Checkout]) -> Result<Option<String>> {
     let mut held = Vec::new();
@@ -524,12 +524,27 @@ fn drop_refusal(layout: &Layout, dir: &Path, pinned: &[Checkout]) -> Result<Opti
             held.push(format!("commit {head}, which no ref holds"));
         }
     }
-    match inspect(&layout.src().join(dir))? {
+    let abs = layout.src().join(dir);
+    let local = inspect(&abs)?;
+    match &local {
         Local::Unborn { files: true } => {
             held.push("git repository without commits holding files".into());
         }
         Local::Present { dirty: true, .. } => held.push("uncommitted changes".into()),
         Local::Missing | Local::Unborn { files: false } | Local::Present { .. } => {}
+    }
+    // only here, not in `inspect`: its `dirty` also drives the sync, where an untracked file is harmless (checkout refuses to overwrite one)
+    if matches!(local, Local::Present { .. }) {
+        let own: Vec<String> = patch::untracked(&abs)?
+            .into_iter()
+            .filter(|f| Path::new(f).file_name() != Some(std::ffi::OsStr::new(prune::MARKER)))
+            .collect();
+        if !own.is_empty() {
+            held.push(format!(
+                "untracked files: {}",
+                own.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     Ok((!held.is_empty()).then(|| held.join("; ")))
 }
@@ -1694,6 +1709,42 @@ mod tests {
             Action::Blocked(_)
         ));
         std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// An untracked file refuses a deletion and is named; xtask's prune marker and a git-ignored file do not.
+    #[test]
+    fn untracked_files_refuse_a_drop() {
+        let remote = Remote::new("drop-untracked");
+        let ws = remote.dir.with_extension("ws");
+        let _ = std::fs::remove_dir_all(&ws);
+        let layout = Layout::new(&ws, None);
+        let d = Path::new("aosp/u");
+        let dir = layout.src().join(d);
+        let url = format!("file://{}", remote.dir.display());
+        create_checkout(
+            &dir,
+            &layout.git_dir(d),
+            &url,
+            "refs/tags/v1",
+            &Sparse::Full,
+            None,
+        )
+        .unwrap();
+        let refusal = || drop_refusal(&layout, d, &[]).unwrap();
+        assert_eq!(refusal(), None);
+        std::fs::write(dir.join("x.c"), "").unwrap();
+        let why = refusal().expect("an untracked file was not counted");
+        assert!(why.contains("untracked files: x.c"), "{why}");
+        std::fs::remove_file(dir.join("x.c")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join(prune::MARKER), "").unwrap();
+        let exclude = git(Some(&dir), &["rev-parse", "--git-path", "info/exclude"]).unwrap();
+        let exclude = dir.join(exclude);
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.o\n").unwrap();
+        std::fs::write(dir.join("y.o"), "").unwrap();
+        assert_eq!(refusal(), None);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// `--drop`: an unpinned or unrequested checkout goes (dry run first); a requested one, a dirty one, one on a local branch and one with a task copy are refused, and one refusal drops nothing.

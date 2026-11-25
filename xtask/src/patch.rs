@@ -476,15 +476,16 @@ fn drift(u: &Up, licenses: &Licenses) -> Result<Option<Vec<String>>> {
 
 /// Untracked files of the checkout (`.gitignore`d ones excluded) that xtask did not put there.
 fn strays(u: &Up) -> Result<Vec<String>> {
-    let out = git(
-        Some(&u.checkout),
-        &["ls-files", "--others", "--exclude-standard"],
-    )?;
-    Ok(out
-        .lines()
-        .filter(|f| !u.untracked.contains(*f))
-        .map(str::to_owned)
+    Ok(untracked(&u.checkout)?
+        .into_iter()
+        .filter(|f| !u.untracked.contains(f.as_str()))
         .collect())
+}
+
+/// Untracked files of checkout `dir`, `.gitignore`d ones excluded; callers drop the ones xtask put there.
+pub(crate) fn untracked(dir: &Path) -> Result<Vec<String>> {
+    let out = git(Some(dir), &["ls-files", "--others", "--exclude-standard"])?;
+    Ok(out.lines().map(str::to_owned).collect())
 }
 
 /// `xtask fetch`'s second step, once the checkout is at its pin or on its patch branch: make the branch
