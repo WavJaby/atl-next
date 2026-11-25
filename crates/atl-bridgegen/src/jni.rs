@@ -190,10 +190,23 @@ pub enum LaneMap {
     Record { name: String, out: bool },
     /// ILP32: a guest pointer to one word -> a host-width temporary, widened in and written back narrowed (`ilp32::Kind::OutWord`)
     OutWord(crate::ilp32::Word),
-    /// ILP32: a guest handle of type `ty` -> the host object it names (`ilp32::Kind::Opaque`); `release`: the call ends the object's life, its handle is freed after it
-    Handle { ty: String, release: bool },
+    /// ILP32: a guest handle of type `ty` -> the host object it names (`ilp32::Kind::Opaque`); `ends`: the call may end the object's life, its handle is freed after it when the result says so
+    Handle { ty: String, ends: Ends },
     /// ILP32: a guest pointer to an array of 4-byte guest words (`ilp32::Kind::OutHandle`, or `Kind::Array` / a listed `Kind::OutWord`) -> a host array of host words for the call: each element converted by `elem`, `len` elements, crossing as `slots` says
     Words { elem: Elem, slots: Slots, len: Len },
+}
+
+/// When a call that ends a handle's object (build.rs `HANDLE_RELEASES`) has ended it, by its result: freed then, else relinked (ndk.rs `end_handle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ends {
+    /// no object ends with this call
+    No,
+    /// `void` result: always
+    Always,
+    /// `aaudio_result_t`, `media_status_t`: the OK value 0
+    OnZero,
+    /// `EGLBoolean`: `EGL_TRUE`, non-zero
+    OnNonZero,
 }
 
 /// How one guest word of a [`LaneMap::Words`] array becomes a host word.

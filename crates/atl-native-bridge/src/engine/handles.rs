@@ -2,7 +2,7 @@
 //! ILP32 handles (phase4-32bit P4b s4): a host object a 32-bit guest only names back (an `opaque` row position: `EGLDisplay`, `AAsset*`, `ALooper*`) crosses as a 32-bit handle, never as its address. One rule for every such value, whatever the address: a host pointer below 4 GiB is not passed raw "because it fits", so a guest cannot forge a host address -- only a handle this table issued resolves.
 //! - One table for every type (a type tag per slot for the live counts, not checked on use: the NDK passes one object under several typedef names, `EGLImage` / `EGLImageKHR` / `GLeglImageOES`).
 //! - One handle per live host address: the same object answers the same handle (`eglGetDisplay`, `AChoreographer_getInstance`), so the guest's comparisons hold.
-//! - Freed by the calls that end the object (build.rs `HANDLE_RELEASES`, `LaneMap::Handle(_, true)`); reference-counted releases keep it (the address keeps its handle while it lives; reused, it answers the same handle again).
+//! - Freed by the calls that end the object when they succeed (build.rs `HANDLE_RELEASES`, `LaneMap::Handle(_, Ends)`, the result decides: ndk.rs `end_handle`); reference-counted releases keep it (the address keeps its handle while it lives; reused, it answers the same handle again).
 //! - A handle the table does not hold (never issued, freed, forged) resolves to nothing: the caller refuses the call and counts it (`native-bridge.ilp32-handle`), never a host crash. AOSP's NDK leaves a bad pointer undefined.
 //! - Text results (`glGetString`, `AAsset_getName`) are copied once per distinct content into guest-addressable memory ([`intern`]): a stable address per string, as the NDK promises for static strings; a per-call buffer (`AAssetDir_getNextFileName`) gets the copy of its content, which stays valid longer than the host's.
 //! - Thread safety: one mutex; a crossing holds it only to look up or insert.
@@ -116,7 +116,7 @@ pub(super) fn to_host(h: usize) -> Option<usize> {
     with(|t| t.index(h).map(|i| t.slots[i].host))
 }
 
-/// Unlinks handle `h` from its host address before the call that ends the object: the slot still resolves for that call ([`to_host`]), but the address, which the host may hand out again the moment it frees the object, gets a new handle from [`to_guest`] -- never the dying one. [`release`] frees the slot after the call.
+/// Unlinks handle `h` from its host address before the call that may end the object: the slot still resolves for that call ([`to_host`]), but the address, which the host may hand out again the moment it frees the object, gets a new handle from [`to_guest`] -- never the dying one. Then [`release`] frees the slot if the call ended the object, else [`restore`] relinks it.
 pub(super) fn retire(h: usize) {
     let Ok(h) = u32::try_from(h) else { return };
     with(|t| {
@@ -144,6 +144,17 @@ pub(super) fn release(h: usize) {
     if let Some((at, len)) = window {
         super::active().release(at, len);
     }
+}
+
+/// Relinks handle `h` after a call that did not end its object (the undo of [`retire`]): the address names `h` again, replacing a handle a callback on another thread issued meanwhile (that handle's own [`release`] then leaves `h` be).
+pub(super) fn restore(h: usize) {
+    let Ok(h) = u32::try_from(h) else { return };
+    with(|t| {
+        if let Some(i) = t.index(h) {
+            let host = t.slots[i].host;
+            t.by_host.insert(host, h);
+        }
+    });
 }
 
 /// The window copy attached to handle `h` ([`attach`]), if any.

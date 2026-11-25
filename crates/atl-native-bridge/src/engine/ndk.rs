@@ -7,7 +7,7 @@
 //!
 //! The other arguments are host values already: object references are the host's, and on an LP64 guest an AAssetManager, ANativeWindow or pixel pointer names host memory the guest reads in the same address space. Every row's lanes fit six int and eight fp registers (build.rs refuses the rest), so one forwarder shape serves all: the fp lanes keep their bits untouched (a float in the low half of its register), an fp result returns in the fp register.
 
-use super::bindings::{self, Elem, LaneMap, Len, MappedRow, RetMap, Slots};
+use super::bindings::{self, Elem, Ends, LaneMap, Len, MappedRow, RetMap, Slots};
 use super::{convert, handles, jni, unsupported};
 
 /// The forwarded host function: six int lanes (SysV's integer registers) and eight fp lanes (its vector registers); a shorter prototype ignores the rest. One int result (a void one's is never read).
@@ -58,17 +58,18 @@ pub(super) fn call_mapped(
         ))
     });
     // ILP32 handles first: an unknown one refuses the whole call before any temporary or host side effect
-    let mut released: Option<usize> = None;
+    // the handle whose object the call may end, and how its result says so (`end_handle` after the call)
+    let mut released: Option<(usize, Ends)> = None;
     // word arrays: (lane, the guest array, its element and direction, the host array); the host arrays live until the call returns
     let mut slots: Vec<(usize, usize, Elem, Slots, Vec<usize>)> = Vec::new();
     for &(i, map) in maps {
         match map {
-            LaneMap::Handle(_, release) => {
+            LaneMap::Handle(_, ends) => {
                 let Some(host) = handles::to_host(lanes[i]) else {
                     return refuse_handle(symbol, i, lanes[i]);
                 };
-                if release {
-                    released = Some(lanes[i]);
+                if ends != Ends::No {
+                    released = Some((lanes[i], ends));
                 }
                 lanes[i] = host;
             }
@@ -129,8 +130,8 @@ pub(super) fn call_mapped(
             LaneMap::Down(_) | LaneMap::DownHandle(..) => {}
         }
     }
-    // the ending call's address may be reused by the host before `release` below: unlink it now so `to_guest` cannot hand out the dying handle
-    if let Some(h) = released {
+    // the ending call's address may be reused by the host once it frees the object: unlink it now so `to_guest` cannot hand out the dying handle
+    if let Some((h, _)) = released {
         handles::retire(h);
     }
     let [a0, a1, a2, a3, a4, a5] = lanes;
@@ -171,8 +172,8 @@ pub(super) fn call_mapped(
             );
         }
     }
-    if let Some(h) = released {
-        handles::release(h);
+    if let Some((h, ends)) = released {
+        end_handle(h, ends, value);
     }
     match ret {
         RetMap::Plain => value,
@@ -194,6 +195,15 @@ pub(super) fn call_mapped(
             );
             0
         }),
+    }
+}
+
+/// The tail of a call that may end the object its handle `h` names: freed when `value` (the result) says it ended, else relinked. A refused call (AOSP `safeReleaseClose`: INVALID_STATE on the callback thread, the stream open) keeps its handle.
+fn end_handle(h: usize, ends: Ends, value: usize) {
+    if ends.ended(value) {
+        handles::release(h);
+    } else {
+        handles::restore(h);
     }
 }
 
@@ -436,5 +446,81 @@ mod tests {
         for h in [arr[0], arr[1]] {
             handles::release(h as usize);
         }
+    }
+
+    /// C3 (brief aaudio-reentrant-close): a close AOSP refuses (`safeReleaseClose` -> AAUDIO_ERROR_INVALID_STATE, -895, the stream still open) keeps the guest's handle; a later close answering 0 frees it.
+    #[test]
+    fn a_refused_close_keeps_its_handle() {
+        let s = 0x7f00_0000_9000usize;
+        let h = handles::to_guest("AAudioStream", s).unwrap() as usize;
+        handles::retire(h);
+        end_handle(h, Ends::OnZero, (-895i32) as u32 as usize);
+        assert_eq!(handles::to_host(h), Some(s), "the stream is still open");
+        assert_eq!(handles::to_guest("AAudioStream", s), Some(h as u32));
+        handles::retire(h);
+        end_handle(h, Ends::OnZero, 0);
+        assert_eq!(handles::to_host(h), None, "a closed stream's handle");
+    }
+
+    /// A C `int` result leaves the register's upper half undefined: 0 in the low word ended the object, whatever the high word holds.
+    #[test]
+    fn an_int_result_is_read_in_its_low_word() {
+        let s = 0x7f00_0000_a000usize;
+        let h = handles::to_guest("AAudioStream", s).unwrap() as usize;
+        handles::retire(h);
+        end_handle(h, Ends::OnZero, 0xffff_ffff_0000_0000);
+        assert_eq!(handles::to_host(h), None);
+    }
+
+    /// A refused close inside the window another thread's callback uses (`scoped` issues a second handle for the address): the older handle is restored, and the callback's own release leaves it.
+    #[test]
+    fn a_refused_close_restores_its_handle_over_a_second_one() {
+        let s = 0x7f00_0000_b000usize;
+        let h = handles::to_guest("AAudioStream", s).unwrap() as usize;
+        handles::retire(h);
+        let (h2, fresh) = handles::scoped("AAudioStream", s).unwrap();
+        assert!(fresh);
+        end_handle(h, Ends::OnZero, (-895i32) as u32 as usize);
+        assert_eq!(handles::to_guest("AAudioStream", s), Some(h as u32));
+        handles::release(h2 as usize);
+        assert_eq!(handles::to_guest("AAudioStream", s), Some(h as u32));
+        handles::release(h);
+    }
+
+    /// `EGLBoolean` (`eglDestroySurface`): EGL_FALSE keeps the surface, EGL_TRUE frees it.
+    #[test]
+    fn an_egl_boolean_frees_its_handle_when_true() {
+        let s = 0x7f00_0000_c000usize;
+        let h = handles::to_guest("EGLSurface", s).unwrap() as usize;
+        handles::retire(h);
+        end_handle(h, Ends::OnNonZero, 0);
+        assert_eq!(handles::to_host(h), Some(s), "EGL_FALSE: the surface lives");
+        handles::retire(h);
+        end_handle(h, Ends::OnNonZero, 1);
+        assert_eq!(handles::to_host(h), None, "EGL_TRUE: destroyed");
+    }
+
+    /// The arm table's generated `Ends` per handle lane (parameter, test) of each release row: the released handle by its result class (`aaudio_result_t` and `media_status_t` OnZero, `EGLBoolean` OnNonZero, `void` Always); the other handle lanes end nothing.
+    #[test]
+    fn release_rows_carry_the_result_test_of_their_return_type() {
+        let ends = |symbol: &str| -> Vec<(usize, Ends)> {
+            bindings::qemu_arm::MAPPED_ROWS
+                .iter()
+                .filter(|(_, s, ..)| *s == symbol)
+                .flat_map(|(_, _, maps, _)| maps.iter())
+                .filter_map(|&(i, m)| match m {
+                    LaneMap::Handle(_, e) => Some((i, e)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(ends("AAudioStream_close"), [(0, Ends::OnZero)]);
+        assert_eq!(ends("AMediaCodec_delete"), [(0, Ends::OnZero)]);
+        // eglDestroySurface(dpy, surface): the display lane is a handle the call does not end
+        assert_eq!(
+            ends("eglDestroySurface"),
+            [(0, Ends::No), (1, Ends::OnNonZero)]
+        );
+        assert_eq!(ends("AFont_close"), [(0, Ends::Always)]);
     }
 }

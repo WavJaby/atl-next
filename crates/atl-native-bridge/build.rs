@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use atl_bridgegen::buildscript::{self, Upstreams};
 use atl_bridgegen::ir::Ty;
-use atl_bridgegen::jni::{Elem, LaneMap, RetMap, Route};
+use atl_bridgegen::jni::{Elem, Ends, LaneMap, RetMap, Route};
 use atl_bridgegen::rust::{Table, api_module_with_table};
 use atl_bridgegen::{Lang, Source, Target};
 
@@ -1832,9 +1832,10 @@ fn ilp32_maps(
                 p,
                 LaneMap::Handle {
                     ty: ty.clone(),
-                    release: HANDLE_RELEASES
+                    ends: HANDLE_RELEASES
                         .iter()
-                        .any(|(f, at, _)| *f == name && *at == p),
+                        .find(|(f, at, _)| *f == name && *at == p)
+                        .map_or(Ends::No, |_| ends_of(name, &sig.ret)),
                 },
             )),
             // a reviewed callback (ILP32_CALLBACKS) whose route made it a down shell: the guest's own prototype placed
@@ -1968,7 +1969,7 @@ const JNI_REF_TYPES: &[&str] = &[
     "_jthrowable",
 ];
 
-/// Calls that end the life of the host object a handle parameter names (function, parameter, the header's words): its handle is freed after the call, so a later use is a counted refusal, never the host's freed memory. Reference-counted releases (`ANativeWindow_release`, `AHardwareBuffer_release`, `ALooper_release`, `ASurfaceControl_release`) are not here: another reference may keep the object, and the handle of a live address is reused (handles.rs). `eglTerminate` keeps the display (egl.h: `eglGetDisplay` answers the same handle). Each row must name a handle parameter of some ILP32 row (build fails otherwise).
+/// Calls that end the life of the host object a handle parameter names (function, parameter, the header's words): its handle is freed after the call when the result says it ended (`ends_of`), so a later use is a counted refusal, never the host's freed memory; a refused call (the object still open) keeps its handle. Reference-counted releases (`ANativeWindow_release`, `AHardwareBuffer_release`, `ALooper_release`, `ASurfaceControl_release`) are not here: another reference may keep the object, and the handle of a live address is reused (handles.rs). `eglTerminate` keeps the display (egl.h: `eglGetDisplay` answers the same handle). Each row must name a handle parameter of some ILP32 row (build fails otherwise).
 const HANDLE_RELEASES: &[(&str, usize, &str)] = &[
     (
         "AAsset_close",
@@ -2105,6 +2106,21 @@ const HANDLE_RELEASES: &[(&str, usize, &str)] = &[
     ("eglDestroySyncKHR", 1, "eglext.h"),
     ("eglDestroyStreamKHR", 1, "eglext.h"),
 ];
+
+/// The result test of a row that ends its object (`HANDLE_RELEASES`), by the return type's typedef name (`Ty::resolved` would erase it). Any other type fails the build, naming the function and type.
+fn ends_of(name: &str, ret: &atl_bridgegen::ir::Ty) -> Ends {
+    use atl_bridgegen::ir::Ty;
+    match ret {
+        Ty::Void => Ends::Always,
+        Ty::Typedef { name: t, .. } if t == "aaudio_result_t" || t == "media_status_t" => {
+            Ends::OnZero
+        }
+        Ty::Typedef { name: t, .. } if t == "EGLBoolean" => Ends::OnNonZero,
+        other => panic!(
+            "{name}: HANDLE_RELEASES row returns {other:?}; its result tests the end of the object only for void, aaudio_result_t, media_status_t and EGLBoolean"
+        ),
+    }
+}
 
 /// The per-guest ILP32 rows of an unequal-data-model guest ([`bindings_table`]): (library, function, the row's kinds, what it waits for: `carried`, its heaviest kind's label, `variable` or `libc-unprototyped`) for every row not wholly `Same`.
 type Ilp32Rows = Vec<(String, String, String, &'static str)>;
@@ -2714,14 +2730,20 @@ fn bindings_table(
     {
         code.push_str("use super::{Elem, Len, Slots};\n\n");
     }
+    if mapped_rows
+        .iter()
+        .any(|r| r.2.iter().any(|(_, m)| matches!(m, LaneMap::Handle { .. })))
+    {
+        code.push_str("use super::Ends;\n\n");
+    }
     code.push_str("/// Per `Entry::Mapped(i)`: library, symbol, the (parameter, map) pairs.\npub const MAPPED_ROWS: &[MappedRow] = &[\n");
     for (lib, name, maps, ret, _) in &mapped_rows {
         let maps: Vec<String> = maps
             .iter()
             .map(|(i, m)| match m {
                 LaneMap::Env => format!("({i}, LaneMap::Env)"),
-                LaneMap::Handle { ty, release } => {
-                    format!("({i}, LaneMap::Handle({ty:?}, {release}))")
+                LaneMap::Handle { ty, ends } => {
+                    format!("({i}, LaneMap::Handle({ty:?}, Ends::{ends:?}))")
                 }
                 LaneMap::Words { elem, slots, len } => {
                     let elem = match elem {

@@ -131,10 +131,36 @@ pub enum LaneMap {
     Record(&'static Conv, bool),
     /// ILP32: a guest pointer to one word -> a host-width temporary, written back narrowed (convert.rs). NULL stays NULL.
     OutWord(Word),
-    /// ILP32: a guest handle of this type -> the host object (handles.rs); `true`: the call ends the object, the handle is freed after it. 0 stays NULL; an unknown handle refuses the call (counted, answers 0).
-    Handle(&'static str, bool),
+    /// ILP32: a guest handle of this type -> the host object (handles.rs); `Ends`: the call may end the object, the handle is freed after it when [`Ends::ended`] says so. 0 stays NULL; an unknown handle refuses the call (counted, answers 0).
+    Handle(&'static str, Ends),
     /// ILP32: a guest pointer to an array of 4-byte guest words -> a host array of host words living for the call (ndk.rs `words_in`), each element converted by [`Elem`], [`Len`] elements, crossing as [`Slots`] says. NULL stays NULL; an unknown handle read in, a length past the bound or an unterminated list refuses the call.
     Words(Elem, Slots, Len),
+}
+
+/// When a call that ends a handle's object has ended it (atl_bridgegen `jni::Ends`), by its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ends {
+    /// no object ends with this call
+    No,
+    /// a `void` result: always
+    Always,
+    /// `aaudio_result_t`, `media_status_t`: the low word is 0
+    OnZero,
+    /// `EGLBoolean`: the low word is non-zero
+    OnNonZero,
+}
+
+impl Ends {
+    /// Whether a call whose result register is `value` ended the object. The C result is 32 bits: only the low word counts, the register's upper half being undefined.
+    pub fn ended(self, value: usize) -> bool {
+        let low = value as u32;
+        match self {
+            Ends::No => false,
+            Ends::Always => true,
+            Ends::OnZero => low == 0,
+            Ends::OnNonZero => low != 0,
+        }
+    }
 }
 
 /// How one guest word of a [`LaneMap::Words`] array becomes a host word (atl_bridgegen `jni::Elem`).
