@@ -215,6 +215,27 @@ pub struct RemoteArgs {
     view: Option<u16>,
 }
 
+/// A control's name and the run-apk flag it sets.
+type Control = (&'static str, fn(&mut Args));
+
+/// The breaks a scenario may declare as its `control` (scenarios.rs `lint`).
+pub const CONTROLS: &[Control] = &[
+    ("break-input", |a| a.break_input = true),
+    ("break-isa", |a| a.break_isa = true),
+    ("break-render-path", |a| a.break_render_path = true),
+    ("break-webview-engine", |a| a.break_webview_engine = true),
+    ("no-app-seccomp", |a| a.no_app_seccomp = true),
+];
+
+/// The control names, comma-separated, for messages.
+pub fn control_names() -> String {
+    CONTROLS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl Args {
     /// A `--drive` run of the APK file `apk`, for `xtask test drive`: its steps go to [`run_on`], not through `drive`.
     pub(crate) fn driven(
@@ -259,20 +280,13 @@ impl Args {
         }
     }
 
-    /// The same scenario run under control `name` (scenarios.rs `CONTROLS`): the break's own flag set.
+    /// The same scenario run under control `name` (`CONTROLS`): the break's own flag set.
     fn under_control(&self, name: &str) -> Result<Self> {
+        let Some((_, set)) = CONTROLS.iter().find(|(n, _)| *n == name) else {
+            bail!("control {name:?} is none of {}", control_names());
+        };
         let mut a = self.clone();
-        match name {
-            "break-input" => a.break_input = true,
-            "break-isa" => a.break_isa = true,
-            "break-render-path" => a.break_render_path = true,
-            "break-webview-engine" => a.break_webview_engine = true,
-            "no-app-seccomp" => a.no_app_seccomp = true,
-            other => bail!(
-                "control {other:?} is none of {}",
-                crate::scenarios::CONTROLS.join(", ")
-            ),
-        }
+        set(&mut a);
         Ok(a)
     }
 

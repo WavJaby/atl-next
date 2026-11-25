@@ -15,14 +15,6 @@ use crate::drive::{self, Network, Script, Step};
 /// The scenarios' dir, relative to the checkout root.
 pub const DIR: &str = "xtask-harness/scenarios";
 const EXT: &str = "drive";
-/// The breaks a scenario may declare as its `control` (run_apk.rs `Args::under_control` maps each to its run-apk flag).
-pub const CONTROLS: &[&str] = &[
-    "break-input",
-    "break-isa",
-    "break-render-path",
-    "break-webview-engine",
-    "no-app-seccomp",
-];
 /// A fixed `wait` is a settle after a condition, never the condition itself: design apk-scenarios S3 bounds it below 3 s, so a slow host fails a condition wait with its name instead of racing a timer.
 pub const FIXED_WAIT_MAX_MS: u64 = 3000;
 
@@ -87,13 +79,15 @@ pub fn lint(row: &str, text: &str, is_row: &dyn Fn(&str) -> bool) -> Result<Scri
     ensure!(
         !script.controls.is_empty(),
         "no `control` line: a scenario names the break it must fail under ({})",
-        CONTROLS.join(", ")
+        crate::run_apk::control_names()
     );
     for c in &script.controls {
         ensure!(
-            CONTROLS.contains(&c.as_str()),
+            crate::run_apk::CONTROLS
+                .iter()
+                .any(|(n, _)| *n == c.as_str()),
             "control {c:?} is none of {}",
-            CONTROLS.join(", ")
+            crate::run_apk::control_names()
         );
     }
     ensure!(
