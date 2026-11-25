@@ -2232,9 +2232,17 @@ impl Host {
     }
 }
 
-/// The control connection's server: answers the services' requests until they end it.
+/// The control connection's server: installer requests (installd's file work) run on the installer lane, every other request on this thread, in arrival order.
 fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
-    let result = control::serve(&fd, |request| {
+    let result = control::serve_lanes(fd, answerer(Arc::clone(&host)), answerer(host));
+    if let Err(e) = result {
+        log(format_args!("process control ended: {e}"));
+    }
+}
+
+/// One control request answered on `host`: a failure is an `Error` reply and a log line. Each thread gets its own instance.
+fn answerer(host: Arc<Host>) -> impl FnMut(Request) -> Response + Send + 'static {
+    move |request| {
         let outcome = match request {
             Request::Start(req) => host.start_app(&req).map(|pid| Response::Started { pid }),
             Request::Kill { pid } => host.kill(pid).map(|()| Response::Killed),
@@ -2289,9 +2297,6 @@ fn serve_control(host: Arc<Host>, fd: std::os::fd::OwnedFd) {
                 message: format!("{e:#}"),
             }
         })
-    });
-    if let Err(e) = result {
-        log(format_args!("process control ended: {e}"));
     }
 }
 

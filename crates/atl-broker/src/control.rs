@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
-//! The process-control protocol (maintainer D1, 2026-11-03): the system services start and kill app processes through the host (atld, which owns the broker) over one SEQPACKET connection, one JSON message per packet, strictly request then reply.
+//! The process-control protocol (maintainer D1, 2026-11-03): the system services start and kill app processes through the host (atld, which owns the broker) over one SEQPACKET connection, one JSON message per packet.
+//! Every message is an [`Envelope`] carrying the id of its call, so calls may overlap and replies may overtake each other: [`Client`] matches replies to calls, [`serve_lanes`] answers them.
 //! `Start` is where ProcessList.startProcessLocked ends (Process.start's arguments reduced to what the broker's sandbox needs); `Kill` is Process.killProcess of a process it started. The server refuses to kill pids it did not start.
 //! `Notify` / `Withdraw` carry the notification service's display requests: the services have no session bus, so atld shows them on the desktop.
 //! Only the services hold the client end (the broker passes it as their stdin, [`crate::Spawn::stdin`]): an app has no way to ask for a start or a kill.
 
+use std::collections::HashMap;
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread;
 
-use rustix::net::{RecvFlags, SendFlags, recv, send};
+use rustix::net::{RecvFlags, SendFlags, Shutdown, recv, send, shutdown};
 use serde::{Deserialize, Serialize};
 
 /// The largest message either side accepts. A start request is a few hundred bytes (names and a short argument list); `recv` reports a longer packet as an error rather than truncating it.
@@ -32,6 +37,14 @@ pub struct StartRequest {
     pub instruction_set: String,
     /// What the package's install-time grants give the sandbox ([`crate::rights_of`]): ProcessList's gids, which PackageManager derives from the grants.
     pub rights: Vec<crate::Right>,
+}
+
+/// One message on the wire: a request or a reply, with the id of the call it belongs to. The body's fields sit beside `id`: `{"id":5,"op":"kill","pid":5}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope<T> {
+    pub id: u64,
+    #[serde(flatten)]
+    pub body: T,
 }
 
 /// `Install` / `Commit` are the installd half of an install (PackageInstallerSession staging + installd): the services own the package list and ask the host for file work only.
@@ -104,6 +117,20 @@ pub enum Request {
     },
     /// The host's default network now, read outside the sandbox (GIO's verdict needs the host's main context). Answered [`Response::Network`]. The services ask once at start, after their watch starts, and again on each watch burst.
     Network,
+}
+
+impl Request {
+    /// installd's file work (staging, the installer run, renames, data dirs): atld answers these on its installer lane, one at a time in arrival order ([`serve_lanes`]). AOSP commits install sessions on one installer thread (PackageInstallerService), so one lane is the same bound.
+    pub fn is_installer_op(&self) -> bool {
+        matches!(
+            self,
+            Request::Install { .. }
+                | Request::Reinstate { .. }
+                | Request::Scan { .. }
+                | Request::Commit { .. }
+                | Request::ScanCommit { .. }
+        )
+    }
 }
 
 /// A notification's desktop form, mapped from Android's by the services (notifications plan N4).
@@ -225,26 +252,194 @@ fn write<T: Serialize>(fd: impl AsFd, m: &T) -> io::Result<()> {
     Ok(())
 }
 
-/// The client's side: sends `request` and waits for the reply. The server ending the connection is an error (`UnexpectedEof`).
-pub fn call(fd: impl AsFd, request: &Request) -> io::Result<Response> {
-    write(fd.as_fd(), request)?;
-    read(fd)?.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+/// The client's waiters: each unanswered call's reply slot, and why the connection ended once it has.
+#[derive(Default)]
+struct Waiting {
+    calls: HashMap<u64, mpsc::Sender<io::Result<Response>>>,
+    closed: Option<String>,
 }
 
-/// The server's side: answers each request with `handle` until the client ends the connection.
+/// Locks the waiter table; a poisoned lock still holds valid state (a panic in another caller).
+fn lock(m: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ended(why: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("control connection ended: {why}"),
+    )
+}
+
+/// The client end, shared by threads. A call takes an id and waits for the reply with that id; a reader thread routes replies by id, so a slow call never holds up another, and replies may overtake each other.
+/// When the connection ends, or a reply matches no call, the connection is shut down and every waiter and every later call fails with `UnexpectedEof`: nothing waits on a dead connection.
+pub struct Client {
+    fd: Arc<OwnedFd>,
+    waiting: Arc<Mutex<Waiting>>,
+    next_id: AtomicU64,
+}
+
+impl Client {
+    /// Takes the connection and starts its reader thread.
+    pub fn new(fd: OwnedFd) -> io::Result<Self> {
+        let fd = Arc::new(fd);
+        let waiting = Arc::new(Mutex::new(Waiting::default()));
+        let (reader_fd, reader_waiting) = (Arc::clone(&fd), Arc::clone(&waiting));
+        thread::Builder::new()
+            .name("control-replies".into())
+            .spawn(move || route_replies(&reader_fd, &reader_waiting))?;
+        Ok(Client {
+            fd,
+            waiting,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Sends `request` and waits for its reply. Fails when the connection has ended or the request could not be sent.
+    pub fn call(&self, request: &Request) -> io::Result<Response> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (slot, answer) = mpsc::channel();
+        {
+            let mut w = lock(&self.waiting);
+            if let Some(why) = &w.closed {
+                return Err(ended(why));
+            }
+            w.calls.insert(id, slot);
+        }
+        // SEQPACKET sends are whole messages: concurrent callers need no lock around the write
+        if let Err(e) = write(&*self.fd, &Envelope { id, body: request }) {
+            lock(&self.waiting).calls.remove(&id);
+            return Err(e);
+        }
+        // the reader answers every waiter before it ends, so a closed slot means the reader is gone
+        answer
+            .recv()
+            .unwrap_or_else(|_| Err(ended("reader stopped")))
+    }
+}
+
+impl Drop for Client {
+    // the reader's read ends and the server sees the end: both threads go
+    fn drop(&mut self) {
+        let _ = shutdown(&*self.fd, Shutdown::Both);
+    }
+}
+
+/// Routes each reply to the call with its id until the connection ends; then every waiter fails.
+fn route_replies(fd: &OwnedFd, waiting: &Mutex<Waiting>) {
+    let why = loop {
+        match read::<Envelope<Response>>(fd) {
+            Ok(Some(Envelope { id, body })) => {
+                let slot = lock(waiting).calls.remove(&id);
+                match slot {
+                    // a caller that went away takes its reply with it
+                    Some(slot) => {
+                        let _ = slot.send(Ok(body));
+                    }
+                    None => break format!("reply {id} matches no call"),
+                }
+            }
+            Ok(None) => break "end of connection".to_owned(),
+            Err(e) => break e.to_string(),
+        }
+    };
+    let _ = shutdown(fd, Shutdown::Both);
+    let mut w = lock(waiting);
+    for slot in w.calls.drain().map(|(_, slot)| slot) {
+        let _ = slot.send(Err(ended(&why)));
+    }
+    w.closed = Some(why);
+}
+
+/// The server's side: answers each request with `handle`, in arrival order, until the client ends the connection.
 pub fn serve(fd: impl AsFd, mut handle: impl FnMut(Request) -> Response) -> io::Result<()> {
-    while let Some(request) = read::<Request>(fd.as_fd())? {
-        write(fd.as_fd(), &handle(request))?;
+    while let Some(Envelope { id, body }) = read::<Envelope<Request>>(fd.as_fd())? {
+        write(
+            fd.as_fd(),
+            &Envelope {
+                id,
+                body: &handle(body),
+            },
+        )?;
     }
     Ok(())
+}
+
+/// Answers the connection until the client ends it. An installer op ([`Request::is_installer_op`]) goes to `installer`, which runs on one lane thread: one request at a time, in arrival order.
+/// Every other request goes to `inline`, on this thread, in arrival order. Each answer carries its request's id, so answers may overtake one another. Returns once the lane has answered what it holds.
+/// A panic on either thread shuts the connection down: the client's waiters fail at once instead of waiting for answers that will not come.
+pub fn serve_lanes(
+    fd: OwnedFd,
+    mut inline: impl FnMut(Request) -> Response,
+    mut installer: impl FnMut(Request) -> Response + Send + 'static,
+) -> io::Result<()> {
+    let fd = Arc::new(fd);
+    let _end = EndOnPanic(Arc::clone(&fd));
+    let (lane_tx, lane_rx) = mpsc::channel::<(u64, Request)>();
+    let lane = {
+        let fd = Arc::clone(&fd);
+        thread::Builder::new()
+            .name("control-installer".into())
+            .spawn(move || {
+                let _end = EndOnPanic(Arc::clone(&fd));
+                for (id, request) in lane_rx {
+                    // a client that went away takes its waiter with it
+                    let _ = write(
+                        &*fd,
+                        &Envelope {
+                            id,
+                            body: &installer(request),
+                        },
+                    );
+                }
+            })?
+    };
+    let result = loop {
+        let (id, request) = match read::<Envelope<Request>>(&*fd) {
+            Ok(Some(Envelope { id, body })) => (id, body),
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        };
+        if request.is_installer_op() {
+            if lane_tx.send((id, request)).is_err() {
+                break Err(io::Error::other("installer lane stopped"));
+            }
+        } else if let Err(e) = write(
+            &*fd,
+            &Envelope {
+                id,
+                body: &inline(request),
+            },
+        ) {
+            break Err(e);
+        }
+    };
+    drop(lane_tx);
+    let _ = lane.join();
+    result
+}
+
+/// Shuts the connection down when its thread panics: the client sees the end and fails its waiters.
+struct EndOnPanic(Arc<OwnedFd>);
+
+impl Drop for EndOnPanic {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let _ = shutdown(&*self.0, Shutdown::Both);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
 
-    fn pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn pair() -> (OwnedFd, OwnedFd) {
         socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -267,11 +462,19 @@ mod tests {
         }
     }
 
+    /// A call on its own thread: a call that never returns fails the test instead of hanging it.
+    fn call_within(client: &Arc<Client>, request: Request) -> io::Result<Response> {
+        let (done, answer) = channel();
+        let client = Arc::clone(client);
+        let _ = thread::spawn(move || done.send(client.call(&request)).ok());
+        answer.recv_timeout(WAIT).expect("the call returned")
+    }
+
     /// A request and its reply cross the socket intact, in order; the server returns when the client closes its end.
     #[test]
     fn request_reply_roundtrip() {
         let (client, server) = pair();
-        let thread = std::thread::spawn(move || {
+        let thread = thread::spawn(move || {
             let mut seen = Vec::new();
             serve(&server, |r| {
                 seen.push(r.clone());
@@ -289,16 +492,17 @@ mod tests {
             .expect("serve");
             seen
         });
+        let client = Client::new(client).expect("client");
         assert_eq!(
-            call(&client, &Request::Start(start())).expect("start"),
+            client.call(&Request::Start(start())).expect("start"),
             Response::Started { pid: 4242 }
         );
         assert_eq!(
-            call(&client, &Request::Kill { pid: 4242 }).expect("kill"),
+            client.call(&Request::Kill { pid: 4242 }).expect("kill"),
             Response::Killed
         );
         assert_eq!(
-            call(&client, &Request::Kill { pid: 7 }).expect("kill"),
+            client.call(&Request::Kill { pid: 7 }).expect("kill"),
             Response::Error {
                 message: "unknown pid 7".into()
             }
@@ -324,11 +528,190 @@ mod tests {
         assert_eq!(back, Response::Started { pid: 9 });
     }
 
-    /// A client that goes away mid-call is an error, not a hang.
+    /// The id sits beside the body's fields: one object per message, request and reply alike.
+    #[test]
+    fn envelope_wire_form() {
+        let json = serde_json::to_string(&Envelope {
+            id: 5,
+            body: &Request::Kill { pid: 5 },
+        })
+        .expect("encode");
+        assert_eq!(json, r#"{"id":5,"op":"kill","pid":5}"#);
+        let back: Envelope<Response> =
+            serde_json::from_str(r#"{"id":9,"status":"started","pid":9}"#).expect("decode");
+        assert_eq!(
+            back,
+            Envelope {
+                id: 9,
+                body: Response::Started { pid: 9 }
+            }
+        );
+    }
+
+    /// A server that is gone fails a call: an error, not a hang.
     #[test]
     fn server_gone() {
         let (client, server) = pair();
         drop(server);
-        assert!(call(&client, &Request::Kill { pid: 1 }).is_err());
+        let client = Arc::new(Client::new(client).expect("client"));
+        assert!(call_within(&client, Request::Kill { pid: 1 }).is_err());
+    }
+
+    /// Two calls in flight; the server answers the second first. Each caller gets the reply with its own id: a reply matched by arrival order would hand the first caller the other's.
+    #[test]
+    fn replies_are_matched_by_id() {
+        let (client, server) = pair();
+        let (first_seen, first_read) = channel();
+        let server = thread::spawn(move || {
+            let first = read::<Envelope<Request>>(&server)
+                .expect("read")
+                .expect("first");
+            first_seen.send(()).expect("signal");
+            let second = read::<Envelope<Request>>(&server)
+                .expect("read")
+                .expect("second");
+            for call in [second, first] {
+                let pid = match call.body {
+                    Request::Kill { pid } => pid,
+                    other => panic!("unexpected {other:?}"),
+                };
+                let reply = Response::Error {
+                    message: format!("pid {pid}"),
+                };
+                write(
+                    &server,
+                    &Envelope {
+                        id: call.id,
+                        body: &reply,
+                    },
+                )
+                .expect("reply");
+            }
+        });
+        let client = Arc::new(Client::new(client).expect("client"));
+        let (done, answers) = channel();
+        for pid in [1, 2] {
+            let (client, done) = (Arc::clone(&client), done.clone());
+            let _ =
+                thread::spawn(move || done.send((pid, client.call(&Request::Kill { pid }))).ok());
+            if pid == 1 {
+                first_read
+                    .recv_timeout(WAIT)
+                    .expect("the first call reached the server");
+            }
+        }
+        let mut answers: Vec<_> = (0..2)
+            .map(|_| answers.recv_timeout(WAIT).expect("a call returned"))
+            .collect();
+        answers.sort_by_key(|(pid, _)| *pid);
+        for (pid, answer) in answers {
+            assert_eq!(
+                answer.expect("call"),
+                Response::Error {
+                    message: format!("pid {pid}")
+                }
+            );
+        }
+        drop(client);
+        server.join().expect("server");
+    }
+
+    /// The server ends the connection with a call in flight: that call fails, and so does one made after. Neither waits for an answer that will not come.
+    #[test]
+    fn a_connection_end_fails_every_waiter() {
+        let (client, server) = pair();
+        let server = thread::spawn(move || {
+            read::<Envelope<Request>>(&server)
+                .expect("read")
+                .expect("the call");
+            drop(server);
+        });
+        let client = Arc::new(Client::new(client).expect("client"));
+        let in_flight = call_within(&client, Request::Kill { pid: 1 });
+        assert!(in_flight.is_err(), "{in_flight:?}");
+        server.join().expect("server");
+        let later = call_within(&client, Request::Kill { pid: 2 });
+        assert!(later.is_err(), "{later:?}");
+    }
+
+    /// An installer that panics ends the connection: its call and the calls after it fail, and the server returns.
+    #[test]
+    fn installer_panic_ends_connection() {
+        let (client, server) = pair();
+        let server = thread::spawn(move || {
+            serve_lanes(server, |_| Response::Noted, |_| panic!("installer bug"))
+        });
+        let client = Arc::new(Client::new(client).expect("client"));
+        let install = call_within(
+            &client,
+            Request::Install {
+                session: 1,
+                uid: 10_001,
+            },
+        );
+        assert!(install.is_err(), "{install:?}");
+        let later = call_within(&client, Request::Network);
+        assert!(later.is_err(), "{later:?}");
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve_lanes returns once the connection ends");
+    }
+
+    /// Installer requests run on one lane thread, in arrival order; the other requests run on the serving thread.
+    #[test]
+    fn installer_requests_share_one_lane_in_order() {
+        let (client, server) = pair();
+        let (seen, record) = channel::<(&'static str, thread::ThreadId, Request)>();
+        let lane_seen = seen.clone();
+        let server = thread::spawn(move || {
+            serve_lanes(
+                server,
+                move |r| {
+                    seen.send(("serving", thread::current().id(), r))
+                        .expect("record");
+                    Response::Noted
+                },
+                move |r| {
+                    lane_seen
+                        .send(("lane", thread::current().id(), r))
+                        .expect("record");
+                    Response::Noted
+                },
+            )
+            .expect("serve_lanes");
+        });
+        let client = Client::new(client).expect("client");
+        let install = |session| Request::Install {
+            session,
+            uid: 10_001,
+        };
+        assert_eq!(client.call(&install(1)).expect("install"), Response::Noted);
+        assert_eq!(
+            client.call(&Request::Network).expect("network"),
+            Response::Noted
+        );
+        assert_eq!(client.call(&install(2)).expect("install"), Response::Noted);
+        drop(client);
+        server.join().expect("server");
+        let all: Vec<_> = record.try_iter().collect();
+        let lane: Vec<_> = all.iter().filter(|s| s.0 == "lane").collect();
+        let serving: Vec<_> = all.iter().filter(|s| s.0 == "serving").collect();
+        assert_eq!(
+            lane.iter().map(|s| s.2.clone()).collect::<Vec<_>>(),
+            vec![install(1), install(2)]
+        );
+        assert_eq!(
+            serving.iter().map(|s| s.2.clone()).collect::<Vec<_>>(),
+            vec![Request::Network]
+        );
+        assert!(
+            lane.windows(2).all(|w| w[0].1 == w[1].1),
+            "one lane thread: {lane:?}"
+        );
+        assert_ne!(
+            lane[0].1, serving[0].1,
+            "the lane is not the serving thread"
+        );
     }
 }

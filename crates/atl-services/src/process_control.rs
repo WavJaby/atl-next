@@ -6,7 +6,6 @@
 
 use std::io;
 use std::os::fd::OwnedFd;
-use std::sync::Mutex;
 
 use atl_broker::control::{self, Request, Response, StagedName, StartRequest};
 
@@ -146,29 +145,31 @@ impl crate::notification::DesktopNotifications for ControlSocket {
     }
 }
 
-/// The control socket to atld. One request is in flight at a time: the protocol is request then reply on one connection.
+/// The control socket to atld. Calls overlap: `control::Client` routes each reply to the call that asked for it, so a slow install does not hold up a start.
 pub struct ControlSocket {
-    fd: Mutex<OwnedFd>,
+    client: control::Client,
 }
 
 impl ControlSocket {
     /// The connection atld passes as the services' stdin ([`atl_broker::Spawn::stdin`]).
     pub fn from_stdin() -> io::Result<Self> {
+        Self::over(rustix::stdio::stdin().try_clone_to_owned()?)
+    }
+
+    fn over(fd: OwnedFd) -> io::Result<Self> {
         Ok(ControlSocket {
-            fd: Mutex::new(rustix::stdio::stdin().try_clone_to_owned()?),
+            client: control::Client::new(fd)?,
         })
     }
 
     /// A socket to a test's fake atld.
     #[cfg(test)]
     pub(crate) fn new(fd: OwnedFd) -> Self {
-        ControlSocket { fd: Mutex::new(fd) }
+        Self::over(fd).expect("control reader thread")
     }
 
     fn call(&self, request: &Request) -> io::Result<Response> {
-        // a panic mid-call leaves the socket usable: the next request starts a fresh exchange
-        let fd = self.fd.lock().unwrap_or_else(|e| e.into_inner());
-        control::call(&*fd, request)
+        self.client.call(request)
     }
 }
 
@@ -261,5 +262,105 @@ mod tests {
         assert!(err.to_string().contains("not started: 5"), "{err}");
         drop(pc);
         server.join().expect("server");
+    }
+
+    /// The fake atld of the next test: `Install` reports its arrival, then waits for a `Start`; the `Start` releases it. Both lanes run this; only the routing decides the thread.
+    struct FakeAtld {
+        install_seen: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        start_tx: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        start_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    fn fake_atld(fake: &FakeAtld, r: Request) -> Response {
+        match r {
+            Request::Start(s) if s == request() => {
+                fake.start_tx
+                    .lock()
+                    .expect("start")
+                    .send(())
+                    .expect("release");
+                Response::Started { pid: 77 }
+            }
+            Request::Install {
+                session: 1,
+                uid: 10_123,
+            } => {
+                fake.install_seen
+                    .lock()
+                    .expect("seen")
+                    .send(())
+                    .expect("seen");
+                let released = fake
+                    .start_rx
+                    .lock()
+                    .expect("wait")
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                match released {
+                    Ok(()) => Response::Staged {
+                        frames: "frames".into(),
+                    },
+                    Err(_) => Response::Error {
+                        message: "no Start while the Install waited".into(),
+                    },
+                }
+            }
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        }
+    }
+
+    /// `Install` in flight does not hold up a `Start` sent after it: atld answers the Start on its serving thread while the installer lane waits for it, and both calls finish.
+    #[test]
+    fn start_is_not_held_behind_an_install() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair");
+        let (install_seen_tx, install_seen_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let fake = Arc::new(FakeAtld {
+            install_seen: Mutex::new(install_seen_tx),
+            start_tx: Mutex::new(start_tx),
+            start_rx: Mutex::new(start_rx),
+        });
+        let inline_fake = Arc::clone(&fake);
+        let atld = std::thread::spawn(move || {
+            control::serve_lanes(
+                theirs,
+                |r| fake_atld(&inline_fake, r),
+                move |r| fake_atld(&fake, r),
+            )
+            .expect("serve_lanes");
+        });
+        let pc = Arc::new(ControlSocket::new(ours));
+        let (install_done, install_result) = mpsc::channel();
+        let installing = Arc::clone(&pc);
+        std::thread::spawn(move || {
+            install_done.send(installing.install(1, 10_123)).ok();
+        });
+        install_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the Install reached atld");
+        let (start_done, start_result) = mpsc::channel();
+        let starting = Arc::clone(&pc);
+        std::thread::spawn(move || {
+            start_done.send(starting.start(&request())).ok();
+        });
+        let started = start_result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the Start returned while the Install was in flight");
+        assert_eq!(started.expect("start"), 77);
+        let installed = install_result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the Install returned");
+        assert_eq!(installed.expect("install"), "frames");
+        drop(pc);
+        atld.join().expect("atld");
     }
 }
