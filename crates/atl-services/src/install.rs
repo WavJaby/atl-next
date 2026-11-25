@@ -6,6 +6,7 @@
 //! ([`change_of`]) fails alone, and the installed package is registered as it is (control `Reinstate`).
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
@@ -16,8 +17,9 @@ use atl_services_types::system_packages;
 
 use crate::activity::log;
 use crate::app_id::AppIds;
-use crate::installed::Installed;
-use crate::packages::{InstallFields, PackageRecord};
+use crate::installed::Installed as Decoded;
+use crate::package_state::PackageUserStates;
+use crate::packages::{InstallFields, PackageRecord, PackageTable, Permissions};
 use crate::process_control::{ControlSocket, ScanReply};
 
 /// The diag interface the install's counts go under (PackageManagerService's binder name).
@@ -29,48 +31,130 @@ pub struct Config {
     pub abis: Vec<SupportedAbi>,
 }
 
-/// Installs every session the host holds files for, in order (PMS's boot scan of installed packages), after the system packages `records` (the scan's): every record the services answer from. Each
-/// package's uid comes from `ids` (AppIdSettingMap). A session named like a scanned package fails the start (updated system packages come with persisted /data packages). `recorded` is each package's
-/// longVersionCode as the last install recorded it (package_state); the reports say what this install did, for the start-time package broadcasts (broadcasts_am.rs package_broadcasts).
-pub fn install(
-    control: &ControlSocket,
-    sessions: &[u32],
-    ids: &mut AppIds,
-    c: &Config,
-    mut records: Vec<PackageRecord>,
-    recorded: &dyn Fn(&str) -> Option<i64>,
-) -> Result<(Vec<PackageRecord>, Vec<Reported>)> {
-    ensure!(!c.abis.is_empty(), "no device ABI");
-    let mut reports = Vec::with_capacity(sessions.len());
-    for &session in sessions {
-        let uid = ids.acquire().context("no application id left")?;
-        let frames = control
+/// Where a session comes from: boot's (`Boot`: a downgrade reinstates the installed code) or a running install (`Session`: a downgrade is refused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// sessions of this start: stand in for the boot scan until P7
+    Boot,
+    /// a session on running services
+    Session,
+}
+
+/// One accepted install: code committed, not yet published.
+pub struct Installed {
+    pub record: PackageRecord,
+    pub reported: Reported,
+}
+
+/// PackageManagerException: an INSTALL_* name and its message (Display `NAME: message`, PackageManager.installStatusToString :10650).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// The one install path (PMS installPackagesTraced): boot's sessions now, a running install later.
+pub struct Installer {
+    control: Arc<ControlSocket>,
+    config: Config,
+    /// the install lock: the app id pool, held from `install_one` to the end of `publish`
+    ids: Mutex<AppIds>,
+    table: Arc<PackageTable>,
+    permissions: Arc<Permissions>,
+    state: Arc<PackageUserStates>,
+}
+
+impl Installer {
+    pub fn new(
+        control: Arc<ControlSocket>,
+        config: Config,
+        ids: AppIds,
+        table: Arc<PackageTable>,
+        permissions: Arc<Permissions>,
+        state: Arc<PackageUserStates>,
+    ) -> Self {
+        Installer {
+            control,
+            config,
+            ids: Mutex::new(ids),
+            table,
+            permissions,
+            state,
+        }
+    }
+
+    /// Boot's sessions as one batch: a refusal fails the start (the boot scan's refusals always did), so nothing is published.
+    pub fn boot(&self, sessions: &[u32]) -> Result<Vec<Reported>> {
+        ensure!(!self.config.abis.is_empty(), "no device ABI");
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch = Vec::with_capacity(sessions.len());
+        for &session in sessions {
+            let accepted = self
+                .install_one(&mut ids, session, Origin::Boot, &batch)
+                .map_err(|f| anyhow::Error::msg(f.message))?;
+            batch.push(accepted);
+        }
+        Ok(self.publish(batch))
+    }
+
+    /// One session up to its commit, in this order: control `install`, parse, name taken (the table or `pending`), `change_of` (a Downgrade: Boot reinstates the installed code,
+    /// Session refuses), staged names, uid (after the parse: a refused session takes none), control `commit` (a failure releases the uid). The caller holds the install lock; nothing is published.
+    fn install_one(
+        &self,
+        ids: &mut AppIds,
+        session: u32,
+        origin: Origin,
+        pending: &[Installed],
+    ) -> Result<Installed, Failure> {
+        let frames = self
+            .control
             .install(session)
-            .with_context(|| format!("installing session {session}"))?;
-        let parsed = Parsed::read(&frames).with_context(|| format!("session {session}"))?;
-        ensure!(
-            !records.iter().any(|r| r.name() == parsed.name),
-            "two packages named {}",
-            parsed.name
-        );
+            .with_context(|| format!("installing session {session}"))
+            .map_err(|e| failure(INTERNAL, e))?;
+        let parsed = Parsed::read(&frames)
+            .with_context(|| format!("session {session}"))
+            .map_err(|e| failure(INVALID_APK, e))?;
+        let name = parsed.name.clone();
+        if self.table.snapshot().by_name(&name).is_some()
+            || pending.iter().any(|i| i.record.name() == name)
+        {
+            return Err(Failure {
+                code: DUPLICATE,
+                message: format!("two packages named {name}"),
+            });
+        }
         // checked before the commit, so a refused session leaves the installed code as it was (InstallPackageHelper.java :2884-2920 refuses ahead of any file move)
         let version = long_version(&parsed.info);
-        let (parsed, version, change) = match change_of(recorded(&parsed.name), version) {
+        let (parsed, version, change) = match change_of(self.state.version_code(&name), version) {
             Ok(change) => (parsed, version, change),
+            Err(Downgrade { installed, .. }) if origin == Origin::Session => {
+                return Err(Failure {
+                    code: DOWNGRADE,
+                    message: format!(
+                        "Update version code {version} is older than current {installed}"
+                    ),
+                });
+            }
             // PMS fails this install only (the installer's session result); the installed package stays as it was and runs: its code is parsed in place and committed unchanged
             Err(Downgrade { installed, .. }) => {
-                let frames = control
-                    .reinstate(session, &parsed.name, version, installed)
-                    .with_context(|| format!("keeping installed {}", parsed.name))?;
-                let kept =
-                    Parsed::read(&frames).with_context(|| format!("installed {}", parsed.name))?;
+                let frames = self
+                    .control
+                    .reinstate(session, &name, version, installed)
+                    .with_context(|| format!("keeping installed {name}"))
+                    .map_err(|e| failure(INTERNAL, e))?;
+                let kept = Parsed::read(&frames)
+                    .with_context(|| format!("installed {name}"))
+                    .map_err(|e| failure(INTERNAL, e))?;
                 let kept_version = long_version(&kept.info);
-                ensure!(
-                    kept.name == parsed.name && kept_version == installed,
-                    "installed {}: parses as {} versionCode {kept_version}, recorded {installed}",
-                    parsed.name,
-                    kept.name
-                );
+                if kept.name != name || kept_version != installed {
+                    return Err(failure(
+                        INTERNAL,
+                        anyhow::anyhow!(
+                            "installed {name}: parses as {} versionCode {kept_version}, recorded {installed}",
+                            kept.name
+                        ),
+                    ));
+                }
                 (kept, installed, Change::Unchanged)
             }
         };
@@ -80,20 +164,68 @@ pub fn install(
             .as_ref()
             .with_context(|| format!("session {session}: no ApplicationInfo"))
             .and_then(staged_names)
-            .with_context(|| format!("session {session}"))?;
-        control
+            .with_context(|| format!("session {session}"))
+            .map_err(|e| failure(INVALID_APK, e))?;
+        let uid = ids
+            .acquire()
+            .ok_or_else(|| failure(INTERNAL, anyhow::anyhow!("no application id left")))?;
+        if let Err(e) = self
+            .control
             .commit(session, &parsed.name, uid, names)
-            .with_context(|| format!("committing {}", parsed.name))?;
-        reports.push(Reported {
-            package: parsed.name.clone(),
-            uid,
-            version,
-            change,
-        });
+            .with_context(|| format!("committing {}", parsed.name))
+        {
+            ids.release(uid);
+            return Err(failure(INTERNAL, e));
+        }
         let code_dir = format!("{DATA_APP}/{}", parsed.name);
-        records.push(parsed.record(uid, &code_dir, true, (0, 0), c));
+        let record = parsed.record(uid, &code_dir, true, (0, 0), &self.config);
+        Ok(Installed {
+            record,
+            reported: Reported {
+                package: name,
+                uid,
+                version,
+                change,
+            },
+        })
     }
-    Ok((records, reports))
+
+    /// The batch becomes visible at once, under the install lock: its permission states, then the table, then each recorded version. Before this nothing of it was visible.
+    fn publish(&self, batch: Vec<Installed>) -> Vec<Reported> {
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        let snapshot = self.table.snapshot();
+        let names: Vec<String> = batch.iter().map(|i| i.record.name().to_owned()).collect();
+        let (records, reports): (Vec<PackageRecord>, Vec<Reported>) =
+            batch.into_iter().map(|i| (i.record, i.reported)).unzip();
+        let next = snapshot.with_records(records);
+        self.permissions.packages_added(&next, &names);
+        self.table.publish(next);
+        for r in &reports {
+            self.state.set_version_code(&r.package, r.version);
+        }
+        reports
+    }
+}
+
+/// INSTALL_* names (PackageManager.java) of the install path's failures; the message is the error chain.
+const INTERNAL: &str = "INSTALL_FAILED_INTERNAL_ERROR";
+const INVALID_APK: &str = "INSTALL_FAILED_INVALID_APK";
+const DUPLICATE: &str = "INSTALL_FAILED_DUPLICATE_PACKAGE";
+const DOWNGRADE: &str = "INSTALL_FAILED_VERSION_DOWNGRADE";
+
+fn failure(code: &'static str, e: anyhow::Error) -> Failure {
+    Failure {
+        code,
+        message: format!("{e:#}"),
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
 }
 
 /// One session's install: the package, its uid and longVersionCode, and what the install did to it against the recorded version.
@@ -118,7 +250,7 @@ pub enum Change {
 
 /// What an install of `version` does to a package recorded at `recorded` (None: never recorded). Compared as longVersionCode.
 /// A lower version is refused, counted: PackageManagerServiceUtils.checkDowngrade :1426-1429 (message text), and isDowngradePermitted :988-992 permits one only on INSTALL_REQUEST_DOWNGRADE, which
-/// nothing here sets. The refusal fails that session only ([`install`] keeps the installed package: its code and data stay and it runs, as the installed app does on a device after a refused update).
+/// nothing here sets. The refusal fails that session only ([`Installer::install_one`] keeps the installed package: its code and data stay and it runs, as the installed app does on a device after a refused update).
 /// Gap: AOSP's equal-version baseRevisionCode / split revision checks (:1430-1455) need revision codes recorded; not modelled.
 pub fn change_of(recorded: Option<i64>, version: i64) -> Result<Change, Downgrade> {
     match recorded {
@@ -222,7 +354,7 @@ pub fn scan(
 struct Parsed {
     name: String,
     info: PackageInfo,
-    installed: Installed,
+    installed: Decoded,
 }
 
 impl Parsed {
@@ -336,6 +468,9 @@ fn staged_names(app: &ApplicationInfo) -> Result<Vec<StagedName>> {
 )]
 mod tests {
     use super::*;
+    use crate::packages::Packages;
+    use atl_broker::control::{Request, Response};
+    use std::collections::BTreeMap;
 
     /// The count of the downgrade refusal (change_of's diag line).
     fn downgrades() -> u64 {
@@ -370,17 +505,17 @@ mod tests {
         assert_eq!(downgrades(), before + 2);
     }
 
-    /// An installer output of `com.example.app` at `version`, its base at `dir`/base.apk.
-    fn frames_file(path: &Path, version: i32, dir: &str) {
+    /// An installer output of `package` at `version`, its base at `dir`/base.apk.
+    fn frames_file(path: &Path, package: &str, version: i32, dir: &str) {
         use atl_parcelables::parts::Part;
         use atl_services_types::installer_output::{Kind, write_frame};
         use binder::binder_impl::Parcel;
         let mut app = ApplicationInfo::default();
-        app.item.package_name = Some("com.example.app".into());
+        app.item.package_name = Some(package.into());
         app.target_sdk_version = 35;
         app.source_dir = Some(format!("{dir}/base.apk"));
         let info = PackageInfo {
-            package_name: Some("com.example.app".into()),
+            package_name: Some(package.into()),
             version_code: version,
             application_info: Some(app),
             ..Default::default()
@@ -420,8 +555,18 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("atl-install-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("tmp");
         let (session_frames, kept_frames) = (tmp.join("0.frames"), tmp.join("0-kept.frames"));
-        frames_file(&session_frames, 1, &format!("{DATA_APP}/vmdl0.tmp"));
-        frames_file(&kept_frames, 2, &format!("{DATA_APP}/com.example.app"));
+        frames_file(
+            &session_frames,
+            "com.example.app",
+            1,
+            &format!("{DATA_APP}/vmdl0.tmp"),
+        );
+        frames_file(
+            &kept_frames,
+            "com.example.app",
+            2,
+            &format!("{DATA_APP}/com.example.app"),
+        );
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -468,29 +613,23 @@ mod tests {
                 .into_inner()
                 .expect("seen")
         });
-        let control = ControlSocket::new(ours);
-        let config = Config {
-            abis: vec![SupportedAbi {
-                abi: "x86_64".into(),
-                isa: "x86_64".into(),
-            }],
-        };
-        let (records, reports) = install(
-            &control,
-            &[0],
-            &mut AppIds::new(),
-            &config,
-            Vec::new(),
-            &|_| Some(2),
-        )
-        .expect("the install goes on with the installed package");
+        let state = Arc::new(PackageUserStates::default());
+        state.set_version_code("com.example.app", 2);
+        let table = empty_table(&state);
+        let control = Arc::new(ControlSocket::new(ours));
+        let installer = installer_over(&control, &table, &state);
+        let reports = installer
+            .boot(&[0])
+            .expect("the boot goes on with the installed package");
+        drop(installer);
         drop(control);
         assert_eq!(
             server.join().expect("server"),
             ["Install", "Reinstate", "Commit"]
         );
-        assert_eq!(records.len(), 1);
-        assert_eq!(long_version(&records[0].info), 2);
+        let installed = table.snapshot();
+        assert_eq!(installed.all().len(), 1);
+        assert_eq!(long_version(&installed.all()[0].info), 2);
         assert_eq!(
             reports,
             [Reported {
@@ -500,6 +639,171 @@ mod tests {
                 change: Change::Unchanged,
             }]
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A fake atld on a socketpair: `answer` serves the control protocol; the services' end comes back as a ControlSocket. Drop it, then join the server.
+    fn fake_atld(
+        answer: impl Fn(Request) -> Response + Clone + Send + 'static,
+    ) -> (Arc<ControlSocket>, std::thread::JoinHandle<()>) {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair");
+        let server = std::thread::spawn(move || {
+            atl_broker::control::serve_lanes(theirs, answer.clone(), answer).expect("serve_lanes");
+        });
+        (Arc::new(ControlSocket::new(ours)), server)
+    }
+
+    /// The services' installer over `control`, `table` and `state` (the table's user state): the device's ABI, a fresh id pool, the permissions of the table's list.
+    fn installer_over(
+        control: &Arc<ControlSocket>,
+        table: &Arc<PackageTable>,
+        state: &Arc<PackageUserStates>,
+    ) -> Installer {
+        let permissions = Arc::new(Permissions::new(&table.snapshot(), &[]));
+        let config = Config {
+            abis: vec![SupportedAbi {
+                abi: "x86_64".into(),
+                isa: "x86_64".into(),
+            }],
+        };
+        Installer::new(
+            Arc::clone(control),
+            config,
+            AppIds::new(),
+            Arc::clone(table),
+            permissions,
+            Arc::clone(state),
+        )
+    }
+
+    /// A table holding no package, over `state` as its user state (system_services shares it the same way).
+    fn empty_table(state: &Arc<PackageUserStates>) -> Arc<PackageTable> {
+        Arc::new(PackageTable::new(
+            Packages::new(vec![], BTreeMap::new()).with_user_state_arc(Arc::clone(state)),
+        ))
+    }
+
+    /// Boot's two sessions: nothing is published between them (the table, read at the second session's install request, holds none) and one publish follows both; ids in session order.
+    #[test]
+    fn boot_publishes_once_after_every_session() {
+        let tmp = std::env::temp_dir().join(format!("atl-install-once-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let (f0, f1) = (tmp.join("0.frames"), tmp.join("1.frames"));
+        frames_file(&f0, "com.example.one", 1, &format!("{DATA_APP}/vmdl0.tmp"));
+        frames_file(&f1, "com.example.two", 1, &format!("{DATA_APP}/vmdl1.tmp"));
+        let (f0, f1) = (
+            f0.to_string_lossy().into_owned(),
+            f1.to_string_lossy().into_owned(),
+        );
+        let state = Arc::new(PackageUserStates::default());
+        let table = empty_table(&state);
+        let seen = Arc::new(Mutex::new(None::<usize>));
+        let (table_seen, seen_at) = (Arc::clone(&table), Arc::clone(&seen));
+        let (control, server) = fake_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Install { session: 1 } => {
+                *seen_at.lock().expect("seen") = Some(table_seen.snapshot().all().len());
+                Response::Staged { frames: f1.clone() }
+            }
+            Request::Commit { .. } => Response::Committed,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let before = table.snapshot();
+        let installer = installer_over(&control, &table, &state);
+        let reports = installer.boot(&[0, 1]).expect("boot");
+        drop(installer);
+        drop(control);
+        server.join().expect("server");
+        assert_eq!(before.all().len(), 0, "a snapshot keeps the list it saw");
+        assert_eq!(*seen.lock().expect("seen"), Some(0));
+        assert_eq!(table.snapshot().all().len(), 2);
+        assert_eq!(
+            reports.iter().map(|r| r.uid).collect::<Vec<_>>(),
+            [10_001, 10_002]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A commit the control refuses fails the boot and publishes nothing; the uid taken for it is free again (`register` takes it back).
+    #[test]
+    fn a_failed_commit_releases_its_id_and_publishes_nothing() {
+        let tmp = std::env::temp_dir().join(format!("atl-install-commit-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let f0 = tmp.join("0.frames");
+        frames_file(&f0, "com.example.one", 1, &format!("{DATA_APP}/vmdl0.tmp"));
+        let f0 = f0.to_string_lossy().into_owned();
+        let state = Arc::new(PackageUserStates::default());
+        let table = empty_table(&state);
+        let (control, server) = fake_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Commit { .. } => Response::Error {
+                message: "commit refused".into(),
+            },
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let installer = installer_over(&control, &table, &state);
+        let err = installer
+            .boot(&[0])
+            .expect_err("a failed commit fails the start");
+        assert!(format!("{err:#}").contains("commit refused"), "{err:#}");
+        assert_eq!(table.snapshot().all().len(), 0);
+        assert!(
+            installer.ids.lock().expect("ids").register(10_001),
+            "the failed commit's uid is free again"
+        );
+        drop(installer);
+        drop(control);
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A session refused at its parse (an empty installer output) takes no uid: the next session of the pool gets 10001.
+    #[test]
+    fn a_refused_first_session_takes_no_id() {
+        let tmp = std::env::temp_dir().join(format!("atl-install-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let (f0, f1) = (tmp.join("0.frames"), tmp.join("1.frames"));
+        std::fs::write(&f0, b"").expect("empty output");
+        frames_file(&f1, "com.example.two", 1, &format!("{DATA_APP}/vmdl1.tmp"));
+        let (f0, f1) = (
+            f0.to_string_lossy().into_owned(),
+            f1.to_string_lossy().into_owned(),
+        );
+        let state = Arc::new(PackageUserStates::default());
+        let table = empty_table(&state);
+        let (control, server) = fake_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Install { session: 1 } => Response::Staged { frames: f1.clone() },
+            Request::Commit { .. } => Response::Committed,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let installer = installer_over(&control, &table, &state);
+        let mut ids = AppIds::new();
+        assert!(
+            installer
+                .install_one(&mut ids, 0, Origin::Session, &[])
+                .is_err()
+        );
+        let second = installer
+            .install_one(&mut ids, 1, Origin::Session, &[])
+            .expect("the second session installs");
+        assert_eq!(second.reported.uid, 10_001);
+        drop(installer);
+        drop(control);
+        server.join().expect("server");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

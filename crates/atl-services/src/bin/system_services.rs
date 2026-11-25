@@ -265,34 +265,21 @@ fn main() -> Result<()> {
     let desktop: Arc<dyn atl_services::notification::DesktopNotifications> = control.clone();
     // the connectivity service asks atld for the host's network on this connection (control `Network`)
     let network_control = Arc::clone(&control);
-    // the package list: installed now through the host's file work (atl_services::install), before any service answers
+    // the package list: the system packages are scanned now through the host's file work (atl_services::install); the boot's sessions are installed once the table exists (Installer::boot), before any service answers
     let config = install::Config {
         abis: a.abis.clone(),
     };
     // one appId pool across the system scan and the sessions, system packages first (PMS's boot order)
     let mut ids = AppIds::new();
-    let system: Vec<PackageRecord> = match &a.partitions {
+    let scanned: Vec<PackageRecord> = match &a.partitions {
         Some(root) => install::scan(&control, root, &mut ids, &config)?,
         None => Vec::new(),
     };
     // user 0's package state as the last run left it: the recorded install versions (install::change_of) and the boot opt-ins; entries of packages no longer installed go after the install
-    let state = match &a.system_dir {
+    let state = Arc::new(match &a.system_dir {
         Some(dir) => PackageUserStates::load(dir),
         None => PackageUserStates::default(),
-    };
-    let recorded = |name: &str| state.version_code(name);
-    let (list, reports): (Vec<PackageRecord>, Vec<install::Reported>) =
-        install::install(&control, &a.sessions, &mut ids, &config, system, &recorded)?;
-    for r in &reports {
-        state.set_version_code(&r.package, r.version);
-        writeln!(
-            std::io::stderr(),
-            "services: install {} version {} {:?}",
-            r.package,
-            r.version,
-            r.change
-        )?;
-    }
+    });
     // the runtime's permission files (SystemConfig's <library> rows, system_config.rs) and the --shared-library rows make one registry; a name given by both is an error
     let system = match &a.partitions {
         Some(root) => SystemConfig::read(root)?,
@@ -308,28 +295,9 @@ fn main() -> Result<()> {
         Some(p) => read_json(p)?,
         None => PlatformManifest::default(),
     };
-    let packages =
-        Packages::new(list, libraries).with_platform_broadcasts(platform.protected_broadcasts);
-    state.set_autostart(&a.autostart);
-    state.prune(|name| packages.by_name(name).is_some());
-    if let Some(dir) = &a.system_dir {
-        // a failed save is logged, not a start failure (package_state.rs: the state never fails a start); the next save replaces the file
-        if let Err(e) = state.save() {
-            writeln!(
-                std::io::stderr(),
-                "services: package state not saved in {}: {e}",
-                dir.display()
-            )?;
-        }
-        writeln!(
-            std::io::stderr(),
-            "services: package state: {} overrides from {}; boot opt-ins {}",
-            state.len(),
-            dir.display(),
-            a.autostart.len()
-        )?;
-    }
-    let packages = packages.with_user_state(state);
+    let packages = Packages::new(scanned, libraries)
+        .with_platform_broadcasts(platform.protected_broadcasts)
+        .with_user_state_arc(Arc::clone(&state));
     let table = Arc::new(PackageTable::new(packages));
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
     let permissions = Arc::new(Permissions::new(&table.snapshot(), &platform.permissions));
@@ -350,10 +318,11 @@ fn main() -> Result<()> {
         Arc::clone(&table),
         desktop,
     ));
+    let process_control: Arc<dyn atl_services::process_control::ProcessControl> = control.clone();
     let activity = ActivityManager::new(
         Arc::clone(&table),
         Arc::clone(&permissions),
-        control,
+        Arc::clone(&process_control),
         Arc::clone(&tasks),
         Arc::clone(&agents),
         !a.no_back_finish,
@@ -365,6 +334,44 @@ fn main() -> Result<()> {
         notices.clone(),
         a.hw_timeouts,
     );
+    // the boot's sessions: one batch, published once (Installer::publish); the permissions and the table are the ones the services already hold
+    let reports = install::Installer::new(
+        control,
+        config,
+        ids,
+        Arc::clone(&table),
+        Arc::clone(&permissions),
+        Arc::clone(&state),
+    )
+    .boot(&a.sessions)?;
+    for r in &reports {
+        writeln!(
+            std::io::stderr(),
+            "services: install {} version {} {:?}",
+            r.package,
+            r.version,
+            r.change
+        )?;
+    }
+    state.set_autostart(&a.autostart);
+    state.prune(|name| table.snapshot().by_name(name).is_some());
+    if let Some(dir) = &a.system_dir {
+        // a failed save is logged, not a start failure (package_state.rs: the state never fails a start); the next save replaces the file
+        if let Err(e) = state.save() {
+            writeln!(
+                std::io::stderr(),
+                "services: package state not saved in {}: {e}",
+                dir.display()
+            )?;
+        }
+        writeln!(
+            std::io::stderr(),
+            "services: package state: {} overrides from {}; boot opt-ins {}",
+            state.len(),
+            dir.display(),
+            a.autostart.len()
+        )?;
+    }
     if let Some(package) = &a.launch
         && table.snapshot().by_name(package).is_none()
     {

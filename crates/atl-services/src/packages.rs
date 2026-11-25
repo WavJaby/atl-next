@@ -216,6 +216,24 @@ impl Packages {
         Packages { user, ..self }
     }
 
+    /// These packages with `records` in place: each replaces the stored record of its name, a new name is appended. Libraries, platform broadcasts and the user state are kept
+    /// (the list is cloned: tens of packages).
+    pub fn with_records(&self, records: Vec<PackageRecord>) -> Packages {
+        let mut list = self.list.clone();
+        for r in records {
+            match list.iter().position(|p| p.name() == r.name()) {
+                Some(i) => list[i] = r,
+                None => list.push(r),
+            }
+        }
+        Packages {
+            list,
+            libraries: self.libraries.clone(),
+            platform_broadcasts: self.platform_broadcasts.clone(),
+            user: Arc::clone(&self.user),
+        }
+    }
+
     /// User 0's package state (IPackageManager's component-state calls read and change it).
     pub fn user_state(&self) -> &PackageUserStates {
         &self.user
