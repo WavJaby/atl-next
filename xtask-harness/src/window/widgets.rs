@@ -521,21 +521,21 @@ fn swipe_check(app: &str) -> Result<String, String> {
     ))
 }
 
-/// The app's first configuration was already its window's monitor: the window reported its monitor (registry SET_DISPLAY) and every report equalled the display the run started with (`display`, atld
-/// `--display`). A changed report means the first layout ran at the start display's density and the activity ran again at the monitor's; AOSP's configuration is final before the first traversal.
+/// The app's first configuration was already its window's monitor: the window reported its monitor (registry REPORT_MONITOR) and every report equalled the display the run started with (`display`,
+/// atld `--monitor` and `--declare-display`). A changed report means the first layout ran at the start display's density and the activity ran again at the monitor's; AOSP's configuration is final before the first traversal.
 fn display_check(services: &str, display: DisplayModel) -> Result<String, String> {
     let reports = super::move_output::display_reports(services);
-    if let Some((d, _)) = reports.iter().find(|(_, changed)| *changed) {
+    if let Some(r) = reports.iter().find(|r| r.changed) {
         return Err(format!(
             "the window's monitor {} replaced the start display {}: the first layout ran at {} dpi",
-            d.to_arg(),
+            r.display.to_arg(),
             display.to_arg(),
             display.dpi
         ));
     }
     if reports.is_empty() {
         return Err(
-            "the window never reported its monitor (no `services: display` line)".to_owned(),
+            "the window never reported its monitor (no `services: monitor` line)".to_owned(),
         );
     }
     Ok(format!(
@@ -1380,10 +1380,10 @@ mod tests {
     fn display_check_wants_the_monitor_as_the_start_display() {
         let fixed = DisplayModel::parse_arg("1280x800@120,160,0").expect("parse");
         let monitor = DisplayModel::parse_arg("2880x1800@120,256,0").expect("parse");
-        let changed = "services: display 2880x1800@120,256,0 from uid 10002\nservices: display change told 0 display callbacks, 2 processes\n";
+        let changed = "services: monitor 2880x1800@120,256,0 from uid 10002: display 2880x1800@120,256,0\nservices: display change told 0 display callbacks, 2 processes\n";
         let e = display_check(changed, fixed).expect_err("a changed display");
         assert!(e.contains("2880x1800@120,256,0"), "{e}");
-        let unchanged = "services: display 2880x1800@120,256,0 from uid 10002 unchanged\n";
+        let unchanged = "services: monitor 2880x1800@120,256,0 from uid 10002: display 2880x1800@120,256,0 unchanged\n";
         assert!(display_check(unchanged, monitor).is_ok());
         assert!(display_check("services: window relayout x\n", monitor).is_err());
     }

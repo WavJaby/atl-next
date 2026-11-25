@@ -1117,7 +1117,7 @@ impl ActivityManager {
         }
     }
 
-    /// The display changed (registry SET_DISPLAY): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
+    /// The display changed (registry REPORT_MONITOR): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
     /// (each WindowProcessController's onConfigurationChanged -> dispatchConfiguration): the new global one, or its Task's on the new display ([`process_configuration`]). Needed: a Task's
     /// override leaves density to the global configuration (task_override), so without it an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
     pub(crate) fn global_configuration_changed(&self) -> usize {
@@ -3715,6 +3715,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use atl_aidl::aidl::android::app::IApplicationThread::BnApplicationThread;
+    use atl_services_types::display_model::Declaration;
     use binder::{BinderFeatures, Interface, StatusCode};
 
     use super::*;
@@ -3749,7 +3750,7 @@ mod tests {
             packages,
             permissions,
             control,
-            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             Arc::new(UiAgents::default()),
             true,
             RootBack::default(),
@@ -3966,7 +3967,7 @@ mod tests {
             packages,
             permissions,
             control,
-            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             Arc::new(UiAgents::default()),
             true,
             RootBack::default(),
@@ -4071,6 +4072,32 @@ mod tests {
         assert_eq!(config.locale_list.as_deref(), Some("zh-TW"));
         let config = global_configuration(&display, None);
         assert_eq!(config.locale_list.as_deref(), Some("en-US"));
+    }
+
+    /// The declared 411x914 dp at 160 dpi (px = dp) and 256 dpi (px = dp x 1.6): 411 x 1.6 = 657.6 -> 658 px, 914 x 1.6 = 1462.4 -> 1462 px.
+    /// Back to dp as global_configuration does (px / 1.6, rounded): 658 / 1.6 = 411.25 -> 411, 1462 / 1.6 = 913.75 -> 914. The smallest width is 411 at both densities.
+    #[test]
+    fn global_configuration_of_a_declared_display_is_411_dp_at_every_density() {
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        for (dpi, px) in [(160, (411, 914)), (256, (658, 1462))] {
+            let monitor = DisplayModel {
+                dpi,
+                ..DisplayModel::default()
+            };
+            let display =
+                DisplayModel::of(monitor, Some(declared)).expect("411x914 dp is in bounds");
+            assert_eq!((display.width, display.height), px);
+            let config = global_configuration(&display, None);
+            assert_eq!(config.density_dpi, dpi);
+            assert_eq!(
+                (config.screen_width_dp, config.screen_height_dp),
+                (411, 914)
+            );
+            assert_eq!(config.smallest_screen_width_dp, 411);
+        }
     }
 
     /// DisplayContent.computeScreenConfiguration:2486-2488 + computeScreenAppConfiguration:2458: bounds, appBounds and maxBounds of the global configuration are the display from the origin.

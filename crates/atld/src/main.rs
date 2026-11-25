@@ -59,7 +59,7 @@ use atl_platform_host::{
 };
 use atl_property_service::{LinearTier, Property};
 use atl_services_types::compositor_registry;
-use atl_services_types::display_model::DisplayModel;
+use atl_services_types::display_model::{Declaration, DisplayModel};
 use atl_services_types::native_libs::LIB_DIR_NAME;
 use atl_services_types::packages::Library;
 use atl_services_types::permission::SYSTEM_PROCESS;
@@ -186,9 +186,14 @@ struct Args {
     /// A package whose launcher activity the services start once they are up.
     #[arg(long)]
     launch: Option<String>,
-    /// The display the services answer with (`WxH@hz,dpi`, atl_services_types::display_model): forwarded to atl-system-services; omitted, the desktop's first monitor (atl-platform-host, DisplayModel::from_monitor).
+    /// The monitor the services start on (`WxH@hz,dpi,rotation`, atl_services_types::display_model), forwarded to atl-system-services; omitted, the desktop's first monitor (atl-platform-host,
+    /// DisplayModel::from_monitor). A window's own report replaces it.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
-    display: Option<DisplayModel>,
+    monitor: Option<DisplayModel>,
+    /// The display declared in dp (`WxH`, atl_services_types::display_model `Declaration`): every app sees this size on the monitor's density, whatever the monitor's size. Omitted: the monitor is
+    /// the display.
+    #[arg(long, value_parser = Declaration::parse_arg)]
+    declare_display: Option<Declaration>,
     /// The headless pointer script, `down:x,y move:x,y up:x,y` (atl-composer `input::parse_script`): every app process gets it as `ro.atl.headless.pointer`, and the app injects it after its first frame. Omitted: no input.
     #[arg(long)]
     headless_pointer: Option<String>,
@@ -382,9 +387,9 @@ fn log(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "atld: {msg}");
 }
 
-/// The display without `--display`: the desktop's first monitor (atl-platform-host) as [`DisplayModel::from_monitor`]. No desktop or no monitor: the default, and atld says why.
-/// A start value only: the window's own monitor (size, scale, rotation) replaces it at the window's first entry (registry SET_DISPLAY).
-fn host_display() -> DisplayModel {
+/// The monitor without `--monitor`: the desktop's first monitor (atl-platform-host) as [`DisplayModel::from_monitor`]. No desktop or no monitor: the default, and atld says why.
+/// A start value only: the window's own monitor (size, scale, rotation) replaces it at the window's first entry (registry REPORT_MONITOR).
+fn host_monitor() -> DisplayModel {
     match atl_platform_host::first_monitor() {
         Ok(Some(m)) => {
             let model = DisplayModel::from_monitor(
@@ -2700,8 +2705,11 @@ fn run(a: &Args) -> Result<ExitCode> {
                 }
             })?;
     }
-    // the services and every app process answer with this one display
-    let display = a.display.unwrap_or_else(host_display);
+    // the monitor the services start on, and the display every app process starts with: the declaration applied to the monitor (DisplayModel::of, the function the services apply to each
+    // report). The services get the monitor and the declaration themselves (below), so this is the one copy atld keeps; it leaves with the composer's start value
+    let monitor = a.monitor.unwrap_or_else(host_monitor);
+    let display = DisplayModel::of(monitor, a.declare_display)
+        .map_err(|e| anyhow::anyhow!("--declare-display: {e}"))?;
     // its density, as a device's vendor build.prop states its panel's (DisplayMetrics DENSITY_DEVICE); into the services' and the apps' areas below
     defaults.push(atl_property_service::lcd_density(display.dpi));
     // the desktop's UI language (LC_MESSAGES, atl_platform_host::ui_locale): the apps' persist.sys.locale and the services' --locale; none: AOSP's en-US
@@ -3098,7 +3106,10 @@ fn run(a: &Args) -> Result<ExitCode> {
     if let Some(p) = &a.launch {
         services_args.extend(["--launch".into(), p.into()]);
     }
-    services_args.extend(["--display".into(), display.to_arg().into()]);
+    services_args.extend(["--monitor".into(), monitor.to_arg().into()]);
+    if let Some(declared) = a.declare_display {
+        services_args.extend(["--declare-display".into(), declared.to_arg().into()]);
+    }
     services_args.extend(["--hw-timeout-multiplier".into(), hw.to_arg().into()]);
     if let Some(tag) = &locale {
         services_args.extend(["--locale".into(), tag.into()]);

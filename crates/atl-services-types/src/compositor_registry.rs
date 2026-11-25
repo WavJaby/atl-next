@@ -13,8 +13,9 @@ pub const DESCRIPTOR: &str = "atl.ICompositorRegistry";
 pub const REGISTER: u32 = 1;
 /// The transaction a UI-mode app process sends when its window's content size changes: the Task's number (the one its UI agent was named, ui_agent.rs TASK), then width and height (i32, physical pixels). The caller's uid must own that Task (tasks.rs). Reply: a status only.
 pub const SET_BOUNDS: u32 = 2;
-/// The transaction a UI-mode app process sends when the monitor its window is on changes (another monitor, or its scale or mode): the monitor as Android's display, a String16 in the `--display` form (display_model.rs `DisplayModel::to_arg`). The caller's uid must own a Task (an app with a window). Reply: a status only.
-pub const SET_DISPLAY: u32 = 3;
+/// The transaction a UI-mode app process sends with the monitor its window is on: at its first entry and at each change (another monitor, or its scale or mode). The monitor is a String16 in the
+/// `WxH@hz,dpi,rotation` form (display_model.rs `DisplayModel::to_arg`). The caller's uid must own a Task (an app with a window). Reply: the display the services answer with, in the same form.
+pub const REPORT_MONITOR: u32 = 3;
 /// The transaction a UI-mode app process sends at its compositor's start, before any Java runs: no arguments. Reply: the size its window opens at, width then height (i32, physical pixels), then the package of its Task (String). The Task is its launch's (tasks.rs); the size is that activity's initial bounds (desktop_bounds.rs). The package is the window's app id (atl-composer ui_window). The caller's pid names the process.
 /// A process with no Task (started for a provider, service or receiver) gets 0 x 0 and an empty package and opens no window: AOSP shows none for it, and a second toplevel takes the desktop's focus from the app's.
 pub const TASK_INFO: u32 = 4;
@@ -25,7 +26,7 @@ pub const REMOVE_TASK: u32 = 6;
 /// The transaction an app process's compositor sends for an input device's key map, for the dispatcher's fallback keys (InputDispatcher / InputManagerService.dispatchUnhandledKey): the device id (i32). Reply: the map in Parcel form (byte[], atl-libinput `KeyCharacterMap::parcel_bytes`), the same bytes the input service puts in that device's InputDevice, so one owner serves one map; empty for an unknown device. Any caller: the maps are what every app reads through getInputDevice.
 /// Not getInputDevice itself: libinput's Parcel form of a map carries no length, so the Rust InputDevice codec cannot read a reply holding a map other than the one it was set up with.
 pub const KEY_MAP: u32 = 7;
-/// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): the same model atld forwards to the services, delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
+/// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): atld's start value of the services' display (`DisplayModel::of` of the monitor and the declaration), delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
 pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
 /// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.
 pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";

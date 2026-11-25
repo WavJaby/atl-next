@@ -246,6 +246,52 @@ public class Main extends Activity {
     private void logDensity(String when, android.content.res.Configuration config) {
         Log.i(TAG, "density " + when + " config=" + config.densityDpi
                 + " metrics=" + getResources().getDisplayMetrics().densityDpi);
+        // the declared display (move_output.rs declared): sw = the application context's, the process's configuration (the Task's override in a freeform window, not the global);
+        // task_sw = this activity's (its Task's); real = the display's size in px
+        android.util.DisplayMetrics real = new android.util.DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(real);
+        Log.i(TAG, "size " + when
+                + " sw=" + getApplicationContext().getResources().getConfiguration().smallestScreenWidthDp
+                + " task_sw=" + config.smallestScreenWidthDp
+                + " real=" + real.widthPixels + "x" + real.heightPixels);
+        logDisplay(when);
+    }
+
+    /** SurfaceFlinger's physical display id (atl-composer host.rs DISPLAY_ID): SurfaceControl's id-keyed queries take it. */
+    private static final long SF_DISPLAY_ID = 1L;
+
+    /**
+     * The display as the app's two sources answer it (move_output.rs declared): info = IDisplayManager.getDisplayInfo(0) (DisplayManagerGlobal, the services) as `WxH@hz,dpi,rotation`;
+     * sf = SurfaceFlinger's active mode (SurfaceControl.getDynamicDisplayInfo, the in-app compositor) as `WxH@hz,dpi`, the panel's natural size. Both @hide: reflection, as apps reach them.
+     */
+    private void logDisplay(String when) {
+        String info;
+        try {
+            Object dmg = Class.forName("android.hardware.display.DisplayManagerGlobal").getMethod("getInstance").invoke(null);
+            Object di = dmg.getClass().getMethod("getDisplayInfo", int.class).invoke(dmg, 0);
+            Class<?> c = di.getClass();
+            info = c.getField("logicalWidth").getInt(di) + "x" + c.getField("logicalHeight").getInt(di)
+                    + "@" + c.getMethod("getRefreshRate").invoke(di)
+                    + "," + c.getField("logicalDensityDpi").getInt(di) + "," + c.getField("rotation").getInt(di);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            info = "error:" + (e.getCause() != null ? e.getCause() : e);
+        }
+        String sf = "none";
+        try {
+            Object dyn = Class.forName("android.view.SurfaceControl").getMethod("getDynamicDisplayInfo", long.class).invoke(null, SF_DISPLAY_ID);
+            Class<?> c = dyn.getClass();
+            int active = c.getField("activeDisplayModeId").getInt(dyn);
+            for (Object mode : (Object[]) c.getField("supportedDisplayModes").get(dyn)) {
+                Class<?> m = mode.getClass();
+                if (m.getField("id").getInt(mode) == active) {
+                    sf = m.getField("width").getInt(mode) + "x" + m.getField("height").getInt(mode)
+                            + "@" + m.getField("peakRefreshRate").getFloat(mode) + "," + Math.round(m.getField("xDpi").getFloat(mode));
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            sf = "error:" + (e.getCause() != null ? e.getCause() : e);
+        }
+        Log.i(TAG, "display " + when + " info=" + info + " sf=" + sf);
     }
 
     /** One frame callback per vsync, FRAME_CALLBACKS in all; each logs the frame time it was given (CLOCK_MONOTONIC ns). */
@@ -257,6 +303,9 @@ public class Main extends Activity {
                 Log.i(TAG, "frame " + frameCallbacks + " time=" + frameTimeNanos);
                 if (frameCallbacks < FRAME_CALLBACKS) {
                     postFrame();
+                } else {
+                    // the instance's frames are over: a display change that relaunched it has reached the in-app compositor too
+                    logDisplay("settled");
                 }
             }
         });

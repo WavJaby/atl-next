@@ -673,7 +673,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     .with_gralloc(root)?;
     // the display this gate judges against: atld takes it as given and never asks the desktop
-    let rt = rt.with_display(display.to_arg());
+    let rt = rt.with_monitor(display.to_arg());
     let rt = if args.break_view {
         rt.with_ui_break(root, "atl-composer/break-no-serve")?
     } else {

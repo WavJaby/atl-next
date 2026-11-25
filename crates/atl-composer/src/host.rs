@@ -570,7 +570,7 @@ impl Composer {
         *self.display.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The window moved to another monitor, or its monitor changed (UI mode): the display answered from now on and the frame interval the next ticks carry. True when it changed.
+    /// The display the services answered a monitor report with (task_reports.rs), from now on, with the frame interval the next ticks carry. True when it changed.
     pub fn set_display(&self, display: DisplayModel) -> bool {
         let mut current = self.display.lock().unwrap_or_else(|e| e.into_inner());
         if *current == display {

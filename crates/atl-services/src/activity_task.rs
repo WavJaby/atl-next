@@ -1280,7 +1280,7 @@ mod tests {
         ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         )
     }
@@ -1359,7 +1359,7 @@ mod tests {
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(display, None)),
+            Arc::new(Tasks::new(display, None, None).expect("the test display")),
             token::new(),
         );
         let (thread, scheduled) = app_thread();
@@ -1412,7 +1412,7 @@ mod tests {
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(display, None)),
+            Arc::new(Tasks::new(display, None, None).expect("the test display")),
             token::new(),
         );
         let task = atm.tasks.new_task(
@@ -1648,7 +1648,7 @@ mod tests {
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         );
         let (status, results) = request_permissions(&atm);
@@ -1737,7 +1737,7 @@ mod tests {
         ActivityTasks::new(
             Arc::clone(&packages),
             Arc::new(Permissions::new(&packages, &[])),
-            Arc::new(Tasks::new(DisplayModel::default(), None)),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         )
     }

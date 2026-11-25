@@ -1006,7 +1006,8 @@ mod tests {
     /// The display starts in touch mode (config_defaultInTouchMode true), setInTouchMode moves it, and what the next add returns follows it: one source of truth.
     #[test]
     fn touch_mode_starts_on_and_follows_set() {
-        let tasks = Tasks::<u32>::new(DisplayModel::default(), None);
+        let tasks =
+            Tasks::<u32>::new(DisplayModel::default(), None, None).expect("the default display");
         assert!(tasks.in_touch_mode());
         tasks.set_in_touch_mode(false);
         assert_eq!(add_result(false, tasks.in_touch_mode(), true) & 0x1, 0);
@@ -1021,7 +1022,7 @@ mod tests {
             dpi: 320,
             ..DisplayModel::default()
         };
-        let tasks = Tasks::<u32>::new(display, None);
+        let tasks = Tasks::<u32>::new(display, None, None).expect("the test display");
         assert_eq!(
             initial_display_density(&tasks, activity::DEFAULT_DISPLAY),
             320
@@ -1032,7 +1033,8 @@ mod tests {
     /// The missing-Task path: no size is refused (BAD_VALUE) and counted, never a panic; a created Task answers its size.
     #[test]
     fn size_of_refuses_a_task_without_a_size() {
-        let tasks = Tasks::<u32>::new(DisplayModel::default(), None);
+        let tasks =
+            Tasks::<u32>::new(DisplayModel::default(), None, None).expect("the default display");
         let refused = |label: &str| {
             atl_diag::counts()
                 .into_iter()

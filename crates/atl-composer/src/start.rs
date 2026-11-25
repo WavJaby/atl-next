@@ -205,7 +205,7 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
         composer
             .start(threads, Presenter::Window(Arc::clone(&mailbox)))
             .map_err(|e| format!("frame clock thread: {e}"))?;
-        let reports = TaskReports::new(Arc::clone(&outbox));
+        let reports = TaskReports::new(Arc::clone(&outbox), Arc::clone(&composer));
         ui_window::install(
             window,
             Arc::clone(&composer),

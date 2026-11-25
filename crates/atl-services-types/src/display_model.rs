@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The display's values, one struct for every reader: DisplayInfo (display.rs, IDisplayManager.getDisplayInfo) and the global Configuration (activity.rs). atld passes it to the services
-//! as `--display WxH@hz,dpi` ([`DisplayModel::parse_arg`], [`DisplayModel::to_arg`]); without the flag atld takes [`DisplayModel::from_monitor`] of the desktop's monitor. That is the start value: the services keep the live one (tasks.rs `Tasks::display`, changed by registry SET_DISPLAY when the window's monitor changes), the app's compositor its SurfaceFlinger copy of the same monitor (atl-composer `Composer::set_display`).
+//! The services own it as [`DisplayModel::of`] of two inputs: the monitor (atld `--monitor` in the [`DisplayModel::parse_arg`] form, else [`DisplayModel::from_monitor`] of the desktop's first monitor; then each window's report, registry REPORT_MONITOR) and the declaration (`--declare-display`, [`Declaration`]; none by default).
+//! tasks.rs `Tasks::display` holds it; the app's compositor keeps the copy its REPORT_MONITOR reply carries (atl-composer `Composer::set_display`).
 //! The default (1280x800, 60 Hz, 160 dpi) is a test value: the fallback when no desktop answers, and the base of the gates' fixed display.
 
 /// `DisplayMetrics.DENSITY_DEFAULT`: the dpi of density 1 (mdpi), where 1 dp is 1 px.
@@ -123,12 +124,76 @@ impl DisplayModel {
         }
     }
 
-    /// The `--display` form of this model: what atld passes on.
+    /// The `WxH@hz,dpi,rotation` form of this model: what atld passes on as `--monitor`, and what the registry carries.
     pub fn to_arg(&self) -> String {
         format!(
             "{}x{}@{},{},{}",
             self.width, self.height, self.refresh_hz, self.dpi, self.rotation
         )
+    }
+}
+
+/// A display declared in dp: the app's whole device display, `411x914` is a 1080x2400 panel at 420 dpi. `--declare-display WxH`; none by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declaration {
+    pub width_dp: i32,
+    pub height_dp: i32,
+}
+
+/// The shortest and longest side of a display, px: AOSP's OverlayDisplayAdapter MIN_WIDTH..MAX_WIDTH and MIN_HEIGHT..MAX_HEIGHT.
+pub const MIN_PX: i32 = 100;
+pub const MAX_PX: i32 = 4096;
+
+impl Declaration {
+    /// `WxH` in dp, both positive: `411x914`.
+    pub fn parse_arg(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s}: not WxH in dp");
+        let (w, h) = s.split_once('x').ok_or_else(bad)?;
+        let declared = Declaration {
+            width_dp: w.parse().map_err(|_| bad())?,
+            height_dp: h.parse().map_err(|_| bad())?,
+        };
+        if declared.width_dp > 0 && declared.height_dp > 0 {
+            Ok(declared)
+        } else {
+            Err(bad())
+        }
+    }
+
+    /// The `WxH` form this parses from.
+    pub fn to_arg(&self) -> String {
+        format!("{}x{}", self.width_dp, self.height_dp)
+    }
+}
+
+impl DisplayModel {
+    /// The display every reader takes: the monitor itself with no declaration. Declared: the dp size at the monitor's density (px = round(dp x dpi / 160)), the monitor's dpi and refresh,
+    /// rotation 0 (the monitor's turn is how the panel is mounted, invisible to the app). Refused when a side falls outside MIN_PX..=MAX_PX.
+    pub fn of(monitor: DisplayModel, declared: Option<Declaration>) -> Result<Self, String> {
+        let Some(declared) = declared else {
+            return Ok(monitor);
+        };
+        let px = |dp: i32| {
+            (f64::from(dp) * f64::from(monitor.dpi) / f64::from(DENSITY_DEFAULT)).round() as i32
+        };
+        let (width, height) = (px(declared.width_dp), px(declared.height_dp));
+        if ![width, height]
+            .into_iter()
+            .all(|side| (MIN_PX..=MAX_PX).contains(&side))
+        {
+            return Err(format!(
+                "{} at {} dpi is {width}x{height} px, outside {MIN_PX}..={MAX_PX}",
+                declared.to_arg(),
+                monitor.dpi
+            ));
+        }
+        Ok(DisplayModel {
+            width,
+            height,
+            refresh_hz: monitor.refresh_hz,
+            dpi: monitor.dpi,
+            rotation: ROTATION_0,
+        })
     }
 }
 
@@ -225,6 +290,80 @@ mod tests {
             "axb@60,160,0",
         ] {
             let e = DisplayModel::parse_arg(bad).expect_err(bad);
+            assert!(e.starts_with(bad), "{e}");
+        }
+    }
+
+    /// The laptop (2560x1600 at scale 1.6: 256 dpi, 120 Hz) declared 411x914 dp: 411 x 256 / 160 = 657.6 -> 658 px, 914 x 256 / 160 = 1462.4 -> 1462 px. Back by the DisplayContent
+    /// formula dp = px x 160 / dpi: 658 -> 411.25 -> 411, 1462 -> 913.75 -> 914.
+    #[test]
+    fn declared_size_at_the_monitor_density() {
+        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let d = DisplayModel::of(
+            monitor,
+            Some(Declaration {
+                width_dp: 411,
+                height_dp: 914,
+            }),
+        )
+        .expect("in range");
+        assert_eq!(
+            (d.width, d.height, d.dpi, d.refresh_hz, d.rotation),
+            (658, 1462, 256, 120.0, 0)
+        );
+        let back = |px: i32| (f64::from(px) * 160.0 / f64::from(d.dpi)).round() as i32;
+        assert_eq!((back(d.width), back(d.height)), (411, 914));
+    }
+
+    /// At scale 1 (160 dpi) the declared dp are the px. A monitor turned a quarter turn keeps the declared sides and gets rotation 0.
+    #[test]
+    fn declared_size_at_mdpi_ignores_the_monitor_turn() {
+        let monitor = DisplayModel::from_monitor(1080, 1920, None, 1.0, 1);
+        let d = DisplayModel::of(
+            monitor,
+            Some(Declaration {
+                width_dp: 411,
+                height_dp: 914,
+            }),
+        )
+        .expect("in range");
+        assert_eq!((d.width, d.height, d.dpi, d.rotation), (411, 914, 160, 0));
+    }
+
+    /// No declaration: the display is the monitor itself, turn and refresh included.
+    #[test]
+    fn no_declaration_is_the_monitor() {
+        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 1);
+        assert_eq!(DisplayModel::of(monitor, None), Ok(monitor));
+    }
+
+    /// The overlay bounds: 100 and 4096 px are accepted on each side, one px beyond either bound is refused. At mdpi px = dp.
+    #[test]
+    fn declared_sides_are_bounded_as_overlay_displays() {
+        let mdpi = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0);
+        let at = |width_dp, height_dp| {
+            DisplayModel::of(
+                mdpi,
+                Some(Declaration {
+                    width_dp,
+                    height_dp,
+                }),
+            )
+        };
+        assert!(at(100, 914).is_ok());
+        assert!(at(4096, 4096).is_ok());
+        assert!(at(99, 914).is_err());
+        assert!(at(411, 4097).is_err());
+    }
+
+    /// `411x914` parses in dp; a missing, malformed or non-positive side is refused with the text given.
+    #[test]
+    fn declaration_parses_and_refuses() {
+        let d = Declaration::parse_arg("411x914").expect("parse");
+        assert_eq!((d.width_dp, d.height_dp), (411, 914));
+        assert_eq!(d.to_arg(), "411x914");
+        for bad in ["", "411", "411x", "0x914", "411x-1", "411x914x1", "axb"] {
+            let e = Declaration::parse_arg(bad).expect_err(bad);
             assert!(e.starts_with(bad), "{e}");
         }
     }

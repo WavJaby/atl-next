@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The Tasks of the one display (plan `Lifecycle / windows`: freeform, one Task = one toplevel window). A Task's size is its toplevel's content size in physical pixels (`Task.setBounds`, Task.java:2786; the compositor's configure plays the Shell's `wct.setBounds`, VeiledResizeTaskPositioner.java:188). The display ([`DisplayModel`]) is the monitor: a window's size never changes it.
+//! The Tasks of the one display (plan `Lifecycle / windows`: freeform, one Task = one toplevel window). A Task's size is its toplevel's content size in physical pixels (`Task.setBounds`, Task.java:2786; the compositor's configure plays the Shell's `wct.setBounds`, VeiledResizeTaskPositioner.java:188). The display ([`DisplayModel`]) is computed from the reported monitor and the declaration, if any ([`DisplayModel::of`]): a window's size never changes it.
 //! A Task is keyed by its [`TaskId`], which the services assign when the launch that makes the Task attaches its process (activity.rs). An activity's token names its Task (ActivityRecord.task), and a window names its Task by its `attrs.token` (window.rs). The owner uid is kept for the checks the registry makes (registry_service.rs), never as a key.
 //! The table also keeps the IWindow client of each window of a Task, so a size change reaches them (window.rs `notify_resized`).
 //! The table is generic over the handle `C` (the services use SpIBinder): handles are cloned and compared by equality, so the table and its tests build without the converter feature, which the test step needs.
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::desktop_bounds::{ActivityInput, Rect, initial_bounds};
-use atl_services_types::display_model::DisplayModel;
+use atl_services_types::display_model::{Declaration, DisplayModel};
 
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,7 +87,9 @@ struct WindowEntry<C> {
 }
 
 struct State<C> {
-    /// the monitor the app windows are on (one display, plan `Lifecycle / windows`)
+    /// the declared display (atld `--declare-display`); None: the display is the monitor
+    declared: Option<Declaration>,
+    /// `DisplayModel::of(monitor, declared)` of the last monitor (atld's at start, then each window's report: set_monitor); the monitor itself is not kept, nothing reads it
     display: DisplayModel,
     tasks: BTreeMap<TaskId, TaskRecord>,
     /// the last TaskId handed out
@@ -107,8 +109,9 @@ struct State<C> {
 pub const DEFAULT_IN_TOUCH_MODE: bool = true;
 
 impl<C> State<C> {
-    fn new(display: DisplayModel) -> Self {
+    fn new(declared: Option<Declaration>, display: DisplayModel) -> Self {
         State {
+            declared,
             display,
             tasks: BTreeMap::new(),
             last_id: 0,
@@ -119,6 +122,17 @@ impl<C> State<C> {
             in_touch_mode: DEFAULT_IN_TOUCH_MODE,
         }
     }
+}
+
+/// What a monitor report changed in the display (Tasks::set_monitor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisplayChange {
+    /// the display is the same
+    Unchanged,
+    /// the refresh rate only: a display event, no Task's configuration changes (AOSP's Configuration has no rate)
+    Refresh,
+    /// the size, density or rotation: each listed Task's configuration follows, with a new config_seq
+    Config(Vec<TaskId>),
 }
 
 /// The Tasks of the display: their owners and sizes, the window tokens bound to each, and the windows of each. `C` is the handle an activity or window is known by.
@@ -149,15 +163,21 @@ fn next_config_seq(seq: i32) -> i32 {
 }
 
 impl<C: Clone + PartialEq> Tasks<C> {
-    /// `display` is the monitor at start; `locale` the host's UI language tag, None when the host gives none.
-    pub fn new(display: DisplayModel, locale: Option<String>) -> Self {
-        Tasks {
-            state: Mutex::new(State::new(display)),
+    /// `monitor` is the monitor at start, `declared` the declared display (None: the display is the monitor); refused when [`DisplayModel::of`] refuses the pair.
+    /// `locale` is the host's UI language tag, None when the host gives none.
+    pub fn new(
+        monitor: DisplayModel,
+        declared: Option<Declaration>,
+        locale: Option<String>,
+    ) -> Result<Self, String> {
+        let display = DisplayModel::of(monitor, declared)?;
+        Ok(Tasks {
+            state: Mutex::new(State::new(declared, display)),
             locale,
-        }
+        })
     }
 
-    /// The display now (the monitor's values, [`Tasks::set_display`]): unchanged by any window's size. The one owner: every service reads it here, none keeps a copy.
+    /// The display now: [`DisplayModel::of`] of the monitor and the declaration, unchanged by any window's size ([`Tasks::set_monitor`]). The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
         self.lock().display
     }
@@ -220,7 +240,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
             .map(|(id, _)| *id)
     }
 
-    /// Whether the app `owner` has a Task: only such an app reports the monitor (registry SET_DISPLAY).
+    /// Whether the app `owner` has a Task: only such an app reports the monitor (registry REPORT_MONITOR).
     pub fn owns_any(&self, owner: u32) -> bool {
         self.lock().tasks.values().any(|t| t.owner == owner)
     }
@@ -253,21 +273,32 @@ impl<C: Clone + PartialEq> Tasks<C> {
         true
     }
 
-    /// The window's monitor changed (size, density or refresh rate: DisplayModel::from_monitor): it becomes the display. Every Task's configuration follows it, so each gets a new config_seq; returns those Tasks, empty when nothing changed.
-    /// No Task's size changes: a window is resized only by SET_BOUNDS, never by the monitor it is on.
-    pub fn set_display(&self, display: DisplayModel) -> Vec<TaskId> {
+    /// A window reported its monitor (REPORT_MONITOR): the display is recomputed from it. A size, density or rotation change renumbers every Task's configuration (config_seq) and lists
+    /// those Tasks; a refresh rate change is a display event only. A refused declaration leaves the state as it was. No Task's size changes: a window is resized only by SET_BOUNDS.
+    /// Returns the change with the display it made, read under the one lock: a concurrent report cannot pair its display with this change.
+    pub fn set_monitor(
+        &self,
+        monitor: DisplayModel,
+    ) -> Result<(DisplayChange, DisplayModel), String> {
         let mut st = self.lock();
-        if st.display == display {
-            return Vec::new();
+        let display = DisplayModel::of(monitor, st.declared)?;
+        let old = std::mem::replace(&mut st.display, display);
+        if display == old {
+            return Ok((DisplayChange::Unchanged, display));
         }
-        st.display = display;
-        st.tasks
+        let configuration = |d: &DisplayModel| (d.width, d.height, d.dpi, d.rotation);
+        if configuration(&display) == configuration(&old) {
+            return Ok((DisplayChange::Refresh, display));
+        }
+        let tasks = st
+            .tasks
             .iter_mut()
             .map(|(id, record)| {
                 record.config_seq = next_config_seq(record.config_seq);
                 *id
             })
-            .collect()
+            .collect();
+        Ok((DisplayChange::Config(tasks), display))
     }
 
     /// The Configuration.seq of `task`'s override (ActivityRecord.java:7697): numbered per size, 0 until the first change. Every copy of one override carries it: the item, IWindow.resized, relayout. They race on the app's main thread (AOSP orders them), and a seq-0 copy reads as older than a pending numbered one, so ActivityThread drops it and a layout runs on the old configuration; an item at seq 0 fares no better: handleActivityConfigurationChangedInner:7112 takes its own pending copy for newer and drops it.
@@ -415,9 +446,9 @@ mod tests {
     /// A stand-in handle: the table only compares and clones them.
     type Handle = u32;
 
-    /// The display the tests use: DisplayModel's default, 1280x800.
+    /// The display the tests use: DisplayModel's default, 1280x800, no declaration.
     fn tasks() -> Tasks<Handle> {
-        Tasks::new(DisplayModel::default(), None)
+        Tasks::new(DisplayModel::default(), None, None).expect("the default display")
     }
 
     /// 3/4 of each side of the 1280x800 display: a new Task's size there, for a landscape app (AOSP desktop default bounds, DesktopModeUtils.kt:49-56).
@@ -517,21 +548,49 @@ mod tests {
         assert_eq!(t.config_seq(task), 2);
     }
 
-    /// A new monitor becomes the display and renumbers every Task's override; the same monitor again changes nothing. No Task's size follows the monitor: a window is resized only by SET_BOUNDS.
+    /// A monitor whose size, density or rotation changes renumbers every Task's override; the same monitor again changes nothing; a refresh rate alone renumbers none. No Task's size
+    /// follows the monitor: a window is resized only by SET_BOUNDS.
     #[test]
-    fn set_display_renumbers_every_task_and_keeps_sizes() {
+    fn set_monitor_renumbers_every_task_on_a_configuration_change_only() {
         let t = tasks();
         let sized = t.new_task(7, "com.example.app", three_quarters());
         let fresh = t.new_task(8, "com.example.other", three_quarters());
         t.set_size(sized, size(1000, 700));
         let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0);
-        assert_eq!(t.set_display(monitor), vec![sized, fresh]);
+        assert_eq!(
+            t.set_monitor(monitor),
+            Ok((DisplayChange::Config(vec![sized, fresh]), monitor))
+        );
         assert_eq!(t.display(), monitor);
         assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
         assert_eq!(t.size(sized), Some(size(1000, 700)));
         assert_eq!(t.size(fresh), Some(three_quarters()));
-        assert_eq!(t.set_display(monitor), Vec::new());
+        assert_eq!(
+            t.set_monitor(monitor),
+            Ok((DisplayChange::Unchanged, monitor))
+        );
         assert_eq!(t.config_seq(sized), 2);
+        let faster = DisplayModel::from_monitor(1920, 1080, Some(120.0), 2.0, 0);
+        assert_eq!(t.set_monitor(faster), Ok((DisplayChange::Refresh, faster)));
+        assert_eq!(t.display().refresh_hz, 120.0);
+        assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
+    }
+
+    /// The laptop declared 411x914 dp shows 658x1462 px (see display_model.rs). A monitor at scale 5 (800 dpi) would need 4570 px on a side: refused, and the state stays.
+    #[test]
+    fn declared_display_follows_the_monitor_density_and_a_refusal_keeps_the_state() {
+        let laptop = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        let t: Tasks<Handle> = Tasks::new(laptop, Some(declared), None).expect("in range");
+        assert_eq!((t.display().width, t.display().height), (658, 1462));
+        let too_dense = DisplayModel::from_monitor(2560, 1600, None, 5.0, 0);
+        assert!(t.set_monitor(too_dense).is_err());
+        let kept = t.display();
+        assert_eq!(kept.width, 658);
+        assert_eq!(t.set_monitor(laptop), Ok((DisplayChange::Unchanged, kept)));
     }
 
     /// A Task that does not exist has no owner, no size, and takes no size.

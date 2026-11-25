@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! atl-system-services: registers the M2 services and the window service with servicemanager (`activity`, `package`, `display`, `window`, as Context.ACTIVITY_SERVICE / PACKAGE_SERVICE /
 //! DISPLAY_SERVICE / WINDOW_SERVICE / INPUT_METHOD_SERVICE name them) and the compositor registry (compositor_registry.rs: how an app's in-process SurfaceFlinger gets registered) and serves them on libbinder's thread pool, until killed. Runs as the system uid: servicemanager accepts addService from it. The packages are
-//! installed at start from the sessions atld holds files for (`--session`), the shared libraries and the display come from arguments (`--display`: display_model.rs; omitted, the model's default). Processes are started
+//! installed at start from the sessions atld holds files for (`--session`), the shared libraries and the display come from arguments (`--monitor`, `--declare-display`: display_model.rs; omitted, the model's default and no declaration). Processes are started
 //! and killed through the control connection atld passes as stdin ([`atl_services::process_control`]).
 //! Prints `services: ready` once all are registered; non-OK replies are counted on stderr (atl-diag).
 
@@ -30,7 +30,7 @@ use atl_services::packages::{PackageRecord, Packages, Permissions};
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
-use atl_services_types::display_model::DisplayModel;
+use atl_services_types::display_model::{Declaration, DisplayModel};
 use atl_services_types::hw_timeouts::HwTimeouts;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::{Library, PlatformManifest};
@@ -63,9 +63,12 @@ struct Args {
     /// A package whose launcher activity starts once the services are up (the stand-in for a home screen tap at boot; later starts come as startActivity with no caller app, `atl-am`).
     #[arg(long)]
     launch: Option<String>,
-    /// The display the services answer with (`WxH@hz,dpi`, display_model.rs). Omitted: the model's default.
+    /// The monitor the services start on (`WxH@hz,dpi,rotation`, display_model.rs), until a window reports its own. Omitted: the model's default.
     #[arg(long, value_parser = DisplayModel::parse_arg)]
-    display: Option<DisplayModel>,
+    monitor: Option<DisplayModel>,
+    /// The display declared in dp (`WxH`, display_model.rs `Declaration`): the apps see this size on the monitor's density. Omitted: the monitor is the display.
+    #[arg(long, value_parser = Declaration::parse_arg)]
+    declare_display: Option<Declaration>,
     /// `ro.hw_timeout_multiplier` as atld reads it (hw_timeouts.rs): scales the process-start and broadcast timers. Omitted: 1.
     #[arg(long = "hw-timeout-multiplier", value_parser = HwTimeouts::parse_arg, default_value = "1")]
     hw_timeouts: HwTimeouts,
@@ -256,7 +259,7 @@ fn exit_totals_on_terminate() -> Result<()> {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    let display = a.display.unwrap_or_default();
+    let monitor = a.monitor.unwrap_or_default();
     let control = Arc::new(ControlSocket::from_stdin().context("the process control on stdin")?);
     // the notification service's display half shares the connection (notifications plan N2)
     let desktop: Arc<dyn atl_services::notification::DesktopNotifications> = control.clone();
@@ -334,7 +337,10 @@ fn main() -> Result<()> {
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());
     // the Tasks of the display: each app's window size (tasks.rs), read by the window service and the registry; the activity service creates each launch's Task here
-    let tasks = Arc::new(atl_services::tasks::Tasks::new(display, a.locale));
+    let tasks = Arc::new(
+        atl_services::tasks::Tasks::new(monitor, a.declare_display, a.locale)
+            .map_err(anyhow::Error::msg)?,
+    );
     // the display listeners of the apps (IDisplayManager.registerCallback): the display service takes them, the registry tells them of a change
     let display_callbacks = Arc::new(atl_services::display::DisplayCallbacks::default());
     // the notification service's state: the activity service posts and cancels the foreground service notifications through it (ServiceRecord.postNotification)

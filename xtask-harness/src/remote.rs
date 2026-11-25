@@ -454,7 +454,7 @@ pub const ATLD_PID: &str = "atld.pid";
 pub const AGENT_RC: &str = "agent.rc";
 pub const AGENT_LOG: &str = "agent.log";
 pub const LIVE_JSON: &str = "live.json";
-/// The hidden `display-probe`'s answer line: atld's `--display` value.
+/// The hidden `display-probe`'s answer line: atld's `--monitor` value.
 pub const DISPLAY_PROBE_LINE: &str = "display-probe: ";
 /// The display probe's bound: one Wayland roundtrip after the binary loads.
 const DISPLAY_PROBE_LIMIT: Duration = Duration::from_secs(30);
@@ -1634,7 +1634,7 @@ impl Target {
         }))
     }
 
-    /// atld's `--display` value from the target's own display (the harness's hidden `display-probe`, window.rs `display_probe`, under the session's `WAYLAND_DISPLAY`): what a remote UI stage
+    /// atld's `--monitor` value from the target's own display (the harness's hidden `display-probe`, window.rs `display_probe`, under the session's `WAYLAND_DISPLAY`): what a remote UI stage
     /// tells atld and judges with. `harness` and the bundle's lib dirs are host paths, relocated. Only the session's socket: a nested labwc lives for one run only.
     pub fn display_model(&self, roots: &Roots, harness: &Path) -> Result<String> {
         let lib_path: Vec<String> = self

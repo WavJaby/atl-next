@@ -25,6 +25,7 @@ use crate::atld_run::{
 };
 use crate::audio_pcm::{RouteSampler, Routing, RunClients, route_verdict, stream_routes};
 use crate::manifest::Manifest;
+use atl_services_types::display_model::Declaration;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
 use crate::nested_wayland::NestedCompositor;
@@ -105,6 +106,9 @@ pub struct Args {
     /// With --scenario: writes the scenario's shots as PNGs into DIR (by their file names) instead of judging them in memory only.
     #[arg(long, value_name = "DIR", requires = "scenario")]
     keep_shots: Option<PathBuf>,
+    /// atld `--declare-display WxH` (dp): the apps see a display of this size whatever the monitor (display_model.rs `Declaration`). Omitted: the monitor is the display.
+    #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
+    declare_display: Option<Declaration>,
     /// atld `--tilt-keys`: held left / right (or a / d) tilt the device for accelerometer games, at atld's default angle, ramp and rate.
     #[arg(long)]
     tilt_keys: bool,
@@ -153,9 +157,9 @@ pub struct RemoteArgs {
     /// Keeps the app up this many seconds after its resume, the window open on the target's desktop.
     #[arg(long, value_name = "SECONDS")]
     hold: u64,
-    /// The display atld answers with (`WxH@hz,dpi`), instead of the target's monitor. Default: the target's own monitor, read by atld on the target's desktop.
-    #[arg(long, value_name = "DISPLAY")]
-    display: Option<String>,
+    /// atld `--declare-display WxH` (dp): the apps see a display of this size on the target's monitor's density. Omitted: the target's own monitor is the display, read by atld on the target's desktop.
+    #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
+    declare_display: Option<Declaration>,
     /// atld `--tilt-keys`, as for `run-apk`.
     #[arg(long)]
     tilt_keys: bool,
@@ -242,6 +246,7 @@ impl Args {
             controls: false,
             network: None,
             keep_shots: None,
+            declare_display: None,
         }
     }
 
@@ -552,12 +557,16 @@ pub(crate) fn run_on(
         (Some(n), Some(p)) => rt
             .clone()
             .with_wayland(&p.listen)
-            .with_display(n.display().to_arg()),
+            .with_monitor(n.display().to_arg()),
         (Some(n), None) => rt
             .clone()
             .with_wayland(&n.socket)
-            .with_display(n.display().to_arg()),
-        (None, _) => rt.clone().with_display(run_display().to_arg()),
+            .with_monitor(n.display().to_arg()),
+        (None, _) => rt.clone().with_monitor(run_display().to_arg()),
+    };
+    let rt = match args.declare_display {
+        Some(declared) => rt.with_declare_display(declared.to_arg()),
+        None => rt,
     };
     // headless (no --hold): nobody listens either, so every stream the run makes plays into a null sink of its own, never the session's sink; --hold is the user's launch and keeps
     // the session's routing. Declared before atld: the sink outlives it.
@@ -822,13 +831,14 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         controls: false,
         network: None,
         keep_shots: None,
+        declare_display: None,
     };
-    // no `--display`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
+    // no `--monitor`: atld reads the target's own monitor, as on the product's host (host_display); this host's monitor is not the target's
     let (rt, foreign) = runtime(root, &args, &files)?;
     // the run's APK is bundled: its copy under the out dir, as the record and the bundle take only the out, java and tree roots
     let files = bundled(&rt.out.join("run-apk").join("package"), files)?;
-    let rt = match &a.display {
-        Some(display) => rt.with_display(display.clone()),
+    let rt = match a.declare_display {
+        Some(declared) => rt.with_declare_display(declared.to_arg()),
         None => rt,
     }
     .with_desktop_env(&a.env)

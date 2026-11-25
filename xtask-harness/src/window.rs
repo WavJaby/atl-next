@@ -21,9 +21,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use atl_layout::Layout;
-use atl_services_types::display_model::DisplayModel;
+use atl_services_types::display_model::{Declaration, DisplayModel};
 
 use crate::atld_run::{
     Counter, Event, MS_PER_S, Package, Run, Runtime, events, parse_stamp, run_display, show, totals,
@@ -174,6 +174,15 @@ pub struct Args {
     /// Stage suspended only: the probe never sends the suspended configure, so the states check must fail (the gate's deliberate break).
     #[arg(long)]
     break_suspended: bool,
+    /// Stage move only: the display declared in dp (atld `--declare-display`, display_model.rs `Declaration`), the apps see this size on each output's density; adds the `declared` sub-gate.
+    #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
+    declare_display: Option<Declaration>,
+    /// Stage move, with `--declare-display` only: the run is not given the declaration, so the declared sub-gate must fail (the gate's deliberate break, harness-side).
+    #[arg(long, requires = "declare_display")]
+    break_declare_display: bool,
+    /// Stage move, with `--declare-display` only: the composer adopts the monitor it reported instead of the services' answer (atl-composer feature `break-declared-adopt`), so its SurfaceFlinger display is not DisplayInfo and the declared sub-gate must fail.
+    #[arg(long, requires = "declare_display")]
+    break_declared_adopt: bool,
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
@@ -2563,6 +2572,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     ),
                     (args.break_input_frames, "atl-composer/break-input-frames"),
                     (args.break_input_no_wake, "atl-composer/break-input-no-wake"),
+                    (
+                        args.break_declared_adopt,
+                        "atl-composer/break-declared-adopt",
+                    ),
                     (args.break_outbox, "atl-composer/break-outbox"),
                     (args.break_handle_hold, "atl-composer/break-handle-hold"),
                     (args.break_ime_copy, "atl-ime/break-copy"),
@@ -2606,7 +2619,16 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => GATE_OUTPUT.display(),
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
-    let rt = rt.with_display(display.to_arg());
+    let rt = rt.with_monitor(display.to_arg());
+    // the declared display is the move stage's: the break runs without it, so the run is judged against the declaration it did not get
+    ensure!(
+        args.declare_display.is_none() || matches!(args.stage, Stage::Move),
+        "--declare-display is for stage move only"
+    );
+    let rt = match args.declare_display {
+        Some(declared) if !args.break_declare_display => rt.with_declare_display(declared.to_arg()),
+        _ => rt,
+    };
     let rt = if args.break_ime_death {
         rt.without_ime_death_link()
     } else {
@@ -3254,7 +3276,14 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             args.esc_back,
         ),
         (Stage::Move, Some(_)) => match moved {
-            Some(moved) => move_output::checks(&app, &services, &liveness, display, moved),
+            Some(moved) => move_output::checks(
+                &app,
+                &services,
+                &liveness,
+                display,
+                moved,
+                args.declare_display,
+            ),
             None => vec![("outputs", Err("no nested compositor".to_owned()))],
         },
         (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
@@ -3693,8 +3722,8 @@ pub fn agent(a: &AgentArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Hidden `display-probe`: this host's first monitor as atld's `--display` value, on the line remote.rs `Target::display_model` reads. The monitor's own model (DisplayModel::from_monitor: size, rate,
-/// density 160 x scale), as atld takes it without `--display` (atld main.rs `host_display`) and as the app's window reports it on entry (atl-composer ui_window.rs `on_monitor`, registry SET_DISPLAY).
+/// Hidden `display-probe`: this host's first monitor as atld's `--monitor` value, on the line remote.rs `Target::display_model` reads. The monitor's own model (DisplayModel::from_monitor: size, rate,
+/// density 160 x scale), as atld takes it without `--monitor` (atld main.rs `host_display`) and as the app's window reports it on entry (atl-composer ui_window.rs `on_monitor`, registry REPORT_MONITOR).
 /// Never the gates' fixed display ([`run_display`]): the window opens on this monitor, so a fixed value would be the app's first configuration only until the window's report replaced it -- the first
 /// layout at the fixed density, then a relaunch at the monitor's (measured on a scale-1.6 laptop: label left=16, then 26). No desktop or no monitor: an error, no default.
 pub fn display_probe() -> Result<ExitCode> {
@@ -3853,7 +3882,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
         ],
         proxy: ui,
     };
-    let rt = rt.with_display(display.to_arg()).with_site(
+    let rt = rt.with_monitor(display.to_arg()).with_site(
         target
             .run_site(&pushed, REMOTE_LIMIT, log.clone(), kind)?
             .with_agent(agent),

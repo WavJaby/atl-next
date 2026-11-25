@@ -74,7 +74,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?
     .with_gralloc(root)?
     .with_gl_driver(root)?;
-    let rt = rt.with_display(run_display().to_arg());
+    let rt = rt.with_monitor(run_display().to_arg());
     let work = rt.out.join("es1-angle");
     let lib = build_lib(root, &work.join("cargo"))?;
     let lib_at = format!("{}/{LIB}", atl_android_paths::SYSTEM_LIB);

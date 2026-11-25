@@ -412,8 +412,10 @@ pub struct Runtime {
     guest_bits: std::collections::BTreeMap<String, u32>,
     /// The headless pointer script (atld `--headless-pointer`), when [`Runtime::with_headless_pointer`] set it.
     headless_pointer: Option<String>,
-    /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
-    display: Option<String>,
+    /// The monitor the run starts on (atld `--monitor`, `WxH@hz,dpi,rotation`).
+    monitor: Option<String>,
+    /// The display declared in dp (atld `--declare-display`, `WxH`); None: the monitor is the display.
+    declared: Option<String>,
     /// The app processes' UI mode (atld `--ui`), when [`Runtime::with_ui`] set it.
     ui: Option<String>,
     /// Variables the desktop would set for this launch, in atld's environment ([`Runtime::with_desktop_env`]).
@@ -982,7 +984,8 @@ impl Runtime {
             native_bridge_guest: Vec::new(),
             platform_files,
             headless_pointer: None,
-            display: None,
+            monitor: None,
+            declared: None,
             ui: None,
             desktop_env: Vec::new(),
             app_env: Vec::new(),
@@ -1286,9 +1289,15 @@ impl Runtime {
         self
     }
 
-    /// The display the run answers with (atld `--display`, `WxH@hz,dpi`).
-    pub fn with_display(mut self, display: String) -> Self {
-        self.display = Some(display);
+    /// The monitor the run starts on (atld `--monitor`, `WxH@hz,dpi,rotation`): the window's own report replaces it at the window's entry.
+    pub fn with_monitor(mut self, monitor: String) -> Self {
+        self.monitor = Some(monitor);
+        self
+    }
+
+    /// The display the run's apps see, declared in dp (atld `--declare-display`, `WxH`).
+    pub fn with_declare_display(mut self, declared: String) -> Self {
+        self.declared = Some(declared);
         self
     }
 
@@ -2193,8 +2202,11 @@ impl Runtime {
         if let Some(script) = &self.headless_pointer {
             cmd.args(["--headless-pointer", script]);
         }
-        if let Some(display) = &self.display {
-            cmd.args(["--display", display]);
+        if let Some(monitor) = &self.monitor {
+            cmd.args(["--monitor", monitor]);
+        }
+        if let Some(declared) = &self.declared {
+            cmd.args(["--declare-display", declared]);
         }
         if let Some(mode) = &self.ui {
             // the compositor logs its `present` lines (first and power-of-two counts) at debug (atl-composer ui_window.rs): the UI runs that read them enable it; read in the app processes, so

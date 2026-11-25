@@ -136,7 +136,7 @@ enum Command {
     /// The window gate's live half on a remote target (window.rs `agent`), started by `remote test window`'s run script; needs no checkout.
     #[command(hide = true)]
     WindowLive(window::AgentArgs),
-    /// This host's first monitor as atld's `--display` value (window.rs `display_probe`), run on a remote target before a UI stage; needs no checkout.
+    /// This host's first monitor as atld's `--monitor` value (window.rs `display_probe`), run on a remote target before a UI stage; needs no checkout.
     #[command(hide = true)]
     DisplayProbe,
     /// The worker and burner processes of `test host-load` (host_load.rs `child`); no checkout, no gate scope.

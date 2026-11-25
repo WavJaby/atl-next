@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering for display 0 from the display the Tasks own (tasks.rs `Tasks::display`: atld's `--display` at start, then the window's monitor via registry SET_DISPLAY); registered callbacks hear each change ([`DisplayCallbacks`]).
+//! The `display` service (Context.DISPLAY_SERVICE): the converter's IDisplayManager stub answering for display 0 from the display the Tasks own (tasks.rs `Tasks::display`: computed from atld's `--monitor` and `--declare-display` at start, then from each window's monitor via registry REPORT_MONITOR); registered callbacks hear each change ([`DisplayCallbacks`]).
 //! getDisplayInfo is display 0's record (DisplayManagerService.getDisplayInfo: null for any other id) and getDisplayIds lists display 0; getOverlaySupport is AOSP's no-HWC default.
 //! Every other method keeps the stub's default body, so each call is counted by the reply hook (atl-diag) and answered UNKNOWN_TRANSACTION.
 
@@ -90,7 +90,7 @@ impl DisplayCallbacks {
         Ok(())
     }
 
-    /// Display 0 changed (Tasks::set_display): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each live callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). Returns the callbacks told.
+    /// Display 0 changed (Tasks::set_monitor): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each live callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). Returns the callbacks told.
     pub fn display_changed(&self) -> usize {
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         records.retain(|r| !r.dead.load(Ordering::Acquire));

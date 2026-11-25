@@ -3,7 +3,7 @@
 //! asks for a frame; the window's frame clock takes the latest there and presents it, and its paint reports the buffers it stopped drawing back into the mailbox. Nothing the compositor does waits for this
 //! thread (maintainer D1, 2026-11-08). Its pointer events reach the input thread ([`Message::Event`]).
 //! GTK objects live on the display thread only (the platform module's own thread, started when the toolkit attaches): the launcher's startup attaches the toolkit and [`open`]s the window before ART boots, showing the starting window (`ro.atl.splash`); [`install`] keeps the session in a thread-local of the display thread and wires the window to the compositor. Both run their work there by `call`, so the caller holds only the Send [`OpenWindow`] token; no other thread touches GTK.
-//! The window is one Task's toplevel (freeform: the display is the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds, the monitor it is on as the display (task_reports.rs); the monitor is also this process's compositor display (Composer::set_display).
+//! The window is one Task's toplevel (freeform: the display is the services' answer to the monitor, not this window): one per process that has a Task (none for a provider, service or receiver process), opened at its Task's size and app id (registry TASK_INFO, start.rs) (the app's first traversal waits for a vsync, which this window's frame clock supplies). Its size changes go to the services as the Task's bounds and the monitor it is on as a report (task_reports.rs); the display the services answer (the monitor, or a declared display at the monitor's density) becomes this process's compositor display (Composer::set_display).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -449,9 +449,8 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
         // the desktop closing the window is the Shell removing its Task (REMOVE_TASK, task_reports.rs)
         let closes = Arc::clone(&session.reports);
         window.on_close_requested(move || closes.submit_remove_task());
-        // the monitor is this process's compositor display (its vsync interval, SurfaceFlinger's display info) and the services' display (DisplayInfo, Configuration)
+        // the monitor goes to the services; their reply is this process's display (its vsync interval, SurfaceFlinger's display info), taken in task_reports.rs
         let monitors = Arc::clone(&session.reports);
-        let frames = Arc::clone(&session.composer);
         window.on_monitor(move |m| {
             let model = DisplayModel::from_monitor(
                 m.size.width,
@@ -460,10 +459,7 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
                 m.scale.get(),
                 m.rotation.quarter_turns(),
             );
-            if frames.set_display(model) {
-                tracing::info!("atl-composer: ui: display {}", model.to_arg());
-            }
-            monitors.submit_display(model);
+            monitors.submit_monitor(model);
         });
         window.request_frame();
         // the in-app input method's desktop side: the window's TextInput (its calls on the editor's connection go to the outbox, atl-ime field.rs)

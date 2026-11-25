@@ -14,10 +14,10 @@ use binder::{
 use crate::activity::ActivityManager;
 use crate::display::DisplayCallbacks;
 use crate::input::KeyMaps;
-use crate::tasks::{TaskId, TaskSize, Tasks};
+use crate::tasks::{DisplayChange, TaskId, TaskSize, Tasks};
 use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, GET_COMPOSER, KEY_MAP, REGISTER, REMOVE_TASK, SET_BOUNDS, SET_DISPLAY, TASK_INFO,
+    DESCRIPTOR, GET_COMPOSER, KEY_MAP, REGISTER, REMOVE_TASK, REPORT_MONITOR, SET_BOUNDS, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
@@ -53,8 +53,9 @@ pub trait ICompositorRegistry: Interface {
         height: i32,
     ) -> Result<(), StatusCode>;
 
-    /// SET_DISPLAY once its argument is read: the monitor in the `--display` form. The caller's uid must own a Task; a malformed form is refused; a change reaches every app (registry `display_changed`).
-    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode>;
+    /// REPORT_MONITOR once its argument is read: the window's monitor in the `WxH@hz,dpi,rotation` form. The caller's uid must own a Task; a malformed or refused monitor is refused; a display
+    /// change reaches every app (registry `display_changed`). Returns the display the services answer with.
+    fn report_monitor(&self, caller_uid: u32, monitor: &str) -> Result<DisplayModel, StatusCode>;
 
     /// REMOVE_TASK once its argument is read: the desktop closed the window of Task `task`. The caller's uid must own the Task, as for SET_BOUNDS.
     fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode>;
@@ -79,7 +80,7 @@ fn method_name(code: TransactionCode) -> Option<&'static str> {
         (REGISTER, "REGISTER"),
         (GET_COMPOSER, "GET_COMPOSER"),
         (SET_BOUNDS, "SET_BOUNDS"),
-        (SET_DISPLAY, "SET_DISPLAY"),
+        (REPORT_MONITOR, "REPORT_MONITOR"),
         (TASK_INFO, "TASK_INFO"),
         (REMOVE_TASK, "REMOVE_TASK"),
         (KEY_MAP, "KEY_MAP"),
@@ -144,9 +145,11 @@ fn dispatch(
         let task: i32 = data.read()?;
         return service.remove_task(ThreadState::get_calling_uid(), task);
     }
-    if code == SET_DISPLAY {
-        let display: String = data.read()?;
-        return service.set_display(ThreadState::get_calling_uid(), &display);
+    if code == REPORT_MONITOR {
+        let monitor: String = data.read()?;
+        // the reply is the display the services answer with, in the monitor's form: the compositor takes it as its own
+        let display = service.report_monitor(ThreadState::get_calling_uid(), &monitor)?;
+        return reply.write(&display.to_arg());
     }
     if code == TASK_INFO {
         // no Task: 0 x 0 and an empty package (compositor_registry.rs TASK_INFO)
@@ -175,7 +178,7 @@ impl ICompositorRegistry for BpCompositorRegistry {
         Err(StatusCode::INVALID_OPERATION)
     }
 
-    fn set_display(&self, _: u32, _: &str) -> Result<(), StatusCode> {
+    fn report_monitor(&self, _: u32, _: &str) -> Result<DisplayModel, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -211,8 +214,8 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
         self.0.set_bounds(caller_uid, task, width, height)
     }
 
-    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
-        self.0.set_display(caller_uid, display)
+    fn report_monitor(&self, caller_uid: u32, monitor: &str) -> Result<DisplayModel, StatusCode> {
+        self.0.report_monitor(caller_uid, monitor)
     }
 
     fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode> {
@@ -337,40 +340,55 @@ impl ICompositorRegistry for Registry {
         Ok(())
     }
 
-    fn set_display(&self, caller_uid: u32, display: &str) -> Result<(), StatusCode> {
+    fn report_monitor(&self, caller_uid: u32, monitor: &str) -> Result<DisplayModel, StatusCode> {
         // only an app with a window reports its monitor
         if !self.tasks.owns_any(caller_uid) {
             atl_diag::set_cause(&format!("uid {caller_uid} owns no task"));
             return Err(StatusCode::PERMISSION_DENIED);
         }
-        let model = DisplayModel::parse_arg(display).map_err(|why| {
+        let model = DisplayModel::parse_arg(monitor).map_err(|why| {
             atl_diag::set_cause(&why.to_string());
             StatusCode::BAD_VALUE
         })?;
-        let tasks = self.tasks.set_display(model);
-        if tasks.is_empty() {
-            // logged too: a window gate tells "the window's monitor was the start display" from "no report reached the services"
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: display {display} from uid {caller_uid} unchanged"
-            );
-            return Ok(());
-        }
+        let (change, display) = self.tasks.set_monitor(model).map_err(|why| {
+            atl_diag::set_cause(&why);
+            StatusCode::BAD_VALUE
+        })?;
+        // logged in every case: a window gate tells "the window's monitor was the start display" from "no report reached the services"
         let _ = writeln!(
             std::io::stderr(),
-            "services: display {display} from uid {caller_uid}"
+            "services: monitor {monitor} from uid {caller_uid}: display {}{}",
+            display.to_arg(),
+            match change {
+                DisplayChange::Unchanged => " unchanged",
+                DisplayChange::Refresh => " refresh only",
+                DisplayChange::Config(_) => "",
+            }
         );
         // AOSP's order: DisplayManagerService delivers the display event, then WindowManager's display change updates the global configuration (ActivityTaskManagerService.updateGlobalConfigurationLocked:4813: ConfigurationChangeItem to each process), then each activity's
-        let callbacks = self.display_callbacks.display_changed();
-        let processes = self.activities.global_configuration_changed();
-        let _ = writeln!(
-            std::io::stderr(),
-            "services: display change told {callbacks} display callbacks, {processes} processes"
-        );
-        for task in tasks {
-            self.task_changed(task);
+        match change {
+            DisplayChange::Unchanged => {}
+            DisplayChange::Refresh => {
+                // a display event only: the apps' display listeners hear it, no Configuration changes
+                let callbacks = self.display_callbacks.display_changed();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "services: display change told {callbacks} display callbacks, 0 processes"
+                );
+            }
+            DisplayChange::Config(tasks) => {
+                let callbacks = self.display_callbacks.display_changed();
+                let processes = self.activities.global_configuration_changed();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "services: display change told {callbacks} display callbacks, {processes} processes"
+                );
+                for task in tasks {
+                    self.task_changed(task);
+                }
+            }
         }
-        Ok(())
+        Ok(display)
     }
 
     fn register(
