@@ -40,7 +40,7 @@ pub const START_CLASS_NOT_FOUND: i32 = -92;
 pub const START_INTENT_NOT_RESOLVED: i32 = -91;
 
 /// Intent.FLAG_ACTIVITY_* bits the decision reads (Intent.java).
-const NEW_TASK: i32 = 0x1000_0000;
+pub const NEW_TASK: i32 = 0x1000_0000;
 const SINGLE_TOP: i32 = 0x2000_0000;
 const NO_HISTORY: i32 = 0x4000_0000;
 const MULTIPLE_TASK: i32 = 0x0800_0000;

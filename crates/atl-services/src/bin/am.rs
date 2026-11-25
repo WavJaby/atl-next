@@ -12,12 +12,11 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use atl_aidl::aidl::android::app::IActivityTaskManager::IActivityTaskManager;
 use atl_parcelables::android::content::{ComponentName, Intent};
+use atl_services::activity_start::NEW_TASK;
 use binder::{ProcessState, Strong};
 
 /// The calling package the shell's starts carry (ActivityManagerShellCommand: SHELL_PACKAGE_NAME).
 const SHELL_PACKAGE: &str = "com.android.shell";
-/// Intent.FLAG_ACTIVITY_NEW_TASK: a start from outside an activity needs it (ContextImpl.startActivity).
-const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,7 +42,7 @@ fn main() -> Result<()> {
             package: package.to_owned(),
             class: class.clone(),
         }),
-        flags: FLAG_ACTIVITY_NEW_TASK,
+        flags: NEW_TASK,
         ..Default::default()
     };
     let code = atm

@@ -1468,6 +1468,43 @@ mod tests {
 
     const CONFIG_ONE_CPU: &str = "[pool]\ncpu_slots = 1\nmem_gib = 20\n";
 
+    // A helper rename breaks the function reference; the filter follows the identifier.
+    macro_rules! child_test {
+        ($test:ident, $ws:expr) => {{
+            let _: fn() = $test;
+            let (_, module) = module_path!().split_once("::").unwrap();
+            run_child_test(&format!("{module}::{}", stringify!($test)), $ws);
+        }};
+    }
+
+    fn run_child_test(name: &str, ws: &Path) {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", name, "--format", "pretty"])
+            .env("POOL_TEST_WS", ws)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name}: {}\n{stdout}\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{name}: expected one passing case\n{stdout}\n{stderr}"
+        );
+    }
+
+    // Break: a nonexistent exact path exits 0 after running zero cases.
+    #[test]
+    #[should_panic(expected = "expected one passing case")]
+    fn child_test_rejects_an_empty_match() {
+        run_child_test("build_pool::tests::missing_helper", Path::new(""));
+    }
+
     /// Holder process: takes a grant, then runs `helper_nested` as its child while holding it. The child's acquire must be refused.
     #[test]
     #[ignore = "run by ancestor_holder_refuses_a_nested_acquire"]
@@ -1482,18 +1519,7 @@ mod tests {
             &mut |_| panic!("holder waited"),
         )
         .unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "build_pool::tests::helper_nested",
-                "--nocapture",
-            ])
-            .env("POOL_TEST_WS", &ws)
-            .stdout(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "the nested acquire was not refused");
+        child_test!(helper_nested, &ws);
     }
 
     #[test]
@@ -1518,18 +1544,7 @@ mod tests {
     #[test]
     fn ancestor_holder_refuses_a_nested_acquire() {
         let ws = scratch_ws("nest-ancestor", Some(CONFIG_ONE_CPU));
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "build_pool::tests::helper_holder",
-                "--nocapture",
-            ])
-            .env("POOL_TEST_WS", &ws)
-            .stdout(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "helper_holder failed");
+        child_test!(helper_holder, &ws);
     }
 
     /// The quiet window takes every slot, and is refused (naming the holder) while one is held.

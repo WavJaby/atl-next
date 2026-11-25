@@ -1019,6 +1019,34 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::time::Duration;
+    use xtask::gate_goals::{GATES, OUTSIDE_CHECK_ROWS};
+
+    // Break: add a gate without a row or reason, schedule a listed exception, or leave an exception after removing its gate.
+    #[test]
+    fn each_native_gate_has_a_check_row_or_a_reason() {
+        for &(name, _) in GATES {
+            let scheduled = ROWS.iter().any(|row| row.cmd() == name);
+            let exceptions = OUTSIDE_CHECK_ROWS
+                .iter()
+                .filter(|&&(n, _)| n == name)
+                .count();
+            assert_eq!(
+                usize::from(scheduled) + exceptions,
+                1,
+                "{name}: expected a check row or one exception"
+            );
+        }
+        for &(name, reason) in OUTSIDE_CHECK_ROWS {
+            assert!(
+                GATES.iter().any(|&(n, _)| n == name),
+                "{name}: stale exception"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "{name}: missing exception reason"
+            );
+        }
+    }
 
     /// A step's need samples: each passing row's own waits, from its deciding run; a red row and the self-test row add none. Expected values written out.
     #[test]

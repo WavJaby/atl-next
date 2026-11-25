@@ -33,6 +33,7 @@ use binder::{
     BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, StatusCode, Strong, ThreadState,
 };
 
+use crate::broadcast::{FLAG_RECEIVER_REGISTERED_ONLY, FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT};
 use crate::packages::Permissions;
 
 /// The HAL instance BatteryService waits for (HealthServiceWrapperAidl.SERVICE_NAME).
@@ -76,9 +77,7 @@ const ACTION_BATTERY_LOW: &str = "android.intent.action.BATTERY_LOW";
 const ACTION_BATTERY_OKAY: &str = "android.intent.action.BATTERY_OKAY";
 const ACTION_POWER_CONNECTED: &str = "android.intent.action.ACTION_POWER_CONNECTED";
 const ACTION_POWER_DISCONNECTED: &str = "android.intent.action.ACTION_POWER_DISCONNECTED";
-const FLAG_RECEIVER_REGISTERED_ONLY: i32 = 0x4000_0000;
 const FLAG_RECEIVER_REPLACE_PENDING: i32 = 0x2000_0000;
-const FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT: i32 = 0x0400_0000;
 
 /// Sends a broadcast as the system to every user, sticky or not (wired to the activity service's `broadcast_as_system` by atl-system-services).
 pub type SystemBroadcast = Arc<dyn Fn(&Intent, bool) + Send + Sync>;
@@ -677,16 +676,14 @@ mod tests {
     }
 
     /// BATTERY_CHANGED carries BatteryService's extras: scale 100, plugged AC 1, the HAL's level and status.
+    // Break: change either Intent.java bit (0x40000000 | 0x20000000).
     #[test]
     fn battery_changed_extras() {
         let mut st = State::default();
         let sent = st.update(on_ac(60), Instant::now());
         let (changed, sticky) = sent.last().expect("sent");
         assert!(sticky);
-        assert_eq!(
-            changed.flags,
-            FLAG_RECEIVER_REGISTERED_ONLY | FLAG_RECEIVER_REPLACE_PENDING
-        );
+        assert_eq!(changed.flags, 0x6000_0000);
         let extras = changed
             .extras
             .as_ref()

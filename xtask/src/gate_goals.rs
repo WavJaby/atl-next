@@ -370,6 +370,27 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("window", window),
 ];
 
+/// Native-goal names without a row in the runtime gate matrix, with the reason for each.
+pub const OUTSIDE_CHECK_ROWS: &[(&str, &str)] = &[
+    ("adb", "No reason recorded: candidate for check."),
+    ("audio-app", "No reason recorded: candidate for check."),
+    ("binder", "No reason recorded: candidate for check."),
+    (
+        "cts",
+        "CTS failures are progress data; the command checks regressions only with a saved baseline.",
+    ),
+    ("drive", "check runs the separate drive-tap quick step."),
+    ("es1-angle", "Standalone ANGLE ES1 spike."),
+    ("gl", "No reason recorded: candidate for check."),
+    ("gl-proxies", "check has a dedicated step for this probe."),
+    ("gles2-fixture", "No reason recorded: candidate for check."),
+    ("installer", "No reason recorded: candidate for check."),
+    ("native-load", "No reason recorded: candidate for check."),
+    ("run-apk", "Separate app launcher command."),
+    ("rv-qemu", "Requires a riscv64 build and qemu-user."),
+    ("sensors", "No reason recorded: candidate for check."),
+];
+
 /// The goals of gate `name`, expanded from the checkout at `root` ([`resolve`]).
 pub fn of(root: &Path, name: &str) -> Result<Goals> {
     resolve(root, declared(name)?)

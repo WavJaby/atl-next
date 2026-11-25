@@ -25,7 +25,9 @@ use atl_parcelables::codecs::android::content::pm::ResolveInfo::{ResolveInfo, Re
 use atl_services_types::installer_output::Kind;
 
 use crate::activity::{filter_of, intent_key};
-use crate::broadcast;
+use crate::broadcast::{
+    self, FLAG_RECEIVER_REGISTERED_ONLY, FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT,
+};
 use crate::packages::FLAG_SYSTEM;
 use atl_parcelables::parts::{ComponentInfo, SharedLibraryInfo};
 use atl_services_types::system_config::Features;
@@ -1271,7 +1273,6 @@ pub fn package_changed_sends(
     dont_kill: bool,
 ) -> Vec<(Intent, Option<u32>)> {
     const ACTION_PACKAGE_CHANGED: &str = "android.intent.action.PACKAGE_CHANGED";
-    const FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT: i32 = 0x0400_0000;
     let (not_exported, exported): (Vec<String>, Vec<String>) =
         components.iter().cloned().partition(|c| p.not_exported(c));
     let intent = |names: Vec<String>, package: Option<&str>| {
@@ -1302,8 +1303,7 @@ pub fn package_changed_sends(
         Intent {
             action: Some(ACTION_PACKAGE_CHANGED.to_owned()),
             data: Some(format!("package:{}", p.name())),
-            flags: broadcast::FLAG_RECEIVER_REGISTERED_ONLY
-                | FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT,
+            flags: FLAG_RECEIVER_REGISTERED_ONLY | FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT,
             package: package.map(str::to_owned),
             extras: Some(extras),
             ..Intent::default()

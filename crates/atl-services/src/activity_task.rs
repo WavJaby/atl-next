@@ -29,7 +29,7 @@ use crate::activity::{
 };
 use crate::activity_stack::{Cancelled, Push};
 use crate::activity_stack::{Command, Machine, ResultTo, Step};
-use crate::activity_start::{self, Call, Rec, Refusal, Source, Target, Then};
+use crate::activity_start::{self, Call, NEW_TASK, Rec, Refusal, Source, Target, Then};
 use crate::config_diff::Config;
 use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
 use crate::package::USER_SYSTEM;
@@ -134,8 +134,6 @@ pub(crate) enum Back {
 /// Intent.ACTION_MAIN / CATEGORY_LAUNCHER: how the launcher starts an app.
 const ACTION_MAIN: &str = "android.intent.action.MAIN";
 const CATEGORY_LAUNCHER: &str = "android.intent.category.LAUNCHER";
-/// Intent.FLAG_ACTIVITY_NEW_TASK, set on a launcher start.
-const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
 
 /// What a Launch step is built from: the activity's package and declaration, the LaunchActivityItem's ident, and the intent it delivers.
 #[derive(Clone)]
@@ -499,7 +497,7 @@ impl ActivityTasks {
             intent: Intent {
                 action: Some(ACTION_MAIN.into()),
                 categories: vec![Some(CATEGORY_LAUNCHER.into())],
-                flags: FLAG_ACTIVITY_NEW_TASK,
+                flags: NEW_TASK,
                 component: Some(ComponentName {
                     package: package.to_owned(),
                     class: decl.component.item.name.clone().unwrap_or_default(),
