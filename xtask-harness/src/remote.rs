@@ -81,6 +81,10 @@ const LABWC_SETUP: &str = "atl-labwc-setup";
 const LABWC_SETUP_LOG: &str = "labwc-setup.log";
 /// wayvnc's log in a run's scratch dir (`--view`).
 const VIEW_LOG: &str = "wayvnc.log";
+/// A nested labwc's log in a run's scratch dir.
+const LABWC_LOG: &str = "labwc.log";
+/// The logs a run's display writes in its scratch dir, those it has.
+pub(crate) const DISPLAY_LOGS: [&str; 3] = [LABWC_LOG, LABWC_SETUP_LOG, VIEW_LOG];
 /// A run's end record in its scratch dir: atld's exit code ([`ended_early`]).
 const ATLD_RC: &str = "atld.rc";
 /// Bundle names of a record's roots: the build dir, the java out and the AOSP tree.
@@ -1061,9 +1065,9 @@ impl Plan {
         // the logs of the display's processes started so far: they come back wherever the run stops
         let mut display_logs = Vec::new();
         if self.display.nested() {
-            display_logs.push(format!("{}/labwc.log", self.scratch));
+            display_logs.push(format!("{}/{LABWC_LOG}", self.scratch));
         }
-        let labwc_log = word(&out_path(&format!("{}/labwc.log", self.scratch)));
+        let labwc_log = word(&out_path(&format!("{}/{LABWC_LOG}", self.scratch)));
         match self.display {
             Display::Headless => {}
             Display::Session => {

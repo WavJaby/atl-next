@@ -36,6 +36,10 @@ use xtask::timing;
 pub(crate) const PRESENT_LINE: &str = "atl-composer: ui: present";
 /// What a remote run returns under its scratch dir besides the logs: atld's log, its exit code (`atld.rc`) and its end time (`end.ms`, the target's clock).
 const END_FILES: [&str; 3] = ["atld.log", "atld.rc", "end.ms"];
+/// The scratch files a remote run keeps in its numbered dir: the next run uses the same scratch, and what stayed only there would be overwritten or read as that run's.
+fn kept_files() -> impl Iterator<Item = &'static str> {
+    END_FILES.into_iter().chain(remote::DISPLAY_LOGS)
+}
 /// How long past the target's limit the transfer may run (its tar and ssh) before it is stopped and the run fails.
 pub(crate) const TRANSFER_MARGIN: Duration = Duration::from_secs(60);
 
@@ -916,7 +920,7 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
     }
     // a dir of its own: an earlier run's logs and shots stay, and a run that ends before its logs return reads none of them
     let logs = next_run_dir(&row_logs)?;
-    for name in END_FILES {
+    for name in kept_files() {
         let _ = std::fs::remove_file(run.scratch.join(name));
     }
     let _ = std::fs::remove_dir_all(run.scratch.join(remote::PW_SAMPLES));
@@ -1460,13 +1464,13 @@ fn judge_ending(
     )
 }
 
-/// Copies a run's logs to `to`: the app's and the services' logs (`root/log`), and atld's log and end record (`END_FILES`). Files the run did not write are skipped.
+/// Copies a run's logs to `to`: the app's and the services' logs (`root/log`), and the scratch files of [`kept_files`] (atld's log and end record, the display's logs). Files the run did not write are skipped.
 fn copy_logs(run: &Run, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
     let mut from: Vec<PathBuf> = std::fs::read_dir(run.root.join("log"))
         .map(|dir| dir.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
-    from.extend(END_FILES.iter().map(|name| run.scratch.join(name)));
+    from.extend(kept_files().map(|name| run.scratch.join(name)));
     for path in from.into_iter().filter(|p| p.is_file()) {
         let name = path.file_name().context("a log without a file name")?;
         std::fs::copy(&path, to.join(name))
@@ -1779,6 +1783,43 @@ fn judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run that ended before its app: the display's logs are in its numbered dir beside atld's, and a file the run did not write is no error.
+    #[test]
+    fn a_failed_run_keeps_the_display_logs() {
+        let work = std::env::temp_dir().join(format!("atl-kept-logs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let run = Run {
+            root: work.join("root"),
+            scratch: work.join("scratch"),
+            launch: None,
+            packages: vec![],
+            libraries: vec![],
+            shell: None,
+            log_tags: String::new(),
+        };
+        std::fs::create_dir_all(&run.scratch).unwrap();
+        // remote.rs Plan::script's names; the empty one is a wayvnc that logged nothing
+        let wrote = [
+            ("atld.log", "atld"),
+            ("labwc-setup.log", "refused"),
+            ("labwc.log", "no format"),
+            ("wayvnc.log", ""),
+        ];
+        for (name, text) in wrote {
+            std::fs::write(run.scratch.join(name), text).unwrap();
+        }
+        let to = work.join("1");
+        copy_logs(&run, &to).unwrap();
+        for (name, text) in wrote {
+            assert_eq!(
+                std::fs::read_to_string(to.join(name)).ok().as_deref(),
+                Some(text),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(&work).unwrap();
+    }
 
     /// `--user-data` takes no value and conflicts with every other data-root choice: a reused DIR, `--clear-data` (the maintainer's saves are never one flag away) and a scenario's fresh root.
     #[test]
