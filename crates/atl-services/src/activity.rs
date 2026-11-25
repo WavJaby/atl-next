@@ -2034,7 +2034,7 @@ impl Inner {
         if let Some(task) = rec.task {
             self.task_gone_locked(st, task);
         }
-        self.broadcasts_died_locked(st, rec.pid);
+        self.broadcasts_died_locked(st, rec);
         self.services_died(st, rec.pid, allow_restart);
         self.uid_gone_locked(st, rec.uid);
         self.touch_all_locked(st);
@@ -4192,6 +4192,92 @@ mod tests {
             "after the force stop: (processes, providers, launch Tasks) left, and the activity's presence"
         );
         assert_eq!(*control.kills.lock().expect("kills"), [pid]);
+    }
+
+    /// BroadcastQueueImpl.onApplicationCleanupLocked (:721-756): a cold-started receiver process that dies after attachApplication and before finishAttachApplication releases the cold slot so the next cold broadcast starts its process immediately. Red with broadcasts_died_locked (pid-only lookup): the second package never starts.
+    #[test]
+    fn cold_start_death_before_finish_attach_releases_the_slot_and_starts_next() {
+        let control = Arc::new(RecordingProcesses::default());
+        let mut p1 = fixture::record("com.example.p1");
+        p1.uid = 10_321;
+        let mut p2 = fixture::record("com.example.p2");
+        p2.uid = 10_322;
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![p1, p2],
+            Default::default(),
+        )));
+        let permissions = Arc::new(Permissions::new(&packages.snapshot(), &[]));
+        let am = ActivityManager::new(
+            packages,
+            permissions,
+            control.clone(),
+            Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
+            Arc::new(UiAgents::default()),
+            true,
+            RootBack::default(),
+            OrientationReshape::default(),
+            true,
+            uid_state::BACKGROUND_SETTLE_TIME_MS,
+            true,
+            Arc::new(crate::notification::NoForegroundNotices),
+            HwTimeouts::default(),
+        );
+        let receiver = |pkg: &str, uid: u32| crate::broadcast_dispatch::Receiver {
+            target: crate::broadcast_dispatch::Target::Manifest(
+                crate::broadcast_dispatch::Component {
+                    package: pkg.to_owned(),
+                    class: ".R".to_owned(),
+                },
+            ),
+            priority: 0,
+            proc: ProcKey {
+                name: pkg.to_owned(),
+                uid,
+            },
+        };
+        let b = crate::broadcast_dispatch::NewBroadcast {
+            facts: crate::broadcast_dispatch::Facts {
+                explicit: true,
+                ..Default::default()
+            },
+            receivers: vec![
+                receiver("com.example.p1", 10_321),
+                receiver("com.example.p2", 10_322),
+            ],
+            ordered: false,
+            result: Outcome {
+                code: -1,
+                data: None,
+                extras: None,
+            },
+            result_to: None,
+            payload: broadcasts_am::Payload {
+                intent: Intent::default(),
+                user: USER_SYSTEM,
+                initial_sticky: false,
+                grant: None,
+            },
+        };
+        let (app, _) = waiting_caller();
+        let pid = {
+            let mut st = am.inner.state();
+            let (_, actions) = am.inner.dispatch(&mut st, |d, p| d.enqueue(b, p));
+            am.inner.perform(&mut st, actions);
+            assert_eq!(*control.starts.lock().expect("starts"), ["com.example.p1"]);
+            // attachApplication completed, finishAttachApplication has not run yet
+            st.processes[0].attached = Some(Attached {
+                thread: app,
+                program_pid: None,
+                _death: DeathRecipient::new(|| {}),
+            });
+            st.processes[0].pid
+        };
+        am.inner.app_died(pid);
+        assert_eq!(
+            *control.starts.lock().expect("starts"),
+            ["com.example.p1", "com.example.p2"],
+            "p1's death before finishAttach releases the cold slot so p2 starts immediately"
+        );
     }
 
     /// The start every caller reaches: start_process_locked for the provider package's default process, under the state lock.

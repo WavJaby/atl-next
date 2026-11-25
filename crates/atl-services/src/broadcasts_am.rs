@@ -844,11 +844,14 @@ impl Inner {
         self.perform(st, actions);
     }
 
-    /// onApplicationCleanupLocked and the ReceiverList cleanup of a dead process: its registrations go, its in-flight delivery fails, its waiting manifest deliveries wait for a new
-    /// process.
-    pub(super) fn broadcasts_died_locked(&self, st: &mut State, pid: i32) {
-        st.broadcasts.process_died(pid);
-        let actions = self.dispatch(st, |d, p| d.process_died(pid, p));
+    /// BroadcastQueueImpl.onApplicationCleanupLocked (:721-756) and the ReceiverList cleanup of a dead process: its registrations go, its active delivery (cold-starting or in-flight) fails (releasing the cold slot), and waiting manifest deliveries wait for a new process.
+    pub(super) fn broadcasts_died_locked(&self, st: &mut State, rec: &ProcessRecord) {
+        st.broadcasts.process_died(rec.pid);
+        let key = ProcKey {
+            name: rec.process_name.clone(),
+            uid: rec.uid,
+        };
+        let actions = self.dispatch(st, |d, p| d.process_died(&key, rec.pid, p));
         self.perform(st, actions);
     }
 

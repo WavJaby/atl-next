@@ -782,7 +782,8 @@ impl Inner {
             uid: rec.uid,
         };
         self.start_failed_locked(st, &key);
-        self.broadcasts_died_locked(st, rec.pid);
+        // the dispatcher heard of this end through start_failed_locked: a key-based cleanup would hit the start its slot release just made
+        st.broadcasts.process_died(rec.pid);
         // unpublished records only: a published one of the same key belongs to a live process (start_launcher starts without the guard)
         let lost = Self::remove_providers_of_process(st, &rec.package, &rec.process_name, |r| {
             r.provider.is_none()

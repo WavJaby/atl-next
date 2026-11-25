@@ -290,22 +290,30 @@ impl<R: Clone, E: Clone, P: Clone> Dispatcher<R, E, P> {
         out
     }
 
-    /// The process with `pid` died (onApplicationCleanupLocked): its in-flight delivery fails and its registered deliveries are skipped. Manifest deliveries wait for a new process.
-    pub fn process_died(&mut self, pid: i32, policy: &mut Policy<'_, R>) -> Vec<Action<R, E, P>> {
+    /// The process `(key, pid)` died (BroadcastQueueImpl.onApplicationCleanupLocked, :721-756): releases the cold-start slot if `key` holds it, fails its active delivery, and skips its pending registered deliveries. Manifest deliveries wait for a new process.
+    pub fn process_died(
+        &mut self,
+        key: &ProcKey,
+        pid: i32,
+        policy: &mut Policy<'_, R>,
+    ) -> Vec<Action<R, E, P>> {
         let mut out = Vec::new();
-        let Some(key) = self.key_of(pid) else {
+        let Some(queue) = self.queues.get_mut(key) else {
             return out;
         };
-        let Some(queue) = self.queues.get_mut(&key) else {
+        // BroadcastQueueImpl.onApplicationCleanupLocked (:729-734): ignore cleanup for a pid other than the queue's attached process
+        if queue.pid.is_some_and(|live| live != pid) {
             return out;
-        };
+        }
+        if self.cold.as_ref() == Some(key) {
+            self.cold = None;
+        }
         queue.pid = None;
-        let failed = match queue.active {
-            Some(Active::InFlight(id, index)) => {
-                queue.active = None;
+        let failed = match queue.active.take() {
+            Some(Active::InFlight(id, index)) | Some(Active::Starting { id, index, .. }) => {
                 Some((id, index))
             }
-            _ => None,
+            None => None,
         };
         let pending: Vec<(BroadcastId, usize)> = queue.pending.iter().copied().collect();
         if let Some((id, index)) = failed {
@@ -692,13 +700,6 @@ impl<R: Clone, E: Clone, P: Clone> Dispatcher<R, E, P> {
         let rec = self.records.get(&id)?;
         let (facts, receiver) = (rec.facts.clone(), rec.receivers[index].clone());
         policy(&facts, &receiver)
-    }
-
-    fn key_of(&self, pid: i32) -> Option<ProcKey> {
-        self.queues
-            .iter()
-            .find(|(_, q)| q.pid == Some(pid))
-            .map(|(k, _)| k.clone())
     }
 
     /// The receiver in flight in process `pid`, if any.
@@ -1214,10 +1215,72 @@ mod tests {
         );
         assert_eq!(dest(&a), [(101, 0)]);
         // receiver 0 failed, so receiver 1 is no longer blocked
-        let a = d.process_died(101, &mut allow);
+        let a = d.process_died(&key("p1"), 101, &mut allow);
         assert_eq!(dest(&a), [(102, 1)]);
         assert_eq!(
             d.finish(102, finish(0, "", false), &mut allow),
+            [Action::Retired { id }]
+        );
+    }
+
+    /// BroadcastQueueImpl.onApplicationCleanupLocked (:721-756): a cold-starting process that dies before finishAttach fails its delivery (no retry) and releases the cold slot so the next cold start proceeds immediately.
+    #[test]
+    fn cold_start_death_before_attach_fails_its_delivery_and_releases_the_slot() {
+        let mut d = D::default();
+        let (id, a) = d.enqueue(
+            broadcast(vec![manifest("p1", 0), manifest("p2", 0)], false),
+            &mut allow,
+        );
+        assert_eq!(started(&a), ["p1"]);
+        assert!(dest(&a).is_empty());
+        let tokens = cold_tokens(&a);
+        assert_eq!(tokens.len(), 1);
+        assert!(d.holds(&key("p1")));
+        // p1 dies before process_attached: its delivery fails (not skipped or re-enqueued), the slot releases, and p2 starts at once
+        let a = d.process_died(&key("p1"), 201, &mut allow);
+        assert_eq!(started(&a), ["p2"]);
+        assert!(dest(&a).is_empty());
+        assert!(!a.iter().any(|x| matches!(x, Action::Skip { .. })));
+        assert!(!d.holds(&key("p1")));
+        // the stale cold-start timer for p1 does nothing
+        assert!(
+            d.cold_start_timeout(&key("p1"), tokens[0], &mut allow)
+                .is_empty()
+        );
+        let a = d.process_attached(&key("p2"), 202, &mut allow);
+        assert_eq!(dest(&a), [(202, 1)]);
+        assert_eq!(
+            d.finish(202, finish(0, "", false), &mut allow),
+            [Action::Retired { id }]
+        );
+    }
+
+    /// BroadcastQueueImpl.onApplicationCleanupLocked (:729-734): death of a process that does not hold the cold slot (attached, unknown, or waiting) leaves the slot with its owner, and a stale pid for an attached queue is ignored.
+    #[test]
+    fn death_of_another_process_leaves_the_cold_start_slot_held() {
+        let mut d = D::default();
+        attach(&mut d, "p3", 103);
+        let (id, a) = d.enqueue(
+            broadcast(vec![manifest("p1", 0), manifest("p2", 0)], false),
+            &mut allow,
+        );
+        assert_eq!(started(&a), ["p1"]);
+        // death of attached p3, unknown p4, or waiting p2 must not release p1's cold slot
+        assert!(d.process_died(&key("p3"), 103, &mut allow).is_empty());
+        assert!(d.process_died(&key("p4"), 104, &mut allow).is_empty());
+        assert!(d.process_died(&key("p2"), 102, &mut allow).is_empty());
+        // p1 still holds the slot: its attach delivers receiver 0 and passes the slot to p2
+        let a = d.process_attached(&key("p1"), 201, &mut allow);
+        assert_eq!(dest(&a), [(201, 0)]);
+        assert_eq!(started(&a), ["p2"]);
+        // a stale pid death for attached p1 does not disturb its in-flight delivery
+        assert!(d.process_died(&key("p1"), 999, &mut allow).is_empty());
+        assert!(d.delivering(201, id, 0));
+        let a = d.process_attached(&key("p2"), 202, &mut allow);
+        assert_eq!(dest(&a), [(202, 1)]);
+        assert!(d.finish(201, finish(0, "", false), &mut allow).is_empty());
+        assert_eq!(
+            d.finish(202, finish(0, "", false), &mut allow),
             [Action::Retired { id }]
         );
     }
