@@ -11,6 +11,7 @@
 //! 3. unwind (testdata/rv-qemu/unwind_vlenb.cpp, `<out>/device/libunwindstack`): an unwind from a signal's ucontext, as ART's fatal-signal dump starts one, stores the probed vlenb (0 without V: libunwindstack patch 0002) and reaches `main`.
 //! 4. units: the lib unit tests of [`UNIT_CRATES`] cross-built for the host's Rust target (`cross::cargo_target`) and run under the model.
 //! 5. engine: the translator's code generator for this host (testdata/rv-qemu/tcg_neon.c, an arm64 guest program, under the host's `qemu-aarch64`: the PIC build whose objects the engine `.so` links): NEON results equal scalar ones. QEMU takes its vector path only where V is probed, so the V models are the ones that exercise it; the log control is check 2's (V instructions exactly with V).
+//! 6. guest-cpu: the engine `.so` of that PIC build boots through its C ABI (atl-qemu-engine tests/spike.rs `--engine-so`, gates q, z, r) and its guest has the hwcaps of the tier the build calls for (qemu_spike.rs `cpu_tier`). The inverted tier is qemu-spike's, on the build machine.
 //!
 //! `--break baseline`: QEMU's default `rv64` replaces the derived baseline; check 1 must turn red (extensions past the row).
 //! Needs: `cargo xtask native --host riscv64 --for rv-qemu`; the `qemu-user` deps row; the host row's sysroot and compilers; the NDK.
@@ -23,7 +24,7 @@ use std::process::{Command, ExitCode, Output};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::ndk::NdkTarget;
-use crate::{arches, cross, deps, qemu, verdict};
+use crate::{arches, cross, deps, qemu, qemu_spike, verdict};
 
 const CMD: &str = "rv-qemu";
 const FIXTURES: &str = "xtask-harness/testdata/rv-qemu";
@@ -154,8 +155,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ],
     )?;
     let units = unit_tests(root, &args.host)?;
-    let engine = qemu::plan_on(root, GUEST, Some(&args.host), args.out.as_deref(), true)?;
-    let engine = qemu::execute(root, &engine)?;
+    let build = qemu::plan_on(root, GUEST, Some(&args.host), args.out.as_deref(), true)?;
+    let engine = qemu::execute(root, &build)?;
+    let guest_cpu = GuestCpu::build(root, &build)?;
     let ndk = crate::ndk::default_ndk(root)?;
     let neon = NdkTarget::new(root, &ndk, GUEST, qemu::GUEST_API)?
         .static_exe(&[&fx.join("tcg_neon.c")], &work.join("tcg_neon"))?;
@@ -212,6 +214,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             check("zlib", run.zlib(model, &zlib, &work, p.v)?);
             check("unwind", run.unwind(model, &unwind, p.vlenb)?);
             check("engine", run.engine(model, &engine, &neon, &work, p.v)?);
+            check("guest-cpu", run.guest_cpu(model, &guest_cpu)?);
         }
         for (name, exe) in &units {
             check(&format!("units {name}"), run.units(model, exe)?);
@@ -414,6 +417,31 @@ fn unit_tests(root: &Path, host: &str) -> Result<Vec<(String, PathBuf)>> {
     Ok(exes)
 }
 
+/// Check 6's files: the spike harness for the host, the engine `.so`, its boot executable (with the entry llvm-readelf names) and the tier expected.
+struct GuestCpu {
+    spike: PathBuf,
+    so: PathBuf,
+    boot: PathBuf,
+    entry: u64,
+    tier: qemu_spike::CpuTier,
+}
+
+impl GuestCpu {
+    fn build(root: &Path, b: &qemu::Build) -> Result<GuestCpu> {
+        let cross = b.cross.as_ref().context("check 6: not a cross PIC build")?;
+        let out = b.dir.join("spike/engine");
+        let so = qemu_spike::engine_so_file(root, b, &out)?;
+        let boot = qemu::boot_exe(root, b, &out)?;
+        Ok(GuestCpu {
+            spike: qemu_spike::cross_spike_bin(root, b, cross)?,
+            entry: qemu_spike::llvm_entry(&boot)?,
+            so,
+            boot,
+            tier: qemu_spike::cpu_tier(b)?,
+        })
+    }
+}
+
 /// How a fixture runs under qemu-user.
 struct Runner {
     qemu: String,
@@ -500,6 +528,24 @@ impl Runner {
         let output = self.output(cmd, "the engine check")?;
         let asm = std::fs::read_to_string(&log).unwrap_or_default();
         Ok(engine_result(&output, &asm, v))
+    }
+
+    fn guest_cpu(&self, model: &Model, g: &GuestCpu) -> Result<Result<String, String>> {
+        let mut cmd = self.command(model, None);
+        // `-E`: qemu-user reads QEMU_* itself from its own environment; these are the engine's probe
+        let mut env = |k: &str, v: &dyn std::fmt::Display| {
+            cmd.arg("-E").arg(format!("{k}={v}"));
+        };
+        for (k, v) in qemu_spike::QEMU_ENV_PROBE {
+            env(k, &v);
+        }
+        env(qemu_spike::CPU_TIER_ENV, &g.tier.name());
+        env("ATL_ENGINE_SO", &g.so.display());
+        env("ATL_ENGINE_BOOT", &g.boot.display());
+        env("ATL_ENGINE_ENTRY", &format_args!("{:#x}", g.entry));
+        cmd.arg(&g.spike).arg("--engine-so");
+        let output = self.output(cmd, "the guest-cpu check")?;
+        Ok(guest_cpu_result(&output, g.tier.name()))
     }
 
     fn units(&self, model: &Model, exe: &Path) -> Result<Result<String, String>> {
@@ -629,6 +675,27 @@ fn engine_result(output: &Output, asm: &str, v: bool) -> Result<String, String> 
         (_, n) => Ok(format!(
             "{} checks ok, {n} V instructions translated",
             ok.len()
+        )),
+    }
+}
+
+fn guest_cpu_result(output: &Output, tier: &str) -> Result<String, String> {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let red: Vec<&str> = ["spike: (q) ok", "spike: (z) ok", "spike: (r) ok"]
+        .into_iter()
+        .filter(|want| !text.lines().any(|l| l == *want))
+        .collect();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("atl-engine: guest cpu "));
+    match (output.status.success() && red.is_empty(), line) {
+        (true, Some(cpu)) => Ok(format!("tier {tier}: {cpu}")),
+        _ => Err(format!(
+            "tier {tier}: missing {red:?}, tier line {line:?} ({}); {} {}",
+            output.status,
+            text.lines().last().unwrap_or_default(),
+            stderr.lines().last().unwrap_or_default()
         )),
     }
 }

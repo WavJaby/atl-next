@@ -12,7 +12,9 @@ pub(super) const ARGV0: &str = "qemu-arm";
 
 /// The guest CPU QEMU emulates (`-cpu`): none, QEMU's default for qemu-arm (`max`), the CPU the P1 spike gates ran on. Choosing the reference device class's model (behaviour decision 1: an arm32 app on an ARMv8 phone in AArch32 state) is open: phase 4 P8 measures what the first app reads.
 #[cfg(feature = "engine-so")]
-pub(super) const GUEST_CPU: &[&str] = &[];
+pub(crate) fn guest_cpu() -> Option<&'static str> {
+    None
+}
 
 /// r0..r15, `uint32_t regs[16]`; r13 = sp, r14 = lr, r15 = pc.
 const REGS: usize = crate::layout::ATL_OFFSET_REGS as usize;

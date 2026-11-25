@@ -41,7 +41,7 @@ const QEMU_H: &str = "linux-user/qemu.h";
 /// linux-user's `main`, whose `parse_args` patch 0003 stops reading `QEMU_*` variables.
 const MAIN_C: &str = "linux-user/main.c";
 /// The QEMU option variables the boot gate sets; the engine must ignore them (spike.rs gate (z) checks they are set). `QEMU_CPU=help` read by QEMU lists the models and exits before BOOT.
-const QEMU_ENV_PROBE: [(&str, &str); 2] = [("QEMU_CPU", "help"), ("QEMU_STRACE", "1")];
+pub(crate) const QEMU_ENV_PROBE: [(&str, &str); 2] = [("QEMU_CPU", "help"), ("QEMU_STRACE", "1")];
 const PACKAGE: &str = "atl-qemu-engine";
 const GATES: [char; 24] = [
     'B', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 's', 't',
@@ -57,6 +57,12 @@ const THUNK_BYTES: u64 = 8;
 const POOL_BYTES: u64 = POOL_SLOTS as u64 * THUNK_BYTES;
 /// The id offset of the `bind-id` break: every slot carries `slot + POOL_SKEW`.
 const POOL_SKEW: u32 = 1;
+/// The load/store helpers' object of a QEMU user build (accel/tcg/user-exec.c with ldst_atomicity.c.inc), under the build dir.
+const USER_EXEC_O: &str = "libuser.a.p/accel_tcg_user-exec.c.o";
+/// The trace event ahead of the `cpu_loop_exit_atomic` of an aligned 16-byte load (`load_atomic16_or_exit`): the compiler drops it exactly where the helper always has a 16-byte atomic.
+const ATOM16_EXIT: &str = "_TRACE_LOAD_ATOM16_OR_EXIT_FALLBACK_DSTATE";
+/// Names the expected tier to the spike harness (spike.rs gate (z)).
+pub(crate) const CPU_TIER_ENV: &str = "ATL_ENGINE_CPU_TIER";
 /// Per harness run. A run that outlives it hangs (the fatal path in the module doc: QEMU's `die_with_signal`, a SIGSEGV that sigchain's SIG_DFL revert does not end) and counts as failed.
 const RUN_TIMEOUT_SECS: u32 = 240;
 /// Whether `timeout` ended the command: 124 when the limit did, 137 when the `-s KILL` both harnesses pass did (timeout(1); run_apk.rs `stopped_at_limit` reads the same two).
@@ -776,7 +782,7 @@ fn sigchain(root: &Path, dir: &Path) -> Result<PathBuf> {
 }
 
 /// The engine `.so` (QEMU bridge plan Q5-1a): atl-qemu-engine's `engine-so` build (the C ABI, as a staticlib) linked with the PIC build's objects into `libatl_engine_<arch>.so`, the version script keeping `atl_engine` and the TLS exports.
-/// Gates: the defined dynamic symbols are exactly those names; `sigaction` and `sigprocmask` are undefined references ([`sigaction_gate`]); the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9); the guest's hwcaps are the device CPU profile with [`QEMU_ENV_PROBE`] set (spike gate (z)). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); no `-cpu` (`cpu-max`: (z) red); the pin's `main.c` linked in ([`ENV_OPTIONS`]: QEMU reads `QEMU_CPU=help` and exits before BOOT, boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
+/// Gates: the defined dynamic symbols are exactly those names; `sigaction` and `sigprocmask` are undefined references ([`sigaction_gate`]); the C ABI boots the Q4-4 boot executable, its AT_ENTRY equals llvm-readelf's e_entry, and BOOT maps and attaches (D9); the guest's hwcaps are the profile of the tier this build calls for ([`cpu_tier`]) with [`QEMU_ENV_PROBE`] set (spike gate (z)). Breaks: a TLS export dropped (exports gate red); the table at major + 1 (the host refuses it: boot gate red); the boot env published after BOOT, or create returning before BOOT (boot gate red); no `-cpu` (`cpu-max`: (z) red); the tier predicate inverted (`cpu-tier`: (z) red for this build's tier, green for the other, so every host pins both tiers); the pin's `main.c` linked in ([`ENV_OPTIONS`]: QEMU reads `QEMU_CPU=help` and exits before BOOT, boot gate red); the boot executable without its BOOT svc (`qemu::SKIP_BOOT`: boot gate red, its error printed).
 fn engine_so(
     root: &Path,
     b: &Build,
@@ -847,6 +853,31 @@ fn engine_so(
         fails.push(Failure::step(
             "engine-so break cpu-max",
             "the boot gate is green with QEMU's default CPU".to_owned(),
+        ));
+    }
+    let other = cpu_tier(b)?.other();
+    let inverted = engine_staticlib(root, b, &out, "cpu-tier", Some("cpu-tier"))?;
+    let inverted = engine_link(b, &inverted, &out, "cpu-tier.so", engine_abi::TLS_EXPORTS)?;
+    if boot_gate(root, b, &out, "cpu-tier", &inverted, &boot, entry).is_ok() {
+        fails.push(Failure::step(
+            "engine-so break cpu-tier",
+            "the boot gate is green with the tier predicate inverted".to_owned(),
+        ));
+    }
+    if let Err(e) = boot_gate_of(
+        root,
+        b,
+        &out,
+        "cpu-tier-other",
+        &inverted,
+        &boot,
+        entry,
+        &['q', 'z', 'r'],
+        Some(other),
+    ) {
+        fails.push(Failure::step(
+            &format!("engine-so tier {}", other.name()),
+            format!("{e:#}"),
         ));
     }
     let (main_o, env_obj) = swap_object(root, b, &out, "env-options", ENV_OPTIONS)?;
@@ -940,7 +971,7 @@ fn cross_engine_so(root: &Path, b: &Build, c: &qemu::Cross) -> Result<ExitCode> 
 }
 
 /// The spike harness (tests/spike.rs) compiled and linked for the cross host, not run: its `--engine-so` boot gate runs on that host. Returns the test executable.
-fn cross_spike_bin(root: &Path, b: &Build, c: &qemu::Cross) -> Result<PathBuf> {
+pub(crate) fn cross_spike_bin(root: &Path, b: &Build, c: &qemu::Cross) -> Result<PathBuf> {
     let target = cross::cargo_target(root, &c.host)?;
     let out = b.dir.join("spike");
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
@@ -1133,7 +1164,7 @@ fn sigaction_gate(so: &Path) -> Result<()> {
 }
 
 /// e_entry as `llvm-readelf -h` prints it: the expected value, read without the engine.
-fn llvm_entry(bin: &Path) -> Result<u64> {
+pub(crate) fn llvm_entry(bin: &Path) -> Result<u64> {
     let out = Command::new("llvm-readelf")
         .arg("-h")
         .arg(bin)
@@ -1163,10 +1194,64 @@ fn boot_gate(
     boot: &Path,
     entry: u64,
 ) -> Result<()> {
-    boot_gate_of(root, b, out, tag, so, boot, entry, &['q', 'z', 'r'])
+    let tier = cpu_tier(b)?;
+    boot_gate_of(
+        root,
+        b,
+        out,
+        tag,
+        so,
+        boot,
+        entry,
+        &['q', 'z', 'r'],
+        Some(tier),
+    )
 }
 
-/// The engine `.so` boot probe (tests/spike.rs `--engine-so`) of `so` on `boot`, green when it exits 0 and prints `spike: (g) ok` for every gate of `gates` (an arm build has no (z): its CPU model is open).
+/// The arm64 guest CPU tiers, as gate (z) names them (spike.rs `profile`).
+#[derive(Clone, Copy)]
+pub(crate) enum CpuTier {
+    Lse2,
+    Base,
+}
+
+impl CpuTier {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CpuTier::Lse2 => "lse2",
+            CpuTier::Base => "base",
+        }
+    }
+
+    fn other(self) -> CpuTier {
+        match self {
+            CpuTier::Lse2 => CpuTier::Base,
+            CpuTier::Base => CpuTier::Lse2,
+        }
+    }
+}
+
+/// The tier build `b`'s engine must run: base where QEMU's compiled helper still holds the exit of an aligned 16-byte load ([`ATOM16_EXIT`]), lse2 where the compiler removed it. Read from the object, so not the engine's predicate asked twice.
+/// A host whose 16-byte atomics QEMU tests at run time (loongarch64) would keep the exit; none is a host row.
+pub(crate) fn cpu_tier(b: &Build) -> Result<CpuTier> {
+    let path = b.build_dir().join(USER_EXEC_O);
+    let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let file =
+        object::File::parse(&*data).with_context(|| format!("parsing {}", path.display()))?;
+    let names: BTreeSet<&str> = file.symbols().filter_map(|s| s.name().ok()).collect();
+    ensure!(
+        names.contains("helper_ld16_mmu"),
+        "{}: no helper_ld16_mmu: not the load/store helpers",
+        path.display()
+    );
+    Ok(if names.contains(ATOM16_EXIT) {
+        CpuTier::Base
+    } else {
+        CpuTier::Lse2
+    })
+}
+
+/// The engine `.so` boot probe (tests/spike.rs `--engine-so`) of `so` on `boot`, green when it exits 0 and prints `spike: (g) ok` for every gate of `gates` (an arm build has no (z) and no tier: its CPU model is open).
 #[allow(
     clippy::too_many_arguments,
     reason = "boot_gate's inputs plus the gate list"
@@ -1180,6 +1265,7 @@ pub(super) fn boot_gate_of(
     boot: &Path,
     entry: u64,
     gates: &[char],
+    tier: Option<CpuTier>,
 ) -> Result<()> {
     let o = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args([
@@ -1200,6 +1286,7 @@ pub(super) fn boot_gate_of(
         .env("ATL_ENGINE_BOOT", boot)
         .env("ATL_ENGINE_ENTRY", format!("{entry:#x}"))
         .envs(QEMU_ENV_PROBE)
+        .envs(tier.map(|t| (CPU_TIER_ENV, t.name())))
         .current_dir(root)
         .output()
         .context("running cargo test --test spike --engine-so")?;

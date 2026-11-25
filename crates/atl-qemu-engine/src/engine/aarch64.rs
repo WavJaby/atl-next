@@ -9,15 +9,41 @@ use super::{Env, Guest, lib, page, ret_stub};
 #[cfg(feature = "engine-so")]
 pub(super) const ARGV0: &str = "qemu-aarch64";
 
-/// The guest CPU QEMU emulates (`-cpu`): what an app reads from HWCAP, /proc/cpuinfo and `mrs` follows the reference device class (behaviour decision 1), today's Android arm64 phone = ARMv9.2 Cortex-A720/X4 with SVE not exposed.
+/// The guest CPU QEMU emulates (`-cpu`), two capability tiers picked by [`guest_cpu`]: what an app reads from HWCAP, /proc/cpuinfo and `mrs` follows the reference device class (behaviour decision 1), today's Android arm64 phone = ARMv9.2 Cortex-A720/X4 with SVE not exposed.
 /// This QEMU has no A720/X model; cortex-a710 is the closest (vs the phone: + mte, - afp dgh ecv evtstrm), `sve=off` as the phone. QEMU's default `max` adds SVE/SME/MOPS/GCS/FP8 and more no phone exposes.
 /// `midr` = QEMU's own `max` value (implementer 0 "software", part 'Q'): no claim to be Arm silicon an app might key errata or tuning on.
-/// Tied to the pinned QEMU: a bump that adds a closer model, or a property this string names going away, changes it (gate (z) of tests/spike.rs pins the result).
-#[cfg(all(feature = "engine-so", not(atl_qe_cpu_max)))]
-pub(super) const GUEST_CPU: &[&str] = &["-cpu", "cortex-a710,sve=off,midr=0x000f0510"];
-// break cpu-max (gate z): no `-cpu`, QEMU's default `max`
-#[cfg(all(feature = "engine-so", atl_qe_cpu_max))]
-pub(super) const GUEST_CPU: &[&str] = &[];
+/// Tied to the pinned QEMU: a bump that adds a closer model, or a property this string names going away, changes it (gate (z) of tests/spike.rs pins the result of both tiers).
+#[cfg(feature = "engine-so")]
+const CPU_LSE2: &str = "cortex-a710,sve=off,midr=0x000f0510";
+/// The tier of an engine without 16-byte atomics: cortex-a76 = an upstream model with no LSE2 (ID_AA64MMFR2.AT 0), so an aligned `ldp`/`stp` needs only 8-byte atomicity.
+/// Under LSE2 such an engine, once a second guest thread exists, leaves the TB at each one to run it alone (`cpu_loop_exit_atomic`: stop the world); function prologues do this. Splitting it 8+8 while claiming LSE2 would tear silently.
+/// Cost: ARMv8.2 features only (no BTI, PAuth, I8MM, BF16, ...), as an A76-class phone. No SVE in the model, so no `sve=off`.
+#[cfg(feature = "engine-so")]
+const CPU_BASE: &str = "cortex-a76,midr=0x000f0510";
+
+#[cfg(feature = "engine-so")]
+unsafe extern "C" {
+    /// `HAVE_ATOMIC128_RW` of this engine's QEMU (src/host_atomic.c).
+    fn atl_host_atomic128_rw() -> bool;
+}
+
+/// The `-cpu` value for this engine, None = QEMU's default. The predicate is QEMU's own, not a host feature list: the one `load_atom_16` / `store_atom_16` (accel/tcg/ldst_atomicity.c.inc) test before giving up on a parallel 16-byte access.
+/// Valid before QEMU's `main`: a build constant, or QEMU's `cpuinfo`, which an initialiser fills.
+#[cfg(feature = "engine-so")]
+pub(crate) fn guest_cpu() -> Option<&'static str> {
+    // break cpu-max (gate z): no `-cpu`, QEMU's default `max`
+    if cfg!(atl_qe_cpu_max) {
+        return None;
+    }
+    // SAFETY: no arguments, no preconditions; reads a constant or QEMU's initialised `cpuinfo`.
+    let atomic16 = unsafe { atl_host_atomic128_rw() };
+    // break cpu-tier (gate z): the predicate inverted
+    Some(if atomic16 != cfg!(atl_qe_cpu_tier) {
+        CPU_LSE2
+    } else {
+        CPU_BASE
+    })
+}
 
 /// Byte offset of TPIDR_EL0 in `CPUArchState` (clang's `offsetof`, a `size_t` the generator types u64; an offset inside a 79 KB record fits any usize).
 const TPIDR_EL0: usize = crate::layout::ATL_OFFSET_TPIDR_EL0 as usize;

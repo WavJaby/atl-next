@@ -300,14 +300,18 @@ pub fn start(library: &Path, argv: &[&str], on_trap: OnTrap) -> Result<Booted, S
 #[cfg_attr(not(atl_qe_guest = "arm"), path = "engine/aarch64.rs")]
 mod target;
 
-/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), the target's `GUEST_CPU`, and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
+/// The `-cpu` value this engine starts QEMU with, None = QEMU's default.
+#[cfg(feature = "engine-so")]
+pub(crate) use target::guest_cpu;
+
+/// The engine `.so`'s start (C ABI `create`): QEMU is linked into this object, so the helper runs its `main` on this object's own symbols. The command line is the engine's: `-B 0` is identity addresses (guest = host, the ABI's `map`), the target's [`guest_cpu`], and the host names only `boot_exe`. QEMU's `QEMU_*` option variables are not read (QEMU patch 0003): argv is the whole configuration.
 /// RCU: QEMU's constructor (util/rcu.c `rcu_init`) registers the thread that ran it -- in a QEMU executable the thread that runs `main`, here the host's loading thread ([`on_loader_thread`]). That thread is moved to the helper: unregistered here, registered there before `main`, as the spike's helper is. Left registered, a later attach on the loading thread registers it twice, the registry becomes a cycle, the next grace period never ends, and QEMU's prefork handler blocks every fork in the process.
 /// Call on the loading thread ([`on_loader_thread`]; C ABI `create` refuses any other).
 #[cfg(feature = "engine-so")]
 pub(crate) fn start_linked(boot_exe: &str, on_trap: OnTrap) -> Result<Booted, String> {
     let argv: Vec<&str> = [target::ARGV0, "-B", "0"]
         .into_iter()
-        .chain(target::GUEST_CPU.iter().copied())
+        .chain(guest_cpu().into_iter().flat_map(|cpu| ["-cpu", cpu]))
         .chain([boot_exe])
         .collect();
     let args = c_args(&argv)?;

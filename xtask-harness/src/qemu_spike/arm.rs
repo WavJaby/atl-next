@@ -133,7 +133,7 @@ fn engine_so(root: &Path, b: &Build, dir: &Path, boot: &Path) -> Result<()> {
     let out = dir.join("engine");
     let so = super::engine_so_file(root, b, &out)?;
     let entry = super::llvm_entry(boot)?;
-    super::boot_gate_of(root, b, &out, "arm", &so, boot, entry, &['q', 'r'])
+    super::boot_gate_of(root, b, &out, "arm", &so, boot, entry, &['q', 'r'], None)
 }
 
 /// fixture_arm.c as a static bionic armv7 executable (NDK clang of the arm row).

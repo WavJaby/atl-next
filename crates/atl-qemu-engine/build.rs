@@ -2,7 +2,7 @@
 //! Always: `OUT_DIR/thunk_constants.rs`, atl-bridgegen's aarch64 and arm thunk constants (`lib.rs` `thunk`).
 //! With feature `qemu`: `OUT_DIR/qemu_layout.rs`, atl-bridgegen's `layout_module` of QEMU's `target/arm/cpu.h` (`CPUArchState` and the records it holds), parsed with the exact flags the PIC build compiles its target's `linux-user/<target>/cpu_loop.c` with -- the file P1's hook is called from ([`TARGETS`]: aarch64 or arm); cfg `atl_qe_guest = "<target>"` names it for the engine's per-target code.
 //! With feature `qemu`: `OUT_DIR/engine_abi_layout.rs`, the engine C ABI's sizes, offsets and values from atl-engine-api's `atl_engine.h` (atl-bridgegen `engine_abi`); lib.rs checks the Rust mirror against them.
-//! With feature `qemu`: `libatl_host_signal.a`, `src/host_signal.c` (QEMU's host fault decode, `linux-user/include/host/<host>/host-signal.h`, for signal.rs) compiled by the unit's own compile command and archived by the build's own `STATIC_LINKER` (build.ninja): the host arch's decode is QEMU's, not a second copy.
+//! With feature `qemu`: `libatl_host_shims.a`, `src/host_signal.c` (QEMU's host fault decode, `linux-user/include/host/<host>/host-signal.h`, for signal.rs) and `src/host_atomic.c` (QEMU's 16-byte atomics predicate, for the guest CPU tier) compiled by the unit's own compile command and archived by the build's own `STATIC_LINKER` (build.ninja): the host arch's decode and capability are QEMU's, not a second copy.
 //! Flags and the source tree come from `$ATL_QEMU_BUILD/compile_commands.json` (meson's), so the offsets are clang's for the pinned, patched headers and that build's generated config headers; nothing is hand-copied.
 //! Breaks (`ATL_QEMU_ENGINE_BREAK=<name>[,<name>]`, [`BREAKS`]) turn a cfg on for this package only.
 
@@ -144,6 +144,8 @@ const BREAKS: &[(&str, &str)] = &[
     ("boot-late", "atl_qe_boot_late"),
     // gate (z): the engine passes no `-cpu`, so the guest gets QEMU's `max` and its HWCAP differs from the device profile
     ("cpu-max", "atl_qe_cpu_max"),
+    // gate (z): the guest CPU tier's predicate inverted, so this engine runs the other tier
+    ("cpu-tier", "atl_qe_cpu_tier"),
     // gate (q, D9): the creator returns before BOOT (no wait on the boot helper)
     ("no-boot-join", "atl_qe_no_boot_join"),
     // gate (r): attach skips the copy's queued work (its plugin init hook), so detach's exit hook asserts (plugins/core.c:293)
@@ -298,22 +300,19 @@ fn unit_entry(build: &Path) -> Result<UnitEntry> {
     })
 }
 
-/// Compiles `src/host_signal.c` with the unit's command (its source, `-o` and depfile words swapped) and archives it with the build's `STATIC_LINKER` tool into `out/libatl_host_signal.a`; links it into this crate.
+/// C files of src/ that export what QEMU keeps in inline functions and macros.
+const HOST_SHIMS: &[&str] = &["host_signal", "host_atomic"];
+
+/// Compiles `src/<name>.c` with the unit's command (its source, `-o` and depfile words swapped) to `out/<name>.o`: its macros and flags are the engine's own. Reruns on every file it read.
 #[expect(
     clippy::disallowed_types,
-    reason = "a build script: it runs the QEMU build's compiler and archiver on the host, never a runtime process"
+    reason = "a build script: it runs the QEMU build's compiler on the host, never a runtime process"
 )]
-fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
+fn host_shim(build: &Path, manifest: &Path, out: &Path, name: &str) -> Result<PathBuf> {
     let UnitEntry { dir, cmd, .. } = unit_entry(build)?;
-    let shim = manifest.join("src/host_signal.c");
-    buildscript::rerun_if_changed(&shim);
-    let host_dir = cmd
-        .iter()
-        .filter_map(|a| a.strip_prefix("-I"))
-        .find(|p| p.contains("linux-user/include/host/"))
-        .context("unit command: no -I linux-user/include/host/<host>")?;
-    buildscript::rerun_if_changed(&dir.join(host_dir).join("host-signal.h"));
-    let obj = out.join("host_signal.o");
+    let shim = manifest.join(format!("src/{name}.c"));
+    let obj = out.join(format!("{name}.o"));
+    let deps = out.join(format!("{name}.d"));
     let mut words = cmd.iter();
     let mut c = std::process::Command::new(words.next().context("empty unit command")?);
     while let Some(w) = words.next() {
@@ -332,10 +331,34 @@ fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
         .arg(&shim)
         .arg("-o")
         .arg(&obj)
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&deps)
         .current_dir(&dir)
         .status()
-        .context("compiling host_signal.c")?;
-    ensure!(status.success(), "host_signal.c: compile failed");
+        .with_context(|| format!("compiling {name}.c"))?;
+    ensure!(status.success(), "{name}.c: compile failed");
+    // make rule `obj: dep dep \`: the shim, QEMU's headers, the build's config-host.h (it decides the 16-byte atomics)
+    let text = std::fs::read_to_string(&deps)?;
+    let (_, list) = text
+        .split_once(": ")
+        .with_context(|| format!("{}: no rule", deps.display()))?;
+    for dep in list.split_whitespace().filter(|w| *w != "\\") {
+        buildscript::rerun_if_changed(&dir.join(dep));
+    }
+    Ok(obj)
+}
+
+/// [`HOST_SHIMS`] compiled ([`host_shim`]) and archived with the build's `STATIC_LINKER` tool into `out/libatl_host_shims.a`; links it into this crate.
+#[expect(
+    clippy::disallowed_types,
+    reason = "a build script: it runs the QEMU build's archiver on the host, never a runtime process"
+)]
+fn host_shims(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
+    let objs = HOST_SHIMS
+        .iter()
+        .map(|name| host_shim(build, manifest, out, name))
+        .collect::<Result<Vec<_>>>()?;
     // meson's rule: `rm -f $out && <ar> $LINK_ARGS $out $in`
     let ninja = std::fs::read_to_string(build.join("build.ninja"))?;
     let ar = ninja
@@ -345,17 +368,17 @@ fn host_signal(build: &Path, manifest: &Path, out: &Path) -> Result<()> {
         .and_then(|l| l.split("&& ").nth(1))
         .and_then(|l| l.split_whitespace().next())
         .context("build.ninja: no STATIC_LINKER archiver")?;
-    let lib = out.join("libatl_host_signal.a");
+    let lib = out.join("libatl_host_shims.a");
     let _ = std::fs::remove_file(&lib);
     let status = std::process::Command::new(ar)
         .arg("crs")
         .arg(&lib)
-        .arg(&obj)
+        .args(&objs)
         .status()
         .with_context(|| format!("running {ar}"))?;
     ensure!(status.success(), "{ar}: archive failed");
     println!("cargo::rustc-link-search=native={}", out.display());
-    println!("cargo::rustc-link-lib=static=atl_host_signal");
+    println!("cargo::rustc-link-lib=static=atl_host_shims");
     Ok(())
 }
 
@@ -452,7 +475,7 @@ fn main() -> Result<()> {
     let (module, guest) = layout(&build, &out, &host.arch)?;
     std::fs::write(out.join("qemu_layout.rs"), module)?;
     println!("cargo::rustc-cfg={GUEST_CFG}=\"{}\"", guest.name);
-    host_signal(&build, &manifest, &out)?;
+    host_shims(&build, &manifest, &out)?;
     // the engine C ABI's facts, read from the header by clang; lib.rs checks atl-engine-api's Rust mirror against them
     let header = manifest.join("../atl-engine-api/include/atl_engine.h");
     buildscript::rerun_if_changed(&header);

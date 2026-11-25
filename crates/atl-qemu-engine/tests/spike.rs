@@ -1672,10 +1672,10 @@ fn main() {
 }
 
 /// Gate (q), the engine `.so` through its C ABI (QEMU bridge plan Q5-1a), in a process of its own: dlopen the library, refuse it unless its table speaks the host's major and fits its size, resolve the TLS exports, create the engine on the boot executable, and read the auxv QEMU built for it at BOOT. Its AT_ENTRY must equal `ATL_ENGINE_ENTRY` (xtask: llvm-readelf's e_entry of that executable).
-/// Env (xtask qemu_spike.rs sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
+/// Env (xtask sets it): `ATL_ENGINE_SO` the library, `ATL_ENGINE_BOOT` the static boot executable, `ATL_ENGINE_ENTRY` the expected entry in hex.
 /// BOOT also probes D9: `map` of a host page and `attach` from a host thread both succeed inside the BOOT trap.
 /// Gate (r), after (q) in the same process: `attach` then `detach` of a CPU on a thread of its own.
-/// Gate (z), from the same BOOT auxv, aarch64 only: AT_HWCAP / AT_HWCAP2 equal the device profile the engine selects (engine.rs `GUEST_CPU`). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed. An arm build runs (q) and (r): its CPU model is not chosen yet (engine/arm.rs `GUEST_CPU`).
+/// Gate (z), from the same BOOT auxv, aarch64 only: AT_HWCAP / AT_HWCAP2 equal the profile of the guest CPU tier `ATL_ENGINE_CPU_TIER` names (`lse2` or `base`; xtask qemu_spike.rs `cpu_tier` reads it from the QEMU build, not from the engine). xtask also sets `QEMU_CPU=help` (QEMU would list its models and exit before BOOT) and `QEMU_STRACE=1` in this process: the engine must not read them (QEMU patch 0003); (z) fails if they are not set, so the probe is armed. An arm build runs (q) and (r): its CPU model is not chosen yet (engine/arm.rs `guest_cpu`).
 /// Guest-neutral: the probe speaks only the C ABI; the auxv's word is the guest's (u32 on arm).
 #[cfg(feature = "qemu")]
 mod engine_so {
@@ -1809,7 +1809,7 @@ mod engine_so {
         }
     }
 
-    /// Gate (z)'s device profile, aarch64's.
+    /// Gate (z)'s device profiles, aarch64's: one per guest CPU tier.
     #[cfg(not(atl_qe_guest = "arm"))]
     mod profile {
         use super::at;
@@ -1822,13 +1822,18 @@ mod engine_so {
         const HWCAP2_MTE: u64 = 1 << 18;
         const HWCAP2_ECV: u64 = 1 << 19;
         const HWCAP2_AFP: u64 = 1 << 20;
-        const WANT_HWCAP: u64 = PHONE_HWCAP & !HWCAP_EVTSTRM;
-        const WANT_HWCAP2: u64 =
+        const LSE2_HWCAP: u64 = PHONE_HWCAP & !HWCAP_EVTSTRM;
+        const LSE2_HWCAP2: u64 =
             (PHONE_HWCAP2 & !(HWCAP2_DGH | HWCAP2_ECV | HWCAP2_AFP)) | HWCAP2_MTE;
+        /// The base tier, by hand: cortex-a76's ID registers (the model in target/arm/tcg/cpu64.c, values of the Arm TRM) through the kernel's hwcap rules (Documentation/arch/arm64/elf_hwcaps.rst).
+        /// PFR0 0x1100_0000_1011_1112: FP 1, AdvSIMD 1 (fp asimd fphp asimdhp), DIT 0. ISAR0 0x1000_1021_1120: AES 2 (aes pmull), SHA1 1, SHA2 1, CRC32 1, Atomic 2 (atomics), RDM 1 (asimdrdm), DP 1 (asimddp). ISAR1 0x10_0001: DPB 1 (dcpop), LRCPC 1 (lrcpc). `cpuid` is the kernel's. MMFR2 0x1011: AT 0, no uscat.
+        /// Bits 0 1, 3..=12, 15, 16, 20; not evtstrm, as above. HWCAP2 none: DPB < 2, TS 0, FRINTTS 0, I8MM 0, BF16 0, BT 0, MTE 0.
+        const BASE_HWCAP: u64 = 0x11_9ffb;
+        const BASE_HWCAP2: u64 = 0;
         /// QEMU option variables xtask sets for (z); patch 0003 keeps QEMU from reading them.
         const QEMU_VARS: [&str; 2] = ["QEMU_CPU", "QEMU_STRACE"];
 
-        /// Gate (z): the guest's hwcaps are the device profile, and the probe's QEMU_* variables were set.
+        /// Gate (z): the guest's hwcaps are the tier's profile, and the probe's QEMU_* variables were set.
         pub(super) fn cpu_profile(auxv: u64) -> Result<(), String> {
             for v in QEMU_VARS {
                 if std::env::var_os(v).is_none() {
@@ -1837,9 +1842,16 @@ mod engine_so {
             }
             let hwcap = at(auxv, libc::AT_HWCAP)?;
             let hwcap2 = at(auxv, libc::AT_HWCAP2)?;
-            if (hwcap, hwcap2) != (WANT_HWCAP, WANT_HWCAP2) {
+            let tier = super::env("ATL_ENGINE_CPU_TIER")?;
+            let want = match tier.as_str() {
+                "lse2" => (LSE2_HWCAP, LSE2_HWCAP2),
+                "base" => (BASE_HWCAP, BASE_HWCAP2),
+                _ => return Err(format!("ATL_ENGINE_CPU_TIER {tier}: lse2 or base")),
+            };
+            if (hwcap, hwcap2) != want {
                 return Err(format!(
-                    "AT_HWCAP {hwcap:#x} AT_HWCAP2 {hwcap2:#x} != device profile {WANT_HWCAP:#x} {WANT_HWCAP2:#x}"
+                    "AT_HWCAP {hwcap:#x} AT_HWCAP2 {hwcap2:#x} != tier {tier} {:#x} {:#x}",
+                    want.0, want.1
                 ));
             }
             Ok(())

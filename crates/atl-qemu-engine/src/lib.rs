@@ -130,7 +130,7 @@ mod capi {
         PROT_EXEC, PROT_READ, PROT_WRITE, TrapExFn, TrapFn, TrapKind,
     };
 
-    use crate::engine::{boot_env, on_loader_thread, set_pages, start_linked};
+    use crate::engine::{boot_env, guest_cpu, on_loader_thread, set_pages, start_linked};
     use crate::{Cpu, Guest, Trap, page};
 
     /// The engine handle: this static's address, the only one there is.
@@ -149,7 +149,7 @@ mod capi {
     // SAFETY: as for Send; the struct is never mutated after create.
     unsafe impl Sync for HostRef {}
 
-    /// Writes one line to stderr: the ABI has no error text channel.
+    /// Writes one line to stderr: the ABI has no text channel.
     fn note(msg: &str) {
         let line = format!("atl-engine: {msg}\n");
         // SAFETY: the buffer is valid for its length; a failed write has nowhere else to report.
@@ -234,6 +234,10 @@ mod capi {
             return -libc::EEXIST;
         }
         crate::signal::set_fault_report(h.ctx, fault_report);
+        // the tier line: the CPU this engine's guest runs on
+        if let Some(cpu) = guest_cpu() {
+            note(&format!("guest cpu {cpu}"));
+        }
         // SAFETY: out is non-null (checked); the handle is published before QEMU runs, so BOOT's callbacks reach the engine through it.
         unsafe { *out = (&raw const ENGINE).cast_mut().cast() };
         match start_linked(exe, host_trap) {
