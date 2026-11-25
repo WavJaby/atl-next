@@ -266,7 +266,7 @@ fn keep_reason(name: &str) -> Option<&'static str> {
 }
 
 /// The first process holding a path inside `dir` (`dir` canonical).
-fn holder(dir: &Path, held: &[(u32, PathBuf)]) -> Option<u32> {
+pub(crate) fn holder(dir: &Path, held: &[(u32, PathBuf)]) -> Option<u32> {
     held.iter()
         .find(|(_, p)| p.starts_with(dir))
         .map(|(pid, _)| *pid)

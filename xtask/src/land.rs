@@ -38,7 +38,7 @@ pub const LAND_WT: &str = "wt/land";
 pub struct Args {
     /// Task branch to land: checked out in a worktree, and a fast-forward of origin/main.
     branch: String,
-    /// Act: rebase the branch onto origin/main when behind (git replay: no checkout is left mid-rebase; a conflict changes nothing, names the files and exits 3), build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up (record the task in `<workspace>/retired-tasks`, remove its worktree, branch and build dir, prune orphan build/driver dirs and old bases). Without it, prints the steps only.
+    /// Act: rebase the branch onto origin/main when behind (git replay: no checkout is left mid-rebase; a conflict changes nothing, names the files and exits 3), build and check in the land worktree, push, bring the main checkout and `src/` to the new commit, publish the land build dir as a base, clean up (record the task in `<workspace>/retired-tasks`, remove its worktree, branch and build dir, prune orphan build/driver dirs and old bases; a worktree holding uncommitted work, a later commit or a process stays whole and is named, `land-cleanup: kept`, and the land is still ok). Without it, prints the steps only.
     #[arg(long)]
     execute: bool,
     /// AOSP projects (`[aosp.projects]` paths) whose shared checkout the branch's `[aosp.sparse]` change can only reach by delete-and-clone: passed to the post-push `fetch --execute --recreate`. The preflight refuses a land that needs one not named here, before anything is pushed (deleting the checkout pulls files from under every reader of `src/`: the maintainer's call).
@@ -1162,17 +1162,61 @@ fn clean_up_child(repo: &Path, branch: &str) -> Result<String> {
         .with_context(|| format!("branch {branch} is not checked out in a worktree"))?;
     // first: once the branch is deleted, this line is the only proof that `out/<branch>/` was a task's (out prune --tasks)
     let landed = git(Some(repo), &["rev-parse", "HEAD"])?;
-    // a commit made on the branch after the push: its worktree and copies stay
-    let tip = git(Some(repo), &["rev-parse", &format!("refs/heads/{branch}")])?;
-    ensure!(
-        is_ancestor(repo, &tip, &landed)?,
-        "{branch} moved during land: now {tip}, landed main is {landed}: nothing removed"
-    );
-    crate::out_tasks::record_retired(&ws, branch, &landed)?;
-    let note = clean_up(repo, &ws, &wt, branch)?;
+    let note = match held(repo, &ws, &wt, branch, &landed)? {
+        Some(why) => kept(&ws, &wt, branch, &why),
+        None => {
+            crate::out_tasks::record_retired(&ws, branch, &landed)?;
+            clean_up(repo, &ws, &wt, branch)?
+        }
+    };
     prune_units_after_land(repo, &ws);
     prune_dirs_after_land(repo, &ws);
     Ok(note)
+}
+
+/// Why `wt` cannot go without losing something, decided before anything is removed: a commit made on the branch after the push, uncommitted work (untracked files count, the state note excepted), a process with its cwd, an fd or a map inside the worktree or its build dir, a build holding the build dir.
+/// Unreadable processes are not a reason: `git worktree remove` without `--force` still refuses files, and a missed cwd loses nothing.
+fn held(repo: &Path, ws: &Path, wt: &Path, branch: &str, landed: &str) -> Result<Option<String>> {
+    let tip = git(Some(repo), &["rev-parse", &format!("refs/heads/{branch}")])?;
+    if !is_ancestor(repo, &tip, landed)? {
+        return Ok(Some(format!(
+            "{branch} moved during land: now {tip}, landed main is {landed}"
+        )));
+    }
+    // explicit mode: a user's status.showUntrackedFiles=no would hide untracked work
+    let porcelain = git_raw(wt, &["status", "--porcelain", "--untracked-files=normal"])?;
+    let dirty = dirty_lines(&porcelain);
+    if !dirty.is_empty() {
+        return Ok(Some(format!("uncommitted work: {}", first(&dirty))));
+    }
+    let id = out::checkout_id(wt)?;
+    let dir = out::dir_of(ws, &id);
+    let (paths, _unreadable) = crate::out_tasks::held_paths()?;
+    for root in [wt, dir.as_path()] {
+        let Ok(real) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if let Some(pid) = crate::out_tasks::holder(&real, &paths) {
+            return Ok(Some(format!("process {pid} holds {}", real.display())));
+        }
+    }
+    if out::present(&dir)? && crate::build_pool::try_lock_dir(ws, &id)?.is_none() {
+        return Ok(Some(format!(
+            "{} is held by a running build",
+            dir.display()
+        )));
+    }
+    Ok(None)
+}
+
+/// The kept outcome: nothing (more) removed, the land stays ok; returns the note line.
+fn kept(ws: &Path, wt: &Path, branch: &str, why: &str) -> String {
+    println!(
+        "land-cleanup: kept {}: {why}; finish with: cargo xtask land {branch} --cleanup --execute",
+        wt.display()
+    );
+    out::count(ws, "land-cleanup-kept");
+    format!("kept {} ({why})", wt.display())
 }
 
 /// After a land: `out prune --execute` (orphan build dirs, driver probe dirs, bases beyond the keep rule; the landed worktree is gone by now, so its dirs are among them). Never fatal: the land is pushed; the outcome is its own `land-prune: ok|FAILED` line, never a `land:` verdict.
@@ -1201,7 +1245,8 @@ fn prune_units_after_land(repo: &Path, ws: &Path) {
     }
 }
 
-/// The task copies, then the state note (kept in out/), the checkout's target and build dir (`out::leave`), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
+/// The task copies, then the state note (moved to out/), the checkout's target and build dir (`out::leave`), the worktree and the branch. Copies go through `patch --done --task`, the command's own path.
+/// `worktree remove` without `--force`: git's own look at modified/untracked files and locks, atomic with the removal, closes the window after [`held`]; its refusal is the kept outcome.
 fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
     let copies = copies_of(&Layout::new(ws, Some(branch)), &sources::load(wt)?);
     if !copies.is_empty() {
@@ -1214,10 +1259,23 @@ fn clean_up(repo: &Path, ws: &Path, wt: &Path, branch: &str) -> Result<String> {
         std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
         let kept = out.join(format!("{branch}-state-note.md"));
         std::fs::copy(&note, &kept).with_context(|| format!("keeping {}", note.display()))?;
+        // untracked: left in place, git's remove below would refuse it
+        std::fs::remove_file(&note).with_context(|| format!("removing {}", note.display()))?;
     }
     let target = out::leave(wt, ws)?;
     let wt_arg = wt.display().to_string();
-    git(Some(repo), &["worktree", "remove", "--force", &wt_arg])?;
+    if let Err(e) = git(Some(repo), &["worktree", "remove", &wt_arg]) {
+        let why = format!("{e:#}");
+        return Ok(kept(
+            ws,
+            wt,
+            branch,
+            &format!(
+                "{}; its build dir was removed: regenerable",
+                why.lines().last().unwrap_or(&why).trim()
+            ),
+        ));
+    }
     git(Some(repo), &["branch", "-d", branch])?;
     Ok(format!(
         "{} task copies, {target}, worktree {wt_arg}, branch {branch}",
@@ -2023,12 +2081,141 @@ mod tests {
         // a commit landing after that check: the push still names the verified commit
         plan.push_head().unwrap();
         assert_eq!(env.origin_main(), verified);
-        // main holds `verified`, the branch one more: cleanup removes nothing
+        // main holds `verified`, the branch one more: cleanup keeps the worktree and says so
         git(Some(&env.repo), &["merge", "-q", "--ff-only", &verified]).unwrap();
-        let err = clean_up_child(&env.repo, "task").expect_err("cleaned up a moved branch");
-        let err = format!("{err:#}");
-        assert!(err.contains(&late) && err.contains(&verified), "{err}");
+        let note = clean_up_child(&env.repo, "task").unwrap();
+        assert!(
+            note.starts_with("kept ") && note.contains(&late) && note.contains(&verified),
+            "{note}"
+        );
         assert!(env.wt.join("late.txt").is_file());
+    }
+
+    /// Land with a cleanup child that runs `during` in the worktree first; returns the land line and the cleanup note.
+    fn land_with_cleanup(env: &Env, during: &dyn Fn(&Path)) -> (String, String) {
+        let plan = Plan::new(&env.repo, "task", true, &in_process).unwrap();
+        let check_fn = |_: &Path| -> Result<String> {
+            during(&env.wt);
+            Ok("check: ok".to_owned())
+        };
+        let fetch_fn = |_: &Path, _: &[String]| -> Result<()> { Ok(()) };
+        let note = std::cell::RefCell::new(String::new());
+        let cleanup_fn = |repo: &Path, branch: &str| -> Result<String> {
+            let n = clean_up_child(repo, branch)?;
+            *note.borrow_mut() = n.clone();
+            Ok(n)
+        };
+        let stages = plan.stages();
+        let line = plan.execute(
+            &stages,
+            &Runner {
+                facts: &in_process,
+                edit: &no_edit,
+                check: &check_fn,
+                fetch: &fetch_fn,
+                cleanup: &cleanup_fn,
+                native: &no_native,
+                stale: &current,
+                publish: &no_publish,
+                reset: &no_reset,
+            },
+        );
+        (line, note.into_inner())
+    }
+
+    fn branch_exists(env: &Env) -> bool {
+        git(
+            Some(&env.repo),
+            &["rev-parse", "--verify", "-q", "refs/heads/task"],
+        )
+        .is_ok()
+    }
+
+    /// Work written in the worktree while land runs (a modified tracked file; an untracked file): landed, worktree + work + branch + build dir kept and named; a later cleanup without the work removes it.
+    #[test]
+    fn work_written_during_land_keeps_the_worktree() {
+        for (name, file) in [("kept-mod", "change.txt"), ("kept-new", "new.txt")] {
+            let env = Env::new(name);
+            let ws = env.root.join("ws");
+            let dir = out::dir_of(&ws, "task");
+            std::fs::create_dir_all(&dir).unwrap();
+            let before = env.origin_main();
+            let (line, note) = land_with_cleanup(&env, &|wt: &Path| write(wt, file, "late\n"));
+            assert_eq!(line, "land: ok (7 steps)", "{name}");
+            assert_ne!(env.origin_main(), before, "{name}");
+            assert!(
+                note.starts_with("kept ")
+                    && note.contains("uncommitted work")
+                    && note.contains(file),
+                "{name}: {note}"
+            );
+            assert!(
+                env.wt.join(file).is_file() && branch_exists(&env) && dir.is_dir(),
+                "{name}"
+            );
+            // the follow-up once the work is gone
+            if file == "new.txt" {
+                std::fs::remove_file(env.wt.join(file)).unwrap();
+            } else {
+                git(Some(&env.wt), &["checkout", "--", file]).unwrap();
+            }
+            let note = clean_up_child(&env.repo, "task").unwrap();
+            assert!(!note.starts_with("kept "), "{name}: {note}");
+            assert!(!env.wt.exists() && !branch_exists(&env), "{name}");
+        }
+    }
+
+    /// The state note is not work: moved to out/, the worktree goes without `--force`.
+    #[test]
+    fn the_state_note_alone_does_not_keep_the_worktree() {
+        let env = Env::new("note-only");
+        let (line, note) = land_with_cleanup(&env, &|wt: &Path| write(wt, STATE_NOTE, "done\n"));
+        assert_eq!(line, "land: ok (7 steps)");
+        assert!(!note.starts_with("kept "), "{note}");
+        assert!(!env.wt.exists());
+        let kept = env.root.join("ws/out/task-state-note.md");
+        assert_eq!(std::fs::read_to_string(kept).unwrap(), "done\n");
+    }
+
+    /// A process with its cwd inside the worktree (the worker's own job) keeps it; the land stays ok.
+    #[test]
+    fn a_process_inside_the_worktree_keeps_it() {
+        let env = Env::new("kept-proc");
+        let child = std::cell::RefCell::new(None);
+        let (line, note) = land_with_cleanup(&env, &|wt: &Path| {
+            *child.borrow_mut() = Some(
+                Command::new("sleep")
+                    .arg("30")
+                    .current_dir(wt)
+                    .spawn()
+                    .unwrap(),
+            );
+        });
+        let mut child = child.into_inner().unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(line, "land: ok (7 steps)");
+        assert!(
+            note.starts_with("kept ") && note.contains(&format!("process {pid}")),
+            "{note}"
+        );
+        assert!(env.wt.is_dir() && branch_exists(&env));
+    }
+
+    /// Work that appears after `held` looked: git's own remove (no `--force`) refuses, the worktree stays.
+    #[test]
+    fn git_refuses_to_remove_work_that_appears_after_the_look() {
+        let env = Env::new("kept-late");
+        let ws = env.root.join("ws");
+        git(Some(&env.repo), &["merge", "-q", "--ff-only", "task"]).unwrap();
+        write(&env.wt, "late.txt", "late\n");
+        let note = clean_up(&env.repo, &ws, &env.wt, "task").unwrap();
+        assert!(
+            note.starts_with("kept ") && note.contains("build dir was removed"),
+            "{note}"
+        );
+        assert!(env.wt.join("late.txt").is_file() && branch_exists(&env));
     }
 
     /// A branch that moved between the preflight and Enter is refused before Build and Verify read it.
