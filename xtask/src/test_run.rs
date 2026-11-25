@@ -101,11 +101,13 @@ fn run_in(root: &Path, scratch: &Path) -> Result<()> {
     done.extend(run_all(&alone, 1, scratch, &show));
     let binaries_took = started.elapsed();
     let started = Instant::now();
-    let doc = crate::check::cargo(
-        root,
-        &["test", "--doc", "--workspace", "--locked"],
-        Units::Recorded,
-    );
+    // `--doc` runs the doc tests of a lib that sets `doctest = false` too: excluded, as `cargo test` leaves them out
+    let skip = crate::workspace::load(root)?.no_doctests;
+    let mut args = vec!["test", "--doc", "--workspace", "--locked"];
+    for package in &skip {
+        args.extend(["--exclude", package]);
+    }
+    let doc = crate::check::cargo(root, &args, Units::Recorded);
     let tests: Counts = done.iter().map(|d| d.counts).sum();
     eprintln!(
         "test: {} binaries, {} passed, {} failed, {} ignored, {} filtered out ({} at a time, {}); doc tests {}",
@@ -143,13 +145,17 @@ fn list(root: &Path, scratch: &Path) -> Result<Vec<Binary>> {
         .arg(&runner)
         .current_dir(root);
     let cargo = unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing)?;
-    ensure!(
-        cargo.status.success(),
-        "listing the test binaries: cargo test exited with {}\n{}{}",
-        cargo.status,
-        cargo.stdout,
-        cargo.stderr
-    );
+    if !cargo.status.success() {
+        let exit = format!(
+            "listing the test binaries: cargo test exited with {}",
+            cargo.status
+        );
+        // the cause leads: check's verdict quotes the first line
+        match verdict::first_failure_line(&format!("{}{}", cargo.stdout, cargo.stderr)) {
+            Some(line) => bail!("{line}\n{exit}"),
+            None => bail!("{exit}\n{}{}", cargo.stdout, cargo.stderr),
+        }
+    }
     let mut paths: Vec<PathBuf> = fs::read_dir(&dir)?
         .map(|e| Ok(e?.path()))
         .collect::<Result<_>>()?;

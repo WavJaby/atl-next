@@ -18,6 +18,8 @@ pub struct Workspace {
     pub build_edges: BTreeSet<(String, String)>,
     /// Members with a build script (`custom-build` target).
     pub build_scripts: BTreeSet<String>,
+    /// Members whose lib target sets `doctest = false`: `cargo test` runs no doc tests of theirs, `cargo test --doc` would.
+    pub no_doctests: BTreeSet<String>,
 }
 
 impl Workspace {
@@ -59,6 +61,21 @@ struct Package {
 #[derive(Deserialize)]
 struct Target {
     kind: Vec<String>,
+    /// set on every target; true only for a lib whose doc tests run
+    #[serde(default)]
+    doctest: bool,
+}
+
+impl Target {
+    /// A library of any crate type but proc-macro (cargo metadata `kind`: lib, rlib, cdylib, staticlib, dylib).
+    fn is_lib(&self) -> bool {
+        self.kind.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                "lib" | "rlib" | "cdylib" | "staticlib" | "dylib"
+            )
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,6 +133,11 @@ fn from_metadata(meta: Metadata) -> Workspace {
                     .iter()
                     .any(|t| t.kind.iter().any(|k| k == "custom-build"))
             })
+            .map(|p| p.name.clone())
+            .collect(),
+        no_doctests: member_pkgs
+            .iter()
+            .filter(|p| p.targets.iter().any(|t| t.is_lib() && !t.doctest))
             .map(|p| p.name.clone())
             .collect(),
         ..Workspace::default()

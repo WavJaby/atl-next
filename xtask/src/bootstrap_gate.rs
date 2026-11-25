@@ -206,6 +206,7 @@ mod tests {
             edges: e.clone(),
             build_edges: e,
             build_scripts: scripts.iter().map(own).collect(),
+            ..Workspace::default()
         }
     }
 
