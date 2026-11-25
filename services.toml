@@ -106,6 +106,7 @@ mirrors = [
     "frameworks/base/core/java/android/app/servertransaction/ActivityRelaunchItem.java",
     "frameworks/base/core/java/android/app/servertransaction/ActivityConfigurationChangeItem.java",
     "frameworks/base/core/java/android/app/servertransaction/ConfigurationChangeItem.java",
+    "frameworks/base/services/core/java/com/android/server/pm/PackageFreezer.java",
 ]
 
 [activity_task]

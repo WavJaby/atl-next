@@ -44,6 +44,8 @@ pub enum Origin {
 pub struct Installed {
     pub record: PackageRecord,
     pub reported: Reported,
+    /// the package's freeze, kept to the publish (dropped last there): the package starts again only with its version recorded
+    pub frozen: Box<dyn Send>,
 }
 
 /// PackageManagerException: an INSTALL_* name and its message (Display `NAME: message`, PackageManager.installStatusToString :10650).
@@ -51,6 +53,11 @@ pub struct Installed {
 pub struct Failure {
     pub code: &'static str,
     pub message: String,
+}
+
+/// PackageFreezer (freezePackage, :65-97): stops the package's processes and freezes the package until the returned guard drops; a frozen package starts nothing. ActivityManager implements it.
+pub trait PackageStops: Send + Sync {
+    fn freeze(&self, package: &str) -> Box<dyn Send>;
 }
 
 /// The one install path (PMS installPackagesTraced): boot's sessions now, a running install later.
@@ -62,6 +69,7 @@ pub struct Installer {
     table: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     state: Arc<PackageUserStates>,
+    stops: Arc<dyn PackageStops>,
 }
 
 impl Installer {
@@ -72,6 +80,7 @@ impl Installer {
         table: Arc<PackageTable>,
         permissions: Arc<Permissions>,
         state: Arc<PackageUserStates>,
+        stops: Arc<dyn PackageStops>,
     ) -> Self {
         Installer {
             control,
@@ -80,6 +89,7 @@ impl Installer {
             table,
             permissions,
             state,
+            stops,
         }
     }
 
@@ -169,6 +179,8 @@ impl Installer {
         let uid = ids
             .acquire()
             .ok_or_else(|| failure(INTERNAL, anyhow::anyhow!("no application id left")))?;
+        // PackageFreezer (commitInstallPackages :1373-1386, after reconcile): frozen from here to the publish, so no start of the package crosses the swap; a failed commit unfreezes at the return
+        let frozen = self.stops.freeze(&parsed.name);
         if let Err(e) = self
             .control
             .commit(session, &parsed.name, uid, names)
@@ -187,6 +199,7 @@ impl Installer {
                 version,
                 change,
             },
+            frozen,
         })
     }
 
@@ -197,14 +210,22 @@ impl Installer {
         }
         let snapshot = self.table.snapshot();
         let names: Vec<String> = batch.iter().map(|i| i.record.name().to_owned()).collect();
-        let (records, reports): (Vec<PackageRecord>, Vec<Reported>) =
-            batch.into_iter().map(|i| (i.record, i.reported)).unzip();
+        let mut frozen = Vec::with_capacity(batch.len());
+        let (records, reports): (Vec<PackageRecord>, Vec<Reported>) = batch
+            .into_iter()
+            .map(|i| {
+                frozen.push(i.frozen);
+                (i.record, i.reported)
+            })
+            .unzip();
         let next = snapshot.with_records(records);
         self.permissions.packages_added(&next, &names);
         self.table.publish(next);
         for r in &reports {
             self.state.set_version_code(&r.package, r.version);
         }
+        // the freezes end last: a package starts again only once its version is recorded (D6)
+        drop(frozen);
         reports
     }
 }
@@ -660,6 +681,14 @@ mod tests {
         (Arc::new(ControlSocket::new(ours)), server)
     }
 
+    /// A package stop that stops nothing: these tests run no process.
+    struct NoStops;
+    impl PackageStops for NoStops {
+        fn freeze(&self, _package: &str) -> Box<dyn Send> {
+            Box::new(())
+        }
+    }
+
     /// The services' installer over `control`, `table` and `state` (the table's user state): the device's ABI, a fresh id pool, the permissions of the table's list.
     fn installer_over(
         control: &Arc<ControlSocket>,
@@ -680,6 +709,7 @@ mod tests {
             Arc::clone(table),
             permissions,
             Arc::clone(state),
+            Arc::new(NoStops),
         )
     }
 

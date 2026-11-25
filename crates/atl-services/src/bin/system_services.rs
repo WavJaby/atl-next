@@ -342,6 +342,7 @@ fn main() -> Result<()> {
         Arc::clone(&table),
         Arc::clone(&permissions),
         Arc::clone(&state),
+        Arc::new(activity.clone()),
     )
     .boot(&a.sessions)?;
     for r in &reports {

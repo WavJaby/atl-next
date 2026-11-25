@@ -565,6 +565,8 @@ struct State {
     uids: uid_state::Uids,
     /// the launch Tasks counted in `uids`, with their uid: a Task leaves once (task_gone_locked)
     open_tasks: std::collections::BTreeMap<TaskId, u32>,
+    /// PackageFreezer's mFrozenPackages: a package's freeze count; a frozen package starts nothing (start_process_locked)
+    frozen: std::collections::BTreeMap<String, u32>,
     /// the packages that got the boot broadcasts at a first process start this run (D2 clause 2, broadcast::first_start_boot)
     booted: std::collections::BTreeSet<String>,
     /// processes (by start_seq) whose activity launch waits for their package's first-start BOOT_COMPLETED to finish (broadcasts_am.rs release_held_launches_locked)
@@ -880,6 +882,30 @@ pub struct ActivityManager {
     inner: Arc<Inner>,
 }
 
+/// A freeze of a package (PackageFreezer): while it lives the package starts nothing; its drop counts the freeze down (PackageFreezer.close :110-121).
+pub struct Frozen {
+    inner: Arc<Inner>,
+    package: String,
+}
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        let mut st = self.inner.state();
+        if let Some(count) = st.frozen.get_mut(&self.package) {
+            *count -= 1;
+            if *count == 0 {
+                st.frozen.remove(&self.package);
+            }
+        }
+    }
+}
+
+impl crate::install::PackageStops for ActivityManager {
+    fn freeze(&self, package: &str) -> Box<dyn Send> {
+        Box::new(self.freeze_package(package))
+    }
+}
+
 pub(crate) fn log(msg: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "services: {msg}");
 }
@@ -1077,6 +1103,21 @@ impl ActivityManager {
     }
 
     /// The lifecycle the activity_task service (IActivityTaskManager) is built on.
+    /// PackageFreezer.freezePackage (:65-97): the count and the package's stop share one hold of the state lock, so no start can land between them. The kills and the
+    /// waiters' answers follow once the lock is released. The returned guard's drop counts the freeze down.
+    pub fn freeze_package(&self, package: &str) -> Frozen {
+        let fx = {
+            let mut st = self.inner.state();
+            *st.frozen.entry(package.to_owned()).or_insert(0) += 1;
+            self.inner.force_stop_package_locked(&mut st, package)
+        };
+        self.inner.deliver(fx);
+        Frozen {
+            inner: Arc::clone(&self.inner),
+            package: package.to_owned(),
+        }
+    }
+
     pub fn activity_tasks(&self) -> Arc<ActivityTasks> {
         Arc::clone(&self.inner.atm)
     }
@@ -1683,6 +1724,22 @@ impl Inner {
         launch_activity: bool,
         instr: Option<ActiveInstrumentation>,
     ) -> std::io::Result<()> {
+        // a frozen package starts nothing (ComputerEngine.getPackageStartability :3643; the text is PackageManagerService :4642); the refusal is counted
+        if st.frozen.contains_key(p.name()) {
+            atl_diag::refused(AM, "start refused: package frozen");
+            return Err(std::io::Error::other(format!(
+                "Package {} is currently frozen!",
+                p.name()
+            )));
+        }
+        // the record is read under the state lock: a caller's snapshot may predate an update published while it waited for the lock
+        let packages = self.packages.snapshot();
+        let Some(p) = packages.by_name(p.name()) else {
+            return Err(std::io::Error::other(format!(
+                "Package {} is not installed",
+                p.name()
+            )));
+        };
         st.proc_start_seq_counter += 1;
         let start_seq = st.proc_start_seq_counter;
         let pid = self.control.start(&StartRequest {
@@ -1696,7 +1753,6 @@ impl Inner {
             rights: atl_broker::rights_of(self.permissions.granted_names(p.uid).as_slice()),
         })?;
         // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
-        let packages = self.packages.snapshot();
         let task = packages.launcher(p).filter(|_| launch_activity).map(|a| {
             let size = self.tasks.opening_size(&crate::packages::bounds_input(a));
             self.tasks.new_task(p.uid, p.name(), size)
@@ -3907,11 +3963,16 @@ mod tests {
     #[derive(Default)]
     struct RecordingProcesses {
         starts: Mutex<Vec<String>>,
+        target_sdks: Mutex<Vec<i32>>,
         kills: Mutex<Vec<i32>>,
     }
 
     impl ProcessControl for RecordingProcesses {
         fn start(&self, request: &StartRequest) -> std::io::Result<i32> {
+            self.target_sdks
+                .lock()
+                .expect("target_sdks")
+                .push(request.target_sdk);
             let mut starts = self.starts.lock().expect("starts");
             starts.push(request.process_name.clone());
             // any pid: the n-th start gets n
@@ -4115,6 +4176,104 @@ mod tests {
             "after the force stop: (processes, providers, launch Tasks) left, and the activity's presence"
         );
         assert_eq!(*control.kills.lock().expect("kills"), [pid]);
+    }
+
+    /// The start every caller reaches: start_process_locked for the provider package's default process, under the state lock.
+    fn start_provider_process(am: &ActivityManager) -> std::io::Result<()> {
+        let mut st = am.inner.state();
+        let packages = am.inner.packages.snapshot();
+        let p = packages
+            .by_name(PROVIDER_PACKAGE)
+            .expect("the provider package is installed");
+        am.inner
+            .start_process_locked(&mut st, p, PROVIDER_PACKAGE, false, None)
+    }
+
+    /// PackageFreezer.freezePackage counts: two freezes need two drops. A frozen package's start is refused (ComputerEngine.getPackageStartability :3643, the text
+    /// PackageManagerService :4642); the first start after the last drop runs. Red before the gate: the start goes through.
+    #[test]
+    fn a_frozen_package_does_not_start() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let first = am.freeze_package(PROVIDER_PACKAGE);
+        let second = am.freeze_package(PROVIDER_PACKAGE);
+        let refused = start_provider_process(&am).expect_err("frozen: the start is refused");
+        assert_eq!(
+            refused.to_string(),
+            format!("Package {PROVIDER_PACKAGE} is currently frozen!")
+        );
+        drop(first);
+        start_provider_process(&am).expect_err("one freeze left: still refused");
+        drop(second);
+        start_provider_process(&am).expect("unfrozen: the start runs");
+        assert_eq!(
+            control.starts.lock().expect("starts").len(),
+            1,
+            "only the unfrozen start reached the control"
+        );
+    }
+
+    /// A start takes its record from a snapshot taken before the state lock; a publish while it waits must not start the old record: start_process_locked re-reads
+    /// the record under the lock. Red before the re-read: the process starts with the stale target SDK.
+    #[test]
+    fn a_start_waiting_for_the_lock_takes_the_published_record() {
+        const UPDATED_TARGET_SDK: i32 = 30;
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let update = am.inner.state();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let inner = Arc::clone(&am.inner);
+        let racer = std::thread::spawn(move || {
+            let snapshot = inner.packages.snapshot();
+            taken_tx.send(()).expect("the test waits for the snapshot");
+            let p = snapshot
+                .by_name(PROVIDER_PACKAGE)
+                .expect("the provider package is installed");
+            let mut st = inner.state();
+            inner.start_process_locked(&mut st, p, PROVIDER_PACKAGE, false, None)
+        });
+        taken_rx.recv().expect("the start took its snapshot");
+        // the update publishes the package with another target SDK while the start waits for the lock
+        let mut updated = fixture::record(PROVIDER_PACKAGE);
+        updated.uid = PROVIDER_UID;
+        updated
+            .info
+            .application_info
+            .as_mut()
+            .expect("the fixture's application info")
+            .target_sdk_version = UPDATED_TARGET_SDK;
+        let next = am.inner.packages.snapshot().with_records(vec![updated]);
+        am.inner.packages.publish(next);
+        drop(update);
+        racer
+            .join()
+            .expect("the racing start")
+            .expect("the start is not refused");
+        assert_eq!(
+            *control.target_sdks.lock().expect("target_sdks"),
+            [UPDATED_TARGET_SDK]
+        );
+    }
+
+    /// freezePackage stops the package's processes in the hold that counts the freeze (PackageFreezer.java :65-97): a start that raced it was killed by it, or it
+    /// is refused. 1000 rounds. Red before the freeze stops anything: a started process is neither killed nor refused.
+    #[test]
+    fn freeze_kills_in_the_same_step() {
+        for round in 0..1000 {
+            let control = Arc::new(RecordingProcesses::default());
+            let am = provider_manager(Arc::clone(&control));
+            let racer = am.clone();
+            let start = std::thread::spawn(move || start_provider_process(&racer).is_ok());
+            let frozen = am.freeze_package(PROVIDER_PACKAGE);
+            let started = start.join().expect("the racing start");
+            let killed = control.kills.lock().expect("kills").len();
+            drop(frozen);
+            assert_eq!(
+                killed,
+                usize::from(started),
+                "round {round}: the freeze kills a start that won the race, and a refused start kills nothing"
+            );
+        }
     }
 
     /// A process of (process, uid) that another package owns cannot publish this provider (publishContentProviders matches the publisher's package): the request gets
