@@ -8,7 +8,7 @@
 //! One mount per upper: two overlays on one upper are undefined (the kernel only warns with index=off), so the outer command holds an exclusive flock whose fd every process of the namespace inherits; a second command of the checkout waits (the line names the holders).
 //! A process still holding it when the command returns (a daemon a build spawned: sccache server, gradle, kotlin) may still use the overlay, so the outer command ends it ([`end_holders`]): the mount and everything using it end with the command.
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
-//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves its class's peak growth for its run ([`judge`]). A verdict other than Admit sends a new dir to the pool; an existing ram dir waits out a land hold ([`admit_keeping`]) and is otherwise kept and its build refused ([`fall_to_pool`]): admission never drops a dir.
+//! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves the growth it adds to its own upper for its run ([`Need::of`]: its class's peak less what its upper already holds, floored at `delta.regrow_gib`), and others' reservations count against the store ([`judge`]). A verdict other than Admit sends a new dir to the pool; an existing ram dir waits out a land hold ([`admit_keeping`]) and is otherwise kept and its build refused ([`fall_to_pool`]): admission never drops a dir.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -287,8 +287,8 @@ fn mem_available() -> Result<u64> {
 /// The admission decision of one build.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Reserve `need_ram` bytes and start.
-    Admit { need_ram: u64 },
+    /// Reserve `need.ram` bytes and start.
+    Admit { need: Need },
     /// Room exists once other builds' reservations end.
     Wait(String),
     /// Not now: the store is full by its own accounting.
@@ -303,7 +303,7 @@ impl Verdict {
     /// The stated numbers of a non-admitting verdict.
     pub fn reason(&self) -> String {
         match self {
-            Verdict::Admit { need_ram } => format!("admitted, {:.2} GiB RAM", gib(*need_ram)),
+            Verdict::Admit { need } => format!("admitted, {:.2} GiB RAM", gib(need.ram)),
             Verdict::Wait(w) => format!("{w} (others' reservations)"),
             Verdict::Refuse(w) | Verdict::NeverFits(w) | Verdict::Held(w) => w.clone(),
         }
@@ -318,9 +318,13 @@ pub struct Need {
 }
 
 impl Need {
-    /// `class`'s peak on `s`: ram = ceil(raw / ratio); class run's ratio is capped at `delta.ratio_run` (app data compresses worse than the build uppers the device ratio mostly measures).
-    pub fn of(class: Class, cfg: &DeltaConfig, s: &Stats) -> Need {
-        let raw = class.peak(cfg);
+    /// Upper growth a build of `class` adds when its upper already holds `own` bytes of its part: raw = min(peak, max(regrow, peak - own)).
+    /// The store's `used` already counts `own`, so the full peak counted it twice (ram-store-admission S1). Regrow floors what a build over an existing upper still adds (measured over 14 windows).
+    /// ram = ceil(raw / ratio); class run's ratio is capped at `delta.ratio_run` (app data compresses worse than the build uppers the device ratio mostly measures).
+    pub fn of(class: Class, cfg: &DeltaConfig, s: &Stats, own: u64) -> Need {
+        let peak = class.peak(cfg);
+        let regrow = cfg.regrow_gib.value * GIB;
+        let raw = peak.min(regrow.max(peak.saturating_sub(own)));
         let ratio = match class {
             Class::Run => s.ratio_milli.min(cfg.ratio_run_milli.value),
             _ => s.ratio_milli,
@@ -347,7 +351,8 @@ pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land: LandState) -> Hold
     if id == out::LAND_ID || !land.active || land.reserved {
         return Hold::default();
     }
-    let native = Need::of(Class::Native, cfg, s);
+    // own 0: land's upper is not credited, so the hold stays the full native peak (conservative)
+    let native = Need::of(Class::Native, cfg, s, 0);
     match judge(
         s,
         native,
@@ -361,6 +366,7 @@ pub fn hold_for(id: &str, cfg: &DeltaConfig, s: &Stats, land: LandState) -> Hold
 }
 
 /// Admission of a build needing `need` while others hold `reserved` RAM bytes and land's `hold` stays free; `margin` RAM bytes stay free.
+/// Refuse / NeverFits: the store is short by its own accounting. Wait: others' reservations (RAM and raw) stand in the way.
 pub fn judge(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> Verdict {
     let (need_raw, need_ram) = (need.raw, need.ram);
     let n = |b: u64| format!("{:.2} GiB", gib(b));
@@ -402,6 +408,17 @@ pub fn judge(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> V
             n(margin)
         ));
     }
+    // others' reservations are RAM bytes: raw at the device ratio (the reservation file keeps one number); a shortfall they cause waits, as the RAM one does
+    let others_raw = reserved.saturating_mul(s.ratio_milli) / 1000;
+    if need_raw + others_raw + hold.raw > s.fs_free {
+        return Verdict::Wait(format!(
+            "store fs free {} < need {} + {} raw reserved by running builds + land hold {} raw",
+            n(s.fs_free),
+            n(need_raw),
+            n(others_raw),
+            n(hold.raw)
+        ));
+    }
     if need_ram + hold.ram + reserved + margin > ram_free {
         return Verdict::Wait(format!(
             "store RAM free {} < need {} + {} reserved by running builds + land hold {} + margin {}",
@@ -412,7 +429,7 @@ pub fn judge(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> V
             n(margin)
         ));
     }
-    Verdict::Admit { need_ram }
+    Verdict::Admit { need }
 }
 
 /// The class of a build command (cli.rs).
@@ -535,19 +552,20 @@ fn land_active(ws: &Path) -> Result<bool> {
     Ok(Flock::try_take(file, Mode::Shared)?.is_none())
 }
 
-/// The verdict for `class` by `id` on `stats` against the live reservations and land's hold; the caller holds the admit gate. Counts `delta-land-hold` on a [`Verdict::Held`].
+/// The verdict for `class` by `id` on `stats`, its upper holding `own` bytes of its part, against the live reservations and land's hold; the caller holds the admit gate. Counts `delta-land-hold` on a [`Verdict::Held`].
 fn judge_now(
     ws: &Path,
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
+    own: u64,
     stats: &Stats,
 ) -> Result<Verdict> {
     let (others, land) = land_now(ws)?;
     let hold = hold_for(id, cfg, stats, land);
     let v = judge(
         stats,
-        Need::of(class, cfg, stats),
+        Need::of(class, cfg, stats, own),
         others,
         hold,
         cfg.ram_margin_gib.value * GIB,
@@ -574,15 +592,16 @@ fn reserve(ws: &Path, id: &str, need_ram: u64) -> Result<Reservation> {
     Ok(Reservation { path, _lock: lock })
 }
 
-/// An admitted reservation: the guard, the store's stats it was judged on, the RAM bytes reserved.
-pub type Admitted = (Reservation, Stats, u64);
+/// An admitted reservation: the guard, the store's stats it was judged on, the growth reserved.
+pub type Admitted = (Reservation, Stats, Need);
 
-/// One admission try of `class` on `probed` (a [`probe`] result), never waiting: run dirs take the pool tier when short (out_run.rs), a wait would only stall an app start. Ok(Err(verdict)) = not admitted, Wait included.
+/// One admission try of `class` on `probed` (a [`probe`] result), its upper holding `own` bytes of its part (0: run dirs, a new dir), never waiting: run dirs take the pool tier when short (out_run.rs), a wait would only stall an app start. Ok(Err(verdict)) = not admitted, Wait included.
 pub fn admit_once(
     ws: &Path,
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
+    own: u64,
     probed: std::result::Result<Stats, String>,
 ) -> Result<std::result::Result<Admitted, Verdict>> {
     let stats = match probed {
@@ -591,8 +610,8 @@ pub fn admit_once(
     };
     let gate = lock_dir(ws).join("admit.lock");
     let _gate = Flock::take(open_lock(&gate)?, Mode::Exclusive)?;
-    match judge_now(ws, id, cfg, class, &stats)? {
-        Verdict::Admit { need_ram } => Ok(Ok((reserve(ws, id, need_ram)?, stats, need_ram))),
+    match judge_now(ws, id, cfg, class, own, &stats)? {
+        Verdict::Admit { need } => Ok(Ok((reserve(ws, id, need.ram)?, stats, need))),
         other => Ok(Err(other)),
     }
 }
@@ -606,11 +625,12 @@ pub fn fits_now(
     store: Option<&Path>,
 ) -> Result<std::result::Result<String, String>> {
     Ok(
-        match admit_once(ws, id, cfg, class, probe_store(store, cfg)?)? {
-            Ok((_released, stats, need_ram)) => Ok(format!(
+        // a dir laid now starts with an empty upper: nothing of its own counts
+        match admit_once(ws, id, cfg, class, 0, probe_store(store, cfg)?)? {
+            Ok((_released, stats, need)) => Ok(format!(
                 "{} build fits, {:.2} GiB RAM; store {}: {}",
                 class.name(),
-                gib(need_ram),
+                gib(need.ram),
                 store.map_or_else(|| "unset".to_owned(), |p| p.display().to_string()),
                 stats.line()
             )),
@@ -619,14 +639,15 @@ pub fn fits_now(
     )
 }
 
-/// Admits a build of `class` on store stats from `probe_now`, waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits / Held.
+/// Admits a build of `class` on store stats from `probe_now`, its upper holding `own` bytes of its part (fixed across the wait: the upper changes only under this checkout's own commands), waiting while only others' reservations stand in the way. Ok(Ok(reservation)), or Ok(Err(verdict)) for Refuse / NeverFits / Held.
 fn admit(
     ws: &Path,
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
+    own: u64,
     mut probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
-) -> Result<std::result::Result<(Reservation, Stats, u64), Verdict>> {
+) -> Result<std::result::Result<Admitted, Verdict>> {
     let mut said = false;
     loop {
         let stats = match probe_now()? {
@@ -635,9 +656,9 @@ fn admit(
         };
         let gate = lock_dir(ws).join("admit.lock");
         let _gate = Flock::take(open_lock(&gate)?, Mode::Exclusive)?;
-        match judge_now(ws, id, cfg, class, &stats)? {
-            Verdict::Admit { need_ram } => {
-                return Ok(Ok((reserve(ws, id, need_ram)?, stats, need_ram)));
+        match judge_now(ws, id, cfg, class, own, &stats)? {
+            Verdict::Admit { need } => {
+                return Ok(Ok((reserve(ws, id, need.ram)?, stats, need)));
             }
             Verdict::Wait(why) => {
                 if !said {
@@ -660,12 +681,13 @@ fn admit_keeping(
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
+    own: u64,
     keep: bool,
     mut probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
 ) -> Result<std::result::Result<Admitted, Verdict>> {
     let mut since = None;
     loop {
-        let got = admit(ws, id, cfg, class, &mut probe_now)?;
+        let got = admit(ws, id, cfg, class, own, &mut probe_now)?;
         let held = match &got {
             Err(Verdict::Held(why)) if keep => Some(why.clone()),
             _ => None,
@@ -872,8 +894,75 @@ pub fn refresh(
     ))
 }
 
+/// Bytes of upper `upper` that a build of `class` grows, allocated (`st_blocks * 512`, each inode once; a missing upper is 0).
+/// Cross = `upper/<cross_host>` only. Other build classes = all of `upper` but the cross host dirs `cross_dirs`: a cross host's outputs are not credited across arches (rhs2-rv-20: 14.4 GiB of x86 upper, its first riscv64 build still grew 10.32).
+/// Run dirs grow from an empty root: 0. A cross command without a host dir (`cross`: cargo writes `target/<triple>`): 0, so its growth is reserved whole and not sampled.
+pub fn own_bytes(
+    upper: &Path,
+    class: Class,
+    cross_host: Option<&str>,
+    cross_dirs: &[String],
+) -> Result<u64> {
+    let (top, skip): (PathBuf, Vec<PathBuf>) = match (class, cross_host) {
+        (Class::Run, _) | (Class::Cross, None) => return Ok(0),
+        (Class::Cross, Some(host)) => (upper.join(host), Vec::new()),
+        _ => (
+            upper.to_owned(),
+            cross_dirs.iter().map(|d| upper.join(d)).collect(),
+        ),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    let mut stack = vec![top];
+    while let Some(p) = stack.pop() {
+        let m = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", p.display())),
+        };
+        if !seen.insert((m.dev(), m.ino())) {
+            continue;
+        }
+        total += m.blocks() * 512;
+        if m.is_dir() {
+            for entry in
+                std::fs::read_dir(&p).with_context(|| format!("reading {}", p.display()))?
+            {
+                let child = entry?.path();
+                if !skip.contains(&child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// The cross host dirs of a build dir: every `[host]` row but the build machine's (`native::host_out` writes a cross host's outputs to `<out>/<host>`).
+fn cross_dirs(root: &Path) -> Result<Vec<String>> {
+    let arches = crate::arches::load(root)?;
+    let (build, _) = crate::arches::build_machine(root, &arches)?;
+    Ok(arches
+        .iter()
+        .filter(|(name, arch)| arch.host.is_some() && name.as_str() != build)
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+/// One ram build's growth sample: its own part of the upper before and after the command, against the raw growth reserved. Returns the line and whether the growth exceeded the reservation (counter `delta-over`: the class peaks or regrow are too small).
+fn growth(id: &str, before: u64, after: u64, reserved: u64) -> (String, bool) {
+    let line = format!(
+        "out: delta ws/{id} upper {:.2} -> {:.2} GiB raw (reserved {:.2})",
+        gib(before),
+        gib(after),
+        gib(reserved)
+    );
+    (line, after.saturating_sub(before) > reserved)
+}
+
 /// The outer side of every build command: decides the tier, admits, and for `ram` runs the rest of the command inside the mounted namespace. Some(code) = ran there; None = continue here (pool tier, or already inside).
-pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
+/// `cross_host`: the host a cross build writes (`upper/<host>`, [`own_bytes`]); None for every other command.
+pub fn enter(root: &Path, class: Class, cross_host: Option<&str>) -> Result<Option<ExitCode>> {
     match stage() {
         Some(Stage::Mount(uid, gid)) => return mount_stage(root, uid, gid).map(Some),
         Some(Stage::In) => return Ok(None),
@@ -902,10 +991,18 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     ) else {
         return pool(NO_STORE);
     };
-    let admitted = admit_keeping(&ws, &id, &cfg.delta, class, rec.is_some(), || {
+    // this checkout's own part of its upper (a new dir: none yet)
+    let dirs = cross_dirs(root)?;
+    let upper = store.join(&id).join("upper");
+    let own = if rec.is_some() {
+        own_bytes(&upper, class, cross_host, &dirs)?
+    } else {
+        0
+    };
+    let admitted = admit_keeping(&ws, &id, &cfg.delta, class, own, rec.is_some(), || {
         probe(&store, &cfg.delta)
     })?;
-    let (reservation, stats, need_ram) = match admitted {
+    let (reservation, stats, need) = match admitted {
         Ok(a) => a,
         Err(Verdict::Admit { .. }) => bail!("delta admission returned Admit as a refusal"),
         Err(v) => return fall_to_pool(&ws, &id, class, rec.as_ref(), v),
@@ -926,9 +1023,10 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
         }
     }
     println!(
-        "out: delta ram ({} build, {:.2} GiB RAM reserved; store {}: {})",
+        "out: delta ram ({} build, {:.2} GiB RAM reserved (own {:.2} GiB counted); store {}: {})",
         class.name(),
-        gib(need_ram),
+        gib(need.ram),
+        gib(own),
         store.display(),
         stats.line()
     );
@@ -964,9 +1062,17 @@ pub fn enter(root: &Path, class: Class) -> Result<Option<ExitCode>> {
     .arg(std::env::current_exe().context("finding xtask's executable")?)
     .args(std::env::args_os().skip(1))
     .env(ENV, format!("mount:{uid}:{gid}"));
+    // the growth sample: own part of the upper before and after, the reservation still held
+    let before = own_bytes(&upper, class, cross_host, &dirs)?;
     let code = run(cmd, "unshare (delta mount namespace)")?;
     // the namespace's processes may still use the overlay (a daemon a build spawned: sccache server, gradle, ...); the mount ends with the command, so they do too
     end_holders(&ws, &id, &lock_path, std::process::id())?;
+    let after = own_bytes(&upper, class, cross_host, &dirs)?;
+    let (line, over) = growth(&id, before, after, need.raw);
+    println!("{line}");
+    if over {
+        out::count(&ws, "delta-over");
+    }
     drop(reservation);
     Ok(Some(code))
 }
@@ -1253,7 +1359,10 @@ mod tests {
         assert_eq!(
             judge(&s, raw(&s, check), 0, Hold::default(), GIB),
             Verdict::Admit {
-                need_ram: 2_642_949_252
+                need: Need {
+                    raw: check,
+                    ram: 2_642_949_252,
+                }
             }
         );
         // 2.46 + 2.5 reserved + 1 = 5.96 > 5.5 free: others' reservations stand in the way -> wait
@@ -1286,7 +1395,10 @@ mod tests {
         assert_eq!(
             judge(&t, raw(&t, check), 0, Hold::default(), GIB),
             Verdict::Admit {
-                need_ram: 4915 * MIB
+                need: Need {
+                    raw: check,
+                    ram: 4915 * MIB,
+                }
             }
         );
         // raw room is judged too: fs free 14 GiB < 15 GiB need with RAM to spare
@@ -1298,6 +1410,201 @@ mod tests {
             judge(&big, raw(&big, 15 * GIB), 0, Hold::default(), GIB),
             Verdict::Refuse(_)
         ));
+    }
+
+    /// Growth of a build over its own upper: raw = min(peak, max(regrow 4 GiB, peak - own)), hand values at ratio 1.95.
+    /// native 9 GiB: own 0 -> 9 GiB; own 3 -> 6 GiB (3_303_820_997 B RAM); own 6.5 -> regrow floor 4 GiB (2_202_547_332 B); own 9.5 (above peak) -> 4 GiB. small 2 GiB: regrow never raises above peak.
+    #[test]
+    fn need_credits_own_upper_above_the_regrow_floor() {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .expect("cfg")
+            .delta;
+        let s = stats(64.0, 0.0, 1950);
+        let need = |class, own| Need::of(class, &cfg, &s, own);
+        assert_eq!(
+            need(Class::Native, 0),
+            Need {
+                raw: 9 * GIB,
+                ram: 4_955_731_496
+            }
+        );
+        assert_eq!(
+            need(Class::Native, 3 * GIB),
+            Need {
+                raw: 6 * GIB,
+                ram: 3_303_820_997
+            }
+        );
+        assert_eq!(
+            need(Class::Native, 13 * GIB / 2),
+            Need {
+                raw: 4 * GIB,
+                ram: 2_202_547_332
+            }
+        );
+        assert_eq!(
+            need(Class::Native, 19 * GIB / 2),
+            Need {
+                raw: 4 * GIB,
+                ram: 2_202_547_332
+            }
+        );
+        assert_eq!(
+            need(Class::Small, GIB),
+            Need {
+                raw: 2 * GIB,
+                ram: 1_101_273_666
+            }
+        );
+        // delta.regrow_gib = 2: own 6.5 -> max(2, 2.5) = 2.5 GiB
+        let two =
+            crate::ws_config::parse("[delta]\nregrow_gib = 2\n", Path::new("/w/workspace.toml"))
+                .expect("cfg")
+                .delta;
+        assert_eq!(
+            Need::of(Class::Native, &two, &s, 13 * GIB / 2),
+            Need {
+                raw: 5 * GIB / 2,
+                ram: 1_376_592_083
+            }
+        );
+    }
+
+    /// Two native builds on 12 GiB fs free: the first is admitted; while its reservation stands, the other's 9_663_676_417 raw B (4_955_731_496 RAM at 1.95) makes 9 + 9 GiB > 12, so the second waits. Red control: the raw of others uncounted admits both.
+    #[test]
+    fn reservations_count_their_raw_on_the_fs() {
+        let s = Stats {
+            fs_free: 12 * GIB,
+            ..stats(64.0, 0.0, 1950)
+        };
+        let native = Need {
+            raw: 9 * GIB,
+            ram: 4_955_731_496,
+        };
+        assert!(matches!(
+            judge(&s, native, 0, Hold::default(), GIB),
+            Verdict::Admit { .. }
+        ));
+        assert!(matches!(
+            judge(&s, native, 4_955_731_496, Hold::default(), GIB),
+            Verdict::Wait(_)
+        ));
+        // a small build (2 GiB raw, 1_101_273_666 RAM) still fits beside it: 2 GiB + 9_663_676_417 B < 12 GiB
+        let small = Need {
+            raw: 2 * GIB,
+            ram: 1_101_273_666,
+        };
+        assert!(matches!(
+            judge(&s, small, 4_955_731_496, Hold::default(), GIB),
+            Verdict::Admit { .. }
+        ));
+    }
+
+    /// Measured store of gnw-dod2 (8.97 GiB = 9184 MiB fs free, own 6.5 GiB = 6656 MiB, native): without the own credit the 9 GiB peak refuses on raw; with it the 4 GiB floor admits.
+    #[test]
+    fn own_credit_admits_a_native_over_an_existing_upper() {
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .expect("cfg")
+            .delta;
+        let s = Stats {
+            fs_free: 9184 * MIB,
+            ..stats(64.0, 0.0, 1950)
+        };
+        assert!(matches!(
+            judge(
+                &s,
+                Need::of(Class::Native, &cfg, &s, 0),
+                0,
+                Hold::default(),
+                GIB
+            ),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            judge(
+                &s,
+                Need::of(Class::Native, &cfg, &s, 6656 * MIB),
+                0,
+                Hold::default(),
+                GIB
+            ),
+            Verdict::Admit { .. }
+        ));
+    }
+
+    /// `own_bytes` on a fixture upper (8 KiB files, one hard link, dirs included): native counts everything but `upper/riscv64`, cross only `upper/riscv64`, run 0, a missing upper 0.
+    /// The oracle sums st_blocks * 512 over the listed entries, each inode once.
+    #[test]
+    fn own_bytes_counts_each_class_its_part() {
+        let root = std::env::temp_dir().join(format!("xtask-delta-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let upper = root.join("upper");
+        std::fs::create_dir_all(upper.join("riscv64").join("deep")).unwrap();
+        std::fs::create_dir_all(upper.join("sub")).unwrap();
+        let blob = vec![7u8; 8192];
+        std::fs::write(upper.join("a.bin"), &blob).unwrap();
+        std::fs::hard_link(upper.join("a.bin"), upper.join("a-link.bin")).unwrap();
+        std::fs::write(upper.join("sub").join("b.bin"), &blob).unwrap();
+        std::fs::write(upper.join("riscv64").join("c.bin"), &blob).unwrap();
+        std::fs::write(upper.join("riscv64").join("deep").join("d.bin"), &blob).unwrap();
+        let dirs = vec!["riscv64".to_owned()];
+        let x86_side = [
+            upper.clone(),
+            upper.join("a.bin"),
+            upper.join("a-link.bin"),
+            upper.join("sub"),
+            upper.join("sub").join("b.bin"),
+        ];
+        let riscv_side = [
+            upper.join("riscv64"),
+            upper.join("riscv64").join("c.bin"),
+            upper.join("riscv64").join("deep"),
+            upper.join("riscv64").join("deep").join("d.bin"),
+        ];
+        assert_eq!(
+            own_bytes(&upper, Class::Native, None, &dirs).unwrap(),
+            allocated(&x86_side)
+        );
+        assert_eq!(
+            own_bytes(&upper, Class::Cross, Some("riscv64"), &dirs).unwrap(),
+            allocated(&riscv_side)
+        );
+        assert_eq!(own_bytes(&upper, Class::Run, None, &dirs).unwrap(), 0);
+        assert_eq!(
+            own_bytes(&root.join("missing"), Class::Native, None, &dirs).unwrap(),
+            0
+        );
+        assert_eq!(own_bytes(&upper, Class::Cross, None, &dirs).unwrap(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// st_blocks * 512 summed over `paths`, each inode once (the oracle of `own_bytes_counts_each_class_its_part`).
+    fn allocated(paths: &[PathBuf]) -> u64 {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0;
+        for p in paths {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            if seen.insert((m.dev(), m.ino())) {
+                total += m.blocks() * 512;
+            }
+        }
+        total
+    }
+
+    /// The growth sample: the line names the own part before -> after and the raw reservation; over = growth past it (counter `delta-over`).
+    #[test]
+    fn growth_sample_flags_growth_past_the_reservation() {
+        let (line, over) = growth("c", 2 * GIB, 7 * GIB, 4 * GIB);
+        assert_eq!(
+            line,
+            "out: delta ws/c upper 2.00 -> 7.00 GiB raw (reserved 4.00)"
+        );
+        assert!(over, "grew 5 GiB against 4 reserved");
+        assert!(
+            !growth("c", 2 * GIB, 6 * GIB, 4 * GIB).1,
+            "grew exactly the reservation"
+        );
+        assert!(growth("c", 0, 4 * GIB + 1, 4 * GIB).1);
     }
 
     /// Land first, hand arithmetic: zram limit 10 GiB, used 3, margin 1 -> RAM free 7 GiB = 7_516_192_768 B; ratio 1.95.
@@ -1317,24 +1624,30 @@ mod tests {
             reserved: false,
         };
         assert_eq!(hold_for("child", &cfg, &s, active), native);
-        let check = Need::of(Class::Check, &cfg, &s);
+        let check = Need::of(Class::Check, &cfg, &s, 0);
         assert_eq!(check.ram, 2_642_949_252);
         // with the hold: 2.46 + 4.62 + 1 = 8.07 GiB > 7 free -> held (a new dir takes the pool)
         assert!(matches!(judge(&s, check, 0, native, GIB), Verdict::Held(_)));
         // land's own admission ignores the hold: 4.62 + 1 = 5.62 <= 7
         assert_eq!(hold_for(out::LAND_ID, &cfg, &s, active), Hold::default());
-        let land = Need::of(Class::Native, &cfg, &s);
+        let land = Need::of(Class::Native, &cfg, &s, 0);
         assert_eq!(
             judge(&s, land, 0, Hold::default(), GIB),
             Verdict::Admit {
-                need_ram: 4_955_731_496
+                need: Need {
+                    raw: 9 * GIB,
+                    ram: 4_955_731_496,
+                }
             }
         );
         // red control, no hold: the child is admitted, and land behind its reservation waits (4.62 + 2.46 + 1 > 7)
         assert_eq!(
             judge(&s, check, 0, Hold::default(), GIB),
             Verdict::Admit {
-                need_ram: 2_642_949_252
+                need: Need {
+                    raw: 4915 * MIB,
+                    ram: 2_642_949_252,
+                }
             }
         );
         assert!(matches!(
@@ -1378,13 +1691,16 @@ mod tests {
             fs_free: 13 * GIB,
             ..stats(64.0, 0.0, 1950)
         };
-        let check = Need::of(Class::Check, &cfg, &roomy);
+        let check = Need::of(Class::Check, &cfg, &roomy, 0);
         let idle = LandState::default();
         assert_eq!(hold_for("child", &cfg, &roomy, idle), Hold::default());
         assert_eq!(
             judge(&roomy, check, 0, hold_for("child", &cfg, &roomy, idle), GIB),
             Verdict::Admit {
-                need_ram: 2_642_949_252
+                need: Need {
+                    raw: 4915 * MIB,
+                    ram: 2_642_949_252,
+                }
             }
         );
     }
@@ -1422,7 +1738,7 @@ mod tests {
             .delta;
         let s = stats(10.0, 3.0, 1950);
         let check = || {
-            admit_once(&ws, "c", &cfg, Class::Check, Ok(s.clone()))
+            admit_once(&ws, "c", &cfg, Class::Check, 0, Ok(s.clone()))
                 .unwrap()
                 .map(|_| ())
         };
@@ -1460,13 +1776,13 @@ mod tests {
         let queued = hold_land_lock(&ws);
         let mut worker = Some(reserve(&ws, "worker", 3 * GIB).unwrap());
         // land 4.62 + worker 3 + margin 1 > 7 free: Wait, and the reason names the reservations
-        let waiting = judge_now(&ws, out::LAND_ID, &cfg, Class::Native, &s).unwrap();
+        let waiting = judge_now(&ws, out::LAND_ID, &cfg, Class::Native, 0, &s).unwrap();
         assert!(
             matches!(&waiting, Verdict::Wait(why) if why.contains("reserved by running builds")),
             "{waiting:?}"
         );
         let mut probes = 0;
-        let (land, _, need_ram) = admit(&ws, out::LAND_ID, &cfg, Class::Native, || {
+        let (land, _, need) = admit(&ws, out::LAND_ID, &cfg, Class::Native, 0, || {
             probes += 1;
             if probes == 2 {
                 worker.take();
@@ -1475,7 +1791,7 @@ mod tests {
         })
         .unwrap()
         .expect("land admitted once the worker's reservation ends");
-        assert_eq!((probes, need_ram), (2, 4_955_731_496));
+        assert_eq!((probes, need.ram), (2, 4_955_731_496));
         assert_eq!(count_of(&ws, "delta-wait"), 1);
         assert_eq!(count_of(&ws, "delta-land-hold"), 0, "land is never held");
         drop((land, queued));
@@ -1492,7 +1808,7 @@ mod tests {
             .unwrap()
             .delta;
         let queued = hold_land_lock(&ws);
-        let Err(v) = admit(&ws, out::LAND_ID, &cfg, Class::Native, || {
+        let Err(v) = admit(&ws, out::LAND_ID, &cfg, Class::Native, 0, || {
             Ok(Ok(stats(8.0, 7.5, 1950)))
         })
         .unwrap() else {
@@ -1525,13 +1841,13 @@ mod tests {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .expect("cfg")
             .delta;
-        let run = Need::of(Class::Run, &cfg, &stats(10.0, 0.0, 1950));
+        let run = Need::of(Class::Run, &cfg, &stats(10.0, 0.0, 1950), 0);
         assert_eq!((run.raw, run.ram), (835_715_072, 610_011_002));
         let t = stats(10.0, 0.0, 1000);
-        assert_eq!(Need::of(Class::Run, &cfg, &t).ram, 835_715_072);
+        assert_eq!(Need::of(Class::Run, &cfg, &t, 0).ram, 835_715_072);
         // build classes keep the device ratio
         assert_eq!(
-            Need::of(Class::Check, &cfg, &stats(10.0, 0.0, 1950)).ram,
+            Need::of(Class::Check, &cfg, &stats(10.0, 0.0, 1950), 0).ram,
             2_642_949_252
         );
     }
@@ -1546,7 +1862,7 @@ mod tests {
             .unwrap()
             .delta;
         let mut started = false;
-        let got = admit(&ws, "child", &cfg, Class::Check, || {
+        let got = admit(&ws, "child", &cfg, Class::Check, 0, || {
             Ok(Ok(stats(8.0, 7.5, 1950)))
         })
         .unwrap();
@@ -1849,7 +2165,7 @@ mod tests {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
-        let Err(v) = admit_keeping(&ws, "c", &cfg, Class::Check, true, probe).unwrap() else {
+        let Err(v) = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, probe).unwrap() else {
             panic!("{tag}: the check was admitted: no refusal to test");
         };
         assert!(want(&v), "{tag}: {v:?}");
@@ -1912,7 +2228,7 @@ mod tests {
             .unwrap()
             .delta;
         let _queued = hold_land_lock(&ws);
-        let Err(v) = admit(&ws, "c", &cfg, Class::Check, || {
+        let Err(v) = admit(&ws, "c", &cfg, Class::Check, 0, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         })
         .unwrap() else {
@@ -1944,7 +2260,7 @@ mod tests {
             .delta;
         let (mut holder, mut bystander) = lingering_holder(&ws, "c");
         let _queued = hold_land_lock(&ws);
-        let verdict = admit_keeping(&ws, "c", &cfg, Class::Check, true, || {
+        let verdict = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         })
         .unwrap();
@@ -1982,15 +2298,15 @@ mod tests {
             let _ = queue.kill();
             let _ = queue.wait();
         });
-        let got = admit_keeping(&ws, "c", &cfg, Class::Check, true, || {
+        let got = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, || {
             Ok(Ok(stats(10.0, 3.0, 1950)))
         });
         release.join().unwrap();
-        let (reservation, _, need_ram) = match got.unwrap() {
+        let (reservation, _, need) = match got.unwrap() {
             Ok(admitted) => admitted,
             Err(v) => panic!("waited for the queue, then refused: {v:?}"),
         };
-        assert_eq!(need_ram, 2_642_949_252);
+        assert_eq!(need.ram, 2_642_949_252);
         assert_eq!(count_of(&ws, "delta-wait"), 1);
         assert_eq!(count_of(&ws, "delta-land-hold"), 1);
         drop(reservation);
@@ -2019,6 +2335,7 @@ mod tests {
                 "c",
                 &cfg,
                 Class::Check,
+                0,
                 true,
                 || Ok(Ok(stats(8.0, 7.5, 1950))),
             ));
@@ -2057,7 +2374,7 @@ mod tests {
             let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
                 .unwrap()
                 .delta;
-            admit_keeping(&worker_ws, "c", &cfg, Class::Check, true, || {
+            admit_keeping(&worker_ws, "c", &cfg, Class::Check, 0, true, || {
                 Ok(Ok(stats(10.0, 3.0, 1950)))
             })
         });
@@ -2076,9 +2393,14 @@ mod tests {
             let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
                 .unwrap()
                 .delta;
-            let _ = tx.send(admit(&land_ws, out::LAND_ID, &cfg, Class::Native, || {
-                Ok(Ok(stats(10.0, 3.0, 1950)))
-            }));
+            let _ = tx.send(admit(
+                &land_ws,
+                out::LAND_ID,
+                &cfg,
+                Class::Native,
+                0,
+                || Ok(Ok(stats(10.0, 3.0, 1950))),
+            ));
         });
         let land = rx
             .recv_timeout(std::time::Duration::from_secs(20))

@@ -159,14 +159,21 @@ pub fn main() -> Result<ExitCode> {
         }
         // the dir's delta tier (delta.rs): a ram dir runs the rest of the command inside its mounted namespace; the outer process only settles `target/`
         let outer = std::env::var_os(tree::ENV).is_none() && crate::delta::stage().is_none();
-        let class = match &cli.command {
-            _ if !outer => crate::delta::Class::Small,
-            Command::Check(_) => crate::delta::Class::Check,
-            Command::Native(a) => crate::delta::class_for_native(&root, &a.host)?,
-            Command::Cross(_) => crate::delta::Class::Cross,
-            _ => crate::delta::Class::Small,
+        // the cross host whose dir (`upper/<host>`) a native --host build grows (delta::own_bytes); `cross` writes target/<triple> instead: no host dir
+        let (class, cross_host) = match &cli.command {
+            _ if !outer => (crate::delta::Class::Small, None),
+            Command::Check(_) => (crate::delta::Class::Check, None),
+            Command::Native(a) => {
+                let class = crate::delta::class_for_native(&root, &a.host)?;
+                (
+                    class,
+                    (class == crate::delta::Class::Cross).then_some(a.host.as_str()),
+                )
+            }
+            Command::Cross(_) => (crate::delta::Class::Cross, None),
+            _ => (crate::delta::Class::Small, None),
         };
-        if let Some(code) = crate::delta::enter(&root, class)? {
+        if let Some(code) = crate::delta::enter(&root, class, cross_host)? {
             if let Err(e) = crate::out::settle_target(&root) {
                 eprintln!("out: target: {e:#}");
             }

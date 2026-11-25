@@ -26,6 +26,7 @@
 //! [delta]              # RAM tier of build-dir deltas (delta.rs)
 //! ram_store = "/mnt/atl-zram"  # filesystem holding children's overlay uppers; used only when RAM-backed (zram or tmpfs); absent = no RAM tier, every build takes the pool
 //! ram_margin_gib = 1   # store RAM kept free past every reservation
+//! regrow_gib = 4       # upper growth a build over an existing upper reserves at least (delta.rs Need::of)
 //! ratio_default = 1.95 # raw/RAM ratio assumed while the zram device holds < 1 GiB
 //! ratio_run = 1.37     # cap on the raw/RAM ratio of class run (app data compresses worse than a build)
 //! peak_small_gib = 2   # per build class: upper growth reserved before the build starts
@@ -108,6 +109,8 @@ pub const DEFAULT_POOL_BACKING_MARGIN: u64 = 2;
 
 /// `delta.ram_margin_gib`: zram reports `mem_limit` as an I/O error in ext4, not ENOSPC, so admission stops short of it by this much (~one small build's RAM at lzo-rle, 2 GiB x 0.54).
 pub const DEFAULT_RAM_MARGIN_GIB: u64 = 1;
+/// `delta.regrow_gib` in GiB: the upper growth a build over an existing upper reserves at least (`Need::of`). Growth of one job over an existing upper, one job alone on the store, 14 windows (2026-11-24/25): max 3.5 GiB (check job) + 15 % = 4.
+pub const DEFAULT_REGROW_GIB: u64 = 4;
 /// `delta.ratio_default` in thousandths: lzo-rle zram orig_data_size / mem_used_total at a full check's peak, 5.04 / 2.59 GiB (ram-delta-prototype B2).
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.ratio_run` in thousandths: lzo-rle zram raw/RAM of one app data root, WeChat 8.0 clean install + launch on the zram store (2026-11-22): 796.6 MiB raw / 581 MiB zram RAM = 1.371. The device ratio mixes in build uppers (1.95), which would under-reserve a run (0.78 GiB / 1.95 = 0.40 reserved, 0.57 used); class run takes min(device ratio, this).
@@ -124,6 +127,8 @@ pub struct DeltaConfig {
     /// `delta.ram_store`: the filesystem holding the ram tier's uppers (plan ram-delta D7: the zram-backed ext4 the owner's boot unit mounts). No default: unset = no RAM tier, every build and run dir takes the pool.
     pub ram_store: Setting<Option<PathBuf>>,
     pub ram_margin_gib: Setting<u64>,
+    /// GiB: the least upper growth a build over an existing upper reserves (`DEFAULT_REGROW_GIB`).
+    pub regrow_gib: Setting<u64>,
     /// Thousandths: 1950 = 1.95 raw bytes per RAM byte.
     pub ratio_milli: Setting<u64>,
     /// Thousandths: cap on class run's ratio (`DEFAULT_RATIO_RUN_MILLI`).
@@ -304,6 +309,7 @@ fn defaults(path: PathBuf) -> WsConfig {
         delta: DeltaConfig {
             ram_store: Setting::default(None),
             ram_margin_gib: Setting::default(DEFAULT_RAM_MARGIN_GIB),
+            regrow_gib: Setting::default(DEFAULT_REGROW_GIB),
             ratio_milli: Setting::default(DEFAULT_RATIO_MILLI),
             ratio_run_milli: Setting::default(DEFAULT_RATIO_RUN_MILLI),
             peak_mib: DEFAULT_PEAK_MIB.map(Setting::default),
@@ -385,6 +391,11 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                 ("delta", "ram_margin_gib") => {
                     cfg.delta.ram_margin_gib = Setting::file(gib(value, &at)?);
                 }
+                ("delta", "regrow_gib") => {
+                    let n = gib(value, &at)?;
+                    ensure!(n >= 1, "{at} must be at least 1 GiB, not {value}");
+                    cfg.delta.regrow_gib = Setting::file(n);
+                }
                 ("delta", "ratio_default") => {
                     let milli = thousandths(value, &at)?;
                     ensure!(milli >= 1000, "{at} must be at least 1.0, not {value}");
@@ -402,7 +413,7 @@ pub fn parse(text: &str, path: &Path) -> Result<WsConfig> {
                     cfg.delta.peak_mib[class as usize] = Setting::file(mib);
                 }
                 _ => bail!(
-                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.ratio_default, delta.ratio_run, delta.peak_{{small,check,native,cross,run}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
+                    "{at} is not a known key (known: build.refresh_min_upstream_files, cache.sccache_size, fetch.for, disk.host_min_free, disk.host_shrink_below, disk.workspace_min_free, disk.pool_min_free, disk.pool_metadata_min_free, disk.pool_backing, disk.pool_backing_margin, delta.ram_store, delta.ram_margin_gib, delta.regrow_gib, delta.ratio_default, delta.ratio_run, delta.peak_{{small,check,native,cross,run}}_gib, pool.cpu_slots, pool.mem_gib, pool.starve_after_s, pool.<class>)"
                 ),
             }
         }
@@ -560,6 +571,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
         assert_eq!(absent.pool.mem_gib, Setting::default(20));
         assert_eq!(absent.sccache_size.origin, Origin::Default);
+    }
+
+    /// `delta.regrow_gib` defaults to 4 GiB (ram-store-admission S1); a value must be a whole GiB of at least 1.
+    #[test]
+    fn regrow_key_defaults_to_four_gib() {
+        assert_eq!(parse("", path()).expect("empty").delta.regrow_gib.value, 4);
+        let set = parse("[delta]\nregrow_gib = 6\n", path()).expect("set");
+        assert_eq!(set.delta.regrow_gib.value, 6);
+        assert!(err("[delta]\nregrow_gib = 0\n").contains("at least 1 GiB"));
     }
 
     /// Defaults follow cpu_slots (check-admission D2): native-full = half the slots, both ends; native-incr and cargo = 4 ..= cpu_slots - 1, min clamped to the max on a tiny pool. Values by hand per slot count.

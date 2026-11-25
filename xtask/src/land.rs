@@ -188,7 +188,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if args.build_dir {
         // the build record lies in the build dir: a ram dir shows it only inside its namespace
-        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small)? {
+        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
             return Ok(code);
         }
         match build_dir_staleness(root)? {
@@ -199,7 +199,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     }
     if args.prune_units {
         // ws/land on ram shows its trees only inside its namespace (outside: the empty mount point)
-        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small)? {
+        if let Some(code) = crate::delta::enter(root, crate::delta::Class::Small, None)? {
             return Ok(code);
         }
         let ws = Layout::of(root)?.workspace().to_owned();

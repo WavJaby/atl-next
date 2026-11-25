@@ -1735,6 +1735,7 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                     c.peak(&cfg.delta) as f64 / 1_073_741_824.0
                 );
             }
+            print!(", regrow {} GiB", cfg.delta.regrow_gib.value);
             println!();
             let p = pool(&ws);
             match free_bytes(&p) {
@@ -1767,7 +1768,7 @@ pub fn run(root: &Path, cmd: &Out) -> Result<ExitCode> {
                 };
                 println!("ws/{id}: {state}, {tier}, {}", age(&path));
             }
-            for name in ["ram", "pool", "wait", "refused", "lost"] {
+            for name in ["ram", "pool", "wait", "refused", "lost", "over"] {
                 let n = std::fs::read_to_string(p.join(format!("delta-{name}.count")))
                     .map_or("0".to_owned(), |t| t.trim().to_owned());
                 print!(

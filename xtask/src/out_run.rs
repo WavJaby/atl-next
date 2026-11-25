@@ -175,12 +175,13 @@ fn choose(
     probed: std::result::Result<delta::Stats, String>,
 ) -> Result<(bool, String)> {
     Ok(
-        match delta::admit_once(ws, id, cfg, delta::Class::Run, probed)? {
-            Ok((_reservation, stats, need_ram)) => (
+        // a run dir grows from an empty root: own 0
+        match delta::admit_once(ws, id, cfg, delta::Class::Run, 0, probed)? {
+            Ok((_reservation, stats, need)) => (
                 true,
                 format!(
                     "class run fits: {:.2} GiB RAM per data root; store {}: {}",
-                    need_ram as f64 / GIB,
+                    need.ram as f64 / GIB,
                     store.display(),
                     stats.line()
                 ),
@@ -342,7 +343,7 @@ fn fresh_at(
     let rec = record(&dir)?.context("run dir lost its record")?;
     if rec.is_ram() {
         let probed = delta::probe_store(cfg.delta.ram_store.value.as_deref(), &cfg.delta)?;
-        if let Err(v) = delta::admit_once(ws, id, &cfg.delta, delta::Class::Run, probed)? {
+        if let Err(v) = delta::admit_once(ws, id, &cfg.delta, delta::Class::Run, 0, probed)? {
             if matches!(v, delta::Verdict::Refuse(_)) {
                 out::count(ws, "run-full");
             }
@@ -453,11 +454,11 @@ pub fn admit_run(root: &Path, data_root: &Path) -> Result<Option<RunAdmission>> 
             .as_deref()
             .context("a ram run dir without delta.ram_store")?;
         let probed = delta::probe(store, &cfg)?;
-        match delta::admit_once(&ws, &id, &cfg, delta::Class::Run, probed)? {
-            Ok((r, stats, need_ram)) => {
+        match delta::admit_once(&ws, &id, &cfg, delta::Class::Run, 0, probed)? {
+            Ok((r, stats, need)) => {
                 println!(
                     "out: run ram (app run in run/{id}, {:.2} GiB RAM reserved; store {}: {})",
-                    need_ram as f64 / GIB,
+                    need.ram as f64 / GIB,
                     store.display(),
                     stats.line()
                 );
@@ -500,7 +501,7 @@ impl Drop for RunAdmission {
         // full by the store's own accounting: land's hold is not fullness, so none here
         let v = delta::judge(
             &stats,
-            delta::Need::of(delta::Class::Run, &self.cfg, &stats),
+            delta::Need::of(delta::Class::Run, &self.cfg, &stats, 0),
             0,
             delta::Hold::default(),
             self.cfg.ram_margin_gib.value << 30,
