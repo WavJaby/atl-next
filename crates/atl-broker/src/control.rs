@@ -885,7 +885,7 @@ mod tests {
                 installed: 3,
             },
             Request::Scan {
-                dir: "/product/app/Fixture".into(),
+                dir: "scanned-dir".into(),
             },
             Request::Commit {
                 session: 1,
@@ -894,7 +894,7 @@ mod tests {
                 names: vec![],
             },
             Request::ScanCommit {
-                dir: "/product/app/Fixture".into(),
+                dir: "scanned-dir".into(),
                 package: "com.example".into(),
                 uid: 10_001,
             },
@@ -992,7 +992,10 @@ mod tests {
         assert!(later.is_err(), "{later:?}");
         release.send(()).expect("release");
         let ended = server.join().expect("server thread");
-        assert!(ended.is_err(), "the read failure is the server's error: {ended:?}");
+        assert!(
+            ended.is_err(),
+            "the read failure is the server's error: {ended:?}"
+        );
     }
 
     /// A panic on the serving thread ends the connection at once as well: the call in flight fails while the installer still runs.

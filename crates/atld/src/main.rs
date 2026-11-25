@@ -1240,7 +1240,12 @@ impl Host {
         // the tables are checked and updated under their locks, the file work between them under none. Only the lane writes them, one item at a time: no other commit or scan runs
         // between this check and the insert. A start reads `committed` on the serving thread and sees the package only after the insert, when its files and data dirs are in place
         let i = &self.installd;
-        let in_place = match i.staged.lock().unwrap_or_else(|e| e.into_inner()).get(&session) {
+        let in_place = match i
+            .staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+        {
             Some(s) if s.uid == uid => s.in_place.clone(),
             _ => bail!("session {session}: not staged for uid {uid}"),
         };

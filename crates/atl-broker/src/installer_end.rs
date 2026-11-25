@@ -107,8 +107,7 @@ mod tests {
     /// A killed run's stderr beyond the bound is cut at its start, its end kept, and the reply that carries the text fits a packet.
     #[test]
     fn a_long_stderr_is_cut_to_fit_a_reply() {
-        let (status, stderr) =
-            ended("head -c 100000 /dev/zero | tr '\\0' x >&2; kill -s KILL $$");
+        let (status, stderr) = ended("head -c 100000 /dev/zero | tr '\\0' x >&2; kill -s KILL $$");
         let InstallerEnd::Failed(text) =
             InstallerEnd::of(&status, &stderr, Path::new("/x/atl-installer"))
         else {
