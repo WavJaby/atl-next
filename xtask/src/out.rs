@@ -60,7 +60,7 @@ pub enum Out {
     },
     /// Deletes the build dirs and run dirs whose checkout is gone, every base but the newest two, and each live checkout's kept gate logs past the newest runs per bucket (red_logs.rs) (dry run unless --execute).
     ///
-    /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days in every build dir plus a real `repo/target`, which no build dir owns; use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
+    /// A dir a build or another process holds is skipped with a line saying so. With --tasks: instead, the task dirs `out/<task>/` whose worktree, unmerged branch and processes are gone (out_tasks.rs: classes keep / live / orphan / unknown; only orphans are removed). With --units: instead, the cargo units and incremental sessions no build used for --older-than days, and the incremental dirs no kept unit owns, in every build dir plus a real `repo/target`, which no build dir owns; use is what each recorded build wrote (`<tree>/.atl-unit-use.json`), a unit with no entry is judged by its fingerprint dir's mtime.
     Prune {
         /// Prune cargo units and incremental sessions instead of dirs.
         #[arg(long)]

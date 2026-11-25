@@ -4,6 +4,7 @@
 //! Use is the record each recorded build writes (`unit_use`): a unit's last reported build, fresh or rebuilt. A unit with no entry is judged by its fingerprint dir's mtime, which cargo moves when it rebuilds the unit: approximate, and the worst case is one rebuild.
 //! A unit is `.fingerprint/<pkg>-<hash>/`, `build/<pkg>-<hash>/` (build-script output), the `deps/` and `examples/` files `*-<hash>` or `*-<hash>.<ext>`, and the uplifted hard links (`<tree>/<name>`) of those files; `<hash>` is 16 lowercase hex digits.
 //! Incremental (`<tree>/incremental/<crate>/`): keeps the newest finalized session, the one rustc loads (`rustc_incremental/src/persist/fs.rs`, `find_source_directory_in_iter`, rustc 1.99.1; rustc reads an older one only when copying the newest fails). Removed: every other finalized session, `-working` sessions older than 10 s (rustc's own grace), and lock files whose session is gone. A held lock is never touched.
+//! Dead incremental dirs go whole (units scope only, not on a tree without its needed record): rustc names a session by its start time and cargo touches `invoked.timestamp` as it starts rustc, so a dir is owned when a kept unit of its crate name was invoked within [`INCREMENTAL_MATCH_SECS`] of the dir's newest finalized session; dead = not owned and that session older than the cutoff. Whatever cannot be judged (no or unparsable session, an owner without `invoked.timestamp`, a held lock, a refused unit) is kept and counted: a wrong deletion costs one compile without reuse, a kept dir only space.
 //! Kept, never deleted: entries that are no unit, `deps/` and `examples/` files no unit owns (counted as orphans). A tree whose record cannot be read refuses its build dir.
 //! Busy: a build holds the dir lock (`build_pool::hold_dir`); prune takes it exclusive without waiting and skips the dir. Every tree also has cargo's own build-dir lock (`<tree>/.cargo-lock`), taken without waiting and held from plan to removal: a tree a build holds is skipped and reported.
 //! Symlinks are never followed. One inside a unit (cxx links a crate's sources in its build dir) is content: unlinked with it. One that is a unit's dir skips that unit (named, counted); one on the way to a unit (a root, a tree, `.fingerprint`, `build`, `deps`) refuses the call. Removal resolves the parent with `openat2` from the workspace, so a link swapped in after the plan is refused too ([`remove`]).
@@ -55,6 +56,9 @@ const WORKING: &str = "-working";
 const LOCK_EXT: &str = ".lock";
 /// rustc's grace before it collects a `-working` session (fs.rs `is_old_enough_to_be_collected`), in micros.
 const SESSION_GRACE_MICROS: u64 = 10_000_000;
+const MICROS_PER_SEC: u64 = 1_000_000;
+/// Widest gap, in seconds, between a unit's `invoked.timestamp` and its incremental dir's newest session that still counts as the same compile. Base afc5228c `target/debug` (2023 dirs, 2-day window): dead at 5 / 30 / 60 / 300 / 3600 s = 802 / 791 / 777 / 770 / 764 dirs (12.09 / 11.77 / 11.63 / 11.52 / 11.51 GiB); every inode-linked pair (233) is within 5 s, so 60 costs 14 dirs (0.14 GiB) over 30 for margin.
+pub const INCREMENTAL_MATCH_SECS: u64 = 60;
 
 /// What one build dir's prune found: no dir, a build holds it, or one plan per target tree.
 #[derive(Debug)]
@@ -92,11 +96,19 @@ pub struct TreePlan {
     pub sessions: Vec<Session>,
     /// Incremental sessions and lock files kept (held, newest, young, or not a session).
     pub kept_sessions: usize,
+    /// Incremental crate dirs no kept unit owns, removed whole.
+    pub dead_incremental: Vec<Incremental>,
+    /// Incremental crate dirs that could not be judged: kept.
+    pub incr_unknown: usize,
 }
 
 impl TreePlan {
     fn stale_bytes(&self) -> u64 {
         self.stale.iter().map(|u| u.bytes).sum()
+    }
+
+    fn incremental_bytes(&self) -> u64 {
+        self.dead_incremental.iter().map(|d| d.bytes).sum()
     }
 
     fn session_bytes(&self) -> u64 {
@@ -121,10 +133,36 @@ pub struct Session {
     _held: Option<Flock>,
 }
 
-/// Totals of one sweep: stale units, stale sessions and their bytes, the refused units, and the build dirs or trees that failed.
+/// A dead incremental crate dir, its apparent bytes, and the flocks of every lock file in it, held from plan to removal.
+#[derive(Debug)]
+pub struct Incremental {
+    pub dir: PathBuf,
+    pub bytes: u64,
+    _held: Vec<Flock>,
+}
+
+/// The kept units' claim on incremental dirs: per crate name, each owner's `invoked.timestamp` in seconds (None: missing). `refused`: a unit was skipped as a link, its crate names unread, so no dir is judged dead.
+#[derive(Debug, Default)]
+struct Owners {
+    crates: HashMap<String, Vec<Option<u64>>>,
+    refused: bool,
+}
+
+impl Owners {
+    fn add(&mut self, fingerprint_dir: &Path) -> Result<()> {
+        let invoked = invoked_secs(fingerprint_dir)?;
+        for name in unit_use::crate_names_of(fingerprint_dir)? {
+            self.crates.entry(name).or_default().push(invoked);
+        }
+        Ok(())
+    }
+}
+
+/// Totals of one sweep: stale units, dead incremental dirs, stale sessions and their bytes, the refused units, and the build dirs or trees that failed.
 #[derive(Debug, Default)]
 pub struct Sweep {
     pub units: usize,
+    pub incremental: usize,
     pub sessions: usize,
     pub bytes: u64,
     pub skipped: usize,
@@ -185,8 +223,9 @@ pub fn sweep(
     }
     for (root, sum) in &roots {
         println!(
-            "root {root}: units {}, sessions {}, {}",
+            "root {root}: units {}, incremental dirs {}, sessions {}, {}",
             sum.units,
+            sum.incremental,
             sum.sessions,
             human(sum.bytes)
         );
@@ -197,8 +236,9 @@ pub fn sweep(
         "dry run, would remove (add --execute)"
     };
     println!(
-        "unit prune: {verb} {} stale units and {} stale sessions, {}{}",
+        "unit prune: {verb} {} stale units, {} dead incremental dirs and {} stale sessions, {}{}",
         total.units,
+        total.incremental,
         total.sessions,
         human(total.bytes),
         total.skipped_note()
@@ -217,7 +257,7 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
             println!("{}: no use record: units not pruned", plan.tree);
         }
         println!(
-            "{}: units {}, stale {} ({}), kept {} (unrecorded {}), unattributed {}, orphan deps {} ({}), sessions stale {} ({}), kept {}",
+            "{}: units {}, stale {} ({}), kept {} (unrecorded {}), unattributed {}, orphan deps {} ({}), incremental dead {} ({}), unknown {}, sessions stale {} ({}), kept {}",
             plan.tree,
             plan.units,
             plan.stale.len(),
@@ -227,6 +267,9 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
             plan.unattributed,
             plan.orphans,
             human(plan.orphan_bytes),
+            plan.dead_incremental.len(),
+            human(plan.incremental_bytes()),
+            plan.incr_unknown,
             plan.sessions.len(),
             human(plan.session_bytes()),
             plan.kept_sessions
@@ -234,10 +277,11 @@ fn report(plans: &[TreePlan], total: &mut Sweep, roots: &mut BTreeMap<String, Sw
         for why in &plan.skipped {
             println!("{}: unit skipped: {why}", plan.tree);
         }
-        let bytes = plan.stale_bytes() + plan.session_bytes();
+        let bytes = plan.stale_bytes() + plan.incremental_bytes() + plan.session_bytes();
         let sum = roots.entry(plan.root.clone()).or_default();
         for target in [&mut *total, sum] {
             target.units += plan.stale.len();
+            target.incremental += plan.dead_incremental.len();
             target.sessions += plan.sessions.len();
             target.bytes += bytes;
             target.skipped += plan.skipped.len();
@@ -297,8 +341,9 @@ pub fn prune_land(ws: &Path, now: u64, execute: bool, inside: bool) -> Result<St
         "dry run, would remove"
     };
     Ok(format!(
-        "land unit prune: ws/{id}: {verb} {} units and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned){}",
+        "land unit prune: ws/{id}: {verb} {} units, {} incremental dirs and {} sessions, {}; kept {kept} units; window {window} d; {} trees ({no_record} without a use record, {busy} busy: not pruned){}",
         total.units,
+        total.incremental,
         total.sessions,
         human(total.bytes),
         plans.len(),
@@ -480,6 +525,10 @@ fn remove_plan(ws: &Path, plan: &TreePlan) -> Result<()> {
     if !hashes.is_empty() {
         unit_use::forget(&plan.dir, &hashes)?;
     }
+    // the dir's lock files go with it; their flocks are held until the plan drops
+    for dead in &plan.dead_incremental {
+        remove(ws, &plan.dir, &dead.dir)?;
+    }
     for session in &plan.sessions {
         remove_session(ws, &plan.dir, session)?;
     }
@@ -511,28 +560,36 @@ fn plan_tree(tree: &Path, root: String, label: String, now: u64, scope: Scope) -
         cutoff,
         need_record,
     } = scope
+        && let Some(owners) = plan_units(tree, now, cutoff, need_record, &mut plan)?
     {
-        plan_units(tree, now, cutoff, need_record, &mut plan)?;
+        plan_incremental(tree, now, cutoff, &owners, &mut plan)?;
     }
-    let (sessions, kept) = stale_sessions(tree, now)?;
+    let dead: Vec<PathBuf> = plan
+        .dead_incremental
+        .iter()
+        .map(|d| d.dir.clone())
+        .collect();
+    let (sessions, kept) = stale_sessions(tree, now, &dead)?;
     plan.sessions = sessions;
     plan.kept_sessions = kept;
     Ok(plan)
 }
 
 /// Plans the units of `tree` into `plan`. Units are the fingerprint dirs; `build/`, `deps/`, `examples/` files are attributed by hash, uplifted links by inode. A unit's last use is its record entry; without one, its fingerprint dir's mtime. Stale when that is older than the cutoff.
+/// Returns the units that stay (kept or skipped) as incremental owners; None when no unit was planned (no record where one is needed).
 fn plan_units(
     tree: &Path,
     now: u64,
     cutoff: u64,
     need_record: bool,
     plan: &mut TreePlan,
-) -> Result<()> {
+) -> Result<Option<Owners>> {
     let record = unit_use::load(tree)?;
     if need_record && record.is_none() {
         plan.no_record = true;
-        return Ok(());
+        return Ok(None);
     }
+    let mut owners = Owners::default();
     let mut units: Vec<(PathBuf, String)> = Vec::new();
     for dir in entries(&tree.join(FINGERPRINT))? {
         plan.units += 1;
@@ -541,7 +598,11 @@ fn plan_units(
             continue;
         };
         match link_refusal(&dir)? {
-            Some(why) => plan.skipped.push(why),
+            Some(why) => {
+                // kept, but its crate names sit behind the link: never read
+                owners.refused = true;
+                plan.skipped.push(why);
+            }
             None => units.push((dir, hash)),
         }
     }
@@ -587,6 +648,7 @@ fn plan_units(
         };
         if !is_stale(last_use, now, cutoff) {
             plan.kept += 1;
+            owners.add(&dir)?;
             continue;
         }
         let mut paths = vec![dir.clone()];
@@ -594,6 +656,7 @@ fn plan_units(
         if exists(&build)? {
             if let Some(why) = link_refusal(&build)? {
                 plan.skipped.push(why);
+                owners.add(&dir)?;
                 continue;
             }
             paths.push(build);
@@ -614,7 +677,90 @@ fn plan_units(
             plan.orphan_bytes += unique_bytes(std::slice::from_ref(path))?;
         }
     }
+    Ok(Some(owners))
+}
+
+/// The incremental crate dirs of `tree` no unit in `owners` owns, into `plan.dead_incremental`; the ones that cannot be judged into `plan.incr_unknown` (kept). Rule: module doc. Every lock file of a dead dir is taken and held by the plan.
+fn plan_incremental(
+    tree: &Path,
+    now: u64,
+    cutoff: u64,
+    owners: &Owners,
+    plan: &mut TreePlan,
+) -> Result<()> {
+    for crate_dir in children(&tree.join(INCREMENTAL))? {
+        if !real_dir(&crate_dir)? {
+            continue;
+        }
+        let name = file_name(&crate_dir);
+        let Some((crate_name, _)) = name.rsplit_once('-') else {
+            plan.incr_unknown += 1;
+            continue;
+        };
+        let (dirs, locks) = session_entries(&crate_dir)?;
+        let parsed = dirs.iter().all(|d| session_time(&file_name(d)).is_some());
+        let newest = newest_finalized(&dirs).and_then(|d| session_time(&file_name(d)));
+        let Some(t) = newest
+            .filter(|_| parsed)
+            .map(|micros| micros / MICROS_PER_SEC)
+        else {
+            plan.incr_unknown += 1;
+            continue;
+        };
+        if !is_stale(t, now, cutoff) {
+            continue;
+        }
+        let claims = owners
+            .crates
+            .get(crate_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if claims.iter().any(Option::is_none) {
+            plan.incr_unknown += 1;
+            continue;
+        }
+        if claims
+            .iter()
+            .flatten()
+            .any(|&invoked| invoked.abs_diff(t) <= INCREMENTAL_MATCH_SECS)
+        {
+            continue;
+        }
+        if owners.refused {
+            plan.incr_unknown += 1;
+            continue;
+        }
+        let mut held = Vec::new();
+        let mut busy = false;
+        for lock in &locks {
+            match take_lock(lock)? {
+                Lock::Held => {
+                    busy = true;
+                    break;
+                }
+                Lock::Free(flock) => held.extend(flock),
+            }
+        }
+        if busy {
+            plan.incr_unknown += 1;
+            continue;
+        }
+        plan.dead_incremental.push(Incremental {
+            bytes: unique_bytes(std::slice::from_ref(&crate_dir))?,
+            dir: crate_dir,
+            _held: held,
+        });
+    }
     Ok(())
+}
+
+/// Unix seconds of a fingerprint dir's `invoked.timestamp`; None when it is missing.
+fn invoked_secs(fingerprint_dir: &Path) -> Result<Option<u64>> {
+    let path = fingerprint_dir.join(unit_use::INVOKED);
+    if !exists(&path)? {
+        return Ok(None);
+    }
+    mtime_secs(&path).map(Some)
 }
 
 /// Stale when the last use is more than `cutoff` seconds before `now`. A use in the future, or a sum that overflows, is kept.
@@ -628,13 +774,13 @@ fn mtime_secs(path: &Path) -> Result<u64> {
     u64::try_from(meta.mtime()).with_context(|| format!("{} is dated before 1970", path.display()))
 }
 
-/// The incremental sessions of `tree` no load reads, and how many entries are kept. Per crate dir: the newest finalized session stays, as rustc loads it; other finalized sessions go; `-working` sessions go once older than the grace; a lock held by a process keeps its session; lock files whose session is gone go once older than the grace. Session names that match no rustc shape are kept.
-fn stale_sessions(tree: &Path, now: u64) -> Result<(Vec<Session>, usize)> {
-    let now_micros = now.saturating_mul(1_000_000);
+/// The incremental sessions of `tree` no load reads, and how many entries are kept. Per crate dir: the newest finalized session stays, as rustc loads it; other finalized sessions go; `-working` sessions go once older than the grace; a lock held by a process keeps its session; lock files whose session is gone go once older than the grace. Session names that match no rustc shape are kept. The crate dirs in `dead` are skipped: their sessions go with the dir.
+fn stale_sessions(tree: &Path, now: u64, dead: &[PathBuf]) -> Result<(Vec<Session>, usize)> {
+    let now_micros = now.saturating_mul(MICROS_PER_SEC);
     let mut stale = Vec::new();
     let mut kept = 0;
     for crate_dir in children(&tree.join(INCREMENTAL))? {
-        if !real_dir(&crate_dir)? {
+        if !real_dir(&crate_dir)? || dead.contains(&crate_dir) {
             continue;
         }
         let (dirs, locks) = session_entries(&crate_dir)?;
@@ -1799,7 +1945,9 @@ mod tests {
         let line = prune_land(&ws, NOW, true, false).expect("land prune");
         assert_eq!(fingerprints(&tree), LAND_KEPT);
         assert!(
-            line.starts_with("land unit prune: ws/land: removed 5 units and 0 sessions, "),
+            line.starts_with(
+                "land unit prune: ws/land: removed 5 units, 0 incremental dirs and 0 sessions, "
+            ),
             "{line}"
         );
         assert!(
@@ -1974,6 +2122,252 @@ mod tests {
         fs::create_dir_all(base.parent().expect("parent")).expect("bases dir");
         out::copy_base(&out::dir_of(&ws, out::LAND_ID), &base).expect("publish copy");
         assert_eq!(fingerprints(&base.join("cargo/release")), LAND_KEPT);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Session start 3 days before NOW, past land's window: NOW - 3 * DAY = 1_799_740_800 s = 1_799_740_800_000_000 micros = base 36 `hpydice0w0`.
+    const T_OLD: u64 = NOW - 3 * DAY;
+    const OLD_SESSION: &str = "s-hpydice0w0-a-svh1";
+    const OLD_LOCK: &str = "s-hpydice0w0-a.lock";
+    /// Session start 1 day before NOW, inside the window: 1_799_913_600_000_000 micros = base 36 `hq0kw51q80`.
+    const NEW_SESSION: &str = "s-hq0kw51q80-b-svh2";
+    /// Match width, written out: 60 s.
+    const MATCH: u64 = 60;
+
+    /// Gives fingerprint dir `unit` of `tree` the target file of `crate_name` and, with `invoked`, an `invoked.timestamp` of that mtime.
+    fn owner(tree: &Path, unit: &str, crate_name: &str, invoked: Option<u64>) {
+        let dir = tree.join(FINGERPRINT).join(unit);
+        let fp_mtime = mtime_secs(&dir).expect("fingerprint mtime");
+        sized(&dir.join(format!("lib-{crate_name}.json")), 2);
+        if let Some(at) = invoked {
+            let stamp = dir.join(unit_use::INVOKED);
+            fs::write(&stamp, "").expect("invoked");
+            set_mtime(&stamp, at);
+        }
+        // the unit's own mtime is its age when it has no record row: keep it
+        set_mtime(&dir, fp_mtime);
+    }
+
+    /// Crate dir `incremental/<crate_name>-<id>` of `tree` with one session and its lock file, 100 bytes. Returns the dir.
+    fn incr(tree: &Path, crate_name: &str, session: &str) -> PathBuf {
+        let dir = tree.join(INCREMENTAL).join(format!("{crate_name}-1abc"));
+        sized(&dir.join(session).join("query-cache.bin"), 100);
+        fs::write(dir.join(lock_name(session)), "").expect("lock");
+        dir
+    }
+
+    /// `land_fixture` + `land_uses` (2-day window): STALE stale, LIVE kept (used an hour ago, compiled 30 days ago).
+    fn incr_fixture(ws: &Path) -> PathBuf {
+        let tree = land_fixture(ws);
+        write_record(&tree, &land_uses());
+        tree
+    }
+
+    fn land_dry(ws: &Path) -> TreePlan {
+        only_plan(prune_dir(ws, out::LAND_ID, LAND_WINDOW, NOW, false).expect("dry run")).remove(0)
+    }
+
+    fn dead_names(plan: &TreePlan) -> Vec<String> {
+        let mut names: Vec<String> = plan
+            .dead_incremental
+            .iter()
+            .map(|d| file_name(&d.dir))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Gate 1: the crate's only unit is stale and the session is past the window -> the dir goes whole, lock file included, and no session of it is planned twice. Break target: stale units as owners keep it.
+    #[test]
+    fn incremental_dir_of_a_crate_with_only_stale_units_is_removed() {
+        let ws = scratch("incr-dead");
+        let tree = incr_fixture(&ws);
+        owner(&tree, STALE, "atl_stale", Some(T_OLD));
+        let dir = incr(&tree, "atl_stale", OLD_SESSION);
+        let plan = land_dry(&ws);
+        assert_eq!(dead_names(&plan), ["atl_stale-1abc"]);
+        assert!(
+            plan.sessions.is_empty(),
+            "its sessions planned twice: {:?}",
+            plan.sessions
+        );
+        assert_eq!(plan.incremental_bytes(), 100);
+        // the dry plan holds the dir's lock: an execute while it lives sees the dir as busy
+        drop(plan);
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert!(
+            line.contains("removed 5 units, 1 incremental dirs and 0 sessions"),
+            "{line}"
+        );
+        assert!(!exists(&dir).expect("dir"), "dead dir survived");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate 2 + 3: a kept unit invoked within the match width of the session owns the dir, at exactly 60 s too; at 61 s it does not. LIVE was compiled 30 days ago, so age alone would drop it. Break targets: no match test (age only) -> the +0 dir goes; `<` for `<=` -> the +60 dir goes.
+    #[test]
+    fn incremental_dir_owned_by_a_kept_unit_is_kept_up_to_the_match_width() {
+        for (offset, dead) in [(0, false), (MATCH, false), (MATCH + 1, true)] {
+            let ws = scratch(&format!("incr-owned-{offset}"));
+            let tree = incr_fixture(&ws);
+            owner(&tree, LIVE, "atl_live", Some(T_OLD + offset));
+            incr(&tree, "atl_live", OLD_SESSION);
+            let plan = land_dry(&ws);
+            assert_eq!(
+                plan.dead_incremental.len(),
+                usize::from(dead),
+                "invoked at T + {offset} s"
+            );
+            fs::remove_dir_all(&ws).expect("cleanup");
+        }
+    }
+
+    /// Gate 4: no owner, but the newest session is inside the window -> kept, not unknown. Break target: dropping the session-age test removes it.
+    #[test]
+    fn incremental_dir_compiled_inside_the_window_is_kept() {
+        let ws = scratch("incr-young");
+        let tree = incr_fixture(&ws);
+        let dir = incr(&tree, "atl_nobody", NEW_SESSION);
+        let plan = land_dry(&ws);
+        assert!(plan.dead_incremental.is_empty());
+        assert_eq!(plan.incr_unknown, 0);
+        prune_land(&ws, NOW, true, false).expect("land prune");
+        assert!(dir.join(NEW_SESSION).is_dir(), "young dir removed");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate 5: what cannot be judged is kept and counted, one case at a time (each would be dead otherwise: no owner, or only a stale one). Break targets: each guard in `plan_incremental`.
+    #[test]
+    fn incremental_dirs_that_cannot_be_judged_are_kept_and_counted() {
+        type Setup = fn(&Path) -> Option<Flock>;
+        let cases: [(&str, Setup); 5] = [
+            ("no finalized session", |tree| {
+                let dir = tree.join(INCREMENTAL).join("atl_a-1abc");
+                sized(&dir.join("s-hpydice0w0-a-working/q"), 1);
+                None
+            }),
+            ("unparsable session name", |tree| {
+                let dir = incr(tree, "atl_b", OLD_SESSION);
+                sized(&dir.join("s-x/q"), 1);
+                None
+            }),
+            ("dir name without a dash", |tree| {
+                sized(
+                    &tree
+                        .join(INCREMENTAL)
+                        .join("nodash")
+                        .join(OLD_SESSION)
+                        .join("q"),
+                    1,
+                );
+                None
+            }),
+            ("held lock", |tree| {
+                let dir = incr(tree, "atl_c", OLD_SESSION);
+                let file = fs::File::open(dir.join(OLD_LOCK)).expect("lock");
+                Flock::try_take(file, Mode::Exclusive).expect("flock")
+            }),
+            ("owner without invoked.timestamp", |tree| {
+                owner(tree, LIVE, "atl_d", None);
+                incr(tree, "atl_d", OLD_SESSION);
+                None
+            }),
+        ];
+        for (i, (what, setup)) in cases.into_iter().enumerate() {
+            let ws = scratch(&format!("incr-unknown-{i}"));
+            let tree = incr_fixture(&ws);
+            let _held = setup(&tree);
+            let plan = land_dry(&ws);
+            assert!(plan.dead_incremental.is_empty(), "{what}: planned dead");
+            assert_eq!(plan.incr_unknown, 1, "{what}: not counted");
+            fs::remove_dir_all(&ws).expect("cleanup");
+        }
+    }
+
+    /// A unit refused as a link keeps every otherwise dead dir as unknown: its crate names are behind the link.
+    #[test]
+    fn a_refused_unit_keeps_dead_incremental_dirs_as_unknown() {
+        let ws = scratch("incr-refused");
+        let tree = incr_fixture(&ws);
+        incr(&tree, "atl_nobody", OLD_SESSION);
+        let fp = tree.join(FINGERPRINT).join(OLD);
+        fs::remove_dir_all(&fp).expect("real dir");
+        symlink(ws.join("outside"), &fp).expect("link");
+        let plan = land_dry(&ws);
+        assert!(plan.dead_incremental.is_empty());
+        assert_eq!(plan.incr_unknown, 1);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate 6: a land tree without a use record plans no incremental dir, and the end-of-build session prune removes none. Break target: calling `plan_incremental` in either.
+    #[test]
+    fn no_record_and_sessions_only_plan_no_incremental_dir() {
+        let ws = scratch("incr-no-record");
+        let tree = land_fixture(&ws);
+        let dir = incr(&tree, "atl_nobody", OLD_SESSION);
+        let line = prune_land(&ws, NOW, true, false).expect("land prune");
+        assert!(line.contains("0 incremental dirs"), "{line}");
+        assert!(dir.join(OLD_SESSION).is_dir(), "removed without a record");
+        let plans = only_plan(prune_sessions(&ws, out::LAND_ID, NOW).expect("session prune"));
+        assert!(plans.iter().all(|p| p.dead_incremental.is_empty()));
+        assert!(
+            dir.join(OLD_SESSION).is_dir(),
+            "removed by the session prune"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate 7: two units of one crate (OLD stale, NEW kept), both invoked near the session -> kept: the kept one owns it.
+    #[test]
+    fn a_crate_with_one_kept_unit_keeps_its_dir() {
+        let ws = scratch("incr-two");
+        let tree = incr_fixture(&ws);
+        owner(&tree, OLD, "atl_old", Some(T_OLD));
+        owner(&tree, NEW, "atl_old", Some(T_OLD + 1));
+        incr(&tree, "atl_old", OLD_SESSION);
+        let plan = land_dry(&ws);
+        assert!(plan.dead_incremental.is_empty());
+        assert_eq!(plan.incr_unknown, 0);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Gate 8: a link under `incremental/` named like a dead dir refuses the call; its target is not followed or removed.
+    #[test]
+    fn a_symlinked_incremental_dir_is_refused() {
+        let ws = scratch("incr-link");
+        let tree = incr_fixture(&ws);
+        let outside = ws.join("outside-incr");
+        sized(&outside.join(OLD_SESSION).join("q"), 1);
+        fs::create_dir_all(tree.join(INCREMENTAL)).expect("incremental");
+        symlink(&outside, tree.join(INCREMENTAL).join("atl_stale-1abc")).expect("link");
+        let err = prune_land(&ws, NOW, true, false).expect_err("link refused");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert!(
+            outside.join(OLD_SESSION).join("q").is_file(),
+            "link target removed"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// `crate_names_of` reads `<kind>-<name>.json` only, `-` -> `_`; the hash file without extension and unknown kinds name nothing.
+    #[test]
+    fn crate_names_come_from_the_target_files() {
+        let ws = scratch("crate-names");
+        let dir = ws.join("fp");
+        for f in [
+            "lib-atl_x",
+            "lib-atl_x.json",
+            "test-integration-test-my-test.json",
+            "build-script-build-script-build.json",
+            "dep-lib-atl_x",
+            "weird-thing.json",
+            "lib-.json",
+        ] {
+            sized(&dir.join(f), 1);
+        }
+        assert_eq!(
+            unit_use::crate_names_of(&dir).expect("names"),
+            ["atl_x", "build_script_build", "my_test"]
+        );
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

@@ -455,9 +455,41 @@ fn package_name(package_id: &str) -> Option<String> {
 }
 
 /// cargo's mark in a fingerprint dir, touched as it invokes rustc for the unit (before the outputs are written).
-const INVOKED: &str = "invoked.timestamp";
+pub const INVOKED: &str = "invoked.timestamp";
 /// Prefix of the fingerprint file of a lib target's unit (cdylib, staticlib, dylib, rlib); test, bin and build-script units carry other prefixes.
 const LIB_FINGERPRINT: &str = "lib-";
+/// Target kinds cargo writes as `<kind>-<target>.json` in a fingerprint dir; longest first, so a kind that is a prefix of another never wins over it.
+const TARGET_KINDS: [&str; 9] = [
+    "test-integration-test",
+    "integration-test",
+    "build-script",
+    "test-lib",
+    "test-bin",
+    "example",
+    "bench",
+    "lib",
+    "bin",
+];
+const TARGET_EXT: &str = ".json";
+
+/// The crate names rustc gives the targets of fingerprint dir `dir` (`-` -> `_`), sorted, each once: one per `<kind>-<name>.json`; a file of no known kind names none.
+pub fn crate_names_of(dir: &Path) -> Result<Vec<String>> {
+    let mut names = BTreeSet::new();
+    for file in dir_entries(dir)? {
+        let Some(stem) =
+            file_name(&file).and_then(|f| f.strip_suffix(TARGET_EXT).map(str::to_owned))
+        else {
+            continue;
+        };
+        let name = TARGET_KINDS
+            .iter()
+            .find_map(|kind| stem.strip_prefix(kind)?.strip_prefix('-'));
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            names.insert(name.replace('-', "_"));
+        }
+    }
+    Ok(names.into_iter().collect())
+}
 
 /// The unit of `package` that wrote unhashed `output` in `tree`: of its lib fingerprint dirs not in `named` (this run named them by hash), the one invoked last at or before `output`'s mtime. None when `output` is gone or no dir qualifies.
 fn owner_of_unhashed(
