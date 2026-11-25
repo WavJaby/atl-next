@@ -4189,6 +4189,23 @@ mod tests {
             .start_process_locked(&mut st, p, PROVIDER_PACKAGE, false, None)
     }
 
+    /// Starts process `process_name` of the provider package; its host pid when accepted (the record the start leaves is found by its name).
+    fn start_provider_process_as(am: &ActivityManager, process_name: &str) -> std::io::Result<i32> {
+        let mut st = am.inner.state();
+        let packages = am.inner.packages.snapshot();
+        let p = packages
+            .by_name(PROVIDER_PACKAGE)
+            .expect("the provider package is installed");
+        am.inner
+            .start_process_locked(&mut st, p, process_name, false, None)?;
+        Ok(st
+            .processes
+            .iter()
+            .find(|r| r.process_name == process_name)
+            .expect("the start recorded its process")
+            .pid)
+    }
+
     /// PackageFreezer.freezePackage counts: two freezes need two drops. A frozen package's start is refused (ComputerEngine.getPackageStartability :3643, the text
     /// PackageManagerService :4642); the first start after the last drop runs. Red before the gate: the start goes through.
     #[test]
@@ -4255,30 +4272,44 @@ mod tests {
         );
     }
 
-    /// freezePackage stops the package's processes in the hold that counts the freeze (PackageFreezer.java :65-97): a start that raced it was killed by it, or it
-    /// is refused. 1000 rounds. Red before the freeze stops anything: a started process is neither killed nor refused.
+    /// freezePackage stops and counts in one hold (PackageFreezer.java :65-97). Four racers start processes of the package in a tight loop, each under its own process name
+    /// (each start is real); the freeze lands among them. Once it returns, the kills are exactly the starts accepted before it: a refused start kills nothing.
+    /// Red with the stop and the count in two holds: a start accepted between them is neither killed nor refused.
     #[test]
-    fn freeze_kills_in_the_same_step() {
-        for round in 0..1000 {
+    fn freeze_kills_every_accepted_start() {
+        const RACERS: usize = 4;
+        const STARTS: usize = 64;
+        for round in 0..200 {
             let control = Arc::new(RecordingProcesses::default());
             let am = provider_manager(Arc::clone(&control));
-            let racer = am.clone();
-            // both sides leave the barrier together, so the start and the freeze contend for the state lock
-            let gate = Arc::new(std::sync::Barrier::new(2));
-            let racing = Arc::clone(&gate);
-            let start = std::thread::spawn(move || {
-                racing.wait();
-                start_provider_process(&racer).is_ok()
-            });
+            let gate = Arc::new(std::sync::Barrier::new(RACERS + 1));
+            let racers: Vec<_> = (0..RACERS)
+                .map(|r| {
+                    let (am, gate) = (am.clone(), Arc::clone(&gate));
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        (0..STARTS)
+                            .filter_map(|s| {
+                                let name = format!("{PROVIDER_PACKAGE}:r{r}s{s}");
+                                start_provider_process_as(&am, &name).ok()
+                            })
+                            .collect::<Vec<i32>>()
+                    })
+                })
+                .collect();
             gate.wait();
             let frozen = am.freeze_package(PROVIDER_PACKAGE);
-            let started = start.join().expect("the racing start");
-            let killed = control.kills.lock().expect("kills").len();
+            let mut accepted: Vec<i32> = racers
+                .into_iter()
+                .flat_map(|t| t.join().expect("a racing start"))
+                .collect();
+            let mut killed = control.kills.lock().expect("kills").clone();
             drop(frozen);
+            accepted.sort_unstable();
+            killed.sort_unstable();
             assert_eq!(
-                killed,
-                usize::from(started),
-                "round {round}: the freeze kills a start that won the race, and a refused start kills nothing"
+                killed, accepted,
+                "round {round}: the freeze kills the starts accepted before it, and a refused start kills nothing"
             );
         }
     }
