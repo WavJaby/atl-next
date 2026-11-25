@@ -198,14 +198,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.prune_units {
-        // the publish's unit prune is non-fatal: a failure is this command's skip line, and it exits 0 (an Err would print the land's `FAILED` verdict in the land log)
-        return Ok(match prune_units(root, args.plan_only) {
-            Ok(code) => code.unwrap_or(ExitCode::SUCCESS),
-            Err(e) => {
-                println!("{}", prune_skipped(&e));
-                ExitCode::SUCCESS
-            }
-        });
+        return Ok(prune_units_step(root, args.plan_only));
     }
     let started = Instant::now();
     verdict::step("land:preflight");
@@ -1005,9 +998,9 @@ fn build_dir_child(wt: &Path, branch: &str) -> Result<Option<String>> {
 /// Publish: ws/land's unit prune first ([`prune_units_child`]; Publish runs only after a green Verify), then `out::publish`. A failed prune is logged and the publish goes on: what was removed went whole, unit by unit.
 fn publish_execute(land: &Path) -> Result<String> {
     verdict::step("land:unit-prune");
-    match prune_units_child(land) {
-        Ok(line) => println!("{line}"),
-        Err(e) => println!("{}", prune_skipped(&e)),
+    // the child's step line is echoed as it arrives; only a child that died before printing one is reported here
+    if let Err(e) = prune_units_child(land) {
+        println!("{LAND_UNIT_PRUNE}FAILED: {e:#}");
     }
     out::publish(land)
 }
@@ -1015,8 +1008,9 @@ fn publish_execute(land: &Path) -> Result<String> {
 /// Prefix of `out_prune::prune_land`'s summary line.
 const LAND_UNIT_PRUNE: &str = "land unit prune: ";
 
-/// `cargo xtask land HEAD --prune-units` in the land worktree, by its own xtask (the landed commit's): enters ws/land's namespace and prunes it under its exclusive dir lock (`out_prune::prune_land`). Returns its summary line; the tree lines show in the land log.
-fn prune_units_child(land: &Path) -> Result<String> {
+/// `cargo xtask land HEAD --prune-units` in the land worktree, by its own xtask (the landed commit's): enters ws/land's namespace and prunes it under its exclusive dir lock (`out_prune::prune_land`).
+/// The child prints the step line ([`prune_units_step`]), echoed into the land log as it arrives: exit 0 when it pruned or was refused, 1 when it failed. Ok when it printed one; Err when it died before (spawn error, signal, panic), its stderr the cause.
+fn prune_units_child(land: &Path) -> Result<()> {
     let mut cmd = crate::cargo_command();
     cmd.args(["xtask", "land", "HEAD", "--prune-units"])
         .current_dir(land);
@@ -1026,18 +1020,11 @@ fn prune_units_child(land: &Path) -> Result<String> {
             land.display()
         )
     })?;
-    ensure!(
-        run.status.success(),
-        "{}: {}",
-        run.status,
-        run.stderr.trim_end()
-    );
-    run.stdout
-        .lines()
-        .rev()
-        .find(|l| l.starts_with(LAND_UNIT_PRUNE))
-        .map(str::to_owned)
-        .context("the unit prune child printed no summary line")
+    let printed = run.stdout.lines().any(|l| l.starts_with(LAND_UNIT_PRUNE));
+    match run.status.code() {
+        Some(0 | 1) if printed => Ok(()),
+        _ => bail!("{}: {}", run.status, run.stderr.trim_end()),
+    }
 }
 
 /// ws/land's unit prune (`out_prune::prune_land`), in its namespace when ws/land is a ram dir. It deletes only, so it enters with no admission (`delta::enter` None). Some(code) = ran there.
@@ -1058,9 +1045,33 @@ fn prune_units(root: &Path, plan_only: bool) -> Result<Option<ExitCode>> {
     Ok(None)
 }
 
-/// The step line of a unit prune that did not finish: skipped, with its cause. Never FAILED: the land goes on, and its verdict is ok.
-fn prune_skipped(e: &anyhow::Error) -> String {
-    format!("{LAND_UNIT_PRUNE}skipped (non-fatal, the land goes on): {e:#}")
+/// The child of publish's unit prune: prints the step line and exits 0 when the prune ran or was refused, 1 when it failed. The land's verdict is never printed here: the land goes on either way.
+fn prune_units_step(root: &Path, plan_only: bool) -> ExitCode {
+    match prune_units(root, plan_only) {
+        Ok(code) => code.unwrap_or(ExitCode::SUCCESS),
+        Err(e) => {
+            println!("{}", prune_step_line(&e));
+            if is_refusal(&e) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// Whether the prune refused a path it found unsafe ([`out_prune::Refused`]): a refusal is a skip, anything else a failure.
+fn is_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<out_prune::Refused>().is_some()
+}
+
+/// The unit prune's step line when it did not prune: `skipped (refused: <why>)` for a refusal, `FAILED: <cause>` for anything else.
+fn prune_step_line(e: &anyhow::Error) -> String {
+    if is_refusal(e) {
+        format!("{LAND_UNIT_PRUNE}skipped ({e:#})")
+    } else {
+        format!("{LAND_UNIT_PRUNE}FAILED: {e:#}")
+    }
 }
 
 fn parse_build_dir(stdout: &str) -> Result<Option<String>> {
@@ -2405,13 +2416,23 @@ mod tests {
         assert_eq!(find_worktree(list, "tas", land), None);
     }
 
-    /// The unit prune's step line when it does not finish: skipped with its cause, never FAILED (the land's verdict stays ok). Break: the word FAILED.
+    /// A refusal of the prune is a skip, its step line naming the refusal. Break: refusals classified as failures -> red.
     #[test]
-    fn a_skipped_unit_prune_is_a_skip_not_a_failure() {
-        let line = prune_skipped(&anyhow::anyhow!("ws/land: refused"));
+    fn a_refused_unit_prune_is_skipped_with_its_reason() {
+        let e = out_prune::refused("ws/land is a symlink".to_owned());
         assert_eq!(
-            line,
-            "land unit prune: skipped (non-fatal, the land goes on): ws/land: refused"
+            prune_step_line(&e),
+            "land unit prune: skipped (refused: ws/land is a symlink)"
+        );
+    }
+
+    /// A failure of the prune's own work is FAILED with its cause; the land's verdict stays ok. Break: every error classified as a skip -> red.
+    #[test]
+    fn a_crashed_unit_prune_is_failed_with_its_cause() {
+        let e = anyhow::anyhow!("removing ws/land/x: Permission denied (os error 13)");
+        assert_eq!(
+            prune_step_line(&e),
+            "land unit prune: FAILED: removing ws/land/x: Permission denied (os error 13)"
         );
     }
 

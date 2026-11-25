@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use rustix::fs::{Mode as RawMode, OFlags, ResolveFlags};
 
 use crate::build_pool;
@@ -454,6 +454,23 @@ pub fn sessions_line(what: &str, plans: &[TreePlan]) -> String {
     )
 }
 
+/// A refusal: the prune declined to act on a path it found unsafe (a symlink, a path outside its tree, no entry). Displays as `refused: <why>`. A caller reports it as a skip; any other error is a failure of the prune's own work.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The error of a refusal of `why` ([`Refused`]).
+pub fn refused(why: String) -> anyhow::Error {
+    anyhow::Error::new(Refused(why))
+}
+
 /// The dir to prune for build dir `dir`: itself when a real dir; None when absent. Anything else is refused: a symlink is never followed.
 fn checked_dir(dir: &Path) -> Result<Option<PathBuf>> {
     let meta = match fs::symlink_metadata(dir) {
@@ -461,11 +478,12 @@ fn checked_dir(dir: &Path) -> Result<Option<PathBuf>> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
-    ensure!(
-        meta.is_dir(),
-        "refused: {} is not a real dir (a symlink is never followed)",
-        dir.display()
-    );
+    if !meta.is_dir() {
+        return Err(refused(format!(
+            "{} is not a real dir (a symlink is never followed)",
+            dir.display()
+        )));
+    }
     Ok(Some(dir.to_owned()))
 }
 
@@ -1049,17 +1067,22 @@ fn add_bytes(path: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) -> Re
 /// Removes a path under `tree` (under workspace `ws`). Refused outside them or when any dir between `ws` and `path` is a symlink; `path` itself a symlink is removed as a link.
 /// The parent is resolved once, by the kernel (`openat2`), and the removal starts from that fd: no link swapped in later redirects it. Below it `fs::remove_dir_all` opens each dir without following and unlinks links.
 fn remove(ws: &Path, tree: &Path, path: &Path) -> Result<()> {
-    ensure!(
-        path.starts_with(tree),
-        "refused: {} is outside {}",
-        path.display(),
-        tree.display()
-    );
-    let inside = path
-        .strip_prefix(ws)
-        .with_context(|| format!("refused: {} is outside {}", path.display(), ws.display()))?;
+    if !path.starts_with(tree) {
+        return Err(refused(format!(
+            "{} is outside {}",
+            path.display(),
+            tree.display()
+        )));
+    }
+    let inside = path.strip_prefix(ws).map_err(|e| {
+        anyhow::Error::new(e).context(Refused(format!(
+            "{} is outside {}",
+            path.display(),
+            ws.display()
+        )))
+    })?;
     let (Some(parent), Some(name)) = (inside.parent(), inside.file_name()) else {
-        bail!("refused: {} names no entry", path.display());
+        return Err(refused(format!("{} names no entry", path.display())));
     };
     let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let anchor = rustix::fs::open(ws, flags, RawMode::empty())
@@ -1071,11 +1094,11 @@ fn remove(ws: &Path, tree: &Path, path: &Path) -> Result<()> {
         RawMode::empty(),
         ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
     )
-    .with_context(|| {
-        format!(
-            "refused: the dir of {} does not resolve without a symlink",
+    .map_err(|e| {
+        anyhow::Error::new(e).context(Refused(format!(
+            "the dir of {} does not resolve without a symlink",
             path.display()
-        )
+        )))
     })?;
     let at = Path::new("/proc/self/fd")
         .join(held.as_raw_fd().to_string())
@@ -1101,11 +1124,9 @@ fn link_refusal(path: &Path) -> Result<Option<String>> {
 fn real_dir(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
-            ensure!(
-                !meta.is_symlink(),
-                "refused: {} is a symlink",
-                path.display()
-            );
+            if meta.is_symlink() {
+                return Err(refused(format!("{} is a symlink", path.display())));
+            }
             Ok(meta.is_dir())
         }
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(false),
@@ -1554,6 +1575,8 @@ mod tests {
         symlink(elsewhere.join("out/pool/ws/a"), ws.join("out/pool/ws/c")).expect("link");
         let err = prune_dir(&ws, "c", CUTOFF, NOW, true).expect_err("symlink refused");
         assert!(format!("{err:#}").contains("refused"), "{err:#}");
+        // typed: the land prune reports it as a skip (break: checked_dir untyped -> red)
+        assert!(err.downcast_ref::<Refused>().is_some(), "{err:#}");
         assert!(
             elsewhere
                 .join("out/pool/ws/a/cargo/release/.fingerprint")
