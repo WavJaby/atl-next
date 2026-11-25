@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use atl_fonts_table::{Accept, Alias, DEFAULT_FAMILY, Group, Table};
 use atl_platform_host::{Face, FontQuery, FontSource};
 
-pub use face::{Axis, FaceInfo};
+pub use face::{Axis, FaceInfo, Style};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -43,6 +43,8 @@ pub struct Font {
     pub file: String,
     pub index: u32,
     pub info: FaceInfo,
+    /// The styles of [`FaceInfo::styles`] no earlier font of the family has: no two fonts of a family share one.
+    pub styles: Vec<Style>,
 }
 
 /// One `<family>`: named (`name`) or a lang fallback (`lang`, AOSP's string verbatim).
@@ -107,11 +109,31 @@ fn nameable(f: &Face) -> bool {
         .is_some_and(|n| !n.chars().any(char::is_whitespace))
 }
 
+/// A face of a family with the styles it keeps ([`one_per_style`]).
+type Styled = (Face, FaceInfo, Vec<Style>);
+
+/// The family's faces with each style once, the first face that has it keeping it (the head is first); a face left with none is dropped.
+/// FontFamily.Builder.addFont throws on a second font of a style, and SystemFonts does not catch it: no app starts. A device's fonts.xml holds each style once; a desktop need not
+/// (Noto Sans 2.x Thin and ExtraLight both state usWeightClass 250; two packages installing one family into two dirs).
+fn one_per_style(faces: Vec<(Face, FaceInfo)>) -> Vec<Styled> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (f, info) in faces {
+        let all = info.styles();
+        let own: Vec<Style> = all.iter().copied().filter(|s| seen.insert(*s)).collect();
+        // a wght range without a multiple of 100 has no style to clash on
+        if all.is_empty() || !own.is_empty() {
+            out.push((f, info, own));
+        }
+    }
+    out
+}
+
 struct Builder<'a, S, R> {
     src: &'a S,
     read: &'a R,
     dirs: BTreeMap<PathBuf, ()>,
-    raw: Vec<(Family, Vec<(Face, FaceInfo)>)>,
+    raw: Vec<(Family, Vec<Styled>)>,
 }
 
 impl<S: FontSource, R: FaceReader> Builder<'_, S, R> {
@@ -210,7 +232,7 @@ pub fn build(
                 lang: None,
                 fonts: vec![],
             };
-            b.raw.push((fam, faces));
+            b.raw.push((fam, one_per_style(faces)));
         } else {
             missing.families.push(name.clone());
         }
@@ -219,7 +241,7 @@ pub fn build(
     let mut used: BTreeSet<(PathBuf, u32)> = b
         .raw
         .iter()
-        .flat_map(|(_, fs)| fs.iter().map(|(f, _)| (f.path.clone(), f.index)))
+        .flat_map(|(_, fs)| fs.iter().map(|(f, ..)| (f.path.clone(), f.index)))
         .collect();
     for l in order {
         let Some(head) = lang_head(&b, &expander, l)? else {
@@ -230,7 +252,9 @@ pub fn build(
             continue;
         }
         let mut faces = b.family_faces(&head)?;
-        faces.retain(|(f, _)| f == &head || used.insert((f.path.clone(), f.index)));
+        faces.retain(|(f, _)| f == &head || !used.contains(&(f.path.clone(), f.index)));
+        let faces = one_per_style(faces);
+        used.extend(faces.iter().map(|(f, ..)| (f.path.clone(), f.index)));
         let fam = Family {
             name: None,
             lang: Some(l.clone()),
@@ -239,14 +263,14 @@ pub fn build(
         b.raw.push((fam, faces));
     }
     for (_, faces) in &b.raw {
-        for (f, _) in faces {
+        for (f, ..) in faces {
             b.dirs.insert(dir_of(&f.path)?, ());
         }
     }
     let dirs: Vec<PathBuf> = b.dirs.into_keys().collect();
     let mut families = Vec::new();
     for (mut fam, faces) in b.raw {
-        for (f, info) in faces {
+        for (f, info, styles) in faces {
             let dir = dirs
                 .binary_search(&dir_of(&f.path)?)
                 .map_err(|_| Error::Face("dir vanished".into()))?;
@@ -262,6 +286,7 @@ pub fn build(
                 file,
                 index: f.index,
                 info,
+                styles,
             });
         }
         families.push(fam);

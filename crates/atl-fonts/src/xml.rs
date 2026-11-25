@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The model as FontListParser's XML (frameworks/base/graphics/java/android/graphics/FontListParser.java).
 //! font_fallback.xml takes a variable family in the shapes SystemFonts.resolveVarFamilyType accepts (one font wght[,ital], or upright + italic fonts wght): `supportedAxes` (readFont 397-407), weight from the axis at draw time.
-//! Every other variable face, and every variable face in the legacy fonts.xml (whose readers know no supportedAxes), becomes static instances at each multiple of 100 inside its wght range, each with a fixed `<axis tag="wght" stylevalue>` (readAxis 460-469), as AOSP's own fonts.xml lays out Roboto.
+//! Every other variable face, and every variable face in the legacy fonts.xml (whose readers know no supportedAxes), becomes static instances at each multiple of 100 inside its wght range ([`Font::styles`]), each with a fixed `<axis tag="wght" stylevalue>` (readAxis 460-469), as AOSP's own fonts.xml lays out Roboto.
 //! `postScriptName` is always written: its default is the file text minus 4 chars (readFont 409-413), wrong for a `<k>/` path.
 
 use std::fmt::Write;
@@ -68,7 +68,7 @@ fn font_lines(out: &mut String, f: &Font, axes: Option<&str>) {
         );
         return;
     }
-    let Some(w) = f.info.axis(&WGHT) else {
+    if f.info.axis(&WGHT).is_none() {
         let _ = writeln!(
             out,
             "        <font weight=\"{}\" style=\"{}\"{ix} postScriptName=\"{ps}\">{p}</font>",
@@ -76,30 +76,21 @@ fn font_lines(out: &mut String, f: &Font, axes: Option<&str>) {
             style(f.info.italic)
         );
         return;
-    };
-    let italics: &[bool] = match f.info.axis(&ITAL) {
-        Some(a) if a.max >= 1.0 => &[false, true],
-        _ => &[f.info.italic],
-    };
-    for &it in italics {
-        for weight in (100..=900)
-            .step_by(100)
-            .filter(|&x| (w.min..=w.max).contains(&(x as f32)))
-        {
-            let ital_axis = if f.info.axis(&ITAL).is_some() {
-                format!(
-                    "\n            <axis tag=\"ital\" stylevalue=\"{}\"/>",
-                    u8::from(it)
-                )
-            } else {
-                String::new()
-            };
-            let _ = writeln!(
-                out,
-                "        <font weight=\"{weight}\" style=\"{}\"{ix} postScriptName=\"{ps}\">{p}\n            <axis tag=\"wght\" stylevalue=\"{weight}\"/>{ital_axis}\n        </font>",
-                style(it)
-            );
-        }
+    }
+    for &(weight, it) in &f.styles {
+        let ital_axis = if f.info.axis(&ITAL).is_some() {
+            format!(
+                "\n            <axis tag=\"ital\" stylevalue=\"{}\"/>",
+                u8::from(it)
+            )
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "        <font weight=\"{weight}\" style=\"{}\"{ix} postScriptName=\"{ps}\">{p}\n            <axis tag=\"wght\" stylevalue=\"{weight}\"/>{ital_axis}\n        </font>",
+            style(it)
+        );
     }
 }
 

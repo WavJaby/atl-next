@@ -12,6 +12,9 @@ pub struct Axis {
     pub max: f32,
 }
 
+/// One style of a family: (weight, italic), FontFamily.Builder's key (makeStyleIdentifier: weight | slant << 16).
+pub type Style = (u16, bool);
+
 /// The tables FontListParser's attributes come from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceInfo {
@@ -26,6 +29,26 @@ pub struct FaceInfo {
 impl FaceInfo {
     pub fn axis(&self, tag: &[u8; 4]) -> Option<Axis> {
         self.axes.iter().copied().find(|a| &a.tag == tag)
+    }
+
+    /// The (weight, italic) styles the face brings to a family: its tables' one; for a wght axis each multiple of 100 in its range, for an ital axis reaching 1 upright and italic both.
+    pub fn styles(&self) -> Vec<Style> {
+        let Some(w) = self.axis(b"wght") else {
+            return vec![(self.weight, self.italic)];
+        };
+        let italics: &[bool] = match self.axis(b"ital") {
+            Some(a) if a.max >= 1.0 => &[false, true],
+            _ => &[self.italic],
+        };
+        italics
+            .iter()
+            .flat_map(|&it| {
+                (100..=900)
+                    .step_by(100)
+                    .filter(move |&x| (w.min..=w.max).contains(&f32::from(x)))
+                    .map(move |x| (x, it))
+            })
+            .collect()
     }
 }
 

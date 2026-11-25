@@ -283,6 +283,88 @@ fn files_with_whitespace_are_never_named() {
     ));
 }
 
+/// A desktop answering sans-serif with `faces` (path, tables; one family, Sans), and face `ja` for Japanese.
+fn one_family(faces: &[(&str, FaceInfo)], ja: usize) -> Desktop {
+    let mut d = Desktop::default();
+    for (path, info) in faces {
+        d.face(path, 0, "Sans", 100, &["ja"], info.clone());
+    }
+    d.prefer("sans-serif", None, &[0]);
+    d.prefer("sans-serif", Some("ja"), &[ja]);
+    d
+}
+
+/// The (dir, file) of family `k`'s fonts, as listed.
+fn files(m: &Model, k: usize) -> Vec<(usize, &str)> {
+    m.families[k]
+        .fonts
+        .iter()
+        .map(|f| (f.dir, f.file.as_str()))
+        .collect()
+}
+
+/// k3's Noto Sans: Thin and ExtraLight both usWeightClass 250, and a second package's Bold and Regular in another dir.
+#[test]
+fn a_family_holds_each_style_once() {
+    let d = one_family(
+        &[
+            ("/f/o/Regular.ttf", stat(400, false, false)),
+            ("/f/o/Bold.ttf", stat(700, false, false)),
+            ("/f/o/ExtraLight.ttf", stat(250, false, false)),
+            ("/f/o/Thin.ttf", stat(250, false, false)),
+            ("/f/t/Bold.ttf", stat(700, false, false)),
+            ("/f/t/BoldItalic.ttf", stat(700, true, false)),
+            ("/f/t/Regular.ttf", stat(400, false, false)),
+        ],
+        0,
+    );
+    let m = build(&d, &d, &table(MINI), vec![], &[]).expect("model");
+    check_schema(&m.font_fallback_xml(), &m);
+    check_schema(&m.fonts_xml(), &m);
+    assert_eq!(
+        files(&m, 0),
+        [
+            (0, "Regular.ttf"),
+            (0, "Bold.ttf"),
+            (0, "ExtraLight.ttf"),
+            (1, "BoldItalic.ttf")
+        ]
+    );
+}
+
+/// A static face beside a variable one of its family: the instances leave out the style the static head has.
+#[test]
+fn a_variable_face_leaves_out_a_static_heads_style() {
+    let d = one_family(
+        &[
+            ("/f/a/Sans-Regular.ttf", stat(400, false, false)),
+            ("/f/a/Sans-VF.ttf", roboto()),
+        ],
+        0,
+    );
+    let m = build(&d, &d, &table(MINI), vec![], &[]).expect("model");
+    check_schema(&m.font_fallback_xml(), &m);
+    check_schema(&m.fonts_xml(), &m);
+    // the static 400 upright + the VF's 9 weights x 2 slants without that one
+    assert_eq!(m.fonts_xml().matches("<font ").count(), 18);
+}
+
+/// A face dropped for its style is not in the list: it still answers a language the desktop prefers it for.
+#[test]
+fn a_face_dropped_for_its_style_still_answers_a_language() {
+    let d = one_family(
+        &[
+            ("/f/o/Regular.ttf", stat(400, false, false)),
+            ("/f/t/Regular.ttf", stat(400, false, false)),
+        ],
+        1,
+    );
+    let m = build(&d, &d, &table(MINI), vec![], &["ja".into()]).expect("model");
+    assert_eq!(files(&m, 0), [(0, "Regular.ttf")]);
+    assert_eq!(m.families[1].lang.as_deref(), Some("ja"));
+    assert_eq!(files(&m, 1), [(1, "Regular.ttf")]);
+}
+
 /// The XML back through FontListParser's rules.
 fn check_schema(xml: &str, m: &Model) {
     let doc = roxmltree::Document::parse(xml).expect("well-formed");
@@ -300,7 +382,16 @@ fn check_schema(xml: &str, m: &Model) {
         if f.attribute("name").is_some() {
             assert!(f.attribute("lang").is_none());
         }
+        let mut styles = BTreeSet::new();
         for font in f.children().filter(|n| n.has_tag_name("font")) {
+            // FontFamily.Builder.addFont throws on a style a second time (readFont's defaults: weight 400, upright)
+            assert!(
+                styles.insert((
+                    font.attribute("weight").unwrap_or("400"),
+                    font.attribute("style") == Some("italic")
+                )),
+                "{font:?}: a style twice in one family"
+            );
             let text: String = font
                 .children()
                 .filter(|n| n.is_text())
