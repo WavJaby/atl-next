@@ -734,9 +734,34 @@ fn may_bypass(class: Class, head_payload: Option<&str>) -> bool {
 /// Waiting: one FIFO [`crate::ticket`] per waiter in [`queue_dir`], judged only at the head ([`may_bypass`] excepted, counter `delta-bypass`). Wait always queues; Refuse and Held queue only for an existing ram dir (`keep`; a new dir takes the pool). NeverFits never waits.
 /// A process inside land's queue ([`inside_land_queue`]) and the land checkout never join the FIFO: the land queue waits for them, and a FIFO head waiting on land's hold would wait for them in turn. They poll a Wait (others' reservations end without them); inside the queue Refuse and Held return at once.
 /// Nothing is held while waiting (admit gate released between polls, no reservation, no mount lock: `enter` takes the lock after admission), so land's own admission and the land queue's commands in this checkout proceed. No timeout: an endless wait shows in `atl-job status`. A line per state change (`out: delta ws/<id>: waiting ...`, naming the store's holders from `store`), counter `delta-wait` once per wait.
-/// Eviction ([`evict_for`]): a FIFO participant's Wait/Refuse/Held short of room first evicts idle checkouts' uppers; a process inside land's queue never does.
+/// Eviction ([`evict_for`]): a FIFO participant's or land's Wait/Refuse/Held short of room evicts idle checkouts' uppers before it waits on them. Land evicts first: it is not queued, so it judges at its own poll rather than behind the FIFO, and it takes victims in the same order (longest idle first). A process inside land's queue that is not land never evicts (it carries no ticket, and the queue waits for its commands).
 #[allow(clippy::too_many_arguments)]
 fn admit_keeping(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    class: Class,
+    own: impl FnMut() -> Result<u64>,
+    keep: bool,
+    store: Option<&Path>,
+    probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
+) -> Result<std::result::Result<Admitted, Verdict>> {
+    admit_in(
+        ws,
+        id,
+        cfg,
+        class,
+        own,
+        keep,
+        store,
+        probe_now,
+        inside_land_queue(ws)?,
+    )
+}
+
+/// [`admit_keeping`] with `inside` given: this process inherited land's queue lock. Tests pass it: the lock is process-wide (threads of one test binary share fds), so one test holding it would change every other test's waiter.
+#[allow(clippy::too_many_arguments)]
+fn admit_in(
     ws: &Path,
     id: &str,
     cfg: &DeltaConfig,
@@ -745,10 +770,12 @@ fn admit_keeping(
     keep: bool,
     store: Option<&Path>,
     mut probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
+    inside: bool,
 ) -> Result<std::result::Result<Admitted, Verdict>> {
-    let inside = inside_land_queue(ws)?;
     // land's own builds never queue behind a waiter that may be waiting on land's hold (the pool's land tier, by checkout)
     let unqueued = inside || id == out::LAND_ID;
+    // who may evict ([`evict_for`]): a FIFO participant and land, never another process inside land's queue
+    let may_evict = id == out::LAND_ID || !inside;
     let queue = queue_dir(ws);
     std::fs::create_dir_all(&queue).with_context(|| format!("creating {}", queue.display()))?;
     let mut ticket: Option<crate::ticket::Ticket> = None;
@@ -776,9 +803,9 @@ fn admit_keeping(
             let own_now = own()?;
             let mut judged = stats;
             let mut v = judge_quiet(ws, id, cfg, class, own_now, &judged)?;
-            // FIFO participants only: a process inside land's queue carries no ticket and never evicts (the queue waits for its commands)
+            // may_evict: the judgement holds only the gate and takes victims' locks without blocking, so it waits on nothing it holds (see evict_for)
             if let Some(store) = store
-                && !unqueued
+                && may_evict
                 && matches!(v, Verdict::Wait(_) | Verdict::Refuse(_) | Verdict::Held(_))
                 && let Some(credited) =
                     evict_for(ws, id, cfg, store, class, own_now, &judged, &tickets)?
@@ -832,8 +859,13 @@ fn admit_keeping(
             }
             said = Some((state, ahead));
             println!(
-                "out: delta ws/{id}: waiting ({} build, queue {total}, {ahead} ahead; an app start in this checkout waits too): {why}; held by: {}",
+                "out: delta ws/{id}: waiting ({} build, queue {total}, {ahead} ahead; an app start in this checkout waits too): {why}; evict {}; held by: {}",
                 class.name(),
+                if may_evict {
+                    "on"
+                } else {
+                    "off (inside land's queue)"
+                },
                 store.map_or_else(|| "store unset".to_owned(), |s| held_by(ws, s, id))
             );
         }
@@ -959,7 +991,8 @@ fn evict_one(ws: &Path, store: &Path, id: &str, lock: Flock, why: &str) -> Resul
     Ok(())
 }
 
-/// Evicts idle ram dirs for a FIFO participant's judgement short of room (the caller holds the admit gate): longest idle first, and only when their stamped sizes cover the whole shortfall (else nothing: a wait that stays costs no warm upper). Returns `stats` credited with the bytes predicted from the stamps (zram frees late; the next poll re-probes), or None when nothing was evicted. One line and one `delta-evict` per eviction.
+/// Evicts idle ram dirs for a FIFO participant's or land's judgement short of room (the caller holds the admit gate): longest idle first, and only when their stamped sizes cover the whole shortfall (else nothing: a wait that stays costs no warm upper). Returns `stats` credited with the bytes predicted from the stamps (zram frees late; the next poll re-probes), or None when nothing was evicted. One line and one `delta-evict` per eviction.
+/// No wait cycle: under the gate every lock is taken without blocking (`try_mount_lock`, `reserving_ids`, the ticket and land probes), so the judgement never waits on a lock another process holds. A queued checkout holds no mount lock, and queued checkouts are skipped as victims anyway.
 #[allow(clippy::too_many_arguments)]
 fn evict_for(
     ws: &Path,
@@ -3288,6 +3321,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             [".evict-p-1"]
         );
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// Land is outside the FIFO and may evict (PM, 2026-11-26). Its judgement runs inside land's queue (`inside`: land-seq's process inherited the lock), holds only the admit gate, and takes victims' locks without blocking, so it waits on nothing while it holds anything. Short by 4.6 GiB RAM with one idle 10 GiB upper: the upper goes and land is admitted at once. Break (land may not evict): refused, red.
+    #[test]
+    fn land_short_of_room_evicts_an_idle_upper() {
+        let ws = fresh_ws("land-evicts");
+        let store_dir = fresh_store("land-evicts");
+        idle_ram_dir(&ws, &store_dir, "p", 10 * GIB, 30);
+        let store = Store::used(9);
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let got = admit_in(
+            &ws,
+            out::LAND_ID,
+            &cfg,
+            Class::Native,
+            || Ok(0),
+            true,
+            Some(&store_dir),
+            || Ok(Ok(store.stats())),
+            true,
+        )
+        .unwrap();
+        let (_reservation, _, need) =
+            got.expect("land refused although an idle upper covers the shortfall");
+        assert_eq!(need.raw, 9 * GIB);
+        assert!(!store_dir.join("p").exists(), "the idle upper stayed");
+        assert_eq!(count_of(&ws, "delta-evict"), 1);
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// A process inside land's queue that is not land (a `repo` command run by land-seq) never evicts: it has no ticket and cannot wait for the queue it sits in, so it is refused at once and the upper stays. Same shortfall and upper as the land case. Break (inside processes may evict): admitted after the eviction, red.
+    #[test]
+    fn non_land_inside_the_queue_does_not_evict() {
+        let ws = fresh_ws("inside-no-evict");
+        let store_dir = fresh_store("inside-no-evict");
+        idle_ram_dir(&ws, &store_dir, "p", 10 * GIB, 30);
+        let store = Store::used(9);
+        let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
+            .unwrap()
+            .delta;
+        let got = admit_in(
+            &ws,
+            "c",
+            &cfg,
+            Class::Native,
+            || Ok(0),
+            true,
+            Some(&store_dir),
+            || Ok(Ok(store.stats())),
+            true,
+        )
+        .unwrap();
+        let Err(v) = got else {
+            panic!("admitted inside land's queue on a short store");
+        };
+        assert!(matches!(v, Verdict::Refuse(_)), "{v:?}");
+        assert!(
+            store_dir.join("p").join("upper").is_dir(),
+            "an inside process evicted p"
+        );
+        assert_eq!(count_of(&ws, "delta-evict"), 0);
         std::fs::remove_dir_all(&ws).unwrap();
         std::fs::remove_dir_all(&store_dir).unwrap();
     }
