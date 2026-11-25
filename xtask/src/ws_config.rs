@@ -32,7 +32,7 @@
 //! peak_small_gib = 2   # per build class: upper growth reserved before the build starts
 //! peak_check_gib = 4.8
 //! peak_native_gib = 9
-//! peak_cross_gib = 20
+//! peak_cross_gib = 20  # native --host credits its upper/<host>; `cross` has no host dir and reserves all of it
 //! peak_run_gib = 0.78  # one app data root (clean install + one launch) in a run dir on the store (out_run.rs)
 //! ```
 
@@ -115,7 +115,7 @@ pub const DEFAULT_REGROW_GIB: u64 = 4;
 pub const DEFAULT_RATIO_MILLI: u64 = 1950;
 /// `delta.ratio_run` in thousandths: lzo-rle zram raw/RAM of one app data root, WeChat 8.0 clean install + launch on the zram store (2026-11-22): 796.6 MiB raw / 581 MiB zram RAM = 1.371. The device ratio mixes in build uppers (1.95), which would under-reserve a run (0.78 GiB / 1.95 = 0.40 reserved, 0.57 used); class run takes min(device ratio, this).
 pub const DEFAULT_RATIO_RUN_MILLI: u64 = 1370;
-/// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (maintainer estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20.
+/// `delta.peak_*_gib` in MiB: upper growth of one build of the class from an empty upper. small 2 GiB: a Rust change + test (maintainer estimate 1-2); check 4.8: tmpfs peak of a full check, 4.79 GiB (prototype B); native 9: all-gates / ART rebuild estimate; cross 20: riscv64 cross upper estimate 12-20. The `cross` command writes target/<triple>, not upper/<host>, so it gets no own credit (delta::own_bytes): it reserves this whole and its growth is not sampled. Accepted as the conservative case.
 /// run 797: store growth of one app data root = clean install + launch of the largest known app into an empty root (every app run starts so, out_run.rs `fresh_root`).
 /// WeChat 8.0 (versionCode 3182) on the zram store, ext4 used from the minimum after the previous root's removal to the run's peak (2 s samples, 2026-11-22): 796.5 and 796.6 MiB in the two windows no other writer touched; peak = end, so no install transient above the final root (du 792.8 MiB) at that resolution. 796.6 -> 797.
 /// Small cases: Temple Run root 251 MiB, fossify-math 7 MiB.
