@@ -20,7 +20,7 @@ use atl_services_types::permission;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
 use crate::activity::global_configuration;
-use crate::packages::{Packages, Permissions};
+use crate::packages::{PackageTable, Permissions};
 use crate::tasks::Tasks;
 
 /// The name the answers are counted under (`atl_diag::answered`, the app gate's SERVICE_CALLS).
@@ -37,7 +37,7 @@ const USER_CURRENT_OR_SELF: i32 = -3;
 const CURRENT_USER: i32 = 0;
 
 struct LocaleService {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
 }
@@ -91,7 +91,10 @@ impl LocaleService {
         if package == permission::PLATFORM_PACKAGE {
             return Some(permission::SYSTEM_UID);
         }
-        self.packages.visible(caller, package).map(|p| p.uid)
+        self.packages
+            .snapshot()
+            .visible(caller, package)
+            .map(|p| p.uid)
     }
 }
 
@@ -153,7 +156,7 @@ impl ILocaleManager for LocaleService {
 
 /// The `locale` binder, for `addService`.
 pub fn new_binder(
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
 ) -> SpIBinder {

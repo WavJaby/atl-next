@@ -35,7 +35,7 @@ use crate::package_state::{
     COMPONENT_ENABLED_STATE_DEFAULT, COMPONENT_ENABLED_STATE_DISABLED,
     COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED,
 };
-use crate::packages::{GET_META_DATA, PackageRecord, Packages, Permissions};
+use crate::packages::{GET_META_DATA, PackageRecord, PackageTable, Packages, Permissions};
 use crate::shell_command::run_package;
 use atl_services_types::packages::LibraryNode;
 use atl_services_types::permission;
@@ -455,8 +455,21 @@ fn listed<T: Clone>(
     (!out.is_empty()).then_some(out)
 }
 
+/// The record `caller` may see under `name` in `user` (ComputerEngine.getApplicationInfoInternal:997 `!mUserManager.exists(userId) return null`; visibility per Packages::visible). The snapshot is the caller's.
+fn visible<'a>(
+    packages: &'a Packages,
+    caller: u32,
+    name: Option<&str>,
+    user: i32,
+) -> Option<&'a PackageRecord> {
+    if user != USER_SYSTEM {
+        return None;
+    }
+    packages.visible(caller, name?)
+}
+
 pub struct PackageManager {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     /// PackageManagerService.mAvailableFeatures: SystemConfig's features (atl_services_types::system_config), read once at start
     features: Features,
@@ -470,7 +483,7 @@ pub struct PackageManager {
 
 impl PackageManager {
     pub fn new(
-        packages: Arc<Packages>,
+        packages: Arc<PackageTable>,
         permissions: Arc<Permissions>,
         features: Features,
         gl_es_version: i32,
@@ -499,14 +512,6 @@ impl PackageManager {
                 ..FeatureInfo::default()
             }))
             .collect()
-    }
-
-    /// The record `caller` may see under `name` in `user` (ComputerEngine.getApplicationInfoInternal:997 `!mUserManager.exists(userId) return null`; visibility per Packages::visible).
-    fn visible(&self, name: Option<&str>, user: i32) -> Option<&PackageRecord> {
-        if user != USER_SYSTEM {
-            return None;
-        }
-        self.packages.visible(ThreadState::get_calling_uid(), name?)
     }
 
     /// PackageInfoUtils.generate (services, :203-207): the parse's requestedPermissionsFlags (REQUIRED, NEVER_FOR_LOCATION, IMPLICIT) plus REQUESTED_PERMISSION_GRANTED for each one the uid
@@ -546,12 +551,25 @@ impl PackageManager {
         flags: i64,
         user: i32,
     ) -> Vec<ResolveInfo> {
-        query_intent_services(&self.packages, caller, intent, resolved_type, flags, user)
+        let packages = self.packages.snapshot();
+        query_intent_services(&packages, caller, intent, resolved_type, flags, user)
+    }
+
+    /// The getApplicationInfo answer for `caller`: the binder method passes its calling uid, tests pass one (ThreadState needs /dev/binder).
+    fn application_info_for(
+        &self,
+        caller: u32,
+        name: Option<&str>,
+        flags: i64,
+        user: i32,
+    ) -> Option<ApplicationInfo> {
+        let packages = self.packages.snapshot();
+        let p = visible(&packages, caller, name, user)?;
+        Some(application_info(p, &packages, flags))
     }
 
     /// getPackageInfo after the visibility check (PackageInfoCommonUtils.generate over the stored info, cut to `flags`).
-    pub fn package_info(&self, p: &PackageRecord, flags: i64) -> PackageInfo {
-        let packages = &self.packages;
+    pub fn package_info(&self, packages: &Packages, p: &PackageRecord, flags: i64) -> PackageInfo {
         let c = |c: &mut ComponentInfo| cut(p, packages, c, flags).is_some();
         let info = &p.info;
         PackageInfo {
@@ -610,8 +628,9 @@ impl Interface for PackageManager {
     ) -> std::result::Result<i32, binder::StatusCode> {
         let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
         let args: Vec<&str> = args.iter().map(|a| &**a).collect();
+        let packages = self.packages.snapshot();
         Ok(run_package(
-            &self.packages,
+            &packages,
             ThreadState::get_calling_uid(),
             &args,
             out,
@@ -645,7 +664,8 @@ impl IPackageManager for PackageManager {
 
     /// PMS.getPermissionControllerPackageName: the package Packages::permission_controller resolves; null while none is installed (the condition of runtime-permissions P1).
     fn r#getPermissionControllerPackageName(&self) -> binder::Result<Option<String>> {
-        Ok(self.packages.permission_controller().map(str::to_owned))
+        let packages = self.packages.snapshot();
+        Ok(packages.permission_controller().map(str::to_owned))
     }
 
     /// ComputerEngine.getApplicationInfo:986: null for a package the caller may not see or that does not exist.
@@ -655,9 +675,7 @@ impl IPackageManager for PackageManager {
         flags: i64,
         user: i32,
     ) -> binder::Result<Option<ApplicationInfo>> {
-        Ok(self
-            .visible(name, user)
-            .map(|p| application_info(p, &self.packages, flags)))
+        Ok(self.application_info_for(ThreadState::get_calling_uid(), name, flags, user))
     }
 
     /// ComputerEngine.getActivityInfoInternal: null for an unknown user, package or class, or a disabled activity without MATCH_DISABLED_COMPONENTS (ApplicationPackageManager then throws
@@ -671,9 +689,14 @@ impl IPackageManager for PackageManager {
         let Some(c) = component else {
             return Ok(None);
         };
-        Ok(self
-            .visible(Some(&c.package), user)
-            .and_then(|p| find_activity_info(p, &self.packages, &c.class, flags)))
+        let packages = self.packages.snapshot();
+        Ok(visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        )
+        .and_then(|p| find_activity_info(p, &packages, &c.class, flags)))
     }
 
     /// IPackageManagerBase.getPackageInstaller:599: mInstallerService, for every caller (instant apps aside, which do not exist here).
@@ -694,9 +717,16 @@ impl IPackageManager for PackageManager {
         let Some(c) = component else {
             return Ok(None);
         };
-        Ok(self.visible(Some(&c.package), user).and_then(|p| {
+        let packages = self.packages.snapshot();
+        Ok(visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        )
+        .and_then(|p| {
             let mut r = p.receiver(&c.class)?.clone();
-            cut(p, &self.packages, &mut r.component, flags)?;
+            cut(p, &packages, &mut r.component, flags)?;
             Some(r)
         }))
     }
@@ -712,9 +742,16 @@ impl IPackageManager for PackageManager {
         let Some(c) = component else {
             return Ok(None);
         };
-        Ok(self.visible(Some(&c.package), user).and_then(|p| {
-            let mut s = self.packages.service_info(p, &c.class, flags)?;
-            s.component.application_info = application_info(p, &self.packages, flags);
+        let packages = self.packages.snapshot();
+        Ok(visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        )
+        .and_then(|p| {
+            let mut s = packages.service_info(p, &c.class, flags)?;
+            s.component.application_info = application_info(p, &packages, flags);
             Some(s)
         }))
     }
@@ -729,9 +766,16 @@ impl IPackageManager for PackageManager {
         let Some(c) = component else {
             return Ok(None);
         };
-        Ok(self.visible(Some(&c.package), user).and_then(|p| {
+        let packages = self.packages.snapshot();
+        Ok(visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        )
+        .and_then(|p| {
             let mut d = p.provider(&c.class)?.clone();
-            cut(p, &self.packages, &mut d.component, flags)?;
+            cut(p, &packages, &mut d.component, flags)?;
             Some(d)
         }))
     }
@@ -746,8 +790,10 @@ impl IPackageManager for PackageManager {
         let Some(name) = name else {
             return Ok(None);
         };
-        Ok(self.packages.all().iter().find_map(|record| {
-            let p = self.visible(Some(record.name()), user)?;
+        let packages = self.packages.snapshot();
+        let caller = ThreadState::get_calling_uid();
+        Ok(packages.all().iter().find_map(|record| {
+            let p = visible(&packages, caller, Some(record.name()), user)?;
             p.providers()
                 .filter(|d| {
                     d.authority
@@ -756,7 +802,7 @@ impl IPackageManager for PackageManager {
                 })
                 .find_map(|d| {
                     let mut d = d.clone();
-                    cut(p, &self.packages, &mut d.component, flags).map(|()| d)
+                    cut(p, &packages, &mut d.component, flags).map(|()| d)
                 })
         }))
     }
@@ -768,9 +814,11 @@ impl IPackageManager for PackageManager {
         flags: i64,
         user: i32,
     ) -> binder::Result<Option<PackageInfo>> {
-        Ok(self
-            .visible(name, user)
-            .map(|p| self.package_info(p, flags)))
+        let packages = self.packages.snapshot();
+        Ok(
+            visible(&packages, ThreadState::get_calling_uid(), name, user)
+                .map(|p| self.package_info(&packages, p, flags)),
+        )
     }
 
     /// PackageManagerService.hasSystemFeature:2954: true when mAvailableFeatures holds `name` at >= `version`; a null name is in no map.
@@ -824,8 +872,9 @@ impl IPackageManager for PackageManager {
             ));
         };
         let caller = ThreadState::get_calling_uid();
+        let packages = self.packages.snapshot();
         let found = query_intent(
-            &self.packages,
+            &packages,
             caller,
             intent,
             resolved_type,
@@ -853,8 +902,9 @@ impl IPackageManager for PackageManager {
             ));
         };
         let caller = ThreadState::get_calling_uid();
+        let packages = self.packages.snapshot();
         Ok(resolve_activity(
-            &self.packages,
+            &packages,
             caller,
             intent,
             resolved_type,
@@ -874,8 +924,8 @@ impl IPackageManager for PackageManager {
         {
             return Ok(None);
         }
-        let names: Vec<Option<String>> = self
-            .packages
+        let packages = self.packages.snapshot();
+        let names: Vec<Option<String>> = packages
             .by_app_id(permission::app_id(uid))
             .map(|p| Some(p.name().to_owned()))
             .collect();
@@ -891,8 +941,9 @@ impl IPackageManager for PackageManager {
         _isa: Option<&str>,
     ) -> binder::Result<()> {
         let caller = ThreadState::get_calling_uid();
+        let packages = self.packages.snapshot();
         let own = package
-            .and_then(|n| self.packages.by_name(n))
+            .and_then(|n| packages.by_name(n))
             .is_some_and(|p| permission::app_id(p.uid) == permission::app_id(caller));
         if !(permission::is_system_or_root(caller) || own) {
             let _ = writeln!(
@@ -916,11 +967,12 @@ impl IPackageManager for PackageManager {
         let list: Vec<PackageInfo> = if user != USER_SYSTEM {
             Vec::new()
         } else {
-            self.packages
+            let packages = self.packages.snapshot();
+            packages
                 .all()
                 .iter()
-                .filter(|p| self.packages.visible(caller, p.name()).is_some())
-                .map(|p| self.package_info(p, flags))
+                .filter(|p| packages.visible(caller, p.name()).is_some())
+                .map(|p| self.package_info(&packages, p, flags))
                 .collect()
         };
         Ok(Some(ParceledListSlice::new(list)))
@@ -940,7 +992,13 @@ impl IPackageManager for PackageManager {
                 Some("getInstrumentationInfoAsUser: null component"),
             ));
         };
-        let Some(p) = self.visible(Some(&c.package), user) else {
+        let packages = self.packages.snapshot();
+        let Some(p) = visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        ) else {
             return Ok(None);
         };
         Ok(p.instrumentation()
@@ -959,12 +1017,13 @@ impl IPackageManager for PackageManager {
         let instrumentation: Vec<InstrumentationInfo> = if user != USER_SYSTEM {
             Vec::new()
         } else {
-            self.packages
+            let packages = self.packages.snapshot();
+            packages
                 .all_instrumentation()
                 .filter(|(_, i)| {
                     target_package.is_none_or(|t| Some(t) == i.target_package.as_deref())
                 })
-                .filter(|(p, _)| self.packages.visible(caller, p.name()).is_some())
+                .filter(|(p, _)| packages.visible(caller, p.name()).is_some())
                 .map(|(_, i)| i.clone())
                 .collect()
         };
@@ -979,7 +1038,12 @@ impl IPackageManager for PackageManager {
         pkg2: Option<&str>,
         user: i32,
     ) -> binder::Result<i32> {
-        let (Some(p1), Some(p2)) = (self.visible(pkg1, user), self.visible(pkg2, user)) else {
+        let packages = self.packages.snapshot();
+        let caller = ThreadState::get_calling_uid();
+        let (Some(p1), Some(p2)) = (
+            visible(&packages, caller, pkg1, user),
+            visible(&packages, caller, pkg2, user),
+        ) else {
             return Ok(SIGNATURE_UNKNOWN_PACKAGE);
         };
         Ok(check_signatures(
@@ -993,7 +1057,8 @@ impl IPackageManager for PackageManager {
     fn r#getInstallerPackageName(&self, name: Option<&str>) -> binder::Result<Option<String>> {
         let uid = ThreadState::get_calling_uid();
         let user = i32::try_from(permission::user_id(uid)).unwrap_or(i32::MAX);
-        if self.visible(name, user).is_none() {
+        let packages = self.packages.snapshot();
+        if visible(&packages, uid, name, user).is_none() {
             return Err(Status::new_exception_str(
                 ExceptionCode::ILLEGAL_ARGUMENT,
                 Some(format!("Unknown package: {}", name.unwrap_or_default())),
@@ -1009,9 +1074,11 @@ impl IPackageManager for PackageManager {
         name: Option<&str>,
         user: i32,
     ) -> binder::Result<Option<InstallSourceInfo>> {
-        Ok(self
-            .visible(name, user)
-            .map(|_| InstallSourceInfo::default()))
+        let packages = self.packages.snapshot();
+        Ok(
+            visible(&packages, ThreadState::get_calling_uid(), name, user)
+                .map(|_| InstallSourceInfo::default()),
+        )
     }
 
     /// PMS.requestChecksumsInternal:1372: NameNotFound for a package the caller may not see, else ApkChecksums.getChecksums over the APK files delivers through the (oneway) listener. Answered
@@ -1033,7 +1100,8 @@ impl IPackageManager for PackageManager {
                 Some("requestPackageChecksums: null listener".to_owned()),
             ));
         };
-        if self.visible(name, user).is_none() {
+        let packages = self.packages.snapshot();
+        if visible(&packages, ThreadState::get_calling_uid(), name, user).is_none() {
             // AOSP: ParcelableException(NameNotFoundException), rethrown as NameNotFoundException by ApplicationPackageManager; no EX_PARCELABLE writer here, so the nearest checked failure
             atl_diag::count(
                 atl_diag::DIVERGENCE,
@@ -1102,13 +1170,21 @@ impl IPackageManager for PackageManager {
         if user != USER_SYSTEM {
             return Ok(COMPONENT_ENABLED_STATE_DISABLED);
         }
-        if self.visible(Some(&c.package), user).is_none() {
+        let packages = self.packages.snapshot();
+        if visible(
+            &packages,
+            ThreadState::get_calling_uid(),
+            Some(&c.package),
+            user,
+        )
+        .is_none()
+        {
             return Err(illegal_argument(format!(
                 "Unknown component: {}",
                 component_string(c)
             )));
         }
-        Ok(self.packages.user_state().component(&c.package, &c.class))
+        Ok(packages.user_state().component(&c.package, &c.class))
     }
 
     /// ComputerEngine.getApplicationEnabledSetting:5268: DISABLED for a user that does not exist, IllegalArgumentException "Unknown package: ..." for a package the caller may not see, else the app
@@ -1117,7 +1193,8 @@ impl IPackageManager for PackageManager {
         if user != USER_SYSTEM {
             return Ok(COMPONENT_ENABLED_STATE_DISABLED);
         }
-        if self.visible(name, user).is_none() {
+        let packages = self.packages.snapshot();
+        if visible(&packages, ThreadState::get_calling_uid(), name, user).is_none() {
             return Err(illegal_argument(format!(
                 "Unknown package: {}",
                 name.unwrap_or("null")
@@ -1275,10 +1352,11 @@ impl PackageManager {
                 "Invalid new component state: {new_state}"
             )));
         }
+        let packages = self.packages.snapshot();
         let allowed_by_permission = self
             .permissions
             .check(uid, Some(permission::CHANGE_COMPONENT_ENABLED_STATE));
-        let own = self.packages.is_same_app(&c.package, uid);
+        let own = packages.is_same_app(&c.package, uid);
         if !own && !allowed_by_permission {
             return Err(Status::new_exception_str(
                 ExceptionCode::SECURITY,
@@ -1288,7 +1366,7 @@ impl PackageManager {
                 )),
             ));
         }
-        let Some(p) = self.packages.visible(uid, &c.package) else {
+        let Some(p) = packages.visible(uid, &c.package) else {
             return Err(illegal_argument(format!(
                 "Unknown component: {}",
                 component_string(c)
@@ -1313,7 +1391,7 @@ impl PackageManager {
             ));
             return Ok(());
         }
-        let state = self.packages.user_state();
+        let state = packages.user_state();
         if !state.set_component(&c.package, &c.class, new_state) {
             atl_diag::answered("IPackageManager", "setComponentEnabledSetting (unchanged)");
             return Ok(());
@@ -1366,7 +1444,7 @@ impl ComponentChanges {
 
     /// mPendingBroadcasts.addComponent, then SEND_PENDING_BROADCAST unless one is on its way: after BROADCAST_DELAY, or BROADCAST_DELAY_DURING_STARTUP in PMS's first minute. The send is
     /// sendPendingBroadcasts: each package's names in one broadcast with DONT_KILL_APP true.
-    fn add_pending(&self, packages: &Arc<Packages>, p: &PackageRecord, class: &str) {
+    fn add_pending(&self, packages: &Arc<PackageTable>, p: &PackageRecord, class: &str) {
         {
             let mut pending = self.pending();
             let names = pending.packages.entry(p.name().to_owned()).or_default();
@@ -1396,6 +1474,8 @@ impl ComponentChanges {
                     p.scheduled = false;
                     std::mem::take(&mut p.packages)
                 };
+                // the list as it is when the broadcast goes, not when it was queued
+                let packages = packages.snapshot();
                 for (name, components) in due {
                     // a package gone since (none is removed while the services run) has nothing to tell
                     if let Some(p) = packages.by_name(&name) {
@@ -1573,9 +1653,13 @@ mod tests {
         b.uid = 10_002;
         b.info.services = Some(vec![service("b", "b.Sync", true)]);
         b.intents = vec![intents("b.Sync", 7)];
-        let packages = Arc::new(Packages::new(vec![a, b], BTreeMap::new()));
+        let table = Arc::new(PackageTable::new(Packages::new(
+            vec![a, b],
+            BTreeMap::new(),
+        )));
+        let packages = table.snapshot();
         let pm = PackageManager::new(
-            Arc::clone(&packages),
+            Arc::clone(&table),
             Arc::new(Permissions::new(&packages, &[])),
             Features::default(),
             0,
@@ -1742,17 +1826,18 @@ mod tests {
     /// PackageInfoCommonUtils.generate: activities only with GET_ACTIVITIES, disabled ones dropped without MATCH_DISABLED_COMPONENTS.
     #[test]
     fn package_info_lists_follow_the_flags() {
-        let packages = Arc::new(packages());
+        let table = Arc::new(PackageTable::new(packages()));
+        let packages = table.snapshot();
         let pm = PackageManager::new(
-            Arc::clone(&packages),
+            Arc::clone(&table),
             Arc::new(Permissions::new(&packages, &[])),
             Features::default(),
             0,
         );
         let p = packages.by_name("a").expect("a");
-        assert!(pm.package_info(p, 0).activities.is_none());
+        assert!(pm.package_info(&packages, p, 0).activities.is_none());
         let names = |flags| -> Vec<String> {
-            pm.package_info(p, flags)
+            pm.package_info(&packages, p, flags)
                 .activities
                 .into_iter()
                 .flatten()
@@ -1777,7 +1862,8 @@ mod tests {
         r.info.requested_permissions =
             Some(vec![Some(INTERNET.into()), Some(POST_NOTIFICATIONS.into())]);
         r.info.requested_permissions_flags = Some(vec![1, 1]);
-        let packages = Arc::new(Packages::new(vec![r], BTreeMap::new()));
+        let table = Arc::new(PackageTable::new(Packages::new(vec![r], BTreeMap::new())));
+        let packages = table.snapshot();
         let platform =
             [(INTERNET, 0x0), (POST_NOTIFICATIONS, 0x1)].map(|(name, level)| PermissionDecl {
                 name: name.into(),
@@ -1785,15 +1871,18 @@ mod tests {
             });
         let permissions = Arc::new(Permissions::new(&packages, &platform));
         let pm = PackageManager::new(
-            Arc::clone(&packages),
+            Arc::clone(&table),
             Arc::clone(&permissions),
             Features::default(),
             0,
         );
         let p = packages.by_name("g").expect("g");
-        assert_eq!(pm.package_info(p, 0).requested_permissions_flags, None);
         assert_eq!(
-            pm.package_info(p, GET_PERMISSIONS)
+            pm.package_info(&packages, p, 0).requested_permissions_flags,
+            None
+        );
+        assert_eq!(
+            pm.package_info(&packages, p, GET_PERMISSIONS)
                 .requested_permissions_flags,
             Some(vec![3, 1])
         );
@@ -1801,7 +1890,7 @@ mod tests {
             .grant_runtime(p, POST_NOTIFICATIONS)
             .expect("grant");
         assert_eq!(
-            pm.package_info(p, GET_PERMISSIONS)
+            pm.package_info(&packages, p, GET_PERMISSIONS)
                 .requested_permissions_flags,
             Some(vec![3, 3])
         );
@@ -1861,13 +1950,14 @@ mod tests {
     /// hasSystemFeature compares versions; getSystemAvailableFeatures lists the features, then the GL ES entry with no name (PackageManagerService :2954, :5398).
     #[test]
     fn features_answer_as_package_manager_service() {
-        let packages = Arc::new(packages());
+        let table = Arc::new(PackageTable::new(packages()));
+        let packages = table.snapshot();
         let features = Features::from_texts([
             r#"<permissions><feature name="android.hardware.touchscreen" /><feature name="v.level" version="1" /></permissions>"#,
         ])
         .expect("features");
         let pm = PackageManager::new(
-            Arc::clone(&packages),
+            Arc::clone(&table),
             Arc::new(Permissions::new(&packages, &[])),
             features,
             0x30002,
@@ -1916,7 +2006,7 @@ mod tests {
     }
 
     /// Package `a` (uid 10 001): receiver `a.R` (exported=false), receiver `a.Pub` (exported), receiver `a.Off` (`android:enabled="false"`); package `b` (uid 10 002) apart.
-    fn state_packages() -> Arc<Packages> {
+    fn state_packages() -> Arc<PackageTable> {
         let mut a = record("a");
         let receiver = |class: &str, exported: bool, enabled: bool| {
             let mut r = activity("a", class);
@@ -1931,19 +2021,41 @@ mod tests {
         ]);
         let mut b = record("b");
         b.uid = 10_002;
-        Arc::new(Packages::new(vec![a, b], BTreeMap::new()))
+        Arc::new(PackageTable::new(Packages::new(
+            vec![a, b],
+            BTreeMap::new(),
+        )))
     }
 
-    fn manager(packages: &Arc<Packages>) -> (PackageManager, Arc<Recorded>) {
+    fn manager(table: &Arc<PackageTable>) -> (PackageManager, Arc<Recorded>) {
         let events = Arc::new(Recorded::default());
         let pm = PackageManager::new(
-            Arc::clone(packages),
-            Arc::new(Permissions::new(packages, &[])),
+            Arc::clone(table),
+            Arc::new(Permissions::new(&table.snapshot(), &[])),
             Features::default(),
             0,
         )
         .with_events(events.clone());
         (pm, events)
+    }
+
+    /// A PackageManager built before a publish answers the new package: it reads the table per call, not the list it had at its constructor.
+    #[test]
+    fn manager_built_before_publish_answers_the_new_package() {
+        let table = Arc::new(PackageTable::new(Packages::new(
+            vec![record("a")],
+            BTreeMap::new(),
+        )));
+        let (pm, _events) = manager(&table);
+        table.publish(
+            Packages::new(vec![record("a"), record("b")], BTreeMap::new())
+                .with_user_state_arc(table.user_state_arc()),
+        );
+        let answer = pm.application_info_for(permission::SYSTEM_UID, Some("b"), 0, USER_SYSTEM);
+        assert_eq!(
+            answer.and_then(|a| a.item.package_name).as_deref(),
+            Some("b")
+        );
     }
 
     fn name(package: &str, class: &str) -> ComponentName {
@@ -1993,7 +2105,7 @@ mod tests {
             )),
             Some(ExceptionCode::ILLEGAL_ARGUMENT)
         );
-        assert!(packages.user_state().is_empty());
+        assert!(packages.snapshot().user_state().is_empty());
         assert!(events.sends.lock().expect("sends").is_empty());
     }
 
@@ -2004,11 +2116,12 @@ mod tests {
     fn set_component_changes_resolution() {
         let packages = state_packages();
         let (pm, events) = manager(&packages);
-        let p = packages.by_name("a").expect("a");
+        let list = packages.snapshot();
+        let p = list.by_name("a").expect("a");
         let receiver = |class: &str, flags: i64| {
             p.receiver(class)
                 .cloned()
-                .filter(|r| packages.answer(&mut r.component.clone(), flags))
+                .filter(|r| list.answer(&mut r.component.clone(), flags))
                 .is_some()
         };
         let set = |c: &str, state, flags| {
@@ -2017,7 +2130,7 @@ mod tests {
         assert!(receiver("a.R", 0) && !receiver("a.Off", 0));
         set("a.R", COMPONENT_ENABLED_STATE_DISABLED, 0).expect("disable");
         assert_eq!(
-            packages.user_state().component("a", "a.R"),
+            list.user_state().component("a", "a.R"),
             COMPONENT_ENABLED_STATE_DISABLED
         );
         assert!(!receiver("a.R", 0));
@@ -2047,7 +2160,8 @@ mod tests {
     fn package_changed_intents() {
         use atl_parcelables::codecs::android::os::Bundle::Value;
         let packages = state_packages();
-        let p = packages.by_name("a").expect("a");
+        let list = packages.snapshot();
+        let p = list.by_name("a").expect("a");
         let sends = package_changed_sends(p, &["a.R".to_owned(), "a.Pub".to_owned()], true);
         assert_eq!(sends.len(), 2);
         let (own, uid) = &sends[0];

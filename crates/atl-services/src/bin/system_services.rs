@@ -26,7 +26,7 @@ use atl_services::install;
 use atl_services::key_attestation;
 use atl_services::package::PackageManager;
 use atl_services::package_state::PackageUserStates;
-use atl_services::packages::{PackageRecord, Packages, Permissions};
+use atl_services::packages::{PackageRecord, PackageTable, Packages, Permissions};
 use atl_services::process_control::ControlSocket;
 use atl_services::ui_agents::UiAgents;
 use atl_services_types::compositor_registry;
@@ -330,9 +330,9 @@ fn main() -> Result<()> {
         )?;
     }
     let packages = packages.with_user_state(state);
-    let packages = Arc::new(packages);
+    let table = Arc::new(PackageTable::new(packages));
     // the permission states every service checks callers against: framework-res's definitions first, then the packages' (permission::initial_states, then runtime grants)
-    let permissions = Arc::new(Permissions::new(&packages, &platform.permissions));
+    let permissions = Arc::new(Permissions::new(&table.snapshot(), &platform.permissions));
     ProcessState::start_thread_pool();
     // the UI agents the registry takes in REGISTER, read by the window service at each window's first relayout
     let agents = Arc::new(UiAgents::default());
@@ -347,11 +347,11 @@ fn main() -> Result<()> {
     let notices = Arc::new(atl_services::notification::Notices::new(
         Arc::clone(&tasks),
         Arc::clone(&permissions),
-        packages.clone(),
+        Arc::clone(&table),
         desktop,
     ));
     let activity = ActivityManager::new(
-        packages.clone(),
+        Arc::clone(&table),
         Arc::clone(&permissions),
         control,
         Arc::clone(&tasks),
@@ -366,7 +366,7 @@ fn main() -> Result<()> {
         a.hw_timeouts,
     );
     if let Some(package) = &a.launch
-        && packages.by_name(package).is_none()
+        && table.snapshot().by_name(package).is_none()
     {
         bail!("--launch {package}: not an installed package");
     }
@@ -400,20 +400,26 @@ fn main() -> Result<()> {
             .join(" ")
     )?;
     // component-state changes broadcast PACKAGE_CHANGED and stop the package through the activity manager, as PMS does through AMS
-    let manager = PackageManager::new(packages.clone(), Arc::clone(&permissions), features, gl_es)
-        .with_events(Arc::new(activity.clone()));
-    let webview_package = match atl_services::webview_update::current_package(&packages, &manager) {
-        Ok(p) => p,
-        Err(why) => {
-            writeln!(std::io::stderr(), "services: webviewupdate: {why}")?;
-            None
-        }
-    };
+    let manager = PackageManager::new(
+        Arc::clone(&table),
+        Arc::clone(&permissions),
+        features,
+        gl_es,
+    )
+    .with_events(Arc::new(activity.clone()));
+    let webview_package =
+        match atl_services::webview_update::current_package(&table.snapshot(), &manager) {
+            Ok(p) => p,
+            Err(why) => {
+                writeln!(std::io::stderr(), "services: webviewupdate: {why}")?;
+                None
+            }
+        };
     let pm = BnPackageManager::new_binder(manager, BinderFeatures::default());
     binder::add_service(PACKAGE, pm.as_binder()).context("addService package")?;
     binder::add_service(
         KEY_ATTESTATION_APP_ID,
-        key_attestation::new_binder(Arc::clone(&packages)),
+        key_attestation::new_binder(Arc::clone(&table)),
     )
     .context("addService sec_key_att_app_id_provider")?;
     let focus = Arc::new(atl_services::focus::FocusedProcess::default());
@@ -522,7 +528,7 @@ fn main() -> Result<()> {
         binder::add_service(
             LOCALE,
             atl_services::locale::new_binder(
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 Arc::clone(&permissions),
                 Arc::clone(&tasks),
             ),
@@ -538,7 +544,7 @@ fn main() -> Result<()> {
         binder::add_service(
             TELEPHONY_REGISTRY,
             atl_services::telephony_registry::new_binder(
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 Arc::clone(&permissions),
             ),
         )
@@ -548,7 +554,7 @@ fn main() -> Result<()> {
     if !a.omit_service.iter().any(|s| s == ACCOUNT) {
         binder::add_service(
             ACCOUNT,
-            atl_services::account::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
+            atl_services::account::new_binder(Arc::clone(&table), Arc::clone(&permissions)),
         )
         .context("addService account")?;
     }
@@ -572,7 +578,7 @@ fn main() -> Result<()> {
         binder::add_service(
             SHORTCUT,
             atl_services::shortcut::new_binder(
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 Arc::clone(&permissions),
                 Arc::clone(&tasks),
                 Arc::clone(&uid_views),
@@ -613,7 +619,7 @@ fn main() -> Result<()> {
             APP_OPS,
             atl_services::appops::new_binder(
                 Arc::clone(&permissions),
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 uid_views,
             ),
         )
@@ -630,7 +636,7 @@ fn main() -> Result<()> {
         binder::add_service(
             PERMISSION_MANAGER,
             atl_services::permission_manager::new_binder(
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 Arc::clone(&permissions),
             ),
         )
@@ -644,14 +650,14 @@ fn main() -> Result<()> {
     binder::add_service(NOTIFICATION, notices.binder()).context("addService notification")?;
     binder::add_service(
         ALARM,
-        atl_services::alarm::new_binder(Arc::clone(&packages), Arc::clone(&permissions)),
+        atl_services::alarm::new_binder(Arc::clone(&table), Arc::clone(&permissions)),
     )
     .context("addService alarm")?;
     if !a.omit_service.iter().any(|s| s == JOB_SCHEDULER) {
         binder::add_service(
             JOB_SCHEDULER,
             atl_services::job_scheduler::new_binder(
-                Arc::clone(&packages),
+                Arc::clone(&table),
                 Arc::clone(&permissions),
                 (!a.no_job_runner).then(|| activity.clone()),
             ),

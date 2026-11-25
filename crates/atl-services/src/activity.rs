@@ -69,7 +69,7 @@ pub use crate::desktop_bounds::OrientationReshape;
 use crate::desktop_bounds::{self, ActivityInput, reshaped_size};
 use crate::memory_levels;
 use crate::package;
-use crate::packages::{PackageRecord, Packages, Permissions};
+use crate::packages::{PackageRecord, PackageTable, Packages, Permissions};
 use crate::pattern_matcher;
 use crate::pending_intent::{self, IntentSink, PendingIntents};
 use crate::pending_intent_table::Key;
@@ -793,7 +793,7 @@ impl IntentSink for IntentRoute {
 }
 
 struct Inner {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     control: Arc<dyn ProcessControl>,
     /// `ro.hw_timeout_multiplier`: scales the process-start timer here and the broadcast timers in the dispatcher (hw_timeouts.rs)
@@ -933,7 +933,7 @@ impl ActivityManager {
     /// break `--no-bind-service`: every bindService answers 0. `hw`: the multiplier of the process-start and broadcast timers ([`HwTimeouts`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        packages: Arc<Packages>,
+        packages: Arc<PackageTable>,
         permissions: Arc<Permissions>,
         control: Arc<dyn ProcessControl>,
         tasks: Arc<Tasks<SpIBinder>>,
@@ -1007,12 +1007,11 @@ impl ActivityManager {
     /// Starts the process of `package`'s launcher activity, which launches once the process has attached: what ActivityTaskManager does for a MAIN / LAUNCHER start (startActivity is not
     /// implemented, so atl-system-services calls this for its `--launch` package, the stand-in for the home screen's tap).
     pub fn start_launcher(&self, package: &str) -> Result<(), String> {
-        let p = self
-            .inner
-            .packages
+        let packages = self.inner.packages.snapshot();
+        let p = packages
             .by_name(package)
             .ok_or_else(|| format!("no package {package}"))?;
-        if self.inner.packages.launcher(p).is_none() {
+        if packages.launcher(p).is_none() {
             return Err(format!("{package} has no launcher activity"));
         }
         let mut st = self.inner.state();
@@ -1047,9 +1046,10 @@ impl ActivityManager {
         flags: i32,
         component: Option<(&str, &str)>,
     ) -> Result<i32, Status> {
-        let p = component.and_then(|(package, _)| self.inner.packages.by_name(package));
+        let packages = self.inner.packages.snapshot();
+        let p = component.and_then(|(package, _)| packages.by_name(package));
         let launcher = p
-            .and_then(|p| self.inner.packages.launcher(p))
+            .and_then(|p| packages.launcher(p))
             .and_then(|a| a.component.item.name.as_deref());
         let mut st = self.inner.state();
         let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name()));
@@ -1511,6 +1511,7 @@ impl Inner {
     /// The launch ActivityTaskManager makes for an attached process started with one (realStartActivityLocked): its Task's launcher record pushed and sent (activity_task.rs). No lock held; a
     /// process that died or launched meanwhile is a no-op.
     fn launch_attached(&self, start_seq: i64) {
+        let packages = self.packages.snapshot();
         let st = self.state();
         let Some(rec) = st
             .processes
@@ -1526,8 +1527,8 @@ impl Inner {
         };
         let (pid, uid, package) = (rec.pid, rec.uid, rec.package.clone());
         drop(st);
-        if let Some(p) = self.packages.by_name(&package)
-            && let Some(activity) = self.packages.launcher(p)
+        if let Some(p) = packages.by_name(&package)
+            && let Some(activity) = packages.launcher(p)
         {
             // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app was bound with its Task's configuration (bind_configuration).
             self.atm
@@ -1600,7 +1601,8 @@ impl Inner {
 
     /// The package's manifest FLAG_PERSISTENT: its processes are never ended by the empty rule.
     fn persistent_app(&self, package: &str) -> bool {
-        self.packages
+        let packages = self.packages.snapshot();
+        packages
             .by_name(package)
             .is_some_and(|p| p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK)
     }
@@ -1694,14 +1696,11 @@ impl Inner {
             rights: atl_broker::rights_of(self.permissions.granted_names(p.uid).as_slice()),
         })?;
         // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
-        let task = self
-            .packages
-            .launcher(p)
-            .filter(|_| launch_activity)
-            .map(|a| {
-                let size = self.tasks.opening_size(&crate::packages::bounds_input(a));
-                self.tasks.new_task(p.uid, p.name(), size)
-            });
+        let packages = self.packages.snapshot();
+        let task = packages.launcher(p).filter(|_| launch_activity).map(|a| {
+            let size = self.tasks.opening_size(&crate::packages::bounds_input(a));
+            self.tasks.new_task(p.uid, p.name(), size)
+        });
         let now = self.now_ms();
         if let Some(task) = task {
             st.open_tasks.insert(task, p.uid);
@@ -1743,7 +1742,8 @@ impl Inner {
         caller_uid: u32,
         authority: &str,
     ) -> binder::Result<Option<ContentProviderHolder>> {
-        let Some((p, info)) = resolve_provider(&self.packages, authority) else {
+        let packages = self.packages.snapshot();
+        let Some((p, info)) = resolve_provider(&packages, authority) else {
             return Ok(None);
         };
         // checkContentProviderPermission's first rule: an unexported provider serves its own uid only (ContentProviderHelper :1186-1192)
@@ -2072,7 +2072,8 @@ impl Inner {
         else {
             return (None, false);
         };
-        let persistent = self.packages.by_name(&rec.package).is_some_and(|p| {
+        let packages = self.packages.snapshot();
+        let persistent = packages.by_name(&rec.package).is_some_and(|p| {
             p.app().flags & PERSISTENT_MASK == PERSISTENT_MASK
                 && permission::user_id(rec.uid) == 0
                 && p.process_name() == rec.process_name
@@ -2301,7 +2302,8 @@ impl IActivityManager for ActivityManager {
             inner.kill(&[pid]);
             return Ok(());
         };
-        let Some(p) = inner.packages.by_name(&st.processes[i].package) else {
+        let packages = inner.packages.snapshot();
+        let Some(p) = packages.by_name(&st.processes[i].package) else {
             log(format_args!(
                 "pending start {start_seq}: no package {}",
                 st.processes[i].package
@@ -2330,12 +2332,11 @@ impl IActivityManager for ActivityManager {
         // :4690 `appInfo = instr != null ? instr.mTargetInfo : app.info`
         let instr = st.processes[i].instr.as_ref();
         let info = match instr {
-            Some(instr) => inner
-                .packages
+            Some(instr) => packages
                 .by_name(&instr.target_package)
-                .map(|t| package::application_info(t, &inner.packages, package::STOCK_PM_FLAGS))
+                .map(|t| package::application_info(t, &packages, package::STOCK_PM_FLAGS))
                 .ok_or_else(|| illegal_state("instrumentation target vanished"))?,
-            None => package::application_info(p, &inner.packages, package::STOCK_PM_FLAGS),
+            None => package::application_info(p, &packages, package::STOCK_PM_FLAGS),
         };
         // AppDeathRecipient (:4600): the record leaves the table when the process's binder dies
         let weak = Arc::downgrade(inner);
@@ -2368,15 +2369,10 @@ impl IActivityManager for ActivityManager {
             None => (None, None, None, None),
         };
         let providers = ProviderInfoList {
-            list: package::process_providers(
-                p,
-                &inner.packages,
-                &process_name,
-                package::STOCK_PM_FLAGS,
-            )
-            .into_iter()
-            .map(Some)
-            .collect(),
+            list: package::process_providers(p, &packages, &process_name, package::STOCK_PM_FLAGS)
+                .into_iter()
+                .map(Some)
+                .collect(),
         };
         thread.r#bindApplication(
             Some(&process_name),
@@ -2726,9 +2722,8 @@ impl IActivityManager for ActivityManager {
         };
         let uid = ThreadState::get_calling_uid();
         if let Some(pkg) = calling_package {
-            let owns = self
-                .inner
-                .packages
+            let packages = self.inner.packages.snapshot();
+            let owns = packages
                 .by_name(pkg)
                 .is_some_and(|p| permission::app_id(p.uid) == permission::app_id(uid));
             if !owns && !permission::is_system_or_root(uid) {
@@ -2883,9 +2878,8 @@ impl IActivityManager for ActivityManager {
 
         let mut st = inner.state();
         // :14472-14486 getInstrumentationInfoAsUser, getApplicationInfo of its target
-        let Some((_, decl)) = inner
-            .packages
-            .instrumentation(&class_name.package, &class_name.class)
+        let packages = inner.packages.snapshot();
+        let Some((_, decl)) = packages.instrumentation(&class_name.package, &class_name.class)
         else {
             inner.report_start_failure(
                 watcher,
@@ -2898,7 +2892,7 @@ impl IActivityManager for ActivityManager {
             return Ok(false);
         };
         let target_package = decl.target_package.as_deref().unwrap_or_default();
-        let Some(target) = inner.packages.by_name(target_package) else {
+        let Some(target) = packages.by_name(target_package) else {
             inner.report_start_failure(
                 watcher,
                 class_name,
@@ -2917,8 +2911,7 @@ impl IActivityManager for ActivityManager {
                 "Permission Denial: instrumentation test {}/{} from pid={calling_pid}, uid={calling_uid}, pkgName={} not allowed because it's not started from SHELL",
                 class_name.package,
                 class_name.class,
-                inner
-                    .packages
+                packages
                     .by_app_id(permission::app_id(calling_uid))
                     .next()
                     .map_or("null", |p| p.name())
@@ -3062,8 +3055,8 @@ impl IActivityManager for ActivityManager {
             }
         }
         let package = package.unwrap_or_default();
-        let owned =
-            permission::is_system_or_root(uid) || self.inner.packages.is_same_app(package, uid);
+        let packages = self.inner.packages.snapshot();
+        let owned = permission::is_system_or_root(uid) || packages.is_same_app(package, uid);
         if !owned {
             return Err(security(&format!(
                 "Permission Denial: getIntentSender() from uid={uid} is not allowed to send as package {package}"
@@ -3316,8 +3309,8 @@ impl IActivityManager for ActivityManager {
                 Some("registerReceiver: null IntentFilter"),
             ));
         };
-        let target_sdk = inner
-            .packages
+        let packages = inner.packages.snapshot();
+        let target_sdk = packages
             .by_name(&package)
             .map_or(0, |p| p.app().target_sdk_version);
         let priority = filter.priority;
@@ -3326,7 +3319,7 @@ impl IActivityManager for ActivityManager {
             && filter
                 .actions
                 .iter()
-                .all(|a| inner.packages.is_protected_broadcast(Some(a)));
+                .all(|a| packages.is_protected_broadcast(Some(a)));
         let exported = broadcast::register_export(
             flags,
             receiver.is_some(),
@@ -3752,8 +3745,11 @@ mod tests {
 
     /// An empty manager whose processes go through `control`.
     fn manager_with(control: Arc<dyn ProcessControl>) -> ActivityManager {
-        let packages = Arc::new(Packages::new(Vec::new(), Default::default()));
-        let permissions = Arc::new(Permissions::new(&packages, &[]));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            Vec::new(),
+            Default::default(),
+        )));
+        let permissions = Arc::new(Permissions::new(&packages.snapshot(), &[]));
         ActivityManager::new(
             packages,
             permissions,
@@ -3969,8 +3965,11 @@ mod tests {
             authority: Some(PROVIDER_AUTHORITY.to_owned()),
             ..Default::default()
         })]);
-        let packages = Arc::new(Packages::new(vec![package], Default::default()));
-        let permissions = Arc::new(Permissions::new(&packages, &[]));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![package],
+            Default::default(),
+        )));
+        let permissions = Arc::new(Permissions::new(&packages.snapshot(), &[]));
         ActivityManager::new(
             packages,
             permissions,

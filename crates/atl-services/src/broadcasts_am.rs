@@ -155,12 +155,12 @@ impl Inner {
         f: impl FnOnce(&mut Dispatch, &mut Policy<'_, ReceiverHandle>) -> T,
     ) -> T {
         let now = self.now_ms();
-        let packages = &self.packages;
+        let packages = self.packages.snapshot();
         let State {
             dispatcher, uids, ..
         } = st;
         let uids: &uid_state::Uids = uids;
-        let mut policy = |facts: &Facts, r: &Recv| dispatch_skip(packages, uids, now, facts, r);
+        let mut policy = |facts: &Facts, r: &Recv| dispatch_skip(&packages, uids, now, facts, r);
         f(dispatcher, &mut policy)
     }
 
@@ -277,6 +277,7 @@ impl Inner {
         &self,
         job: bd::Job<ReceiverHandle, Bundle, Payload>,
     ) -> Option<broadcast_queue::Job> {
+        let packages = self.packages.snapshot();
         let (result_code, data, extras) = (job.result.code, job.result.data, job.result.extras);
         match job.receiver {
             Target::Registered(ReceiverHandle::Binder(receiver)) => {
@@ -298,7 +299,7 @@ impl Inner {
                 None
             }
             Target::Manifest(component) => {
-                let Some(p) = self.packages.by_name(&component.package) else {
+                let Some(p) = packages.by_name(&component.package) else {
                     atl_diag::answered(AM, "broadcast dropped: receiver package is gone");
                     return None;
                 };
@@ -307,7 +308,7 @@ impl Inner {
                     return None;
                 };
                 // the stored receiver for STOCK_PM_FLAGS (ComputerEngine.queryIntentReceivers' ResolveInfo.activityInfo)
-                let info = package::activity_info(p, &self.packages, decl, package::STOCK_PM_FLAGS);
+                let info = package::activity_info(p, &packages, decl, package::STOCK_PM_FLAGS);
                 // the receiver's Intent carries its component (BroadcastRecord.getReceiverIntent: setComponent for a ResolveInfo)
                 let mut intent = job.payload.intent;
                 intent.component = Some(ComponentName {
@@ -402,7 +403,8 @@ impl Inner {
         sender_uid: u32,
         required: &[String],
     ) -> Option<Recv> {
-        let Some(p) = self.packages.by_name(package) else {
+        let packages = self.packages.snapshot();
+        let Some(p) = packages.by_name(package) else {
             atl_diag::answered(
                 AM,
                 "broadcast to a component of an unknown package: no receiver",
@@ -411,7 +413,7 @@ impl Inner {
         };
         let Some(decl) = p
             .receiver(class)
-            .filter(|r| self.packages.enabled(&r.component, 0))
+            .filter(|r| packages.enabled(&r.component, 0))
         else {
             atl_diag::answered(
                 AM,
@@ -431,8 +433,9 @@ impl Inner {
         required: &[String],
     ) -> Vec<Recv> {
         let mut out = Vec::new();
+        let packages = self.packages.snapshot();
         for info in package::query_intent_receivers(
-            &self.packages,
+            &packages,
             sender_uid,
             intent,
             resolved_type,
@@ -448,7 +451,7 @@ impl Inner {
             ) else {
                 continue;
             };
-            let Some(p) = self.packages.by_name(package) else {
+            let Some(p) = packages.by_name(package) else {
                 continue;
             };
             out.extend(self.manifest_receiver(sender_uid, required, p, decl, class, info.priority));
@@ -651,7 +654,8 @@ impl Inner {
         package: &str,
         hold: Option<i64>,
     ) -> bool {
-        let opted_in = self.packages.user_state().autostart(package);
+        let packages = self.packages.snapshot();
+        let opted_in = packages.user_state().autostart(package);
         if !broadcast::first_start_boot(&mut st.booted, package, opted_in) {
             return false;
         }
@@ -1124,9 +1128,10 @@ impl ActivityManager {
         }
         let (package, persistent) = app;
         let action = intent.action.as_deref();
+        let packages = self.inner.packages.snapshot();
         match broadcast::sender_check(
             action,
-            self.inner.packages.is_protected_broadcast(action),
+            packages.is_protected_broadcast(action),
             pid,
             uid,
             package.as_deref(),

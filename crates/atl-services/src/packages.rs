@@ -8,7 +8,7 @@ use atl_parcelables::android::content::pm::{
     ServiceInfo,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use atl_parcelables::parts::{ComponentInfo, ParsedIntentInfo};
 use atl_services_types::installer_output::Kind;
@@ -167,7 +167,8 @@ pub struct Packages {
     libraries: BTreeMap<String, Library>,
     /// framework-res's `<protected-broadcast>`s: package `android` is not scanned (atl-services-types system_packages), so its manifest's list comes as a services input ([`Self::with_platform_broadcasts`])
     platform_broadcasts: BTreeSet<String>,
-    user: PackageUserStates,
+    /// the table's state, shared by every list of one table: [`PackageTable::publish`] refuses a list that does not carry it
+    user: Arc<PackageUserStates>,
 }
 
 impl Packages {
@@ -177,7 +178,7 @@ impl Packages {
             list,
             libraries,
             platform_broadcasts: BTreeSet::new(),
-            user: PackageUserStates::default(),
+            user: Arc::new(PackageUserStates::default()),
         }
     }
 
@@ -204,6 +205,14 @@ impl Packages {
 
     /// These packages with `user` as user 0's package state (the services' start: [`PackageUserStates::load`]).
     pub fn with_user_state(self, user: PackageUserStates) -> Self {
+        Packages {
+            user: Arc::new(user),
+            ..self
+        }
+    }
+
+    /// These packages with the table's shared state ([`PackageTable::user_state_arc`]): the kind of list [`PackageTable::publish`] takes.
+    pub fn with_user_state_arc(self, user: Arc<PackageUserStates>) -> Self {
         Packages { user, ..self }
     }
 
@@ -356,6 +365,43 @@ impl Packages {
             || force_queryable
             || granted)
             .then_some(p)
+    }
+}
+
+/// The package list the services read (PackageManagerService.snapshotComputer): a whole Packages at a time, replaced by publish; snapshots already taken keep theirs.
+#[derive(Debug)]
+pub struct PackageTable {
+    current: Mutex<Arc<Packages>>,
+}
+
+impl PackageTable {
+    /// The list published at start; its user state is the table's for life.
+    pub fn new(first: Packages) -> Self {
+        PackageTable {
+            current: Mutex::new(Arc::new(first)),
+        }
+    }
+
+    /// The list as published now: a clone of its Arc, the lock held for the clone only.
+    pub fn snapshot(&self) -> Arc<Packages> {
+        Arc::clone(&self.current.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The user state every list of this table carries: a list for [`PackageTable::publish`] is built with [`Packages::with_user_state_arc`].
+    /// Fixed for the table's life (publish keeps it), so the Arc taken here stays the table's.
+    pub fn user_state_arc(&self) -> Arc<PackageUserStates> {
+        Arc::clone(&self.current.lock().unwrap_or_else(|e| e.into_inner()).user)
+    }
+
+    /// Replaces the list. Component state belongs to the table (PMS's Settings, not the list): `next` must carry the table's state, else panic (caller bug: the state set so far would be dropped).
+    /// Snapshots already taken keep their list; they share the state, so they read its writes too.
+    pub fn publish(&self, next: Packages) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            Arc::ptr_eq(&next.user, &current.user),
+            "PackageTable::publish: next must carry the table's user state (PackageTable::user_state_arc); component state belongs to the table"
+        );
+        *current = Arc::new(next);
     }
 }
 
@@ -865,6 +911,54 @@ mod tests {
         let mut r = record("org.target");
         edit(&mut r);
         r
+    }
+
+    /// A snapshot taken before a publish keeps the list it saw; one taken after sees the new list.
+    #[test]
+    fn snapshot_is_the_published_list() {
+        let table = PackageTable::new(Packages::new(vec![record("a")], BTreeMap::new()));
+        let before = table.snapshot();
+        table.publish(
+            Packages::new(vec![record("a"), record("b")], BTreeMap::new())
+                .with_user_state_arc(table.user_state_arc()),
+        );
+        assert_eq!(before.all().len(), 1);
+        assert!(before.by_name("b").is_none());
+        assert_eq!(table.snapshot().all().len(), 2);
+        assert!(table.snapshot().by_name("b").is_some());
+    }
+
+    /// publish's rule: the component state belongs to the table, so a list on another state would drop the state set so far; the panic names the rule.
+    #[test]
+    #[should_panic(expected = "must carry the table's user state")]
+    fn publish_refuses_a_list_with_another_user_state() {
+        let table = PackageTable::new(Packages::new(vec![record("a")], BTreeMap::new()));
+        table.publish(Packages::new(
+            vec![record("a"), record("b")],
+            BTreeMap::new(),
+        ));
+    }
+
+    /// The component state belongs to the table, not to one list: a state set through an old snapshot is read through a snapshot taken after the publish.
+    #[test]
+    fn component_state_is_shared_by_snapshots() {
+        let table = PackageTable::new(Packages::new(vec![record("a")], BTreeMap::new()));
+        let before = table.snapshot();
+        let changed =
+            before
+                .user_state()
+                .set_component("a", "a.C", COMPONENT_ENABLED_STATE_DISABLED);
+        assert!(changed);
+        table.publish(
+            Packages::new(vec![record("a"), record("b")], BTreeMap::new())
+                .with_user_state_arc(table.user_state_arc()),
+        );
+        let after = table.snapshot();
+        assert_eq!(after.all().len(), 2);
+        assert_eq!(
+            after.user_state().component("a", "a.C"),
+            COMPONENT_ENABLED_STATE_DISABLED
+        );
     }
 
     /// AppsFilterUtils.canQueryViaPackage: `<queries><package>` names the package it may see; another name grants nothing.

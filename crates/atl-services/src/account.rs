@@ -25,7 +25,7 @@ use atl_services_types::installer_output::Kind;
 use atl_services_types::permission;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::packages::{PackageRecord, Packages, Permissions};
+use crate::packages::{PackageRecord, PackageTable, Permissions};
 
 /// The name the answers are counted under (`atl_diag::answered`, the app gate's SERVICE_CALLS).
 const ACCOUNT_MANAGER: &str = "IAccountManager";
@@ -36,7 +36,7 @@ const INTERACT_ACROSS_USERS_FULL: &str = "android.permission.INTERACT_ACROSS_USE
 const NOT_READ: &str = "(authenticator not read)";
 
 struct AccountService {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     /// UserAccounts.mReceiversForType: account type (None = any) -> package -> registration count.
     listeners: Mutex<HashMap<Option<String>, HashMap<String, u32>>>,
@@ -75,7 +75,7 @@ impl AccountService {
     /// AppOpsManager.checkPackage (AppOpsManager.java :10010-10018).
     fn check_package(&self, uid: u32, package: Option<&str>) -> binder::Result<()> {
         let package = package.unwrap_or_default();
-        if self.packages.is_same_app(package, uid) {
+        if self.packages.snapshot().is_same_app(package, uid) {
             return Ok(());
         }
         Err(security(format!(
@@ -94,7 +94,8 @@ impl AccountService {
 
     /// Whether the caller's app declares an authenticator (any package of its app id).
     fn caller_declares(&self, uid: u32) -> bool {
-        self.packages
+        let packages = self.packages.snapshot();
+        packages
             .by_app_id(permission::app_id(uid))
             .any(declares_authenticator)
     }
@@ -286,7 +287,7 @@ impl IAccountManager for AccountService {
 }
 
 /// The `account` binder, for `addService`.
-pub fn new_binder(packages: Arc<Packages>, permissions: Arc<Permissions>) -> SpIBinder {
+pub fn new_binder(packages: Arc<PackageTable>, permissions: Arc<Permissions>) -> SpIBinder {
     BnAccountManager::new_binder(
         AccountService {
             packages,

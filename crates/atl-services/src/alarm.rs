@@ -28,7 +28,7 @@ use crate::alarm_table::{
     IdleOptions, RTC_WAKEUP, idle_options,
 };
 use crate::alarm_timer::{self, Timers};
-use crate::packages::Packages;
+use crate::packages::PackageTable;
 use crate::packages::Permissions;
 use crate::pending_intent;
 use crate::uid_state;
@@ -46,7 +46,7 @@ const MAX_INTERVAL_MS: i64 = 365 * INTERVAL_DAY_MS;
 type Table = AlarmTable<SpIBinder, SpIBinder>;
 
 struct Inner {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     table: Mutex<Table>,
     timers: Timers,
@@ -59,7 +59,7 @@ impl Inner {
 
     /// The caller is `package`'s uid, or system / root (notification.rs's rule). AlarmManagerService compares the package's uid (:2694, :2918).
     fn owns(&self, uid: u32, package: &str) -> bool {
-        permission::is_system_or_root(uid) || self.packages.is_same_app(package, uid)
+        permission::is_system_or_root(uid) || self.packages.snapshot().is_same_app(package, uid)
     }
 
     /// Arms the timers to the table's earliest trigger on each clock. Called with the table lock held, so the arms follow the table's order.
@@ -177,9 +177,8 @@ impl IAlarmManager for AlarmService {
         // setImpl's idleOptions (AlarmManagerService :2735-2820): a core caller's allow-while-idle and prioritize are cleared (:2735-2748, UserHandle.isCore);
         // a package the services do not know reads as the current targetSdk
         let core = permission::sees_all_packages(uid);
-        let exact_change = self
-            .0
-            .packages
+        let packages = self.0.packages.snapshot();
+        let exact_change = packages
             .by_name(package)
             .is_none_or(|p| p.app().target_sdk_version >= uid_state::SDK_S);
         let idle = operation
@@ -352,7 +351,7 @@ impl IAlarmCompleteListener for Completion {
 }
 
 /// The service's binder, for `addService`: the packages decide who owns a package name, the permissions the @EnforcePermission methods. Starts the timer thread (one per service).
-pub fn new_binder(packages: Arc<Packages>, permissions: Arc<Permissions>) -> SpIBinder {
+pub fn new_binder(packages: Arc<PackageTable>, permissions: Arc<Permissions>) -> SpIBinder {
     let timers = Timers::new().expect("alarm timerfd");
     let inner = Arc::new(Inner {
         packages,

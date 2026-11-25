@@ -16,7 +16,7 @@ use atl_parcelables::android::app::SyncNotedAppOp;
 use atl_parcelables::com::android::internal::app::MessageSamplingConfig;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::packages::{Packages, Permissions};
+use crate::packages::{PackageTable, Permissions};
 use crate::uid_state::{ProcessState, UidView, UidViews};
 use atl_services_types::{app_ops, permission};
 
@@ -44,7 +44,7 @@ const FOREGROUND_SETTLE_TIME_MS: u64 = 5_000;
 
 struct AppOps {
     permissions: Arc<Permissions>,
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     /// the op uid's state (the activity manager's)
     uids: UidViews,
 }
@@ -102,11 +102,12 @@ enum Verified {
 impl AppOps {
     fn verify(&self, uid: i32, package: &str) -> Verified {
         let caller = ThreadState::get_calling_uid();
-        if self.packages.visible(caller, package).is_none() {
+        let packages = self.packages.snapshot();
+        if packages.visible(caller, package).is_none() {
             return Verified::Invalid;
         }
         match u32::try_from(uid) {
-            Ok(uid) if self.packages.is_same_app(package, uid) => Verified::Ok,
+            Ok(uid) if packages.is_same_app(package, uid) => Verified::Ok,
             _ => Verified::WrongUid,
         }
     }
@@ -336,7 +337,7 @@ impl IAppOpsService for AppOps {
 /// The `appops` binder, for `addService`.
 pub fn new_binder(
     permissions: Arc<Permissions>,
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     uids: UidViews,
 ) -> SpIBinder {
     BnAppOpsService::new_binder(

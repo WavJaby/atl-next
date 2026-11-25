@@ -11,7 +11,7 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Thread
 use std::sync::Arc;
 
 use crate::activity::log;
-use crate::packages::{GrantError, Packages, Permissions};
+use crate::packages::{GrantError, PackageTable, Packages, Permissions};
 
 /// PackageManager.PERMISSION_GRANTED / PERMISSION_DENIED.
 const GRANTED: i32 = 0;
@@ -35,7 +35,7 @@ const REVOKE_RUNTIME_PERMISSIONS: &str = "android.permission.REVOKE_RUNTIME_PERM
 const GET_RUNTIME_PERMISSIONS: &str = "android.permission.GET_RUNTIME_PERMISSIONS";
 
 struct PermissionManagerService {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
 }
 
@@ -79,8 +79,9 @@ impl IPermissionManager for PermissionManagerService {
         _persistent_device_id: Option<&str>,
         user_id: i32,
     ) -> binder::Result<i32> {
+        let packages = self.packages.snapshot();
         Ok(check(
-            &self.packages,
+            &packages,
             &self.permissions,
             package,
             permission,
@@ -112,7 +113,8 @@ impl IPermissionManager for PermissionManagerService {
         if user_id != USER_SYSTEM {
             return Ok(0);
         }
-        let Some(p) = self.packages.by_name(package) else {
+        let packages = self.packages.snapshot();
+        let Some(p) = packages.by_name(package) else {
             return Ok(0);
         };
         Ok(self.permissions.flags(p.uid, permission) as i32)
@@ -132,7 +134,8 @@ impl IPermissionManager for PermissionManagerService {
             false,
         )?;
         let permission = permission.unwrap_or_default();
-        let Some(p) = package.and_then(|n| self.packages.by_name(n)) else {
+        let packages = self.packages.snapshot();
+        let Some(p) = package.and_then(|n| packages.by_name(n)) else {
             log(format_args!(
                 "grantRuntimePermission: unknown package {package:?}"
             ));
@@ -187,7 +190,7 @@ fn check(
 }
 
 /// The service's binder, for `addService`.
-pub fn new_binder(packages: Arc<Packages>, permissions: Arc<Permissions>) -> SpIBinder {
+pub fn new_binder(packages: Arc<PackageTable>, permissions: Arc<Permissions>) -> SpIBinder {
     BnPermissionManager::new_binder(
         PermissionManagerService {
             packages,

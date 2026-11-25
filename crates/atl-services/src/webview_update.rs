@@ -125,7 +125,7 @@ pub fn current_package(
     let Some(p) = packages.by_name(CANDIDATE) else {
         return Ok(None);
     };
-    let info = pm.package_info(p, PACKAGE_FLAGS);
+    let info = pm.package_info(packages, p, PACKAGE_FLAGS);
     validity(&info)
         .map(|()| Some(info))
         .map_err(|why| format!("{CANDIDATE} is not a valid provider: {why:?}"))

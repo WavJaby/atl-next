@@ -34,7 +34,7 @@ use binder::binder_impl::Parcel;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 use serde::{Deserialize, Serialize};
 
-use crate::packages::{Packages, Permissions};
+use crate::packages::{PackageTable, Packages, Permissions};
 use crate::tasks::Tasks;
 use crate::uid_state::{UidView, UidViews};
 
@@ -415,7 +415,7 @@ fn save_failed(why: &str) {
 }
 
 struct ShortcutService {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
     /// the caller uid's state (the activity manager's)
@@ -444,7 +444,12 @@ impl ShortcutService {
     }
 
     /// verifyCaller (:1740-1758): non-empty package; the caller's own user; the package's uid must be the caller's.
-    fn verify_caller(&self, package: Option<&str>, user_id: i32) -> binder::Result<(String, u32)> {
+    fn verify_caller(
+        &self,
+        packages: &Packages,
+        package: Option<&str>,
+        user_id: i32,
+    ) -> binder::Result<(String, u32)> {
         let package = package
             .filter(|p| !p.is_empty())
             .ok_or_else(|| illegal_argument("packageName"))?;
@@ -455,7 +460,7 @@ impl ShortcutService {
         if i64::from(permission::user_id(uid)) != i64::from(user_id) {
             return Err(security("Invalid userId"));
         }
-        if self.packages.by_name(package).map(|p| p.uid) != Some(uid) {
+        if packages.by_name(package).map(|p| p.uid) != Some(uid) {
             return Err(security("Calling package name mismatch"));
         }
         Ok((package.to_owned(), uid))
@@ -493,13 +498,16 @@ impl ShortcutService {
     }
 
     /// fillInDefaultActivity (:1945-1960): a shortcut without an activity gets the package's launcher activity.
-    fn fill_in_default_activity(&self, list: &mut [ShortcutInfo]) -> binder::Result<()> {
+    fn fill_in_default_activity(
+        &self,
+        packages: &Packages,
+        list: &mut [ShortcutInfo],
+    ) -> binder::Result<()> {
         for si in list.iter_mut().filter(|s| s.activity.is_none()) {
             let package = si.package.clone().unwrap_or_default();
-            let launcher = self
-                .packages
+            let launcher = packages
                 .by_name(&package)
-                .and_then(|p| self.packages.launcher(p))
+                .and_then(|p| packages.launcher(p))
                 .and_then(|a| a.component.item.name.clone());
             let Some(class) = launcher else {
                 return Err(illegal_state(&format!(
@@ -512,7 +520,12 @@ impl ShortcutService {
     }
 
     /// fixUpIncomingShortcutInfo (:1888-1920) + validateIcon: the activity must be the package's main activity; unless updating, the mandatory fields; flags reduced to FLAG_LONG_LIVED.
-    fn fix_up(&self, si: &mut ShortcutInfo, for_update: bool) -> binder::Result<()> {
+    fn fix_up(
+        &self,
+        packages: &Packages,
+        si: &mut ShortcutInfo,
+        for_update: bool,
+    ) -> binder::Result<()> {
         let package = si.package.clone().unwrap_or_default();
         if let Some(a) = &si.activity {
             let name = format!("ComponentInfo{{{}/{}}}", a.package, a.class);
@@ -521,10 +534,9 @@ impl ShortcutService {
                     "Cannot publish shortcut: activity {name} does not belong to package {package}"
                 )));
             }
-            if !self
-                .packages
+            if !packages
                 .by_name(&package)
-                .is_some_and(|p| self.packages.is_launcher(p, &a.class))
+                .is_some_and(|p| packages.is_launcher(p, &a.class))
             {
                 return Err(illegal_state(&format!(
                     "Cannot publish shortcut: activity {name} is not main activity"
@@ -650,7 +662,8 @@ impl ShortcutService {
         user_id: i32,
         op: Operation,
     ) -> binder::Result<bool> {
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let packages = self.packages.snapshot();
+        let (package, uid) = self.verify_caller(&packages, package, user_id)?;
         let reset = self.foreground(uid);
         let mut list = Self::list_of(list)?;
         list.iter()
@@ -658,7 +671,7 @@ impl ShortcutService {
         let now = now_ms();
         let mut store = self.store();
         let service_reset = store.update_times(now);
-        self.fill_in_default_activity(&mut list)?;
+        self.fill_in_default_activity(&packages, &mut list)?;
         let ps = store.package(&package);
         Self::enforce_counts(ps, &list, op)?;
         let mut implicit: Vec<i32> = (0..list.len())
@@ -675,7 +688,7 @@ impl ShortcutService {
             return Ok(false);
         }
         for si in &mut list {
-            self.fix_up(si, false)?;
+            self.fix_up(&packages, si, false)?;
         }
         if op == Operation::Set {
             // deleteAllDynamicShortcuts: nothing is pinned or cached, so every dynamic shortcut goes (removeOrphans)
@@ -744,7 +757,7 @@ impl ShortcutService {
         ids: Option<&[Option<String>]>,
         user_id: i32,
     ) -> binder::Result<()> {
-        let (package, _) = self.verify_caller(package, user_id)?;
+        let (package, _) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         let ids = Self::ids(ids)?;
         let mut store = self.store();
         let ps = store.package(&package);
@@ -796,19 +809,20 @@ impl IShortcutService for ShortcutService {
         shortcut: Option<&ShortcutInfo>,
         user_id: i32,
     ) -> binder::Result<()> {
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let packages = self.packages.snapshot();
+        let (package, uid) = self.verify_caller(&packages, package, user_id)?;
         let mut si = shortcut.cloned().ok_or_else(|| null_pointer("shortcut"))?;
         Self::verify_shortcut_package(&package, uid, &si)?;
         let now = now_ms();
         let mut store = self.store();
-        self.fill_in_default_activity(std::slice::from_mut(&mut si))?;
+        self.fill_in_default_activity(&packages, std::slice::from_mut(&mut si))?;
         let d = si.details.get_or_insert_with(ShortcutDetails::default);
         if d.rank == RANK_NOT_SET {
             d.rank = 0;
         }
         let ps = store.package(&package);
         ps.clear_implicit_ranks();
-        self.fix_up(&mut si, false)?;
+        self.fix_up(&packages, &mut si, false)?;
         if si.flags & FLAG_DISABLED != 0 {
             return Err(illegal_argument(
                 "pushDynamicShortcuts() cannot publish disabled shortcuts",
@@ -852,7 +866,8 @@ impl IShortcutService for ShortcutService {
         list: Option<&ParceledListSlice>,
         user_id: i32,
     ) -> binder::Result<bool> {
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let packages = self.packages.snapshot();
+        let (package, uid) = self.verify_caller(&packages, package, user_id)?;
         let reset = self.foreground(uid);
         let list = Self::list_of(list)?;
         list.iter()
@@ -877,7 +892,7 @@ impl IShortcutService for ShortcutService {
         }
         ps.clear_implicit_ranks();
         for (i, mut source) in list.into_iter().enumerate() {
-            self.fix_up(&mut source, true)?;
+            self.fix_up(&packages, &mut source, true)?;
             let id = source.id.clone().unwrap_or_default();
             let Some(pos) = ps.shortcuts.iter().position(|e| e.id() == id) else {
                 continue;
@@ -992,7 +1007,7 @@ impl IShortcutService for ShortcutService {
         ids: Option<&[Option<String>]>,
         user_id: i32,
     ) -> binder::Result<()> {
-        self.verify_caller(package, user_id)?;
+        self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         Self::ids(ids)?;
         atl_diag::answered(SHORTCUT, "enableShortcuts");
         Ok(())
@@ -1004,7 +1019,7 @@ impl IShortcutService for ShortcutService {
         package: Option<&str>,
         user_id: i32,
     ) -> binder::Result<()> {
-        let (package, _) = self.verify_caller(package, user_id)?;
+        let (package, _) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         let mut store = self.store();
         let ps = store.package(&package);
         ps.shortcuts.retain(|e| !e.is_dynamic());
@@ -1020,7 +1035,7 @@ impl IShortcutService for ShortcutService {
         match_flags: i32,
         user_id: i32,
     ) -> binder::Result<Option<ParceledListSlice>> {
-        let (package, _) = self.verify_caller(package, user_id)?;
+        let (package, _) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         let mut flags = 0;
         for (m, f) in [
             (FLAG_MATCH_DYNAMIC, FLAG_DYNAMIC),
@@ -1068,13 +1083,13 @@ impl IShortcutService for ShortcutService {
         package: Option<&str>,
         user_id: i32,
     ) -> binder::Result<i32> {
-        self.verify_caller(package, user_id)?;
+        self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         atl_diag::answered(SHORTCUT, "getMaxShortcutCountPerActivity");
         Ok(MAX_SHORTCUTS_PER_ACTIVITY)
     }
 
     fn r#getRemainingCallCount(&self, package: Option<&str>, user_id: i32) -> binder::Result<i32> {
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let (package, uid) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         let reset = self.foreground(uid);
         let now = now_ms();
         let mut store = self.store();
@@ -1088,7 +1103,7 @@ impl IShortcutService for ShortcutService {
 
     /// getNextResetTimeLocked (:1288): the service-wide last reset + the interval.
     fn r#getRateLimitResetTime(&self, package: Option<&str>, user_id: i32) -> binder::Result<i64> {
-        self.verify_caller(package, user_id)?;
+        self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         let last = self.store().update_times(now_ms());
         atl_diag::answered(SHORTCUT, "getRateLimitResetTime");
         Ok(last + RESET_INTERVAL_MS)
@@ -1096,7 +1111,7 @@ impl IShortcutService for ShortcutService {
 
     /// mMaxIconDimension = injectDipToPixel(96) (:828, :848): TypedValue.applyDimension(DIP) = dp * densityDpi / 160 in float, truncated.
     fn r#getIconMaxDimensions(&self, package: Option<&str>, user_id: i32) -> binder::Result<i32> {
-        self.verify_caller(package, user_id)?;
+        self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         atl_diag::answered(SHORTCUT, "getIconMaxDimensions");
         #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         Ok((MAX_ICON_DIMENSION_DP * (self.tasks.display().dpi as f32 / DENSITY_DEFAULT)) as i32)
@@ -1109,7 +1124,7 @@ impl IShortcutService for ShortcutService {
         shortcut_id: Option<&str>,
         user_id: i32,
     ) -> binder::Result<()> {
-        self.verify_caller(package, user_id)?;
+        self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         shortcut_id.ok_or_else(|| null_pointer("shortcutId"))?;
         atl_diag::answered(SHORTCUT, "reportShortcutUsed (no usage stats)");
         Ok(())
@@ -1146,7 +1161,7 @@ impl IShortcutService for ShortcutService {
                 "Shortcut excluded from launcher cannot be pinned",
             ));
         }
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let (package, uid) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         Self::verify_shortcut_package(&package, uid, si)?;
         if !self.is_foreground(uid) {
             atl_diag::refused(SHORTCUT, "requestPinShortcut from a background uid");
@@ -1169,7 +1184,7 @@ impl IShortcutService for ShortcutService {
         if si.flags & FLAG_DISABLED != 0 {
             return Err(illegal_argument("Shortcut must be enabled"));
         }
-        let (package, uid) = self.verify_caller(package, user_id)?;
+        let (package, uid) = self.verify_caller(&self.packages.snapshot(), package, user_id)?;
         Self::verify_shortcut_package(&package, uid, si)?;
         atl_diag::answered(SHORTCUT, "createShortcutResultIntent (no launcher: null)");
         Ok(None)
@@ -1178,13 +1193,14 @@ impl IShortcutService for ShortcutService {
 
 /// The `shortcut` binder, for `addService`; `state_dir` the services' state dir (None: in memory only). Files of packages not installed are skipped.
 pub fn new_binder(
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
     uids: UidViews,
     state_dir: Option<PathBuf>,
 ) -> SpIBinder {
-    let store = Store::load(state_dir, |p| packages.by_name(p).is_some());
+    let list = packages.snapshot();
+    let store = Store::load(state_dir, |p| list.by_name(p).is_some());
     {
         use std::io::Write;
         let n: usize = store.packages.values().map(|p| p.shortcuts.len()).sum();

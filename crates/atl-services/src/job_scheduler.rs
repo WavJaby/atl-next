@@ -28,7 +28,7 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong
 
 use crate::activity::ActivityManager;
 use crate::activity::log;
-use crate::packages::{Packages, Permissions};
+use crate::packages::{PackageTable, Permissions};
 use crate::service_records::BIND_AUTO_CREATE;
 
 /// The interface name counters use.
@@ -243,7 +243,7 @@ fn ignored_constraints(info: &JobInfo) -> Vec<&'static str> {
 }
 
 struct Inner {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     state: Mutex<State>,
     /// the activity service that binds job services; None is the test-only break `--no-job-runner`: jobs are stored, never run
@@ -478,7 +478,8 @@ impl Inner {
         };
         let (package, class) = (service.package.as_str(), service.class.as_str());
         let shown = format!("ComponentInfo{{{package}/{class}}}");
-        let p = self.packages.by_name(package);
+        let packages = self.packages.snapshot();
+        let p = packages.by_name(package);
         let Some(si) = p.and_then(|p| p.service(class)) else {
             return Err(illegal_argument(format!(
                 "Tried to schedule job for non-existent component: {shown}"
@@ -777,7 +778,7 @@ impl IJobCallback for JobCallback {
 
 /// The service's binder, for `addService`. `runner`: the activity service that binds job services; None is the test-only break `--no-job-runner` (jobs stored, never run).
 pub fn new_binder(
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
     runner: Option<ActivityManager>,
 ) -> SpIBinder {

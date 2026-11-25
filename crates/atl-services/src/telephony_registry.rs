@@ -19,7 +19,7 @@ use atl_aidl::aidl::com::android::internal::telephony::ITelephonyRegistry::{
 };
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
 
-use crate::packages::{Packages, Permissions};
+use crate::packages::{PackageTable, Permissions};
 
 /// The name the answers are counted under (`atl_diag::answered`, the app gate's SERVICE_CALLS).
 const TELEPHONY_REGISTRY: &str = "ITelephonyRegistry";
@@ -52,7 +52,7 @@ fn required_permissions(events: &[i32]) -> Vec<&'static str> {
 }
 
 struct TelephonyRegistry {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     permissions: Arc<Permissions>,
 }
 
@@ -66,12 +66,9 @@ impl TelephonyRegistry {
     /// AppOpsManager.checkPackage(callingUid, package): the package must be installed, visible to the caller and the caller's own; else SecurityException.
     fn check_package(&self, method: &str, package: Option<&str>) -> binder::Result<()> {
         let uid = ThreadState::get_calling_uid();
+        let packages = self.packages.snapshot();
         match package {
-            Some(p)
-                if self.packages.visible(uid, p).is_some() && self.packages.is_same_app(p, uid) =>
-            {
-                Ok(())
-            }
+            Some(p) if packages.visible(uid, p).is_some() && packages.is_same_app(p, uid) => Ok(()),
             _ => Err(security(format!(
                 "{method}: package {package:?} does not belong to uid {uid}"
             ))),
@@ -160,7 +157,7 @@ impl ITelephonyRegistry for TelephonyRegistry {
 }
 
 /// The `telephony.registry` binder, for `addService`.
-pub fn new_binder(packages: Arc<Packages>, permissions: Arc<Permissions>) -> SpIBinder {
+pub fn new_binder(packages: Arc<PackageTable>, permissions: Arc<Permissions>) -> SpIBinder {
     BnTelephonyRegistry::new_binder(
         TelephonyRegistry {
             packages,

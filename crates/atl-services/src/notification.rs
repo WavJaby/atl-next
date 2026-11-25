@@ -26,7 +26,7 @@ use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong
 
 use crate::notification_channels::{ChannelError, Channels};
 use crate::notification_display;
-use crate::packages::Packages;
+use crate::packages::PackageTable;
 use crate::packages::Permissions;
 use crate::tasks::Tasks;
 use atl_broker::control::{NotificationContent, NotifyOutcome};
@@ -124,7 +124,7 @@ impl ForegroundNotices for NoForegroundNotices {
 struct Inner {
     tasks: Arc<Tasks<SpIBinder>>,
     permissions: Arc<Permissions>,
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     desktop: Arc<dyn DesktopNotifications>,
     state: Mutex<State>,
     next_id: AtomicU64,
@@ -141,6 +141,7 @@ impl Inner {
         if permission::is_system_or_root(uid)
             || self
                 .packages
+                .snapshot()
                 .by_app_id(permission::app_id(uid))
                 .any(|p| p.name() == pkg)
         {
@@ -568,7 +569,7 @@ impl Notices {
     pub fn new(
         tasks: Arc<Tasks<SpIBinder>>,
         permissions: Arc<Permissions>,
-        packages: Arc<Packages>,
+        packages: Arc<PackageTable>,
         desktop: Arc<dyn DesktopNotifications>,
     ) -> Self {
         Notices(Arc::new(Inner {

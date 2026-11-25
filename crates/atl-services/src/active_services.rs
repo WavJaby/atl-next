@@ -288,8 +288,9 @@ impl Inner {
     /// retrieveServiceLocked's resolveService for an implicit Intent (no component): the first of queryIntentServices (resolveServiceInternal:453, highest priority), STOCK_PM_FLAGS
     /// (no MATCH_DEFAULT_ONLY), as the system user. `resolvedType` is the Intent's own type: bindServiceInstance gets the caller's but does not pass it down (intent_key falls back to the Intent's type).
     fn resolve_implicit(&self, caller_uid: u32, intent: &Intent) -> Option<ComponentName> {
+        let packages = self.packages.snapshot();
         let first = package::query_intent_services(
-            &self.packages,
+            &packages,
             caller_uid,
             intent,
             None,
@@ -317,12 +318,13 @@ impl Inner {
                 None => return Lookup::NotFound(Some("implicit Intent matched no <service>")),
             },
         };
-        let Some(p) = self.packages.by_name(&component.package) else {
+        let packages = self.packages.snapshot();
+        let Some(p) = packages.by_name(&component.package) else {
             return Lookup::NotFound(Some("no such package"));
         };
         let Some(decl) = p
             .service(&component.class)
-            .filter(|s| self.packages.enabled(&s.component, 0))
+            .filter(|s| packages.enabled(&s.component, 0))
         else {
             return Lookup::NotFound(Some("no enabled <service>"));
         };
@@ -353,7 +355,7 @@ impl Inner {
             component: (component.package.clone(), component.class.clone()),
             uid: p.uid,
             process,
-            info: package::service_info(p, &self.packages, decl, package::STOCK_PM_FLAGS),
+            info: package::service_info(p, &packages, decl, package::STOCK_PM_FLAGS),
             target_sdk: p.app().target_sdk_version,
             persistent: self.persistent_app(&component.package),
         }))
@@ -375,7 +377,8 @@ impl Inner {
         {
             return Ok(false);
         }
-        match self.packages.by_name(package) {
+        let packages = self.packages.snapshot();
+        match packages.by_name(package) {
             Some(p) => self
                 .start_process_locked(st, p, process, false, None)
                 .map(|()| true)
@@ -795,8 +798,9 @@ impl Inner {
         let now = self.now_ms();
         let mut calls = Vec::new();
         let mut stopped = 0_u32;
+        let packages = self.packages.snapshot();
         for component in st.services.started_of_uid(uid) {
-            let Some(p) = self.packages.by_name(&component.0) else {
+            let Some(p) = packages.by_name(&component.0) else {
                 continue;
             };
             let persistent = self.persistent_app(&component.0);
@@ -956,7 +960,8 @@ impl Inner {
             );
             return Ok(None);
         };
-        let Some(package) = self.packages.by_name(&component.0) else {
+        let packages = self.packages.snapshot();
+        let Some(package) = packages.by_name(&component.0) else {
             return Ok(None);
         };
         let (uid, target_sdk) = (package.uid, package.app().target_sdk_version);

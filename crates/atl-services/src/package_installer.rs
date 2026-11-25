@@ -13,13 +13,13 @@ use atl_parcelables::android::content::pm::{PackageInstaller_SessionInfo, Parcel
 use atl_services_types::permission;
 use binder::{BinderFeatures, ExceptionCode, Interface, Status, Strong, ThreadState};
 
-use crate::packages::Packages;
+use crate::packages::PackageTable;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IPackageInstaller";
 
 struct PackageInstaller {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
 }
 
 impl Interface for PackageInstaller {}
@@ -92,9 +92,9 @@ impl IPackageInstaller for PackageInstaller {
     ) -> binder::Result<Option<ParceledListSlice>> {
         enforce_same_user(user, "getMySessions")?;
         let uid = ThreadState::get_calling_uid();
-        let owned = installer.is_some_and(|p| {
-            self.packages.visible(uid, p).is_some() && self.packages.is_same_app(p, uid)
-        });
+        let packages = self.packages.snapshot();
+        let owned = installer
+            .is_some_and(|p| packages.visible(uid, p).is_some() && packages.is_same_app(p, uid));
         if !owned && !permission::is_system_or_root(uid) {
             return Err(Status::new_exception_str(
                 ExceptionCode::SECURITY,
@@ -130,6 +130,6 @@ impl IPackageInstaller for PackageInstaller {
 }
 
 /// The installer binder for `packages`; one per PackageManager, as AOSP's one mInstallerService.
-pub(crate) fn new(packages: Arc<Packages>) -> Strong<dyn IPackageInstaller> {
+pub(crate) fn new(packages: Arc<PackageTable>) -> Strong<dyn IPackageInstaller> {
     BnPackageInstaller::new_binder(PackageInstaller { packages }, BinderFeatures::default())
 }

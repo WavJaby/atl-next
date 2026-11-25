@@ -13,7 +13,7 @@ use atl_aidl::aidl::android::security::keystore::Signature::Signature;
 use atl_services_types::permission;
 use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, ThreadState};
 
-use crate::packages::{PackageRecord, Packages};
+use crate::packages::{PackageRecord, PackageTable};
 
 /// AID_KEYSTORE and AID_CREDSTORE (system/core/libcutils/include/private/android_filesystem_config.h:68, :127): the only callers KeyAttestationApplicationIdProviderService admits.
 const KEYSTORE_UID: u32 = 1017;
@@ -24,7 +24,7 @@ const ERROR_GET_ATTESTATION_APPLICATION_ID_FAILED: i32 = 1;
 const VERSION_CODE_MAJOR_SHIFT: u32 = 32;
 
 struct AttestationAppIds {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
 }
 
 impl Interface for AttestationAppIds {}
@@ -76,8 +76,9 @@ impl IKeyAttestationApplicationIdProvider for AttestationAppIds {
             ));
         }
         // getPackagesForUid's answer (AOSP reads it with the caller cleared, so no visibility check here); none -> the service-specific error
+        let snapshot = self.packages.snapshot();
         let packages: Vec<&PackageRecord> = match u32::try_from(uid) {
-            Ok(uid) => self.packages.by_app_id(permission::app_id(uid)).collect(),
+            Ok(uid) => snapshot.by_app_id(permission::app_id(uid)).collect(),
             Err(_) => Vec::new(),
         };
         if packages.is_empty() {
@@ -94,7 +95,7 @@ impl IKeyAttestationApplicationIdProvider for AttestationAppIds {
 }
 
 /// The service's binder, registered as `sec_key_att_app_id_provider` (system_services.rs).
-pub fn new_binder(packages: Arc<Packages>) -> SpIBinder {
+pub fn new_binder(packages: Arc<PackageTable>) -> SpIBinder {
     BnKeyAttestationApplicationIdProvider::new_binder(
         AttestationAppIds { packages },
         BinderFeatures::default(),

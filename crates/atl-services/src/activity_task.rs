@@ -33,7 +33,7 @@ use crate::activity_start::{self, Call, Rec, Refusal, Source, Target, Then};
 use crate::config_diff::Config;
 use crate::desktop_bounds::{ActivityInput, ActivityOrientation};
 use crate::package::USER_SYSTEM;
-use crate::packages::{Packages, Permissions, real_config_changes};
+use crate::packages::{PackageTable, Packages, Permissions, real_config_changes};
 use crate::permission_request;
 use crate::tasks::{TaskId, Tasks};
 use crate::token;
@@ -237,7 +237,7 @@ fn step_names<L, I, R>(steps: &[Step<L, I, R>]) -> String {
 }
 
 pub struct ActivityTasks {
-    packages: Arc<Packages>,
+    packages: Arc<PackageTable>,
     /// the callers' grants: a dismissed permission request returns their current state (permission_request)
     permissions: Arc<Permissions>,
     tasks: Arc<Tasks<SpIBinder>>,
@@ -252,7 +252,7 @@ pub struct ActivityTasks {
 
 impl ActivityTasks {
     pub(crate) fn new(
-        packages: Arc<Packages>,
+        packages: Arc<PackageTable>,
         permissions: Arc<Permissions>,
         tasks: Arc<Tasks<SpIBinder>>,
         controller: SpIBinder,
@@ -301,10 +301,11 @@ impl ActivityTasks {
         pid: i32,
         step: Step<Launch, ReferrerIntent, ResultInfo>,
     ) -> Option<ClientTransactionItem> {
+        let packages = self.packages.snapshot();
         let activity_token = Some(token.clone());
         Some(match step {
             Step::Launch(launch) => {
-                let Some(p) = self.packages.by_name(&launch.package) else {
+                let Some(p) = packages.by_name(&launch.package) else {
                     atl_diag::answered(ATM, "launch of a package not installed");
                     return None;
                 };
@@ -319,7 +320,7 @@ impl ActivityTasks {
                 };
                 let display = self.tasks.display();
                 ClientTransactionItem::LaunchActivity(Box::new(launch_item(
-                    &self.packages,
+                    &packages,
                     process_configuration(&*self.tasks, pid),
                     sent_task_override(&*self.tasks, &display, task, size),
                     &self.controller,
@@ -468,6 +469,7 @@ impl ActivityTasks {
         decl: &ActivityInfo,
         task: TaskId,
     ) -> SpIBinder {
+        let packages = self.packages.snapshot();
         let token = token::new();
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
@@ -478,8 +480,7 @@ impl ActivityTasks {
             affinity: affinity_of(decl, package),
             component: decl.component.item.name.clone().unwrap_or_default(),
             reported: self.launch_config(task),
-            declared: self
-                .packages
+            declared: packages
                 .by_name(package)
                 .map_or(0, |_| real_config_changes(decl)),
             relaunching: false,
@@ -528,6 +529,7 @@ impl ActivityTasks {
         calling_package: &str,
         args: StartArgs<'_>,
     ) -> Result<i32, Status> {
+        let packages = self.packages.snapshot();
         let StartArgs {
             intent,
             reuse,
@@ -562,7 +564,7 @@ impl ActivityTasks {
             finishing: m.is_finishing(t) == Some(true),
             owes: m.owed(t).is_some(),
         });
-        let package = component.and_then(|(p, _)| self.packages.by_name(p));
+        let package = component.and_then(|(p, _)| packages.by_name(p));
         let info = component.and_then(|(_, class)| package.and_then(|p| p.activity(class)));
         let declared = info.map(crate::packages::declared);
         let call = Call {
@@ -587,10 +589,9 @@ impl ActivityTasks {
         };
         // runtime-permissions P1 (maintainer 2026-11-14): no permission controller installed -> the request is answered as dismissed; deleted when PermissionController is the controller (S4)
         if let Some(request) = intent.filter(|_| {
-            permission_request::answered_as_dismissed(intent, self.packages.permission_controller())
+            permission_request::answered_as_dismissed(intent, packages.permission_controller())
         }) {
-            let target_sdk = self
-                .packages
+            let target_sdk = packages
                 .by_name(calling_package)
                 .map_or(0, |p| p.app().target_sdk_version);
             let data =
@@ -799,8 +800,9 @@ impl ActivityTasks {
 
     /// `intent` made explicit to the activity the package manager resolves it to for `caller` (visibility, MATCH_DEFAULT_ONLY, priority); None: no activity, or a chooser tie.
     fn resolve(&self, caller: u32, intent: &Intent, resolved_type: Option<&str>) -> Option<Intent> {
+        let packages = self.packages.snapshot();
         let found = crate::package::resolve_activity(
-            &self.packages,
+            &packages,
             caller,
             intent,
             resolved_type,
@@ -1165,7 +1167,11 @@ impl IActivityTaskManager for ActivityTaskService {
         let Some(calling_package) = calling_package else {
             return Err(security("startActivity: no calling package"));
         };
-        assert_package_matches_calling_uid(&self.atm.packages, calling_uid, calling_package)?;
+        assert_package_matches_calling_uid(
+            &self.atm.packages.snapshot(),
+            calling_uid,
+            calling_package,
+        )?;
         let Some(caller) = caller else {
             let component = intent
                 .and_then(|i| i.component.as_ref())
@@ -1276,10 +1282,13 @@ mod tests {
         let mut record = crate::packages::fixture::record(PACKAGE);
         record.uid = UID;
         record.info.activities = Some(vec![Some(decl(LAUNCHER)), Some(decl(VIDEO))]);
-        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![record],
+            BTreeMap::new(),
+        )));
         ActivityTasks::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Permissions::new(&packages.snapshot(), &[])),
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         )
@@ -1291,12 +1300,15 @@ mod tests {
     fn calling_package_must_be_the_callers() {
         let atm = fixture_atm();
         let other = UID + 1;
-        assert!(assert_package_matches_calling_uid(&atm.packages, UID, PACKAGE).is_ok());
+        assert!(assert_package_matches_calling_uid(&atm.packages.snapshot(), UID, PACKAGE).is_ok());
         for uid in [0, 1000] {
-            assert!(assert_package_matches_calling_uid(&atm.packages, uid, PACKAGE).is_ok());
+            assert!(
+                assert_package_matches_calling_uid(&atm.packages.snapshot(), uid, PACKAGE).is_ok()
+            );
         }
         for uid in [other, 101_000] {
-            let e = assert_package_matches_calling_uid(&atm.packages, uid, PACKAGE).unwrap_err();
+            let e = assert_package_matches_calling_uid(&atm.packages.snapshot(), uid, PACKAGE)
+                .unwrap_err();
             assert_eq!(e.exception_code(), binder::ExceptionCode::SECURITY);
             let want = format!("Permission Denial: package={PACKAGE} does not belong to uid={uid}");
             assert!(e.get_description().contains(&want), "{e:?}");
@@ -1309,9 +1321,14 @@ mod tests {
         const SHELL: &str = "com.android.shell";
         let atm = fixture_atm();
         let shell_uid = atl_services_types::permission::SHELL_UID;
-        assert!(assert_package_matches_calling_uid(&atm.packages, shell_uid, SHELL).is_ok());
-        assert!(assert_package_matches_calling_uid(&atm.packages, shell_uid, PACKAGE).is_err());
-        assert!(assert_package_matches_calling_uid(&atm.packages, UID, SHELL).is_err());
+        assert!(
+            assert_package_matches_calling_uid(&atm.packages.snapshot(), shell_uid, SHELL).is_ok()
+        );
+        assert!(
+            assert_package_matches_calling_uid(&atm.packages.snapshot(), shell_uid, PACKAGE)
+                .is_err()
+        );
+        assert!(assert_package_matches_calling_uid(&atm.packages.snapshot(), UID, SHELL).is_err());
     }
 
     /// The launcher record, pushed and launched as finishAttachApplication does it; returns its token.
@@ -1350,7 +1367,10 @@ mod tests {
         let mut record = crate::packages::fixture::record(PACKAGE);
         record.uid = UID;
         record.info.activities = Some(vec![Some(decl(LAUNCHER))]);
-        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![record],
+            BTreeMap::new(),
+        )));
         let display = DisplayModel {
             width: 1920,
             height: 1200,
@@ -1358,7 +1378,7 @@ mod tests {
         };
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Permissions::new(&packages.snapshot(), &[])),
             Arc::new(Tasks::new(display, None, None).expect("the test display")),
             token::new(),
         );
@@ -1402,7 +1422,10 @@ mod tests {
         let mut record = crate::packages::fixture::record(PACKAGE);
         record.uid = UID;
         record.info.activities = Some(vec![Some(decl(LAUNCHER))]);
-        let packages = Arc::new(Packages::new(vec![record], BTreeMap::new()));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![record],
+            BTreeMap::new(),
+        )));
         let display = DisplayModel {
             width: 1920,
             height: 1200,
@@ -1411,7 +1434,7 @@ mod tests {
         };
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Permissions::new(&packages.snapshot(), &[])),
             Arc::new(Tasks::new(display, None, None).expect("the test display")),
             token::new(),
         );
@@ -1643,11 +1666,17 @@ mod tests {
         let mut app = crate::packages::fixture::record(PACKAGE);
         app.uid = UID;
         app.info.activities = Some(vec![Some(decl(LAUNCHER))]);
-        let packages = Arc::new(Packages::new(vec![app, c], BTreeMap::new()));
-        assert_eq!(packages.permission_controller(), Some(controller));
+        let packages = Arc::new(PackageTable::new(Packages::new(
+            vec![app, c],
+            BTreeMap::new(),
+        )));
+        assert_eq!(
+            packages.snapshot().permission_controller(),
+            Some(controller)
+        );
         let atm = ActivityTasks::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Permissions::new(&packages.snapshot(), &[])),
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         );
@@ -1733,10 +1762,10 @@ mod tests {
             o.intents = vec![viewer(&class)];
             records.push(o);
         }
-        let packages = Arc::new(Packages::new(records, BTreeMap::new()));
+        let packages = Arc::new(PackageTable::new(Packages::new(records, BTreeMap::new())));
         ActivityTasks::new(
             Arc::clone(&packages),
-            Arc::new(Permissions::new(&packages, &[])),
+            Arc::new(Permissions::new(&packages.snapshot(), &[])),
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             token::new(),
         )
