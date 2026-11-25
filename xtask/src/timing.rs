@@ -6,40 +6,116 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+/// Steps the `critical:` line names.
+const CRITICAL: usize = 3;
+
 /// A duration as `<s>.<tenths>s`: tenths, since steps run from milliseconds to many minutes and the table ranks them, not profiles them.
 pub fn secs(d: Duration) -> String {
     format!("{:.1}s", d.as_secs_f64())
 }
 
-/// Each step's wall time, in run order, and its pool wait when the step took a grant (build_pool.rs).
+/// CPU time (user + system) of this process and of every ended descendant its parents waited for: `/proc/self/stat` utime + stime + cutime + cstime (proc_pid_stat(5)). Not counted: a process still running, or one reaped by another than its parent chain (a user systemd unit, a daemon).
+pub fn cpu_used() -> Duration {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    cpu_of_stat(&stat, rustix::param::clock_ticks_per_second())
+}
+
+/// Zero for an unreadable record: the time is a report, never a verdict.
+fn cpu_of_stat(stat: &str, ticks_per_second: u64) -> Duration {
+    // comm (field 2) may hold spaces and parentheses: fields count from its last one
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return Duration::ZERO;
+    };
+    // fields 14..=17; `rest` starts at field 3
+    let ticks: u64 = rest
+        .split_whitespace()
+        .skip(14 - 3)
+        .take(4)
+        .filter_map(|f| f.parse::<u64>().ok())
+        .sum();
+    Duration::from_secs_f64(ticks as f64 / ticks_per_second as f64)
+}
+
+/// One step: its wall time, its pool wait when it took a grant (build_pool.rs), its CPU time when measured.
+struct Step {
+    name: String,
+    took: Duration,
+    wait: Option<Duration>,
+    cpu: Option<Duration>,
+}
+
+impl Step {
+    /// Cores at work on average: CPU time over wall time.
+    fn cores(&self, cpu: Duration) -> f64 {
+        if self.took.is_zero() {
+            return 0.0;
+        }
+        cpu.as_secs_f64() / self.took.as_secs_f64()
+    }
+}
+
+/// The steps in run order.
 #[derive(Default)]
-pub struct Timings(Vec<(String, Duration, Option<Duration>)>);
+pub struct Timings(Vec<Step>);
 
 impl Timings {
     pub fn push(&mut self, step: &str, took: Duration) {
-        self.0.push((step.to_owned(), took, None));
+        self.0.push(Step {
+            name: step.to_owned(),
+            took,
+            wait: None,
+            cpu: None,
+        });
     }
 
-    /// A step that queued `wait` for its pool grant before running `took`.
-    pub fn push_waited(&mut self, step: &str, took: Duration, wait: Duration) {
-        self.0.push((step.to_owned(), took, Some(wait)));
+    /// A step that queued `wait` for its pool grant before running `took`, its processes using `cpu`.
+    pub fn push_step(&mut self, step: &str, took: Duration, wait: Duration, cpu: Duration) {
+        self.0.push(Step {
+            name: step.to_owned(),
+            took,
+            wait: Some(wait),
+            cpu: Some(cpu),
+        });
+    }
+
+    /// `critical: ` and the three longest steps: wall, CPU, cores, pool wait. A long step at few cores is the machine left idle.
+    pub fn critical(&self) -> String {
+        let mut rows: Vec<&Step> = self.0.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.took));
+        let shown: Vec<String> = rows
+            .iter()
+            .take(CRITICAL)
+            .map(|r| {
+                let mut text = format!("{} {}", r.name, secs(r.took));
+                if let Some(cpu) = r.cpu {
+                    text.push_str(&format!(" (cpu {}, {:.1} cores)", secs(cpu), r.cores(cpu)));
+                }
+                if let Some(w) = r.wait.filter(|w| !w.is_zero()) {
+                    text.push_str(&format!(" wait {}", secs(w)));
+                }
+                text
+            })
+            .collect();
+        format!("critical: {}", shown.join(", "))
     }
 
     /// `<cmd> times:` then one row per step, longest first (ties keep run order): name, seconds, share of the total; then the total.
+    /// With CPU recorded: the step's CPU seconds and its cores at work.
     /// With pool waits recorded: a `wait` column (excluded from the step's seconds) and a `pool waits: <n>, <s>` line.
     pub fn table(&self, cmd: &str) -> String {
-        let total: Duration = self.0.iter().map(|r| r.1).sum();
-        let pooled = self.0.iter().any(|r| r.2.is_some());
-        let mut rows: Vec<&(String, Duration, Option<Duration>)> = self.0.iter().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let total: Duration = self.0.iter().map(|r| r.took).sum();
+        let pooled = self.0.iter().any(|r| r.wait.is_some());
+        let mut rows: Vec<&Step> = self.0.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.took));
         let width = rows
             .iter()
-            .map(|r| r.0.len())
+            .map(|r| r.name.len())
             .max()
             .unwrap_or(0)
             .max("total".len());
         let mut out = format!("{cmd} times:\n");
-        for (name, took, wait) in rows {
+        for step in rows {
+            let Step { name, took, .. } = step;
             let share = if total.is_zero() {
                 0.0
             } else {
@@ -49,7 +125,14 @@ impl Timings {
                 "  {name:<width$} {:>8} {share:>5.1}%",
                 secs(*took)
             ));
-            if let Some(w) = wait.filter(|w| !w.is_zero()) {
+            if let Some(cpu) = step.cpu {
+                out.push_str(&format!(
+                    " cpu {:>8} {:>4.1} cores",
+                    secs(cpu),
+                    step.cores(cpu)
+                ));
+            }
+            if let Some(w) = step.wait.filter(|w| !w.is_zero()) {
                 out.push_str(&format!(" wait {}", secs(w)));
             }
             out.push('\n');
@@ -59,7 +142,7 @@ impl Timings {
             let waits: Vec<Duration> = self
                 .0
                 .iter()
-                .filter_map(|r| r.2)
+                .filter_map(|r| r.wait)
                 .filter(|w| !w.is_zero())
                 .collect();
             out.push_str(&format!(
@@ -246,15 +329,34 @@ mod tests {
     #[test]
     fn pool_waits_show_beside_their_step_and_are_summed() {
         let mut t = Timings::default();
-        t.push_waited(
-            "test",
-            Duration::from_millis(3_000),
-            Duration::from_millis(2_000),
-        );
-        t.push_waited("fmt", Duration::from_millis(1_000), Duration::ZERO);
-        // the wait is not in the step's seconds: shares 3/4 and 1/4; one nonzero wait of 2 s; name column width 5 ("total")
-        let want = "check times:\n  test      3.0s  75.0% wait 2.0s\n  fmt       1.0s  25.0%\n  total     4.0s\ncheck pool waits: 1, 2.0s\n";
+        let ms = Duration::from_millis;
+        t.push_step("test", ms(3_000), ms(2_000), ms(36_000));
+        t.push_step("fmt", ms(1_000), Duration::ZERO, ms(500));
+        // the wait is not in the step's seconds: shares 3/4 and 1/4; cores 36/3 and 0.5/1; one nonzero wait of 2 s; name column width 5 ("total")
+        let want = "check times:\n  test      3.0s  75.0% cpu    36.0s 12.0 cores wait 2.0s\n  fmt       1.0s  25.0% cpu     0.5s  0.5 cores\n  total     4.0s\ncheck pool waits: 1, 2.0s\n";
         assert_eq!(t.table("check"), want);
+    }
+
+    #[test]
+    fn the_critical_line_names_the_three_longest() {
+        let mut t = Timings::default();
+        let s = Duration::from_secs;
+        t.push_step("fmt", s(1), Duration::ZERO, s(1));
+        t.push_step("gates", s(200), s(7), s(400));
+        t.push_step("test", s(40), Duration::ZERO, s(50));
+        t.push_step("tables", s(20), Duration::ZERO, s(160));
+        assert_eq!(
+            t.critical(),
+            "critical: gates 200.0s (cpu 400.0s, 2.0 cores) wait 7.0s, test 40.0s (cpu 50.0s, 1.2 cores), tables 20.0s (cpu 160.0s, 8.0 cores)"
+        );
+    }
+
+    /// proc_pid_stat(5): fields 14..=17 are utime stime cutime cstime; a comm with a space and a parenthesis does not shift them.
+    #[test]
+    fn cpu_is_own_and_waited_for_time() {
+        let stat = "7 (a) b) S 1 7 7 0 -1 0 0 0 0 0 100 20 3000 400 20 0 1 0 99 0";
+        // 3520 ticks at 100 a second
+        assert_eq!(cpu_of_stat(stat, 100), Duration::from_millis(35_200));
     }
 
     #[test]

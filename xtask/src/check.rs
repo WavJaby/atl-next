@@ -68,7 +68,9 @@ enum Step {
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
     Deny,
-    /// cargo test, whole workspace
+    /// `cargo test --no-run`, whole workspace: the compile of `test`
+    TestBuild,
+    /// the workspace's tests: the test binaries at once, as many as the grant has slots, then the doc tests (test_run.rs)
     Test,
     /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
     Converter,
@@ -92,7 +94,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 29] = [
+const ALL: [Step; 30] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -111,6 +113,7 @@ const ALL: [Step; 29] = [
     Step::EnvReads,
     Step::Clippy,
     Step::Deny,
+    Step::TestBuild,
     Step::Test,
     Step::Converter,
     Step::Libcxx,
@@ -145,6 +148,7 @@ impl Step {
             Step::EnvReads => "env-reads",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
+            Step::TestBuild => "test-build",
             Step::Test => "test",
             Step::Converter => "converter",
             Step::Libcxx => "libcxx",
@@ -159,19 +163,22 @@ impl Step {
         }
     }
 
-    /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles `cargo`, runtime gates `harness`, the rest `light`. None: `gates`, whose rows each take their own grant (check_gates.rs), so the step holds none (a holder above them would refuse their nested admission).
+    /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles and the test run `cargo`, runtime gates `harness`, the rest `light`. None: `gates`, whose rows each take their own grant (check_gates.rs), so the step holds none (a holder above them would refuse their nested admission).
     fn class(self) -> Option<Class> {
         Some(match self {
             Step::Gates => return None,
-            Step::Clippy
+            // tables: its scenario half builds the harness
+            Step::Tables
+            | Step::Clippy
+            | Step::TestBuild
             | Step::Test
             | Step::Bootstrap
             | Step::Converter
             | Step::ConverterPackages
             | Step::GtkImports
             | Step::CrossBionic => Class::Cargo,
-            // tables: its scenario half builds and runs the harness
-            Step::Tables | Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
+            // the harness is built (tables): these run it
+            Step::GlProxies | Step::DriveTap | Step::HostFonts => Class::Harness,
             _ => Class::Light,
         })
     }
@@ -407,7 +414,12 @@ impl Step {
                     .context("cargo-deny not installed: cargo install --locked cargo-deny")?;
                 cargo(root, &["deny", "--locked", "check"], Units::Plain)
             }
-            Step::Test => cargo(root, &["test", "--workspace", "--locked"], Units::Recorded),
+            Step::TestBuild => cargo(
+                root,
+                &["test", "--no-run", "--workspace", "--locked"],
+                Units::Recorded,
+            ),
+            Step::Test => crate::test_run::run(root),
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
@@ -467,6 +479,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         eprintln!("== check: {}", step.name());
         let mut started = Instant::now();
         let mut wait = Duration::ZERO;
+        let cpu = timing::cpu_used();
         // every step ends with one `== check: <step> (<s>) <outcome>` line: the time sits on the line that names the outcome
         let outcome = if let Some(why) = step.skip(&out) {
             skipped.push(step.name());
@@ -512,20 +525,23 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         };
         let took = started.elapsed();
-        times.push_waited(step.name(), took, wait);
+        let cpu = timing::cpu_used().saturating_sub(cpu);
+        times.push_step(step.name(), took, wait, cpu);
         let waited = if wait.is_zero() {
             String::new()
         } else {
             format!(", pool wait {}", timing::secs(wait))
         };
         eprintln!(
-            "== check: {} ({}{waited}) {outcome}",
+            "== check: {} ({}{waited}, cpu {}) {outcome}",
             step.name(),
-            timing::secs(took)
+            timing::secs(took),
+            timing::secs(cpu)
         );
     }
     // stderr like the step lines: stdout's last line stays the verdict line atl-out and land read
     eprintln!("{}", times.table("check").trim_end());
+    eprintln!("{}", times.critical());
     let verdict = Verdict {
         cmd: "check",
         total: Some((steps.len(), "steps")),
@@ -576,7 +592,7 @@ fn cross_bionic(root: &Path) -> Result<Option<String>> {
 }
 
 /// A cargo step: its output shown live as before, and kept, so a failure's first error line can name the cause.
-fn cargo(root: &Path, args: &[&str], units: Units) -> Result<()> {
+pub(crate) fn cargo(root: &Path, args: &[&str], units: Units) -> Result<()> {
     cargo_with(root, args, units, &[])
 }
 

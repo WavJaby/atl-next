@@ -112,6 +112,9 @@ enum Command {
     /// Per service, most churn first; per entry lines added + deleted, of the whole file or of the named declaration's body (overloads together), GONE when it vanished. Read-only.
     /// The src/aosp checkouts are shallow (pinned tag only): fetch the other tag there blobless, or pass `--repo <project>=<git dir>` holding both; a missing revision fails with the command it needs.
     UpgradeDiff(service_mirrors::Args),
+    /// Cargo's target runner while check step `test` lists the test binaries (test_run.rs).
+    #[command(hide = true)]
+    RecordTest(test_run::RecordArgs),
     /// Runs a test APK row (test-apks.toml), or an APK file given by path, under atld the way an app is (xtask-harness; `run-apk --help` for its options).
     #[command(disable_help_flag = true)]
     RunApk(Passthrough),
@@ -133,6 +136,10 @@ struct Passthrough {
 /// Parses the command line and runs the subcommand; the binary's whole `main`.
 pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // as cargo's runner: cwd and environment are a test binary's, nothing else of this command line applies
+    if let Command::RecordTest(args) = &cli.command {
+        return test_run::record(args).map(|()| ExitCode::SUCCESS);
+    }
     let root = checkout_root()?;
     // every command: the next `git worktree add` then links target/ into the pool before cargo's first build there
     if std::env::var_os(tree::ENV).is_none()
@@ -236,6 +243,7 @@ pub fn main() -> Result<ExitCode> {
             })?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::RecordTest(_) => unreachable!("main handles record-test first"),
         Command::RunApk(p) => harness::pass_through(&root, "run-apk", &p.args),
         Command::Remote(p) => harness::pass_through(&root, "remote", &p.args),
         Command::Test(p) => harness::pass_through(&root, "test", &p.args),

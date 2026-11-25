@@ -446,7 +446,7 @@ fn linked_hash(path: &Path, tree: &Path) -> Result<Option<String>> {
 }
 
 /// The package name in a `package_id`: `<source>#<name>@<version>`, or `<source>#<version>` where the name is the source path's last segment.
-fn package_name(package_id: &str) -> Option<String> {
+pub(crate) fn package_name(package_id: &str) -> Option<String> {
     let (source, rest) = package_id.split_once('#')?;
     match rest.split_once('@') {
         Some((name, _)) => Some(name.to_owned()),

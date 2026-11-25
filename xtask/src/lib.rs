@@ -85,6 +85,7 @@ pub mod spdx;
 pub mod stage_env;
 pub mod system;
 pub mod test_apks;
+pub mod test_run;
 pub mod ticket;
 pub mod timing;
 pub mod tree;
