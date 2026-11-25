@@ -1249,6 +1249,24 @@ impl Host {
         }
     }
 
+    /// Request `Abandon`: staged session `session` was refused by the services: its staged entry goes, and its staging dir with it (a session parsed in place keeps the installed code).
+    fn abandon(&self, session: u32) -> Result<()> {
+        let i = &self.installd;
+        let staged = i
+            .staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session)
+            .with_context(|| format!("session {session}: not staged"))?;
+        if staged.in_place.is_none() {
+            let dir = self.root.data().join("app").join(staging_name(session));
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing the staging dir {}", dir.display()))?;
+        }
+        log(format_args!("install session {session}: abandoned"));
+        Ok(())
+    }
+
     /// Request `Commit`: session `session` becomes `/data/app/<package>` as uid `uid` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
     /// The swap ([`code_swap::replace`]) is the commit point. An error before it leaves the installed code, the table and the permissions as they were: the staging dir and the staged entry go.
     /// An update waits until every process of the package is reaped (`Processes::wait_gone`): a `Kill` only signals.
@@ -2313,6 +2331,7 @@ fn answerer(host: Arc<Host>) -> impl FnMut(Request) -> Response + Send + 'static
             } => host
                 .commit(session, &package, uid, &names)
                 .map(|()| Response::Committed),
+            Request::Abandon { session } => host.abandon(session).map(|()| Response::Abandoned),
             Request::Reinstate {
                 session,
                 package,

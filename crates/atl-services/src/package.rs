@@ -1500,6 +1500,17 @@ fn signers(d: &SigningDetails) -> Option<Vec<&Signature>> {
     }
 }
 
+/// Whether an update signed as `new` may replace the installed package signed as `old`: both known, equal as sets (compareSignatureArrays). Unknown or missing signing on
+/// either side refuses. A rotated key is refused too: the lineage's capability flags are not decoded (AOSP checkCapability), so no lineage is trusted here.
+pub fn same_signers(old: Option<&SigningDetails>, new: Option<&SigningDetails>) -> bool {
+    match (old, new) {
+        (Some(old), Some(new)) => {
+            compare_signature_arrays(signers(old), signers(new)) == SIGNATURE_MATCH
+        }
+        _ => false,
+    }
+}
+
 /// The oldest signer of a lineage, if `d` has one (SigningDetails.hasPastSigningCertificates: non-null and non-empty).
 fn oldest_signer(d: &SigningDetails) -> Option<&Signature> {
     match d {

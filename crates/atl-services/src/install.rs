@@ -13,11 +13,13 @@ use atl_android_paths::{DATA_APP, DATA_USER, DATA_USER_DE};
 use atl_broker::control::StagedName;
 use atl_parcelables::android::content::pm::{ApplicationInfo, PackageInfo};
 use atl_services_types::native_libs::{SupportedAbi, instruction_set};
+use atl_services_types::permission::TARGET_SDK_RUNTIME_PERMISSIONS;
 use atl_services_types::system_packages;
 
 use crate::activity::log;
 use crate::app_id::AppIds;
 use crate::installed::Installed as Decoded;
+use crate::package::same_signers;
 use crate::package_state::PackageUserStates;
 use crate::packages::{InstallFields, PackageRecord, PackageTable, Permissions};
 use crate::process_control::{ControlSocket, ScanReply};
@@ -107,8 +109,8 @@ impl Installer {
         Ok(self.publish(batch))
     }
 
-    /// One session up to its commit, in this order: control `install`, parse, name taken (the table or `pending`), `change_of` (a Downgrade: Boot reinstates the installed code,
-    /// Session refuses), staged names, uid (after the parse: a refused session takes none), control `commit` (a failure releases the uid). The caller holds the install lock; nothing is published.
+    /// One session up to its commit: control `install`, then `check` (the refusals), the freeze, control `commit`. A refusal drops the staged session (control `abandon`); a failed
+    /// commit is atld's to clean up (its staging dir and entry go) and releases a fresh uid. The caller holds the install lock; nothing is published.
     fn install_one(
         &self,
         ids: &mut AppIds,
@@ -121,17 +123,69 @@ impl Installer {
             .install(session)
             .with_context(|| format!("installing session {session}"))
             .map_err(|e| failure(INTERNAL, e))?;
-        let parsed = Parsed::read(&frames)
-            .with_context(|| format!("session {session}"))
-            .map_err(|e| failure(INVALID_APK, e))?;
+        let Checked {
+            parsed,
+            version,
+            change,
+            names,
+            uid,
+            fresh,
+        } = self
+            .check(ids, session, &frames, origin, pending)
+            .map_err(|f| self.abandon(session, f))?;
         let name = parsed.name.clone();
-        if self.table.snapshot().by_name(&name).is_some()
-            || pending.iter().any(|i| i.record.name() == name)
+        // PackageFreezer (commitInstallPackages :1373-1386, after reconcile): frozen from here to the publish, so no start of the package crosses the swap; a failed commit unfreezes at the return
+        let frozen = self.stops.freeze(&name);
+        if let Err(e) = self
+            .control
+            .commit(session, &name, uid, names)
+            .with_context(|| format!("committing {name}"))
         {
-            return Err(Failure {
-                code: DUPLICATE,
-                message: format!("two packages named {name}"),
-            });
+            if fresh {
+                ids.release(uid);
+            }
+            return Err(failure(INTERNAL, e));
+        }
+        let code_dir = format!("{DATA_APP}/{name}");
+        let record = parsed.record(uid, &code_dir, true, (0, 0), &self.config);
+        Ok(Installed {
+            record,
+            reported: Reported {
+                package: name,
+                uid,
+                version,
+                change,
+            },
+            frozen,
+        })
+    }
+
+    /// The refusals of one staged session, each a [`refusal`]; the session takes no uid unless it passes. A Session of an installed name is an update ([`Installer::update`]);
+    /// any other name must be new (a Boot session also refuses a name the table holds: boot's batch is the only source of installed packages there).
+    fn check(
+        &self,
+        ids: &mut AppIds,
+        session: u32,
+        frames: &str,
+        origin: Origin,
+        pending: &[Installed],
+    ) -> Result<Checked, Failure> {
+        let parsed = Parsed::read(frames)
+            .with_context(|| format!("session {session}"))
+            .map_err(|e| refusal(INVALID_APK, e))?;
+        let name = parsed.name.clone();
+        let snapshot = self.table.snapshot();
+        let old = snapshot.by_name(&name);
+        if pending.iter().any(|i| i.record.name() == name)
+            || (origin == Origin::Boot && old.is_some())
+        {
+            return Err(refusal_text(
+                DUPLICATE,
+                format!("two packages named {name}"),
+            ));
+        }
+        if let (Origin::Session, Some(old)) = (origin, old) {
+            return self.update(session, parsed, old);
         }
         // checked before the commit, so a refused session leaves the installed code as it was (InstallPackageHelper.java :2884-2920 refuses ahead of any file move)
         let version = long_version(&parsed.info);
@@ -168,39 +222,89 @@ impl Installer {
                 (kept, installed, Change::Unchanged)
             }
         };
-        let names = parsed
+        let names = renames(&parsed, session)?;
+        let uid = ids
+            .acquire()
+            .ok_or_else(|| refusal_text(INTERNAL, "no application id left".into()))?;
+        Ok(Checked {
+            parsed,
+            version,
+            change,
+            names,
+            uid,
+            fresh: true,
+        })
+    }
+
+    /// A running install of `old`, the installed package of its name (P4c, PMS's replace): its refusals in the table's order, then the update. The uid is `old`'s: the pool gives none.
+    /// An equal version is an update too (Boot's equal version stays Unchanged, in [`Installer::check`]).
+    fn update(
+        &self,
+        session: u32,
+        parsed: Parsed,
+        old: &PackageRecord,
+    ) -> Result<Checked, Failure> {
+        let name = parsed.name.clone();
+        if old.app().flags & crate::packages::FLAG_SYSTEM != 0 {
+            return Err(refusal_text(
+                INTERNAL,
+                format!("updating system package {name} is not modelled"),
+            ));
+        }
+        let version = long_version(&parsed.info);
+        // the recorded version (P7 takes it from the code); a lower one is a Downgrade, counted by change_of
+        let from = self
+            .state
+            .version_code(&name)
+            .unwrap_or_else(|| long_version(&old.info));
+        if let Err(Downgrade { installed, .. }) = change_of(Some(from), version) {
+            return Err(Failure {
+                code: DOWNGRADE,
+                message: format!("Update version code {version} is older than current {installed}"),
+            });
+        }
+        let was = old.app().target_sdk_version;
+        let now = parsed
             .info
             .application_info
             .as_ref()
-            .with_context(|| format!("session {session}: no ApplicationInfo"))
-            .and_then(staged_names)
-            .with_context(|| format!("session {session}"))
-            .map_err(|e| failure(INVALID_APK, e))?;
-        let uid = ids
-            .acquire()
-            .ok_or_else(|| failure(INTERNAL, anyhow::anyhow!("no application id left")))?;
-        // PackageFreezer (commitInstallPackages :1373-1386, after reconcile): frozen from here to the publish, so no start of the package crosses the swap; a failed commit unfreezes at the return
-        let frozen = self.stops.freeze(&parsed.name);
-        if let Err(e) = self
-            .control
-            .commit(session, &parsed.name, uid, names)
-            .with_context(|| format!("committing {}", parsed.name))
-        {
-            ids.release(uid);
-            return Err(failure(INTERNAL, e));
+            .map_or(0, |a| a.target_sdk_version);
+        if was >= TARGET_SDK_RUNTIME_PERMISSIONS && now < TARGET_SDK_RUNTIME_PERMISSIONS {
+            return Err(refusal_text(
+                PERMISSION_MODEL,
+                format!(
+                    "Package {name} new target SDK {now} doesn't support runtime permissions but the old target SDK {was} does."
+                ),
+            ));
         }
-        let code_dir = format!("{DATA_APP}/{}", parsed.name);
-        let record = parsed.record(uid, &code_dir, true, (0, 0), &self.config);
-        Ok(Installed {
-            record,
-            reported: Reported {
-                package: name,
-                uid,
-                version,
-                change,
-            },
-            frozen,
+        if !same_signers(
+            old.info.signing_info.as_ref(),
+            parsed.info.signing_info.as_ref(),
+        ) {
+            return Err(refusal_text(
+                UPDATE_INCOMPATIBLE,
+                format!("Existing package {name} signatures do not match newer version; ignoring!"),
+            ));
+        }
+        let names = renames(&parsed, session)?;
+        Ok(Checked {
+            parsed,
+            version,
+            change: Change::Updated { from },
+            names,
+            uid: old.uid,
+            fresh: false,
         })
+    }
+
+    /// Refused staged `session` (`f`): atld drops the session (control `abandon`). A failed abandon is logged; the refusal stands.
+    fn abandon(&self, session: u32, f: Failure) -> Failure {
+        if let Err(e) = self.control.abandon(session) {
+            log(format_args!(
+                "install session {session}: abandon failed: {e}"
+            ));
+        }
+        f
     }
 
     /// The batch becomes visible at once, under the install lock: its permission states, then the table, then each recorded version. Before this nothing of it was visible.
@@ -235,12 +339,47 @@ const INTERNAL: &str = "INSTALL_FAILED_INTERNAL_ERROR";
 const INVALID_APK: &str = "INSTALL_FAILED_INVALID_APK";
 const DUPLICATE: &str = "INSTALL_FAILED_DUPLICATE_PACKAGE";
 const DOWNGRADE: &str = "INSTALL_FAILED_VERSION_DOWNGRADE";
+const PERMISSION_MODEL: &str = "INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE";
+const UPDATE_INCOMPATIBLE: &str = "INSTALL_FAILED_UPDATE_INCOMPATIBLE";
 
+/// An installer or control failure: the session fails, nothing of it is committed. Not a refusal: see [`refusal`].
 fn failure(code: &'static str, e: anyhow::Error) -> Failure {
     Failure {
         code,
         message: format!("{e:#}"),
     }
+}
+
+/// A refusal of a session (PMS's checks): the session fails and takes nothing; counted under its INSTALL_* name (IPackageManager.install). `change_of` counts DOWNGRADE itself.
+fn refusal(code: &'static str, e: anyhow::Error) -> Failure {
+    refusal_text(code, format!("{e:#}"))
+}
+
+fn refusal_text(code: &'static str, message: String) -> Failure {
+    atl_diag::refused(DIAG, &format!("install: {code}"));
+    Failure { code, message }
+}
+
+/// The renames the commit takes: the parse's ApplicationInfo names each staged file (`staged_names`); a parse without one is a refusal.
+fn renames(parsed: &Parsed, session: u32) -> Result<Vec<StagedName>, Failure> {
+    parsed
+        .info
+        .application_info
+        .as_ref()
+        .with_context(|| format!("session {session}: no ApplicationInfo"))
+        .and_then(staged_names)
+        .with_context(|| format!("session {session}"))
+        .map_err(|e| refusal(INVALID_APK, e))
+}
+
+/// A session past its refusals, as the commit takes it. `fresh`: `uid` came from the pool for it (a failed commit releases it); an update keeps the installed uid.
+struct Checked {
+    parsed: Parsed,
+    version: i64,
+    change: Change,
+    names: Vec<StagedName>,
+    uid: u32,
+    fresh: bool,
 }
 
 impl std::fmt::Display for Failure {
@@ -526,19 +665,42 @@ mod tests {
         assert_eq!(downgrades(), before + 2);
     }
 
-    /// An installer output of `package` at `version`, its base at `dir`/base.apk.
+    /// An installer output of `package` at `version`, its base at `dir`/base.apk; targetSdk 35, unsigned.
     fn frames_file(path: &Path, package: &str, version: i32, dir: &str) {
+        frames_file_with(path, package, version, dir, 35, None);
+    }
+
+    /// `frames_file` with the targetSdk and one signing certificate (`cert`; None: no signing info).
+    fn frames_file_with(
+        path: &Path,
+        package: &str,
+        version: i32,
+        dir: &str,
+        target_sdk: i32,
+        cert: Option<&[u8]>,
+    ) {
+        use atl_parcelables::codecs::android::content::pm::PackageInfo::{
+            Signature, SigningDetails,
+        };
         use atl_parcelables::parts::Part;
         use atl_services_types::installer_output::{Kind, write_frame};
         use binder::binder_impl::Parcel;
         let mut app = ApplicationInfo::default();
         app.item.package_name = Some(package.into());
-        app.target_sdk_version = 35;
+        app.target_sdk_version = target_sdk;
         app.source_dir = Some(format!("{dir}/base.apk"));
         let info = PackageInfo {
             package_name: Some(package.into()),
             version_code: version,
             application_info: Some(app),
+            signing_info: cert.map(|c| SigningDetails::Known {
+                signatures: Some(vec![Some(Signature {
+                    bytes: Some(c.to_vec()),
+                })]),
+                scheme_version: 3,
+                public_keys: None,
+                past_signing_certificates: None,
+            }),
             ..Default::default()
         };
         let mut p = Parcel::new();
@@ -695,22 +857,298 @@ mod tests {
         table: &Arc<PackageTable>,
         state: &Arc<PackageUserStates>,
     ) -> Installer {
+        installer_with(control, table, state, Arc::new(NoStops))
+    }
+
+    /// [`installer_over`] with `stops` as the package freezer.
+    fn installer_with(
+        control: &Arc<ControlSocket>,
+        table: &Arc<PackageTable>,
+        state: &Arc<PackageUserStates>,
+        stops: Arc<dyn PackageStops>,
+    ) -> Installer {
         let permissions = Arc::new(Permissions::new(&table.snapshot(), &[]));
-        let config = Config {
-            abis: vec![SupportedAbi {
-                abi: "x86_64".into(),
-                isa: "x86_64".into(),
-            }],
-        };
         Installer::new(
             Arc::clone(control),
-            config,
+            test_config(),
             AppIds::new(),
             Arc::clone(table),
             permissions,
             Arc::clone(state),
-            Arc::new(NoStops),
+            stops,
         )
+    }
+
+    /// The device's ABI for the tests: x86_64.
+    fn test_config() -> Config {
+        Config {
+            abis: vec![SupportedAbi {
+                abi: "x86_64".into(),
+                isa: "x86_64".into(),
+            }],
+        }
+    }
+
+    /// Counts the freezes taken; the guard drops at once (these tests run no process).
+    struct CountingStops(Arc<std::sync::atomic::AtomicUsize>);
+    impl PackageStops for CountingStops {
+        fn freeze(&self, _package: &str) -> Box<dyn Send> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(())
+        }
+    }
+
+    /// [`fake_atld`] that also records each request's name (the first word of its Debug form); the join gives the names in arrival order.
+    fn recording_atld(
+        answer: impl Fn(Request) -> Response + Clone + Send + 'static,
+    ) -> (Arc<ControlSocket>, std::thread::JoinHandle<Vec<String>>) {
+        use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("socketpair");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            let serve = move |r: Request| {
+                let name = format!("{r:?}")
+                    .split([' ', '{', '('])
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
+                record.lock().expect("seen").push(name);
+                answer(r)
+            };
+            atl_broker::control::serve_lanes(theirs, serve.clone(), serve).expect("serve_lanes");
+            let names = seen.lock().expect("seen").clone();
+            names
+        });
+        (Arc::new(ControlSocket::new(ours)), server)
+    }
+
+    /// A table holding `record`, recorded at `version`, over `state`.
+    fn table_with(
+        state: &Arc<PackageUserStates>,
+        record: PackageRecord,
+        version: i64,
+    ) -> Arc<PackageTable> {
+        state.set_version_code(record.name(), version);
+        Arc::new(PackageTable::new(
+            Packages::new(vec![record], BTreeMap::new()).with_user_state_arc(Arc::clone(state)),
+        ))
+    }
+
+    /// The record `package` at `version` has once installed: its frames parsed and recorded at uid 10_001, flags as its location gives (`flags`).
+    fn installed_record(
+        tag: &str,
+        package: &str,
+        version: i32,
+        target_sdk: i32,
+        cert: Option<&[u8]>,
+        flags: i32,
+    ) -> PackageRecord {
+        let path =
+            std::env::temp_dir().join(format!("atl-install-{tag}-{}.frames", std::process::id()));
+        let dir = format!("{DATA_APP}/{package}");
+        frames_file_with(&path, package, version, &dir, target_sdk, cert);
+        let parsed = Parsed::read(&path.to_string_lossy()).expect("installed frames");
+        let _ = std::fs::remove_file(&path);
+        parsed.record(10_001, &dir, false, (flags, 0), &test_config())
+    }
+
+    /// What one Session install did: its report or refusal, the requests the control saw in order, and the freezes taken.
+    struct Outcome {
+        result: Result<Reported, Failure>,
+        requests: Vec<String>,
+        freezes: usize,
+    }
+
+    /// One Session install (session 0) of `package` at `version` (targetSdk `target`, signed by `cert`) over `recorded` (the installed record and its recorded version). The pool
+    /// holds the installed uid, as boot leaves it. The fake atld stages, commits and abandons; any other request is an error.
+    fn session_over(
+        tag: &str,
+        recorded: Option<(PackageRecord, i64)>,
+        package: &str,
+        version: i32,
+        target: i32,
+        cert: Option<&[u8]>,
+    ) -> Outcome {
+        let tmp = std::env::temp_dir().join(format!("atl-install-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let f0 = tmp.join("0.frames");
+        frames_file_with(
+            &f0,
+            package,
+            version,
+            &format!("{DATA_APP}/vmdl0.tmp"),
+            target,
+            cert,
+        );
+        let f0 = f0.to_string_lossy().into_owned();
+        let state = Arc::new(PackageUserStates::default());
+        let mut ids = AppIds::new();
+        let table = match recorded {
+            Some((record, from)) => {
+                ids.register(record.uid);
+                table_with(&state, record, from)
+            }
+            None => empty_table(&state),
+        };
+        let (control, server) = recording_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Commit { .. } => Response::Committed,
+            Request::Abandon { session: 0 } => Response::Abandoned,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let freezes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let installer = installer_with(
+            &control,
+            &table,
+            &state,
+            Arc::new(CountingStops(Arc::clone(&freezes))),
+        );
+        let result = installer
+            .install_one(&mut ids, 0, Origin::Session, &[])
+            .map(|i| i.reported);
+        drop(installer);
+        drop(control);
+        let requests = server.join().expect("server");
+        let _ = std::fs::remove_dir_all(&tmp);
+        Outcome {
+            result,
+            requests,
+            freezes: freezes.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// A session refused at its parse drops its staged session: control `abandon` follows its install, and no `Commit` is sent.
+    #[test]
+    fn a_refused_session_is_abandoned() {
+        let tmp = std::env::temp_dir().join(format!("atl-install-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let f0 = tmp.join("0.frames");
+        std::fs::write(&f0, b"").expect("empty output");
+        let f0 = f0.to_string_lossy().into_owned();
+        let state = Arc::new(PackageUserStates::default());
+        let table = empty_table(&state);
+        let (control, server) = recording_atld(move |r| match r {
+            Request::Install { session: 0 } => Response::Staged { frames: f0.clone() },
+            Request::Abandon { session: 0 } => Response::Abandoned,
+            other => Response::Error {
+                message: format!("unexpected {other:?}"),
+            },
+        });
+        let installer = installer_over(&control, &table, &state);
+        let mut ids = AppIds::new();
+        let err = installer
+            .install_one(&mut ids, 0, Origin::Session, &[])
+            .err()
+            .expect("an empty output is refused");
+        assert_eq!(err.code, "INSTALL_FAILED_INVALID_APK");
+        drop(installer);
+        drop(control);
+        assert_eq!(server.join().expect("server"), ["Install", "Abandon"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An installed system package is not updated by a running install (D9): refused by name, the session dropped, nothing committed, no freeze.
+    #[test]
+    fn a_system_package_is_not_updated() {
+        let record = installed_record(
+            "sys",
+            "com.example.app",
+            2,
+            35,
+            None,
+            crate::packages::FLAG_SYSTEM,
+        );
+        let out = session_over("sys", Some((record, 2)), "com.example.app", 3, 35, None);
+        assert_eq!(
+            out.result,
+            Err(Failure {
+                code: "INSTALL_FAILED_INTERNAL_ERROR",
+                message: "updating system package com.example.app is not modelled".into(),
+            })
+        );
+        assert_eq!(out.requests, ["Install", "Abandon"]);
+        assert_eq!(out.freezes, 0);
+    }
+
+    /// A lower version than the installed one is refused as a downgrade (its text as checkDowngrade's); the session is dropped and nothing committed, no freeze.
+    #[test]
+    fn a_lower_version_of_an_installed_package_is_refused() {
+        let record = installed_record("down", "com.example.app", 2, 35, None, 0);
+        let out = session_over("down", Some((record, 2)), "com.example.app", 1, 35, None);
+        assert_eq!(
+            out.result,
+            Err(Failure {
+                code: "INSTALL_FAILED_VERSION_DOWNGRADE",
+                message: "Update version code 1 is older than current 2".into(),
+            })
+        );
+        assert_eq!(out.requests, ["Install", "Abandon"]);
+        assert_eq!(out.freezes, 0);
+    }
+
+    /// An install at the installed version is an update: it keeps the installed uid (the pool's next id is not taken) and reports Updated from that version; the commit goes
+    /// with that uid, and the package is frozen once.
+    #[test]
+    fn an_update_keeps_the_uid_and_reports_an_update() {
+        let cert = Some(&b"cert-a"[..]);
+        let record = installed_record("same", "com.example.app", 2, 35, cert, 0);
+        let out = session_over("same", Some((record, 2)), "com.example.app", 2, 35, cert);
+        assert_eq!(
+            out.result,
+            Ok(Reported {
+                package: "com.example.app".into(),
+                uid: 10_001,
+                version: 2,
+                change: Change::Updated { from: 2 },
+            })
+        );
+        assert_eq!(out.requests, ["Install", "Commit"]);
+        assert_eq!(out.freezes, 1);
+    }
+
+    /// An update may not drop the target SDK below runtime permissions: INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE, AOSP's text, nothing committed.
+    #[test]
+    fn a_target_sdk_that_drops_runtime_permissions_is_refused() {
+        let record = installed_record("model", "com.example.app", 2, 30, None, 0);
+        let out = session_over("model", Some((record, 2)), "com.example.app", 3, 22, None);
+        assert_eq!(
+            out.result,
+            Err(Failure {
+                code: "INSTALL_FAILED_PERMISSION_MODEL_DOWNGRADE",
+                message: "Package com.example.app new target SDK 22 doesn't support runtime permissions but the old target SDK 30 does.".into(),
+            })
+        );
+        assert_eq!(out.requests, ["Install", "Abandon"]);
+    }
+
+    /// An update carries the installed package's signers, equal as sets. Another signer, or none on either side, is refused (INSTALL_FAILED_UPDATE_INCOMPATIBLE).
+    #[test]
+    fn an_update_with_other_or_no_signers_is_refused() {
+        let text =
+            "Existing package com.example.app signatures do not match newer version; ignoring!";
+        let (a, b) = (Some(&b"cert-a"[..]), Some(&b"cert-b"[..]));
+        for (installed, new) in [(a, b), (a, None), (None, a)] {
+            let record = installed_record("sign", "com.example.app", 2, 35, installed, 0);
+            let out = session_over("sign", Some((record, 2)), "com.example.app", 3, 35, new);
+            assert_eq!(
+                out.result,
+                Err(Failure {
+                    code: "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+                    message: text.into(),
+                }),
+                "installed {installed:?}, update {new:?}"
+            );
+            assert_eq!(out.requests, ["Install", "Abandon"]);
+        }
     }
 
     /// A table holding no package, over `state` as its user state (system_services shares it the same way).

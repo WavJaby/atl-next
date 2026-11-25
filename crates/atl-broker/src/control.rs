@@ -104,6 +104,11 @@ pub enum Request {
         version: i64,
         installed: i64,
     },
+    /// Drop staged session `session` after the services refused it (a refusal before its `Commit`): its staged entry goes, and its staging dir with it (a session parsed in place keeps the
+    /// installed code). Answered [`Response::Abandoned`]; a session atld does not hold is an `Error`. An installer op: the staging dir is file work, on the lane like the session's install.
+    Abandon {
+        session: u32,
+    },
     /// PMS's system scan of one preinstalled package dir (`dir`: its Android path, one of atl-services-types `system_packages::scan`'s dirs, e.g. `/product/app/Fixture`): the installer parses it
     /// where it lies (read-only partition, no staging, no native-library copy). No uid yet: PMS assigns the appId only to a package the scan accepts. Answered [`Response::Staged`]; a failed run
     /// answers its stderr.
@@ -148,7 +153,8 @@ impl Request {
             | Request::Reinstate { .. }
             | Request::Scan { .. }
             | Request::Commit { .. }
-            | Request::ScanCommit { .. } => true,
+            | Request::ScanCommit { .. }
+            | Request::Abandon { .. } => true,
             Request::Start(_)
             | Request::Kill { .. }
             | Request::ProgramPid { .. }
@@ -222,6 +228,8 @@ pub enum Response {
     },
     /// The package is in place.
     Committed,
+    /// The refused session's staged entry is gone ([`Request::Abandon`]).
+    Abandoned,
     /// The notification's fate.
     Notified {
         outcome: NotifyOutcome,

@@ -37,6 +37,15 @@ impl ControlSocket {
         }
     }
 
+    /// Drops staged session `session` after the services refused it ([`Request::Abandon`]).
+    pub fn abandon(&self, session: u32) -> io::Result<()> {
+        match self.call(&Request::Abandon { session })? {
+            Response::Abandoned => Ok(()),
+            Response::Error { message } => Err(io::Error::other(message)),
+            other => Err(io::Error::other(format!("abandon answered {other:?}"))),
+        }
+    }
+
     /// The host's default network now, as `DefaultNetwork::to_arg` writes it (atld reads it outside the sandbox); None = no default route.
     pub fn network(&self) -> io::Result<Option<String>> {
         match self.call(&Request::Network)? {
