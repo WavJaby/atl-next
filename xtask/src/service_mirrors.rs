@@ -230,6 +230,10 @@ pub fn declarations(text: &str, name: &str, is_type: bool) -> Vec<usize> {
                     }
                     before = class;
                 }
+                // Kotlin `fun Receiver.name(`: the receiver's dot stands where the space does
+                if before.ends_with('.') && before.split_whitespace().any(|t| t == "fun") {
+                    return true;
+                }
                 // the declared name follows whitespace, after a type token that is not a keyword
                 if !before.ends_with([' ', '\t']) || before.contains('=') {
                     return false;
@@ -474,6 +478,20 @@ class Outer {
             bodies(JAVA, "abs", false),
             vec!["    abstract void abs(int a);"]
         );
+    }
+
+    #[test]
+    fn a_kotlin_extension_function_is_a_declaration_and_its_call_is_not() {
+        let d = |l: &str| declarations(l, "onPackageAdded", false);
+        // AppIdPermissionPolicy.kt's line
+        assert_eq!(
+            d("    override fun MutateStateScope.onPackageAdded(packageState: PackageState) {"),
+            [0]
+        );
+        assert_eq!(d("    fun <T> Scope<T>.onPackageAdded() {}"), [0]);
+        // the call forms: without the `fun` token the dot rule does not apply
+        assert!(d("        policy.onPackageAdded(state)").is_empty());
+        assert!(d("        with(policy) { scope.onPackageAdded(state) }").is_empty());
     }
 
     #[test]

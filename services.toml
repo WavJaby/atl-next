@@ -159,7 +159,7 @@ mirrors = [
     "frameworks/base/services/core/java/com/android/server/pm/PackageManagerShellCommand.java#runListPackages",
     "frameworks/libs/modules-utils/java/com/android/modules/utils/BasicShellCommandHandler.java#handleDefaultCommands",
     "frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java#installPackagesTraced",
-    "frameworks/base/services/permission/java/com/android/server/permission/access/permission/AppIdPermissionPolicy.kt",
+    "frameworks/base/services/permission/java/com/android/server/permission/access/permission/AppIdPermissionPolicy.kt#onPackageAdded",
 ]
 
 [display]
