@@ -803,6 +803,7 @@ pub fn try_lock_dir(ws: &Path, id: &str) -> Result<Option<DirLock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
@@ -1512,6 +1513,17 @@ mod tests {
         );
     }
 
+    /// The process group of a test's holder (`process_group(0)`), killed with every member at drop. The test SIGKILLs the holder and its `sleep` outlives it: that sleep would hold the ram mount lock of the namespace the test runs in until the namespace ends.
+    struct Group(i32);
+
+    impl Drop for Group {
+        fn drop(&mut self) {
+            if let Some(pid) = rustix::process::Pid::from_raw(self.0) {
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
     /// A holder killed with SIGKILL frees its slot: the lock goes with its file. The holder is flock(1) (util-linux), another process.
     #[test]
     fn killed_holder_frees_its_slot() {
@@ -1523,11 +1535,14 @@ mod tests {
             .arg("-o")
             .arg(&cpu1)
             .args(["sleep", "60"])
+            // its own group: the sleep left behind when flock is killed is in it, and `Group` kills it at the test's end
+            .process_group(0)
             .stdout(Stdio::null())
             // the orphaned sleep must not hold the test binary's stderr open (a piped `cargo test` would wait 60 s)
             .stderr(Stdio::null())
             .spawn()
             .expect("flock(1) from util-linux");
+        let _group = Group(i32::try_from(child.id()).expect("a pid fits i32"));
         // wait until the child holds it
         let held = (0..250).any(|_| {
             std::thread::sleep(FAST);
