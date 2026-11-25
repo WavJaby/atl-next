@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -497,15 +497,19 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
             .unwrap_or_else(|p| p.into_inner())
             .note(&snapshot, Some(&row.name()));
     };
-    let run_one = |row: &Row, admitted: &Admitted| -> Done {
+    // a row's place is taken on the lanes' thread, in start order; its grant is waited for on the row's own thread
+    let take = |row: &Row| build_pool::enqueue(&ws, root, row.class);
+    let run_one = |row: &Row, place: Result<build_pool::Queued>, admitted: &Admitted| -> Done {
         // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
-        let gated = build_pool::acquire_quiet_stdout(&ws, root, row.class).and_then(|grant| {
-            let entered = admitted.enter();
-            let mut done = at.row(row, Attempt::First)?;
-            done.running = entered.count;
-            done.grant = grant.class;
-            Ok((done, grant))
-        });
+        let gated = place
+            .and_then(|queued| queued.wait(build_pool::POLL, &mut |line: &str| eprintln!("{line}")))
+            .and_then(|grant| {
+                let entered = admitted.enter();
+                let mut done = at.row(row, Attempt::First)?;
+                done.running = entered.count;
+                done.grant = grant.class;
+                Ok((done, grant))
+            });
         note_moved(row);
         gated
             .map(|(done, _grant)| done)
@@ -528,7 +532,9 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         eprintln!("{}", done.line);
         done
     };
-    let (stats, mut done) = run_lanes(ROWS, &run_one, &mut |first| eprintln!("{}", first.line));
+    let (stats, mut done) = run_lanes(ROWS, &take, &run_one, &mut |first| {
+        eprintln!("{}", first.line)
+    });
     settle(&mut done, &mut |i, first| rerun(&ROWS[i], first));
     let names: Vec<String> = ROWS.iter().map(Row::name).collect();
     let Judged {
@@ -612,24 +618,56 @@ fn with_lane(line: &str, lane: Lane, running: usize) -> String {
     }
 }
 
-/// Runs `rows` with `run_one` (which takes the row's grant itself, then enters `Admitted`): parallel rows concurrently, each once its `after` rows ended, then serial rows one at a time, alone.
+/// A row's result on its way to the lanes: sent when the row's thread ends, or as `None` when it unwinds, so the lanes never wait for a result that will not come.
+struct Sent {
+    tx: mpsc::Sender<(usize, Option<Done>)>,
+    i: usize,
+    done: Option<Done>,
+}
+
+impl Drop for Sent {
+    fn drop(&mut self) {
+        let _ = self.tx.send((self.i, self.done.take()));
+    }
+}
+
+/// Runs `rows` with `run_one`: parallel rows concurrently, then serial rows one at a time, alone.
+/// `take` makes a row's pool place on this thread, in start order (the parallel rows others wait for first, then table order), each once its `after` rows ended; `run_one` waits for that place on the row's own thread. So the queue serves the start order, not the order the threads reach the pool.
 /// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` ([`Done::running`]). Returns the stats and every result, in table order.
-fn run_lanes(
+fn run_lanes<P: Send>(
     rows: &[Row],
-    run_one: &(dyn Fn(&Row, &Admitted) -> Done + Sync),
+    take: &(dyn Fn(&Row) -> P + Sync),
+    run_one: &(dyn Fn(&Row, P, &Admitted) -> Done + Sync),
     emit: &mut dyn FnMut(&Done),
 ) -> (LaneStats, Vec<Done>) {
     let started = Instant::now();
     let names: Vec<String> = rows.iter().map(Row::name).collect();
-    let ended = Mutex::new(vec![false; rows.len()]);
-    let wake = Condvar::new();
+    // `after` names are checked against the table by a test (`after_names_earlier_parallel_rows`); a name that is no row is ignored
+    let deps: Vec<Vec<usize>> = rows
+        .iter()
+        .map(|row| {
+            row.after
+                .iter()
+                .filter_map(|a| names.iter().position(|n| n == a))
+                .collect()
+        })
+        .collect();
+    let depended: Vec<bool> = (0..rows.len())
+        .map(|i| deps.iter().any(|d| d.contains(&i)))
+        .collect();
+    let mut waiting: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].lane == Lane::Parallel)
+        .collect();
+    // start order: the rows others wait for first, then table order (a stable sort)
+    waiting.sort_by_key(|&i| !depended[i]);
     let admitted = Admitted::default();
-    let start_one = |i: usize| -> Done {
-        let mut done = run_one(&rows[i], &admitted);
+    let start_one = |i: usize, place: P| -> Done {
+        let mut done = run_one(&rows[i], place, &admitted);
         done.line = with_lane(&done.line, rows[i].lane, done.running);
         done
     };
     let mut results: Vec<Option<Done>> = (0..rows.len()).map(|_| None).collect();
+    let mut ended = vec![false; rows.len()];
     let mut next = 0;
     let mut flush = |results: &[Option<Done>], next: &mut usize| {
         while let Some(Some(done)) = results.get(*next) {
@@ -639,39 +677,40 @@ fn run_lanes(
     };
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
-        for (i, row) in rows.iter().enumerate() {
-            if row.lane != Lane::Parallel {
-                continue;
-            }
-            let tx = tx.clone();
-            let (ended, wake, names, start_one) = (&ended, &wake, &names, &start_one);
-            scope.spawn(move || {
-                // `after` names are checked against the table by a test (`after_names_earlier_parallel_rows`)
-                let deps: Vec<usize> = row
-                    .after
-                    .iter()
-                    .filter_map(|a| names.iter().position(|n| n == a))
-                    .collect();
-                let mut e = ended.lock().unwrap_or_else(|p| p.into_inner());
-                while deps.iter().any(|&d| !e[d]) {
-                    e = wake.wait(e).unwrap_or_else(|p| p.into_inner());
+        let mut running = 0;
+        while !waiting.is_empty() || running > 0 {
+            let mut k = 0;
+            while k < waiting.len() {
+                let i = waiting[k];
+                if deps[i].iter().all(|&d| ended[d]) {
+                    waiting.remove(k);
+                    let place = take(&rows[i]);
+                    let (tx, run) = (tx.clone(), &start_one);
+                    scope.spawn(move || {
+                        let mut sent = Sent { tx, i, done: None };
+                        sent.done = Some(run(i, place));
+                    });
+                    running += 1;
+                } else {
+                    k += 1;
                 }
-                drop(e);
-                let done = start_one(i);
-                ended.lock().unwrap_or_else(|p| p.into_inner())[i] = true;
-                wake.notify_all();
-                let _ = tx.send((i, done));
-            });
-        }
-        drop(tx);
-        for (i, done) in rx {
+            }
+            assert!(running > 0, "the parallel rows' `after` edges form a cycle");
+            let (i, done) = rx.recv().expect("the lanes hold a sender");
+            let Some(done) = done else {
+                // a row unwound: stop dispatching; the scope re-raises its panic when it ends
+                break;
+            };
+            running -= 1;
+            ended[i] = true;
             results[i] = Some(done);
             flush(&results, &mut next);
         }
     });
     for (i, row) in rows.iter().enumerate() {
         if row.lane == Lane::Serial {
-            results[i] = Some(start_one(i));
+            let place = take(row);
+            results[i] = Some(start_one(i, place));
             flush(&results, &mut next);
         }
     }
@@ -996,7 +1035,7 @@ mod tests {
         ];
         let t0 = Instant::now();
         let spans = Mutex::new(Vec::new());
-        let run_one = |row: &Row, admitted: &Admitted| -> Done {
+        let run_one = |row: &Row, _: (), admitted: &Admitted| -> Done {
             let entered = admitted.enter();
             let from = t0.elapsed();
             // the stager is slowest, so a reader that ignored its edge would start first
@@ -1025,7 +1064,7 @@ mod tests {
             }
         };
         let mut seen = Vec::new();
-        let (stats, _) = run_lanes(FAKE, &run_one, &mut |d| {
+        let (stats, _) = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |d| {
             seen.push((d.line.clone(), d.outcome))
         });
         let names: Vec<String> = seen
@@ -1063,6 +1102,103 @@ mod tests {
             "parallel rows did not overlap: {stats:?}"
         );
         assert!((stats.sum - 0.4).abs() < 1e-9);
+    }
+
+    /// The lanes admit `app` (the row others wait for) first, whatever the table order: width 1 admits it first; width 3 admits `app` and the two rows after it in table order. The first wave holds its grants until `width` rows are admitted, so the set is exact, not a timing guess.
+    #[test]
+    fn lanes_admit_the_dependency_first() {
+        const FAKE: &[Row] = &[
+            Row::new(&["reader-a"], false, false),
+            Row::new(&["reader-b"], false, false),
+            Row::new(&["reader-c"], false, false),
+            Row::new(&["reader-d"], false, false),
+            Row::new(&["app"], false, false),
+            Row::new(&["follower"], false, false).after(&["app"]),
+        ];
+        const FAST: Duration = Duration::from_millis(5);
+        for width in [1, 3] {
+            let ws =
+                std::env::temp_dir().join(format!("atl-lanes-w{width}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&ws);
+            std::fs::create_dir_all(&ws).expect("scratch ws");
+            let toml = format!(
+                "[pool]\ncpu_slots = {width}\nmem_gib = 20\n[pool.harness]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 1\n"
+            );
+            std::fs::write(ws.join("workspace.toml"), toml).expect("workspace.toml");
+            let who = ws.join("checkout");
+            let t0 = Instant::now();
+            let order: Mutex<Vec<String>> = Mutex::new(Vec::new());
+            let spans: Mutex<Vec<(String, Duration, Duration)>> = Mutex::new(Vec::new());
+            let take = |row: &Row| build_pool::enqueue(&ws, &who, row.class);
+            let run_one = |row: &Row, place: Result<build_pool::Queued>, admitted: &Admitted| {
+                let grant = place
+                    .and_then(|queued| queued.wait(FAST, &mut |_: &str| {}))
+                    .expect("grant");
+                let entered = admitted.enter();
+                let from = t0.elapsed();
+                order.lock().expect("order").push(row.name());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while order.lock().expect("order").len() < width && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+                spans
+                    .lock()
+                    .expect("spans")
+                    .push((row.name(), from, t0.elapsed()));
+                let running = entered.count;
+                drop(entered);
+                drop(grant);
+                Done {
+                    took: 0.03,
+                    running,
+                    ..Done::bare(
+                        Outcome::Pass,
+                        format!("gates: {} x (0.0s peak=0MiB) v", row.name()),
+                        row.name(),
+                    )
+                }
+            };
+            let _ = run_lanes(FAKE, &take, &run_one, &mut |_| {});
+            let order = order.into_inner().expect("order");
+            let mut first: Vec<&str> = order[..width].iter().map(String::as_str).collect();
+            first.sort_unstable();
+            let expect: &[&str] = if width == 1 {
+                &["app"]
+            } else {
+                &["app", "reader-a", "reader-b"]
+            };
+            assert_eq!(first, expect, "width {width}: admitted {order:?}");
+            let spans = spans.into_inner().expect("spans");
+            let span = |n: &str| {
+                let s = spans.iter().find(|s| s.0 == n).expect("span");
+                (s.1, s.2)
+            };
+            assert!(
+                span("follower").0 >= span("app").1,
+                "width {width}: follower admitted before app ended"
+            );
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+    }
+
+    /// A row that unwinds does not leave the lanes waiting for its result: the lanes stop dispatching and the panic surfaces (without the `Sent` guard this test hangs).
+    #[test]
+    #[should_panic(expected = "a scoped thread panicked")]
+    fn lanes_do_not_wait_for_an_unwound_row() {
+        const FAKE: &[Row] = &[
+            Row::new(&["fails"], false, false),
+            Row::new(&["after-fail"], false, false).after(&["fails"]),
+        ];
+        let run_one = |row: &Row, _: (), _: &Admitted| -> Done {
+            assert_ne!(row.name(), "fails", "the row unwinds");
+            Done::bare(
+                Outcome::Pass,
+                format!("gates: {} x", row.name()),
+                row.name(),
+            )
+        };
+        let _ = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |_| {});
     }
 
     #[test]
@@ -1329,7 +1465,7 @@ mod tests {
             "starved-red" => Outcome::Fail,
             _ => Outcome::Undecided,
         };
-        let run_one = |row: &Row, admitted: &Admitted| -> Done {
+        let run_one = |row: &Row, _: (), admitted: &Admitted| -> Done {
             let entered = admitted.enter();
             let outcome = first_of(&row.name());
             Done {
@@ -1344,7 +1480,7 @@ mod tests {
                 ..Done::bare(outcome, format!("gates: {} first", row.name()), row.name())
             }
         };
-        let (_, mut done) = run_lanes(FAKE, &run_one, &mut |_| {});
+        let (_, mut done) = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |_| {});
         let mut reran = Vec::new();
         settle(&mut done, &mut |i, _| {
             let name = FAKE[i].name();

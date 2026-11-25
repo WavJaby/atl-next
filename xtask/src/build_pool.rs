@@ -220,14 +220,27 @@ pub fn acquire_quiet_stdout(ws: &Path, who: &Path, class: Class) -> Result<Grant
     })
 }
 
-fn acquire_with(
-    ws: &Path,
-    who: &Path,
+/// [`acquire`] split at the queue: [`enqueue`] takes the place now, [`Queued::wait`] waits for its grant on the thread that will hold it. The queue serves places in the order they were taken, so the caller's order is the pool's order.
+pub struct Queued {
+    pool: PoolConfig,
+    dir: PathBuf,
+    queue: PathBuf,
     class: Class,
     tier: Tier,
-    poll: Duration,
-    report: &mut dyn FnMut(&str),
-) -> Result<Grant> {
+    w: ClassWeight,
+    record: String,
+    /// `None` for light: it queues only when it would take a slot the head needs (`bypass_allowed`)
+    ticket: Option<Ticket>,
+    /// the wait's start: `after N s` and the starvation bound count from here
+    started: Instant,
+}
+
+/// Takes `class`'s place for checkout `who` in workspace `ws` without waiting ([`Tier::of`] `who`). Dropped unwaited, the place leaves the queue.
+pub fn enqueue(ws: &Path, who: &Path, class: Class) -> Result<Queued> {
+    enqueue_with(ws, who, class, Tier::of(who))
+}
+
+fn enqueue_with(ws: &Path, who: &Path, class: Class, tier: Tier) -> Result<Queued> {
     let pool = ws_config::load(ws)?.pool;
     let w = pool.classes[&class];
     fits(&pool, class, w)?;
@@ -237,11 +250,53 @@ fn acquire_with(
     check_nesting(&pool, &dir)?;
     let record = holder_record(who, class.name());
     // heavy work queues at once; light queues only when it would take a slot the head needs (`bypass_allowed`)
-    let mut ticket = match class {
+    let ticket = match class {
         Class::Light => None,
         _ => Some(Ticket::new(&queue, std::process::id(), class, tier)?),
     };
-    let started = Instant::now();
+    Ok(Queued {
+        pool,
+        dir,
+        queue,
+        class,
+        tier,
+        w,
+        record,
+        ticket,
+        started: Instant::now(),
+    })
+}
+
+fn acquire_with(
+    ws: &Path,
+    who: &Path,
+    class: Class,
+    tier: Tier,
+    poll: Duration,
+    report: &mut dyn FnMut(&str),
+) -> Result<Grant> {
+    enqueue_with(ws, who, class, tier)?.wait(poll, report)
+}
+
+impl Queued {
+    /// Waits for the grant on the calling thread, which holds it: `poll` between tries, `report` gets each `pool:` line.
+    pub fn wait(self, poll: Duration, report: &mut dyn FnMut(&str)) -> Result<Grant> {
+        wait_place(self, poll, report)
+    }
+}
+
+fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> Result<Grant> {
+    let Queued {
+        pool,
+        dir,
+        queue,
+        class,
+        tier,
+        w,
+        record,
+        mut ticket,
+        started,
+    } = queued;
     let starve_after = Duration::from_secs(pool.starve_after_s.value.into());
     let mut waited = false;
     let grant = |cpu: u32, mem_gib: u32, waited: Duration, files: Vec<Flock>, record: String| {
@@ -1388,6 +1443,27 @@ mod tests {
             panic!("waited")
         })
         .expect("admitted again after the release");
+    }
+
+    /// Places taken on one thread are served in the order taken, whichever thread waits: the second place's waiter is spawned first. The holder records its turn before it releases the only slot, so the order is exact.
+    #[test]
+    fn queued_places_are_served_in_the_order_taken() {
+        let ws = scratch_ws("queued-order", Some(CONFIG_ONE_CPU));
+        let who = ws.join("checkout");
+        let first = enqueue(&ws, &who, Class::Cargo).expect("first place");
+        let second = enqueue(&ws, &who, Class::Cargo).expect("second place");
+        let served = std::sync::Mutex::new(Vec::new());
+        let serve = |place: Queued, name: &'static str| {
+            let grant = place.wait(FAST, &mut |_: &str| {}).expect("grant");
+            served.lock().expect("served").push(name);
+            std::thread::sleep(Duration::from_millis(50));
+            drop(grant);
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| serve(second, "second"));
+            s.spawn(|| serve(first, "first"));
+        });
+        assert_eq!(served.into_inner().expect("served"), ["first", "second"]);
     }
 
     const CONFIG_ONE_CPU: &str = "[pool]\ncpu_slots = 1\nmem_gib = 20\n";
