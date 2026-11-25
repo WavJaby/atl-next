@@ -10,7 +10,7 @@
 //! Only this process tree sees the dir: outside, `ws/<id>` is the empty mount point. Cargo's bootstrap of xtask (before xtask runs) stays on `pool/boot/<id>`, the checkout's `target` link; cargo runs inside get the dir's target as `CARGO_TARGET_DIR` (out::pending_target).
 //! Admission: the store's own accounting (zram mm_stat, statvfs) is the persistent term; a build reserves the growth it adds to its own upper for its run ([`Need::of`]: its class's peak less what its upper already holds, floored at `delta.regrow_gib`), and others' reservations count against the store ([`judge`]). Waiters queue FIFO ([`admit_keeping`]): a new dir waits out others' reservations and otherwise takes the pool; an existing ram dir also waits out a full store and land's hold, and is refused only when it never fits or inside land's queue ([`fall_to_pool`]): admission never drops a dir.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -31,6 +31,8 @@ pub const ENV: &str = "ATL_XTASK_DELTA";
 const FRESH: &str = "fresh";
 /// In `<store>/<id>/`: the workspace path that made it. Ids are unique per workspace only.
 const OWNER: &str = "workspace";
+/// In an evicted ram dir's mount point: why its upper is gone ([`evict_one`]); removed with the dir when it is made again.
+const EVICTED: &str = "evicted";
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 /// statfs f_type of tmpfs (linux/magic.h TMPFS_MAGIC).
@@ -604,8 +606,7 @@ fn judge_quiet(
     own: u64,
     stats: &Stats,
 ) -> Result<Verdict> {
-    let (others, land) = land_now(ws)?;
-    let hold = hold_for(id, cfg, stats, land);
+    let (others, hold) = inputs(ws, id, cfg, stats)?;
     Ok(judge(
         stats,
         Need::of(class, cfg, stats, own),
@@ -613,6 +614,22 @@ fn judge_quiet(
         hold,
         cfg.ram_margin_gib.value * GIB,
     ))
+}
+
+/// Others' RAM reservations and land's hold on `stats`, as [`judge`] takes them.
+fn inputs(ws: &Path, id: &str, cfg: &DeltaConfig, stats: &Stats) -> Result<(u64, Hold)> {
+    let (others, land) = land_now(ws)?;
+    Ok((others, hold_for(id, cfg, stats, land)))
+}
+
+/// Bytes short of admitting `need` on `s` with `reserved` RAM held by others and `hold`: judge's checks summed, (raw, RAM), 0 = room. Others' reservations count in both, as a Wait counts them; a refusal is covered only with them.
+fn shortfall(s: &Stats, need: Need, reserved: u64, hold: Hold, margin: u64) -> (u64, u64) {
+    let others_raw = reserved.saturating_mul(s.ratio_milli) / 1000;
+    let ram_free = s.ram_limit.saturating_sub(s.ram_used);
+    (
+        (need.raw + others_raw + hold.raw).saturating_sub(s.fs_free),
+        (need.ram + hold.ram + reserved + margin).saturating_sub(ram_free),
+    )
 }
 
 /// Land's hold on `stats` as a non-land admission sees it now (`out show`).
@@ -688,7 +705,7 @@ fn admit(
     own: u64,
     probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
 ) -> Result<std::result::Result<Admitted, Verdict>> {
-    admit_keeping(ws, id, cfg, class, own, false, None, probe_now)
+    admit_keeping(ws, id, cfg, class, || Ok(own), false, None, probe_now)
 }
 
 /// The store queue's directory: one [`crate::ticket`] per waiting admission.
@@ -713,17 +730,18 @@ fn may_bypass(class: Class, head_payload: Option<&str>) -> bool {
         && head_payload.and_then(|p| p.split_whitespace().nth(1)) == Some("refuse")
 }
 
-/// Admits a build of `class` on store stats from `probe_now`, its upper holding `own` bytes of its part (fixed across the wait: the upper changes only under this checkout's own commands). Ok(Ok(reservation)), or Ok(Err(verdict)) for a verdict that does not wait.
+/// Admits a build of `class` on store stats from `probe_now`; `own` is its upper's credit, read under the gate at each judgement (an absent upper reads 0, so its need grows). Ok(Ok(reservation)), or Ok(Err(verdict)) for a verdict that does not wait.
 /// Waiting: one FIFO [`crate::ticket`] per waiter in [`queue_dir`], judged only at the head ([`may_bypass`] excepted, counter `delta-bypass`). Wait always queues; Refuse and Held queue only for an existing ram dir (`keep`; a new dir takes the pool). NeverFits never waits.
 /// A process inside land's queue ([`inside_land_queue`]) and the land checkout never join the FIFO: the land queue waits for them, and a FIFO head waiting on land's hold would wait for them in turn. They poll a Wait (others' reservations end without them); inside the queue Refuse and Held return at once.
-/// Nothing is held while waiting (admit gate released between polls, no reservation, no mount lock), so land's own admission proceeds. No timeout: an endless wait shows in `atl-job status`. A line per state change (`out: delta ws/<id>: waiting ...`, naming the store's holders from `store`), counter `delta-wait` once per wait.
+/// Nothing is held while waiting (admit gate released between polls, no reservation, no mount lock: `enter` takes the lock after admission), so land's own admission and the land queue's commands in this checkout proceed. No timeout: an endless wait shows in `atl-job status`. A line per state change (`out: delta ws/<id>: waiting ...`, naming the store's holders from `store`), counter `delta-wait` once per wait.
+/// Eviction ([`evict_for`]): a FIFO participant's Wait/Refuse/Held short of room first evicts idle checkouts' uppers; a process inside land's queue never does.
 #[allow(clippy::too_many_arguments)]
 fn admit_keeping(
     ws: &Path,
     id: &str,
     cfg: &DeltaConfig,
     class: Class,
-    own: u64,
+    mut own: impl FnMut() -> Result<u64>,
     keep: bool,
     store: Option<&Path>,
     mut probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
@@ -754,7 +772,20 @@ fn admit_keeping(
         };
         let bypass = ahead > 0 && may_bypass(class, tickets.first().map(|(_, p)| p.as_str()));
         let (state, why) = if ahead == 0 || bypass {
-            let v = judge_quiet(ws, id, cfg, class, own, &stats)?;
+            // read under the gate at every judgement: a changed or evicted upper shows here, not at the wait's start
+            let own_now = own()?;
+            let mut judged = stats;
+            let mut v = judge_quiet(ws, id, cfg, class, own_now, &judged)?;
+            // FIFO participants only: a process inside land's queue carries no ticket and never evicts (the queue waits for its commands)
+            if let Some(store) = store
+                && !unqueued
+                && matches!(v, Verdict::Wait(_) | Verdict::Refuse(_) | Verdict::Held(_))
+                && let Some(credited) =
+                    evict_for(ws, id, cfg, store, class, own_now, &judged, &tickets)?
+            {
+                v = judge_quiet(ws, id, cfg, class, own_now, &credited)?;
+                judged = credited;
+            }
             if matches!(v, Verdict::Held(_)) && said.is_none_or(|(s, _)| s != "held") {
                 out::count(ws, "delta-land-hold");
             }
@@ -771,7 +802,7 @@ fn admit_keeping(
                             t0.elapsed().as_secs_f64()
                         );
                     }
-                    return Ok(Ok((r, stats, need)));
+                    return Ok(Ok((r, judged, need)));
                 }
                 Verdict::NeverFits(_) => return Ok(Err(v)),
                 Verdict::Refuse(_) | Verdict::Held(_) if inside || !keep => return Ok(Err(v)),
@@ -781,7 +812,7 @@ fn admit_keeping(
             ("queued", format!("{ahead} ahead in the store queue"))
         };
         if !unqueued {
-            let payload = format!("{} {state}", class.name());
+            let payload = format!("{} {state} {id}", class.name());
             match &mut ticket {
                 Some(t) => t.set_payload(&payload)?,
                 None => {
@@ -818,7 +849,7 @@ fn admit_command(
     id: &str,
     cfg: &DeltaConfig,
     class: Option<Class>,
-    own: u64,
+    own: impl FnMut() -> Result<u64>,
     keep: bool,
     store: Option<&Path>,
     probe_now: impl FnMut() -> Result<std::result::Result<Stats, String>>,
@@ -831,24 +862,180 @@ fn admit_command(
     }
 }
 
+/// Checkout ids with a queued ticket: the payload's third field (`<class> <state> <id>`, [`admit_keeping`]).
+fn queued_ids(tickets: &[(String, String)]) -> HashSet<String> {
+    tickets
+        .iter()
+        .filter_map(|(_, p)| p.split_whitespace().nth(2))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Checkout ids with a live reservation (admitted, not yet mounted): a reservation file is `<id>-<pid>` and lives while its process does.
+fn reserving_ids(ws: &Path) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    let Ok(rd) = std::fs::read_dir(lock_dir(ws).join("reserve")) else {
+        return Ok(ids);
+    };
+    for e in rd.flatten() {
+        let Ok(f) = std::fs::File::open(e.path()) else {
+            continue;
+        };
+        if Flock::try_take(f, Mode::Shared)?.is_none()
+            && let Some((id, _)) = e.file_name().to_string_lossy().rsplit_once('-')
+        {
+            ids.insert(id.to_owned());
+        }
+    }
+    Ok(ids)
+}
+
+/// A ram dir an admission may evict ([`victims`]).
+struct Victim {
+    id: String,
+    /// Its whole upper, bytes: the `used` stamp.
+    raw: u64,
+    idle: std::time::Duration,
+}
+
+/// The ram dirs of `store` an admission by `me` may evict, longest idle first. Eligible: owned by `ws`; its record names `store`; its `used` stamp holds a size (written at each command's end; no stamp = unknown size = not eligible); its mount lock free (no command runs in it); not in `skip` (queued, reserving), not `me`, not land, not a dot name (`.run`, `.evict-` leftovers).
+fn victims(ws: &Path, store: &Path, me: &str, skip: &HashSet<String>) -> Result<Vec<Victim>> {
+    let rd = std::fs::read_dir(store).with_context(|| format!("reading {}", store.display()))?;
+    let mut found = Vec::new();
+    for e in rd.flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        let sd = e.path();
+        if id.starts_with('.') || id == me || id == out::LAND_ID || skip.contains(&id) {
+            continue;
+        }
+        if !sd.join("upper").is_dir() || !owned(&sd, ws) {
+            continue;
+        }
+        // an unreadable record leaves the dir unevictable, not the admission failed
+        if !record(&out::dir_of(ws, &id))
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.store.as_path() == store)
+        {
+            continue;
+        }
+        let stamp = sd.join(USED);
+        let Some(raw) = std::fs::read_to_string(&stamp)
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(idle) = std::fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+        else {
+            continue;
+        };
+        if try_mount_lock(ws, &id)?.is_none() {
+            continue;
+        }
+        found.push(Victim { id, raw, idle });
+    }
+    found.sort_by(|a, b| b.idle.cmp(&a.idle).then_with(|| a.id.cmp(&b.id)));
+    Ok(found)
+}
+
+/// Evicts ram dir `id` of `store` under its mount lock `lock` (taken by the caller; released here): renamed out of place first (its upper is gone at once), then the reason written into its mount point (its next command prints it, [`lost`]), then removed. A crash leaves `<store>/.evict-<id>-<pid>` (an orphan, [`orphan_store_dirs`] removes it) or the marker alone (the dir reads as lost, without the reason).
+fn evict_one(ws: &Path, store: &Path, id: &str, lock: Flock, why: &str) -> Result<()> {
+    let sd = store.join(id);
+    let tmp_name = format!(".evict-{id}-{}", std::process::id());
+    let tmp = store.join(&tmp_name);
+    std::fs::rename(&sd, &tmp)
+        .with_context(|| format!("renaming {} -> {}", sd.display(), tmp.display()))?;
+    std::fs::write(out::dir_of(ws, id).join(EVICTED), format!("{why}\n"))
+        .with_context(|| format!("writing the evicted marker of ws/{id}"))?;
+    // the leftover's own lock while it is removed: out prune's orphan sweep skips a dir whose removal runs here (`if let` keeps the guard alive)
+    if let Some(_leftover) = try_mount_lock(ws, &tmp_name)? {
+        remove_tree(&tmp)?;
+    }
+    drop(lock);
+    Ok(())
+}
+
+/// Evicts idle ram dirs for a FIFO participant's judgement short of room (the caller holds the admit gate): longest idle first, and only when their stamped sizes cover the whole shortfall (else nothing: a wait that stays costs no warm upper). Returns `stats` credited with the bytes predicted from the stamps (zram frees late; the next poll re-probes), or None when nothing was evicted. One line and one `delta-evict` per eviction.
+#[allow(clippy::too_many_arguments)]
+fn evict_for(
+    ws: &Path,
+    id: &str,
+    cfg: &DeltaConfig,
+    store: &Path,
+    class: Class,
+    own: u64,
+    stats: &Stats,
+    tickets: &[(String, String)],
+) -> Result<Option<Stats>> {
+    let (others, hold) = inputs(ws, id, cfg, stats)?;
+    let need = Need::of(class, cfg, stats, own);
+    let margin = cfg.ram_margin_gib.value * GIB;
+    let (short_raw, short_ram) = shortfall(stats, need, others, hold, margin);
+    if short_raw == 0 && short_ram == 0 {
+        return Ok(None);
+    }
+    let mut skip = queued_ids(tickets);
+    skip.extend(reserving_ids(ws)?);
+    let cands = victims(ws, store, id, &skip)?;
+    let ram_of = |raw: u64| raw * 1000 / stats.ratio_milli.max(1);
+    let total_raw: u64 = cands.iter().map(|c| c.raw).sum();
+    let total_ram: u64 = cands.iter().map(|c| ram_of(c.raw)).sum();
+    if total_raw < short_raw || total_ram < short_ram {
+        return Ok(None);
+    }
+    let (mut freed_raw, mut freed_ram) = (0u64, 0u64);
+    for c in &cands {
+        if freed_raw >= short_raw && freed_ram >= short_ram {
+            break;
+        }
+        // taken now, under the gate: a command that started since the scan keeps its dir
+        let Some(lock) = try_mount_lock(ws, &c.id)? else {
+            continue;
+        };
+        let why = format!(
+            "for ws/{id} {} build, idle {} min, {:.2} GiB raw freed",
+            class.name(),
+            c.idle.as_secs() / 60,
+            gib(c.raw)
+        );
+        evict_one(ws, store, &c.id, lock, &why)?;
+        out::count(ws, "delta-evict");
+        println!("out: delta evict ws/{}: {why}", c.id);
+        freed_raw += c.raw;
+        freed_ram += ram_of(c.raw);
+    }
+    Ok((freed_raw > 0).then(|| Stats {
+        fs_free: stats.fs_free + freed_raw,
+        ram_used: stats.ram_used.saturating_sub(freed_ram),
+        ..stats.clone()
+    }))
+}
+
 /// The store's deltas other than `me`, largest first: `<id> <GiB> GiB running|idle <min> min` (running = its mount lock is held; idle since its `used` stamp, [`USED`]). What the PM acts on while a build waits.
 fn held_by(ws: &Path, store: &Path, me: &str) -> String {
     let Ok(rd) = std::fs::read_dir(store) else {
         return format!("{} unreadable", store.display());
     };
     let mut rows: Vec<(u64, String)> = Vec::new();
+    let queued = queued_ids(&crate::ticket::live(&queue_dir(ws)).unwrap_or_default());
     for e in rd.flatten() {
         let Some(id) = e.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         let upper = e.path().join("upper");
-        if id == me || !upper.is_dir() {
+        if id == me || id.starts_with('.') || !upper.is_dir() {
             continue;
         }
         // whole upper, every host dir: what the delta holds on the store
         let size = own_bytes(&upper, Class::Small, None, &[]).unwrap_or(0);
         let running = try_mount_lock(ws, &id).ok().flatten().is_none();
-        let state = if running {
+        let state = if queued.contains(&id) {
+            "queued".to_owned()
+        } else if running {
             "running".to_owned()
         } else {
             let mins = std::fs::metadata(e.path().join(USED))
@@ -1110,6 +1297,32 @@ fn growth(id: &str, before: u64, after: u64, reserved: u64) -> (String, bool) {
     (line, after.saturating_sub(before) > reserved)
 }
 
+/// A checkout's own upper credit ([`own_bytes`]), read under the admit gate at each judgement. A full walk costs ~1 s per 200k entries, so it re-walks only when the upper changed: every command's end rewrites the `used` stamp ([`USED`]); an absent upper is 0 (evicted, or not made yet). `seen`: the stamp text and credit of the last walk.
+fn own_at(
+    store_dir: &Path,
+    upper: &Path,
+    class: Option<Class>,
+    cross_host: Option<&str>,
+    dirs: &[String],
+    seen: &mut Option<(String, u64)>,
+) -> Result<u64> {
+    if !upper.is_dir() {
+        return Ok(0);
+    }
+    let stamp = std::fs::read_to_string(store_dir.join(USED)).unwrap_or_default();
+    if let Some((text, own)) = seen
+        && *text == stamp
+    {
+        return Ok(*own);
+    }
+    let own = match class {
+        Some(c) => own_bytes(upper, c, cross_host, dirs)?,
+        None => 0,
+    };
+    *seen = Some((stamp, own));
+    Ok(own)
+}
+
 /// The outer side of every build command: decides the tier, admits, and for `ram` runs the rest of the command inside the mounted namespace. Some(code) = ran there; None = continue here (pool tier, or already inside).
 /// `class` None: a command that grows no upper (a prune deletes, a status read changes nothing). It enters an existing ram dir with no admission ([`admit_command`]): no reservation, never queued or refused. No record yet: nothing to enter, None.
 /// `cross_host`: the host a cross build writes (`upper/<host>`, [`own_bytes`]); None for every other command.
@@ -1149,23 +1362,31 @@ pub fn enter(
     // this checkout's own part of its upper (a new dir: none yet)
     let dirs = cross_dirs(root)?;
     let upper = store.join(&id).join("upper");
-    let own = match class {
-        Some(class) if rec.is_some() => own_bytes(&upper, class, cross_host, &dirs)?,
-        _ => 0,
-    };
     if class.is_none() && rec.is_none() {
         return Ok(None);
     }
+    let mut seen = None;
     let admitted = admit_command(
         &ws,
         &id,
         &cfg.delta,
         class,
-        own,
+        || {
+            own_at(
+                &store.join(&id),
+                &upper,
+                class,
+                cross_host,
+                &dirs,
+                &mut seen,
+            )
+        },
         rec.is_some(),
         Some(&store),
         || probe(&store, &cfg.delta),
     )?;
+    // the own credit the last judgement used (0: no walk, an absent upper)
+    let own = seen.as_ref().map_or(0, |(_, b)| *b);
     let (reservation, stats, need) = match admitted {
         Ok(Some((reservation, stats, need))) => (Some(reservation), Some(stats), need),
         Ok(None) => (None, None, Need::default()),
@@ -1176,12 +1397,27 @@ pub fn enter(
             None => bail!("a command that grows nothing was refused: {}", v.reason()),
         },
     };
+    // the mount lock, right after admission and before the upper is read or made: nothing is held while queued, and an upper exists only under its lock, so no eviction sees it idle
+    let lock_path = mount_lock_path(&ws, &id);
+    let lock = match try_mount_lock(&ws, &id)? {
+        Some(l) => l,
+        None => {
+            let held_by = holders(&lock_path, std::process::id())?;
+            println!(
+                "out: ws/{id} ram delta in use by another command of this checkout ({}), waiting",
+                holders_text(&held_by)
+            );
+            out::count(&ws, "delta-wait");
+            Flock::take(open_lock(&lock_path)?, Mode::Exclusive)?
+        }
+    };
     match rec {
         Some(r) => {
             if let Some(why) = lost(&ws, &id, &r)? {
                 out::count(&ws, "delta-lost");
                 println!("out: ws/{id} ram delta lost ({why}): remade");
-                drop_ram(&ws, &id, &r)?;
+                // under the mount lock taken above: drop_ram would wait for itself
+                remove_ram(&ws, &id, &r)?;
                 make_ram(root, &ws, &id, &store, true)?;
             }
         }
@@ -1206,19 +1442,6 @@ pub fn enter(
         ),
     }
     out::count(&ws, "delta-ram");
-    let lock_path = mount_lock_path(&ws, &id);
-    let lock = match try_mount_lock(&ws, &id)? {
-        Some(l) => l,
-        None => {
-            let held_by = holders(&lock_path, std::process::id())?;
-            println!(
-                "out: ws/{id} ram delta in use by another command of this checkout ({}), waiting",
-                holders_text(&held_by)
-            );
-            out::count(&ws, "delta-wait");
-            Flock::take(open_lock(&lock_path)?, Mode::Exclusive)?
-        }
-    };
     // a cross host's part, laid under the mount lock (no mount of this upper runs now) and before unshare; the record is re-read: make_ram / lost above may have rewritten it
     if let Some(host) = cross_host {
         let mut rec = record(&dir)?.context("ram dir has no record after its make")?;
@@ -1254,8 +1477,9 @@ pub fn enter(
     let after = class
         .map(|c| own_bytes(&upper, c, cross_host, &dirs))
         .transpose()?;
-    // idle-since stamp for other checkouts' wait lines; a lost stamp only shows the upper's mtime
-    let _ = std::fs::write(store.join(&id).join(USED), "");
+    // the whole upper's size at this command's end, under the mount lock: the `used` stamp (idle time in the wait lines, sizes for eviction, the re-walk signal of own_at); a lost stamp only shows the upper's mtime
+    let total = own_bytes(&upper, Class::Small, None, &[])?;
+    let _ = std::fs::write(store.join(&id).join(USED), format!("{total}\n"));
     if let (Some(before), Some(after)) = (before, after) {
         let (line, over) = growth(&id, before, after, need.raw);
         println!("{line}");
@@ -1438,7 +1662,13 @@ pub fn pins(id: &str, rec: &Record, store_usable: bool) -> bool {
 /// A gone part with no `upper/<arch>` is no loss: [`lay_part`] drops its line and lays the newest part again.
 fn lost(ws: &Path, id: &str, rec: &Record) -> Result<Option<String>> {
     if let Some(why) = lost_upper(id, rec) {
-        return Ok(Some(why));
+        // an evicted dir says why ([`evict_one`]'s marker), else the missing path
+        return Ok(Some(
+            match std::fs::read_to_string(out::dir_of(ws, id).join(EVICTED)) {
+                Ok(t) => format!("evicted: {}", t.trim()),
+                Err(_) => why,
+            },
+        ));
     }
     if !out::base_of(ws, &rec.base).is_dir() {
         return Ok(Some(format!("base/{} is gone", rec.base)));
@@ -2034,9 +2264,16 @@ mod tests {
             "a small build on the full store: {:?}",
             small.as_ref().err()
         );
-        let prune = admit_command(&ws, "land", &cfg, None, 0, true, None, || {
-            Ok(Ok(full.clone()))
-        })
+        let prune = admit_command(
+            &ws,
+            "land",
+            &cfg,
+            None,
+            || Ok(0),
+            true,
+            None,
+            || Ok(Ok(full.clone())),
+        )
         .unwrap();
         assert!(
             matches!(prune, Ok(None)),
@@ -2049,9 +2286,16 @@ mod tests {
             "a prune reserves nothing"
         );
         let roomy = stats(10.0, 3.0, 1950);
-        let got = admit_command(&ws, "land", &cfg, None, 0, true, None, || {
-            Ok(Ok(roomy.clone()))
-        })
+        let got = admit_command(
+            &ws,
+            "land",
+            &cfg,
+            None,
+            || Ok(0),
+            true,
+            None,
+            || Ok(Ok(roomy.clone())),
+        )
         .unwrap();
         assert!(
             matches!(got, Ok(None)),
@@ -2515,7 +2759,8 @@ mod tests {
         let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
             .unwrap()
             .delta;
-        let Err(v) = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, None, probe).unwrap()
+        let Err(v) =
+            admit_keeping(&ws, "c", &cfg, Class::Check, || Ok(0), true, None, probe).unwrap()
         else {
             panic!("{tag}: the check was admitted: no refusal to test");
         };
@@ -2611,9 +2856,16 @@ mod tests {
             .delta;
         let (mut holder, mut bystander) = lingering_holder(&ws, "c");
         let _queued = hold_land_lock(&ws);
-        let verdict = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, None, || {
-            Ok(Ok(stats(10.0, 3.0, 1950)))
-        })
+        let verdict = admit_keeping(
+            &ws,
+            "c",
+            &cfg,
+            Class::Check,
+            || Ok(0),
+            true,
+            None,
+            || Ok(Ok(stats(10.0, 3.0, 1950))),
+        )
         .unwrap();
         let got = match verdict {
             Err(v) => fall_to_pool(&ws, "c", Class::Check, Some(&rec), v),
@@ -2649,9 +2901,16 @@ mod tests {
             let _ = queue.kill();
             let _ = queue.wait();
         });
-        let got = admit_keeping(&ws, "c", &cfg, Class::Check, 0, true, None, || {
-            Ok(Ok(stats(10.0, 3.0, 1950)))
-        });
+        let got = admit_keeping(
+            &ws,
+            "c",
+            &cfg,
+            Class::Check,
+            || Ok(0),
+            true,
+            None,
+            || Ok(Ok(stats(10.0, 3.0, 1950))),
+        );
         release.join().unwrap();
         let (reservation, _, need) = match got.unwrap() {
             Ok(admitted) => admitted,
@@ -2662,6 +2921,375 @@ mod tests {
         assert_eq!(count_of(&ws, "delta-land-hold"), 1);
         drop(reservation);
         std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Fresh store dir of the eviction tests (ram dirs live in it).
+    fn fresh_store(tag: &str) -> PathBuf {
+        let s = std::env::temp_dir().join(format!(
+            "xtask-delta-evict-store-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&s);
+        std::fs::create_dir_all(&s).unwrap();
+        s
+    }
+
+    /// Ram dir `id` of workspace `ws` in `store` as a command leaves it: record in the mount point, upper, work, owner, and the `used` stamp (`raw` bytes) aged `idle_min` minutes.
+    fn idle_ram_dir(ws: &Path, store: &Path, id: &str, raw: u64, idle_min: u64) -> Record {
+        let rec = Record {
+            base: "b".into(),
+            store: store.to_owned(),
+            parts: BTreeMap::new(),
+        };
+        let sd = rec.dir(id);
+        std::fs::create_dir_all(sd.join("upper")).unwrap();
+        std::fs::create_dir_all(sd.join("work")).unwrap();
+        std::fs::write(sd.join(OWNER), format!("{}\n", ws.display())).unwrap();
+        let stamp = sd.join(USED);
+        std::fs::write(&stamp, format!("{raw}\n")).unwrap();
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(idle_min * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        let dir = out::dir_of(ws, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(RECORD), rec.text()).unwrap();
+        rec
+    }
+
+    /// A queued waiter holds no mount lock, and its ticket names its checkout (`<class> <state> <id>`): the land queue's command in that checkout (land-seq's prune in `repo`) takes the lock while the waiter waits. Break (lock taken before the queue): red.
+    #[test]
+    fn queued_waiter_holds_no_mount_lock() {
+        let ws = fresh_ws("no-mount-lock");
+        let store = Store::used(8);
+        let rx = waiter(&ws, "c", Class::Check, &store);
+        queued(&ws, 1);
+        let tickets = crate::ticket::live(&queue_dir(&ws)).unwrap();
+        assert_eq!(
+            tickets[0].1.split_whitespace().nth(2),
+            Some("c"),
+            "the ticket names no checkout: {:?}",
+            tickets[0].1
+        );
+        let lock = try_mount_lock(&ws, "c").unwrap();
+        assert!(
+            lock.is_some(),
+            "a queued waiter holds its checkout's mount lock"
+        );
+        drop(lock);
+        store.set(0);
+        rx.recv_timeout(ADMITTED)
+            .expect("still waiting after the release")
+            .expect("refused after the release");
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// The land deadlock (ram-delta D3 Queue): a `repo` build waits behind land's hold while land's queue runs a command in `repo` that takes its mount lock. The queue waits for that command, so a queued waiter holding the lock would hold the queue. Break (lock taken before the queue): the take times out, red.
+    #[test]
+    fn queue_command_in_a_queued_checkout_is_not_blocked() {
+        let ws = fresh_ws("land-deadlock");
+        let mut queue = sleeper_on(&land_lock_path(&ws), true);
+        // Held: land's native hold (9 GiB raw, 4.6 GiB RAM) does not fit beside a 3 GiB store
+        let store = Store::used(3);
+        let rx = waiter(&ws, "repo", Class::Check, &store);
+        queued(&ws, 1);
+        let (tx, took) = std::sync::mpsc::channel();
+        let w = ws.clone();
+        std::thread::spawn(move || {
+            let lock = Flock::take(
+                open_lock(&mount_lock_path(&w, "repo")).unwrap(),
+                Mode::Exclusive,
+            );
+            let _ = tx.send(lock.is_ok());
+        });
+        assert!(
+            took.recv_timeout(ADMITTED)
+                .expect("the queue's command waits for a queued waiter's mount lock"),
+            "the queue's command could not take the lock"
+        );
+        let _ = queue.kill();
+        let _ = queue.wait();
+        rx.recv_timeout(ADMITTED)
+            .expect("the waiter stuck after the queue released")
+            .expect("refused after the queue released");
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Own credit is read under the admit gate at each judgement: a waiter judged after its upper is gone (evicted, or removed) needs the class peak, not the credit it queued with. Break (own read once, before the queue): the need keeps the old credit, red.
+    #[test]
+    fn queued_waiter_whose_upper_is_gone_needs_the_full_peak() {
+        let ws = fresh_ws("own-gone");
+        let upper = ws.join("upper-c");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(upper.join("f"), vec![0u8; MIB as usize]).unwrap();
+        let store = Store::used(8);
+        let own_upper = upper.clone();
+        let rx = waiter_on(&ws, "c", Class::Native, &store, None, move || {
+            Ok(if own_upper.is_dir() { MIB } else { 0 })
+        });
+        queued(&ws, 1);
+        std::fs::remove_dir_all(&upper).unwrap();
+        store.set(0);
+        let need = rx
+            .recv_timeout(ADMITTED)
+            .expect("still waiting after the release")
+            .expect("refused after the release");
+        assert_eq!(
+            need.raw,
+            9 * GIB,
+            "the need kept the credit of a gone upper"
+        );
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+
+    /// Two waiters: the head `h` judges, `w` queues behind it with an idle upper that would cover `h`'s shortfall alone; `x` is idle but covers it with no one's help (4 GiB RAM 2.05 < 4.6). Nothing is evicted: queued uppers are never victims. Break (queued uppers not excluded): `w` goes, red.
+    #[test]
+    fn queued_uppers_are_never_evicted() {
+        let ws = fresh_ws("queued-kept");
+        let store_dir = fresh_store("queued-kept");
+        idle_ram_dir(&ws, &store_dir, "x", 4 * GIB, 1);
+        let store = Store::used(9);
+        let head = waiter_on(
+            &ws,
+            "h",
+            Class::Native,
+            &store,
+            Some(store_dir.clone()),
+            || Ok(0),
+        );
+        queued(&ws, 1);
+        idle_ram_dir(&ws, &store_dir, "w", 16 * GIB, 60);
+        let behind = waiter_on(
+            &ws,
+            "w",
+            Class::Check,
+            &store,
+            Some(store_dir.clone()),
+            || Ok(0),
+        );
+        queued(&ws, 2);
+        assert!(
+            head.recv_timeout(NOT_ADMITTED).is_err(),
+            "the head was admitted on a full store"
+        );
+        assert!(
+            store_dir.join("w").join("upper").is_dir(),
+            "a queued waiter's upper was evicted"
+        );
+        assert!(
+            store_dir.join("x").join("upper").is_dir(),
+            "x evicted though it alone does not cover the shortfall"
+        );
+        assert_eq!(count_of(&ws, "delta-evict"), 0);
+        store.set(0);
+        head.recv_timeout(ADMITTED)
+            .expect("head waiting")
+            .expect("head refused");
+        behind
+            .recv_timeout(ADMITTED)
+            .expect("behind waiting")
+            .expect("behind refused");
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// Longest idle first, only until the shortfall is covered: native needs 4.6 GiB RAM beyond the 1 GiB free; p (30 min) and q (20 min) give 4.1 each, so both go, r (1 min) stays. The judgement credits the freed bytes and admits at once; one count per eviction; the evicted dir reads as lost, with its reason. Break (no eviction): red.
+    #[test]
+    fn short_judgement_evicts_longest_idle_until_covered() {
+        let ws = fresh_ws("evict-order");
+        let store_dir = fresh_store("evict-order");
+        let p = idle_ram_dir(&ws, &store_dir, "p", 8 * GIB, 30);
+        idle_ram_dir(&ws, &store_dir, "q", 8 * GIB, 20);
+        idle_ram_dir(&ws, &store_dir, "r", 8 * GIB, 1);
+        let store = Store::used(9);
+        let rx = waiter_on(
+            &ws,
+            "a",
+            Class::Native,
+            &store,
+            Some(store_dir.clone()),
+            || Ok(0),
+        );
+        let need = rx
+            .recv_timeout(ADMITTED)
+            .expect("not admitted by the eviction")
+            .expect("refused despite the eviction");
+        assert_eq!(need.raw, 9 * GIB);
+        assert!(
+            !store_dir.join("p").exists(),
+            "p (longest idle) not evicted"
+        );
+        assert!(
+            !store_dir.join("q").exists(),
+            "q not evicted: p alone covers 4.1 of 4.6 GiB"
+        );
+        assert!(
+            store_dir.join("r").join("upper").is_dir(),
+            "r evicted past the cover"
+        );
+        assert_eq!(count_of(&ws, "delta-evict"), 2);
+        let leftover = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".evict-"));
+        assert!(!leftover, "a rename left behind");
+        let why = lost(&ws, "p", &p)
+            .unwrap()
+            .expect("an evicted dir reads as lost");
+        assert!(why.starts_with("evicted: for ws/a native build"), "{why}");
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// A shortfall the idle total does not cover waits as before: p and q (2.05 GiB RAM each, 4.1 < 4.6) stay. Break (evicts anyway): red.
+    #[test]
+    fn uncovered_shortfall_evicts_nothing() {
+        let ws = fresh_ws("no-cover");
+        let store_dir = fresh_store("no-cover");
+        idle_ram_dir(&ws, &store_dir, "p", 4 * GIB, 30);
+        idle_ram_dir(&ws, &store_dir, "q", 4 * GIB, 20);
+        let store = Store::used(9);
+        let rx = waiter_on(
+            &ws,
+            "a",
+            Class::Native,
+            &store,
+            Some(store_dir.clone()),
+            || Ok(0),
+        );
+        assert!(
+            rx.recv_timeout(NOT_ADMITTED).is_err(),
+            "admitted on an uncovered shortfall"
+        );
+        assert!(
+            store_dir.join("p").join("upper").is_dir()
+                && store_dir.join("q").join("upper").is_dir(),
+            "an uncovered judgement evicted"
+        );
+        assert_eq!(count_of(&ws, "delta-evict"), 0);
+        store.set(0);
+        rx.recv_timeout(ADMITTED)
+            .expect("still waiting after the release")
+            .expect("refused after the release");
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// Eviction skips what runs or is about to: `run` (mount lock held), `res` (a live reservation: admitted, not yet mounted), `foreign` (owned by another workspace). Each is the longest idle, so a sweep ignoring the rules takes them first; `v` (1 min, 12 GiB) is the one eligible dir and alone covers the 5.6 GiB shortfall. Break (no exclusion): red.
+    #[test]
+    fn eviction_skips_running_reserved_and_foreign() {
+        let ws = fresh_ws("exclusions");
+        let store_dir = fresh_store("exclusions");
+        idle_ram_dir(&ws, &store_dir, "run", 20 * GIB, 60);
+        idle_ram_dir(&ws, &store_dir, "res", 20 * GIB, 60);
+        idle_ram_dir(&ws, &store_dir, "foreign", 20 * GIB, 60);
+        std::fs::write(store_dir.join("foreign").join(OWNER), "/elsewhere\n").unwrap();
+        idle_ram_dir(&ws, &store_dir, "v", 12 * GIB, 1);
+        let _running = try_mount_lock(&ws, "run")
+            .unwrap()
+            .expect("fixture: run's lock");
+        let _reserved = reserve(&ws, "res", GIB).unwrap();
+        let store = Store::used(9);
+        let rx = waiter_on(
+            &ws,
+            "a",
+            Class::Native,
+            &store,
+            Some(store_dir.clone()),
+            || Ok(0),
+        );
+        rx.recv_timeout(ADMITTED)
+            .expect("not admitted")
+            .expect("refused");
+        assert!(
+            !store_dir.join("v").exists(),
+            "v (the eligible dir) not evicted"
+        );
+        assert!(
+            store_dir.join("run").join("upper").is_dir(),
+            "a running checkout evicted"
+        );
+        assert!(
+            store_dir.join("res").join("upper").is_dir(),
+            "a reserved checkout evicted"
+        );
+        assert!(
+            store_dir.join("foreign").join("upper").is_dir(),
+            "another workspace's dir evicted"
+        );
+        assert_eq!(count_of(&ws, "delta-evict"), 1);
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// The wait line names a queued checkout as `queued` (its ticket), not `idle`: a queued waiter holds no lock, so the lock alone misreads it. Break (lock state only): red.
+    #[test]
+    fn held_by_names_queued_checkouts() {
+        let ws = fresh_ws("held-by-queued");
+        let store_dir = fresh_store("held-by-queued");
+        idle_ram_dir(&ws, &store_dir, "q", 2 * GIB, 5);
+        idle_ram_dir(&ws, &store_dir, "p", 3 * GIB, 5);
+        std::fs::create_dir_all(queue_dir(&ws)).unwrap();
+        let _ticket =
+            crate::ticket::Ticket::new(&queue_dir(&ws), "", std::process::id(), "check refuse q")
+                .unwrap();
+        let text = held_by(&ws, &store_dir, "me");
+        assert!(text.contains("q 0.0 GiB queued"), "{text}");
+        assert!(text.contains("p 0.0 GiB idle"), "{text}");
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
+    }
+
+    /// The own credit is re-walked only when the upper changed: absent is 0; an unchanged `used` stamp serves the cached credit (no walk per poll, the 1 MiB file added without a stamp change is not seen); a rewritten stamp re-walks and sees it. Break (walk every judgement): red.
+    #[test]
+    fn own_credit_is_read_when_the_upper_changes() {
+        let root =
+            std::env::temp_dir().join(format!("xtask-delta-own-credit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sd = root.join("c");
+        let upper = sd.join("upper");
+        let mut seen = None;
+        let own = |seen: &mut Option<(String, u64)>| {
+            own_at(&sd, &upper, Some(Class::Native), None, &[], seen).unwrap()
+        };
+        assert_eq!(own(&mut seen), 0, "an absent upper");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::write(sd.join(USED), "0\n").unwrap();
+        std::fs::write(upper.join("a"), vec![0u8; MIB as usize]).unwrap();
+        let first = own(&mut seen);
+        assert!(first >= MIB, "{first}");
+        std::fs::write(upper.join("b"), vec![0u8; 2 * MIB as usize]).unwrap();
+        assert_eq!(own(&mut seen), first, "re-walked without a stamp change");
+        std::fs::write(sd.join(USED), "1\n").unwrap();
+        let after = own(&mut seen);
+        assert!(
+            after > first + MIB,
+            "a changed stamp did not re-walk: {after} vs {first}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A leftover `<store>/.evict-<id>-<pid>` of a crashed eviction is this workspace's orphan store dir, so out prune removes it.
+    #[test]
+    fn evict_leftover_is_an_orphan_store_dir() {
+        let ws = fresh_ws("leftover");
+        let store_dir = fresh_store("leftover");
+        let left = store_dir.join(".evict-p-1");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join(OWNER), format!("{}\n", ws.display())).unwrap();
+        let orphans = orphan_store_dirs(&store_dir, &ws, &std::collections::BTreeSet::new());
+        assert_eq!(
+            orphans
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            [".evict-p-1"]
+        );
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::remove_dir_all(&store_dir).unwrap();
     }
 
     /// Store whose RAM use a test changes while waiters poll it: limit 10 GiB, ratio 1.95, fs 14 GiB free. Native needs 4.615 GiB RAM / 9 raw, check 2.461 / 4.8, small 1.026 / 2 (default peaks, own 0); margin 1.
@@ -2684,12 +3312,24 @@ mod tests {
         }
     }
 
-    /// A waiter thread: `admit_keeping` of an existing ram dir `id` on `store`; the result goes to the receiver, the reservation dropped.
+    /// A waiter thread: `admit_keeping` of an existing ram dir `id` on `store`, no eviction store, own credit 0; the result goes to the receiver, the reservation dropped.
     fn waiter(
         ws: &Path,
         id: &'static str,
         class: Class,
         store: &Store,
+    ) -> std::sync::mpsc::Receiver<std::result::Result<Need, String>> {
+        waiter_on(ws, id, class, store, None, || Ok(0))
+    }
+
+    /// [`waiter`] with eviction on (store dir `dir`) and the own credit `own`, read at each judgement.
+    fn waiter_on(
+        ws: &Path,
+        id: &'static str,
+        class: Class,
+        store: &Store,
+        dir: Option<PathBuf>,
+        own: impl FnMut() -> Result<u64> + Send + 'static,
     ) -> std::sync::mpsc::Receiver<std::result::Result<Need, String>> {
         let (tx, rx) = std::sync::mpsc::channel();
         let (ws, store) = (ws.to_owned(), store.clone());
@@ -2697,7 +3337,7 @@ mod tests {
             let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
                 .unwrap()
                 .delta;
-            let got = admit_keeping(&ws, id, &cfg, class, 0, true, None, || {
+            let got = admit_keeping(&ws, id, &cfg, class, own, true, dir.as_deref(), || {
                 Ok(Ok(store.stats()))
             })
             .unwrap();
@@ -2868,9 +3508,16 @@ mod tests {
             let cfg = crate::ws_config::parse("", Path::new("/w/workspace.toml"))
                 .unwrap()
                 .delta;
-            admit_keeping(&worker_ws, "c", &cfg, Class::Check, 0, true, None, || {
-                Ok(Ok(stats(10.0, 3.0, 1950)))
-            })
+            admit_keeping(
+                &worker_ws,
+                "c",
+                &cfg,
+                Class::Check,
+                || Ok(0),
+                true,
+                None,
+                || Ok(Ok(stats(10.0, 3.0, 1950))),
+            )
         });
         let started = std::time::Instant::now();
         while count_of(&ws, "delta-wait") == 0 {
