@@ -15,7 +15,7 @@ use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::flock::{Flock, Mode};
 use anyhow::{Context, Result, bail, ensure};
@@ -132,9 +132,6 @@ thread_local! {
     /// The grant this thread holds: its holder record and CPU count. Cleared when the grant drops.
     static HELD: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
 }
-
-/// Ticket counter: the same process queues several tickets from several threads in one nanosecond.
-static TICKETS: AtomicU64 = AtomicU64::new(0);
 
 /// Slots held until drop. `cpu` is the job count for the tool; `mem_gib` is reserved memory.
 #[derive(Debug)]
@@ -507,52 +504,27 @@ fn parent_pid(stat: &str) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// One queue entry. Its file is locked by its waiter for as long as the waiter lives; the lock is taken before the file is visible.
+/// One queue entry ([`crate::ticket`]): named by tier, then arrival, so names sort in (tier, arrival) order; the payload is the class name.
 struct Ticket {
-    path: PathBuf,
+    t: crate::ticket::Ticket,
     name: String,
     tier: Tier,
-    _lock: Flock,
 }
 
 impl Ticket {
-    /// Named by tier, arrival time, pid and a counter, so names sort in (tier, arrival) order. Written under `tmp-` with the class name, locked, then renamed.
     fn new(queue: &Path, pid: u32, class: Class, tier: Tier) -> Result<Ticket> {
-        let seq = TICKETS.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let name = format!("{}{nanos:020}-{pid:010}-{seq:010}", tier.prefix());
-        let tmp = queue.join(format!("tmp-{name}"));
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        let mut lock = Flock::try_take(lock, Mode::Exclusive)
-            .with_context(|| format!("flock {}", tmp.display()))?
-            .with_context(|| format!("{} is held: a fresh ticket", tmp.display()))?;
-        lock.file()
-            .write_all(class.name().as_bytes())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        let path = queue.join(&name);
-        std::fs::rename(&tmp, &path).with_context(|| format!("queueing {}", path.display()))?;
+        let t = crate::ticket::Ticket::new(queue, tier.prefix(), pid, class.name())?;
         Ok(Ticket {
-            path,
-            name,
+            name: t.name.clone(),
+            t,
             tier,
-            _lock: lock,
         })
     }
 
-    /// Moves the ticket into the top tier, keeping its arrival: a rename, so the waiter's lock (on the open file) stays and readers see one name or the other.
+    /// Moves the ticket into the top tier, keeping its arrival.
     fn promote(&mut self, queue: &Path) -> Result<()> {
         let name = format!("{}{}", Tier::Interactive.prefix(), arrival(&self.name));
-        let path = queue.join(&name);
-        std::fs::rename(&self.path, &path)
-            .with_context(|| format!("promoting {}", self.path.display()))?;
-        self.path = path;
+        self.t.rename(queue, name.clone())?;
         self.name = name;
         self.tier = Tier::Interactive;
         Ok(())
@@ -575,54 +547,17 @@ fn passed_earlier(tickets: &[(String, Option<Class>)], me: &str) -> usize {
         .count()
 }
 
-impl Drop for Ticket {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// The live tickets, oldest first, each with the class its waiter wrote (`None` when unreadable or unknown). A ticket whose lock is free has no waiter left: it is removed.
+/// The live tickets, oldest first, each with the class its waiter wrote (`None` when unreadable or unknown).
 fn live_tickets(queue: &Path) -> Result<Vec<(String, Option<Class>)>> {
-    let mut live = Vec::new();
-    for entry in std::fs::read_dir(queue).with_context(|| format!("reading {}", queue.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // a `tmp-` entry is still being written by its waiter
-        if name.starts_with("tmp-") {
-            continue;
-        }
-        let path = entry.path();
-        let file = match OpenOptions::new().read(true).open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-        };
-        match Flock::try_take(file, Mode::Exclusive)
-            .with_context(|| format!("flock {}", path.display()))?
-        {
-            Some(_dead) => {
-                let _ = std::fs::remove_file(&path);
-            }
-            None => {
-                let class = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|text| Class::from_name(text.trim()));
-                live.push((name, class));
-            }
-        }
-    }
-    // names sort in arrival order: fixed-width time, then pid, then counter
-    live.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(live)
+    Ok(crate::ticket::live(queue)?
+        .into_iter()
+        .map(|(name, payload)| (name, Class::from_name(&payload)))
+        .collect())
 }
 
 /// (live tickets ordered before `me`, all live tickets); `me` is a ticket's file name.
 fn queue_position(tickets: &[(String, Option<Class>)], me: &str) -> (usize, usize) {
-    let ahead = tickets
-        .iter()
-        .filter(|(name, _)| name.as_str() < me)
-        .count();
-    (ahead, tickets.len())
+    crate::ticket::position(tickets, me)
 }
 
 /// Takes one slot without waiting. The holder record is written under the lock; a reader may see it half-written, which costs a garbled wait line, nothing else.
