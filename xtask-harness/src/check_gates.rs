@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
-use xtask::build_pool::{self, Class};
+use xtask::build_pool::{self, Class, Demand};
 use xtask::gate_need;
 use xtask::harness::{Ruling, Starvation, Supply, Undecided, judged_in, undecided_verdict};
 use xtask::red_logs;
@@ -42,14 +42,13 @@ impl Lane {
 }
 
 /// One gate run: `xtask test <args>`, plus `--host <build machine>` when `host` and `--out <build dir>` when `out` (each only where the gate's own arguments have it).
-/// `lane`: [`Lane`]; `after`: row names that must have ended first (the row reads what they stage); `class`: the pool class of its grant, sized from its measured `peak=` (build_pool.rs `Class::default_weight`).
+/// `lane`: [`Lane`]; `after`: row names that must have ended first (the row reads what they stage); its pool demand is its own ledger history (`plan_of`).
 pub struct Row {
     pub args: &'static [&'static str],
     pub host: bool,
     pub out: bool,
     pub lane: Lane,
     pub after: &'static [&'static str],
-    pub class: Class,
     /// its waits feed the need ledger (gate_need.rs); off for the sampler's self-test, whose waits starve on purpose
     samples: bool,
 }
@@ -62,7 +61,6 @@ impl Row {
             out,
             lane: Lane::Parallel,
             after: &[],
-            class: Class::Harness,
             samples: true,
         }
     }
@@ -83,10 +81,6 @@ impl Row {
 
     const fn after(self, after: &'static [&'static str]) -> Self {
         Self { after, ..self }
-    }
-
-    const fn class(self, class: Class) -> Self {
-        Self { class, ..self }
     }
 
     /// The gate's verdict-line name (`window: ...` for every window stage).
@@ -145,8 +139,7 @@ pub const ROWS: &[Row] = &[
     // frame-time bounds
     Row::new(&["composer"], true, true).serial(),
     Row::new(&["instrument"], true, true),
-    // its tree peaks above the `harness` reserve
-    Row::new(&["app"], true, true).class(Class::HarnessHeavy),
+    Row::new(&["app"], true, true),
     // reads the `app/` tree the app gate stages (its refusal otherwise: "missing <out>/app/root/system/lib64/x86_64 ... run `xtask test app`")
     Row::new(&["nb-identity"], false, true).after(&["app"]),
     // needs what nb-identity needs (the staged `app/`)
@@ -481,6 +474,23 @@ impl Drop for Entered<'_> {
     }
 }
 
+/// Each row's admission: its demand and predicted wall (ms; `u64::MAX` cold), from `resource_ledger::demand_of` over its own gate-run history, in table order.
+fn plan_of(
+    rows: &[Row],
+    history: &[resource_ledger::RunRecord],
+    budget: u32,
+    cpu: u32,
+) -> Vec<(Demand, u64)> {
+    rows.iter()
+        .map(|row| {
+            let name = row.name();
+            let runs: Vec<resource_ledger::RunRecord> =
+                history.iter().filter(|r| r.name == name).cloned().collect();
+            resource_ledger::demand_of(&runs, budget, cpu)
+        })
+        .collect()
+}
+
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows, neither pass nor fail ([`Outcome`]).
 /// Each row takes its own pool grant (memory admission decides how many run at once); no grant is held around the step ([`run_lanes`]).
 pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
@@ -537,14 +547,18 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
             .note(&snapshot, Some(&row.name()));
     };
     // a row's place is taken on the lanes' thread, in start order; its grant is waited for on the row's own thread
-    let take = |row: &Row| build_pool::enqueue(&ws, root, row.class);
+    let history = resource_ledger::read_runs(&ws, resource_ledger::GATE_RUN)?;
+    let (budget, cpu) = build_pool::demand_budget(&ws)?;
+    let plan = plan_of(ROWS, &history, budget, cpu);
+    let wall: Vec<u64> = plan.iter().map(|p| p.1).collect();
+    let take = |i: usize| build_pool::enqueue_demand(&ws, root, plan[i].0);
     let run_one = |row: &Row, place: Result<build_pool::Queued>, admitted: &Admitted| -> Done {
         // the grant lives on this thread until the row's process ended; a pool or spawn error is the row's red verdict, so the other rows still report
         let gated = place
             .and_then(|queued| queued.wait(build_pool::POLL, &mut |line: &str| eprintln!("{line}")))
             .and_then(|grant| {
                 let entered = admitted.enter();
-                let mut done = at.row(row, Attempt::First)?;
+                let mut done = at.row(row, Attempt::First, grant.mem_gib)?;
                 done.running = entered.count;
                 done.grant = grant.class;
                 Ok((done, grant))
@@ -554,11 +568,12 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
             .map(|(done, _grant)| done)
             .unwrap_or_else(|e| errored(row, &e))
     };
-    // an undecided row's rerun: alone after the lanes, under the pool's quiet grant when it is idle, else the row's class
-    let rerun = |row: &Row, first: &Done| -> Done {
-        let gated = build_pool::acquire_rerun(&ws, root, row.class).and_then(|grant| {
+    // an undecided row's rerun: alone after the lanes, under the pool's quiet grant when it is idle, else the row's demand
+    let rerun = |i: usize, first: &Done| -> Done {
+        let row = &ROWS[i];
+        let gated = build_pool::acquire_rerun(&ws, root, plan[i].0).and_then(|grant| {
             let starved = first.supply();
-            let mut done = at.row(row, Attempt::Rerun { starved })?;
+            let mut done = at.row(row, Attempt::Rerun { starved }, grant.mem_gib)?;
             done.running = 1;
             done.grant = grant.class;
             Ok((done, grant))
@@ -571,10 +586,10 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         eprintln!("{}", done.line);
         done
     };
-    let (stats, mut done) = run_lanes(ROWS, &take, &run_one, &mut |first| {
+    let (stats, mut done) = run_lanes(ROWS, &wall, &take, &run_one, &mut |first| {
         eprintln!("{}", first.line)
     });
-    settle(&mut done, &mut |i, first| rerun(&ROWS[i], first));
+    settle(&mut done, &mut |i, first| rerun(i, first));
     let names: Vec<String> = ROWS.iter().map(Row::name).collect();
     let Judged {
         mut failed,
@@ -681,11 +696,12 @@ impl Drop for Sent {
 }
 
 /// Runs `rows` with `run_one`: parallel rows concurrently, then serial rows one at a time, alone.
-/// `take` makes a row's pool place on this thread, in start order (the parallel rows others wait for first, then table order), each once its `after` rows ended; `run_one` waits for that place on the row's own thread. So the queue serves the start order, not the order the threads reach the pool.
+/// `take` makes a row's pool place on this thread, in start order (the parallel rows others wait for first, then the longest predicted), each once its `after` rows ended; `run_one` waits for that place on the row's own thread. So the queue serves the start order, not the order the threads reach the pool.
 /// `emit` gets each result in table order as soon as every earlier row has one; each line gains `lane=` and `running=` ([`Done::running`]). Returns the stats and every result, in table order.
 fn run_lanes<P: Send>(
     rows: &[Row],
-    take: &(dyn Fn(&Row) -> P + Sync),
+    wall: &[u64],
+    take: &(dyn Fn(usize) -> P + Sync),
     run_one: &(dyn Fn(&Row, P, &Admitted) -> Done + Sync),
     emit: &mut dyn FnMut(&Done),
 ) -> (LaneStats, Vec<Done>) {
@@ -707,8 +723,8 @@ fn run_lanes<P: Send>(
     let mut waiting: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].lane == Lane::Parallel)
         .collect();
-    // start order: the rows others wait for first, then table order (a stable sort)
-    waiting.sort_by_key(|&i| !depended[i]);
+    // start order: the rows others wait for first, then the longest predicted first (a cold row leads: its wall is unknown, `u64::MAX`); a stable sort keeps table order among equals
+    waiting.sort_by_key(|&i| (!depended[i], std::cmp::Reverse(wall[i])));
     let admitted = Admitted::default();
     let start_one = |i: usize, place: P| -> Done {
         let mut done = run_one(&rows[i], place, &admitted);
@@ -733,7 +749,7 @@ fn run_lanes<P: Send>(
                 let i = waiting[k];
                 if deps[i].iter().all(|&d| ended[d]) {
                     waiting.remove(k);
-                    let place = take(&rows[i]);
+                    let place = take(i);
                     let (tx, run) = (tx.clone(), &start_one);
                     scope.spawn(move || {
                         let mut sent = Sent { tx, i, done: None };
@@ -758,7 +774,7 @@ fn run_lanes<P: Send>(
     });
     for (i, row) in rows.iter().enumerate() {
         if row.lane == Lane::Serial {
-            let place = take(row);
+            let place = take(i);
             results[i] = Some(start_one(i, place));
             flush(&results, &mut next);
         }
@@ -821,8 +837,10 @@ struct RowRun<'a> {
 impl RowRun<'_> {
     /// One row as its own `xtask test` process, its output in `<logs>/<row>.log` (a rerun's in `<row>.rerun.log`); a red or undecided log is kept ([`keep_unless_pass`]).
     /// Called on the thread holding the row's grant: its job count reaches the gate's cargo runs (xtask `grant_jobs`).
-    fn row(&self, row: &Row, attempt: Attempt) -> Result<Done> {
+    fn row(&self, row: &Row, attempt: Attempt, memory_gib: u32) -> Result<Done> {
         let log = self.logs.join(attempt.log_name(row));
+        // the leaf's memory.max: the memory the grant reserved (swap off, group kill: an overrun is an OOM kill the record certifies)
+        let memory_max = u64::from(memory_gib) * resource_ledger::GIB;
         let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
         let argv = row.argv(self.host, self.out);
         let started = Instant::now();
@@ -836,6 +854,8 @@ impl RowRun<'_> {
             .arg(self.exe)
             .args(["scope-supervise", "--record"])
             .arg(&log)
+            .arg("--memory-max")
+            .arg(memory_max.to_string())
             .arg("--")
             .arg(self.exe)
             .arg("test")
@@ -1345,9 +1365,13 @@ mod tests {
             }
         };
         let mut seen = Vec::new();
-        let (stats, _) = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |d| {
-            seen.push((d.line.clone(), d.outcome))
-        });
+        let (stats, _) = run_lanes(
+            FAKE,
+            &vec![0u64; FAKE.len()],
+            &|_: usize| (),
+            &run_one,
+            &mut |d| seen.push((d.line.clone(), d.outcome)),
+        );
         let names: Vec<String> = seen
             .iter()
             .map(|(l, _)| l.split_whitespace().nth(1).expect("name").to_owned())
@@ -1410,7 +1434,16 @@ mod tests {
             let t0 = Instant::now();
             let order: Mutex<Vec<String>> = Mutex::new(Vec::new());
             let spans: Mutex<Vec<(String, Duration, Duration)>> = Mutex::new(Vec::new());
-            let take = |row: &Row| build_pool::enqueue(&ws, &who, row.class);
+            let take = |_: usize| {
+                build_pool::enqueue_demand(
+                    &ws,
+                    &who,
+                    build_pool::Demand {
+                        mem_gib: 1,
+                        cores: 1.0,
+                    },
+                )
+            };
             let run_one = |row: &Row, place: Result<build_pool::Queued>, admitted: &Admitted| {
                 let grant = place
                     .and_then(|queued| queued.wait(FAST, &mut |_: &str| {}))
@@ -1440,7 +1473,7 @@ mod tests {
                     )
                 }
             };
-            let _ = run_lanes(FAKE, &take, &run_one, &mut |_| {});
+            let _ = run_lanes(FAKE, &vec![0u64; FAKE.len()], &take, &run_one, &mut |_| {});
             let order = order.into_inner().expect("order");
             let mut first: Vec<&str> = order[..width].iter().map(String::as_str).collect();
             first.sort_unstable();
@@ -1479,7 +1512,13 @@ mod tests {
                 row.name(),
             )
         };
-        let _ = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |_| {});
+        let _ = run_lanes(
+            FAKE,
+            &vec![0u64; FAKE.len()],
+            &|_: usize| (),
+            &run_one,
+            &mut |_| {},
+        );
     }
 
     #[test]
@@ -1766,7 +1805,13 @@ mod tests {
                 ..Done::bare(outcome, format!("gates: {} first", row.name()), row.name())
             }
         };
-        let (_, mut done) = run_lanes(FAKE, &|_: &Row| (), &run_one, &mut |_| {});
+        let (_, mut done) = run_lanes(
+            FAKE,
+            &vec![0u64; FAKE.len()],
+            &|_: usize| (),
+            &run_one,
+            &mut |_| {},
+        );
         let mut reran = Vec::new();
         settle(&mut done, &mut |i, _| {
             let name = FAKE[i].name();
@@ -1804,6 +1849,107 @@ mod tests {
         assert_eq!(
             starvation_of(&done).line("gates"),
             "gates: starvation starved=3 (cpu=3 gpu=0) rerun quiet=3 shared=0 -> ok=1 failed=1 undecided=1; judged late=0; unknown=0; ceiling=0"
+        );
+    }
+
+    /// Independent rows start longest predicted first, a cold row (no prediction, `u64::MAX`) leading: of a 4 s and an 8 s row, the 8 s row's place is taken first.
+    #[test]
+    fn independent_rows_start_longest_predicted_first() {
+        const FAKE: &[Row] = &[
+            Row::new(&["short"], false, false),
+            Row::new(&["long"], false, false),
+            Row::new(&["cold"], false, false),
+        ];
+        let taken = Mutex::new(Vec::new());
+        let take = |i: usize| taken.lock().expect("taken").push(FAKE[i].name());
+        let run_one = |row: &Row, _: (), _: &Admitted| {
+            Done::bare(
+                Outcome::Pass,
+                format!("gates: {} x", row.name()),
+                row.name(),
+            )
+        };
+        let _ = run_lanes(
+            FAKE,
+            &[4_000, 8_000, u64::MAX],
+            &take,
+            &run_one,
+            &mut |_| {},
+        );
+        assert_eq!(
+            taken.into_inner().expect("taken"),
+            ["cold", "long", "short"]
+        );
+    }
+
+    /// A row that follows another waits for it to end, however long it is predicted: the follower (20 s) is taken after the stager (3 s) ended.
+    #[test]
+    fn a_predicted_long_row_waits_for_the_row_it_follows() {
+        const FAKE: &[Row] = &[
+            Row::new(&["follower"], false, false).after(&["stager"]),
+            Row::new(&["stager"], false, false),
+        ];
+        let events = Mutex::new(Vec::new());
+        let take = |i: usize| {
+            events
+                .lock()
+                .expect("events")
+                .push(format!("take {}", FAKE[i].name()))
+        };
+        let run_one = |row: &Row, _: (), _: &Admitted| {
+            let done = Done::bare(
+                Outcome::Pass,
+                format!("gates: {} x", row.name()),
+                row.name(),
+            );
+            events
+                .lock()
+                .expect("events")
+                .push(format!("end {}", row.name()));
+            done
+        };
+        let _ = run_lanes(FAKE, &[20_000, 3_000], &take, &run_one, &mut |_| {});
+        let events = events.into_inner().expect("events");
+        let at = |e: &str| events.iter().position(|x| x == e).expect(e);
+        assert!(at("take follower") > at("end stager"), "{events:?}");
+    }
+
+    /// Each row's admission is its own gate-run history (`demand_of`): no history is cold (the whole budget, alone, predicted `u64::MAX`); a passed 3 GiB peak at 2 cores over 9 s reserves 4 GiB (25 % headroom, rounded up) and predicts 9 s.
+    #[test]
+    fn each_row_s_demand_is_its_own_history() {
+        let passed = resource_ledger::RunRecord {
+            kind: resource_ledger::GATE_RUN,
+            name: "app".to_owned(),
+            run: "r1".to_owned(),
+            mem_peak: 3 << 30,
+            oom: false,
+            cpu_usec: 18_000_000,
+            wall_ms: 9_000,
+        };
+        const FAKE: &[Row] = &[
+            Row::new(&["app"], false, false),
+            Row::new(&["task-bind"], false, false),
+        ];
+        let plan = plan_of(FAKE, &[passed], 20, 16);
+        assert_eq!(
+            plan[0],
+            (
+                Demand {
+                    mem_gib: 4,
+                    cores: 2.0
+                },
+                9_000
+            )
+        );
+        assert_eq!(
+            plan[1],
+            (
+                Demand {
+                    mem_gib: 20,
+                    cores: 16.0
+                },
+                u64::MAX
+            )
         );
     }
 

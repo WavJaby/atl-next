@@ -282,10 +282,14 @@ pub fn enqueue(ws: &Path, who: &Path, class: Class) -> Result<Queued> {
     enqueue_with(ws, who, class, Tier::of(who), None)
 }
 
-/// Takes `d` for checkout `who` in workspace `ws`, waiting its turn in the same queue as the classes ([`Tier::of`] `who`): memory slots as `d` says, CPU as a soft claim ([`cpu_fits`]). A demand larger than the pool's shared memory is refused.
+/// Takes `d` for checkout `who` in workspace `ws`, waiting its turn in the queue ([`enqueue_demand`]): memory slots as `d` says, CPU as a soft claim ([`cpu_fits`]).
 pub fn acquire_demand(ws: &Path, who: &Path, d: Demand) -> Result<Grant> {
-    enqueue_with(ws, who, Class::Test, Tier::of(who), Some(d))?
-        .wait(POLL, &mut |line| eprintln!("{line}"))
+    enqueue_demand(ws, who, d)?.wait(POLL, &mut |line| eprintln!("{line}"))
+}
+
+/// Takes `d`'s place for checkout `who` in workspace `ws` without waiting ([`Tier::of`] `who`): the queue serves places in the order taken, as for the classes. A demand larger than the pool's shared memory is refused.
+pub fn enqueue_demand(ws: &Path, who: &Path, d: Demand) -> Result<Queued> {
+    enqueue_with(ws, who, Class::Test, Tier::of(who), Some(d))
 }
 
 fn enqueue_with(
@@ -490,13 +494,13 @@ pub fn try_take_all(ws: &Path, who: &Path) -> Result<std::result::Result<Grant, 
     }))
 }
 
-/// The grant of an undecided gate row's rerun: every slot (`quiet`) when the pool is idle, else `class`'s normal grant, waiting its turn. The refusal (`pool: quiet window refused`) goes to stderr.
-pub fn acquire_rerun(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
+/// The grant of an undecided gate row's rerun: every slot (`quiet`) when the pool is idle, else the row's demand `d`, waiting its turn. The refusal (`pool: quiet window refused`) goes to stderr.
+pub fn acquire_rerun(ws: &Path, who: &Path, d: Demand) -> Result<Grant> {
     match try_take_all(ws, who)? {
         Ok(quiet) => Ok(quiet),
         Err(held) => {
             eprintln!("{held}");
-            acquire_quiet_stdout(ws, who, class)
+            acquire_demand(ws, who, d)
         }
     }
 }

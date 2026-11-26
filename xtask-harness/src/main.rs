@@ -152,7 +152,7 @@ enum Command {
         /// The workload's log: the record line is appended to it.
         #[arg(long)]
         record: PathBuf,
-        /// A test fixture: the leaf's `memory.max` in bytes (swap off, group kill on), so the leaf can OOM.
+        /// The leaf's `memory.max` in bytes (swap off, group kill on): an overrun is an OOM kill inside the leaf, which the record certifies. The grant's memory for a row (check_gates.rs `RowRun::row`), the whole budget for a cold test binary.
         #[arg(long)]
         memory_max: Option<u64>,
         /// The workload's program and arguments, after `--`.
