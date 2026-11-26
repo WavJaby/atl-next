@@ -68,9 +68,7 @@ enum Step {
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
     Deny,
-    /// `cargo test --no-run`, whole workspace: the compile of `test`
-    TestBuild,
-    /// the workspace's tests: the test binaries at once, as many as the grant has slots, then the doc tests (test_run.rs)
+    /// the workspace's tests under one grant: `cargo test --no-run`, then the test binaries at once, as many as the grant has slots, then the doc tests (test_run.rs)
     Test,
     /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
     Converter,
@@ -94,7 +92,7 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 30] = [
+const ALL: [Step; 29] = [
     Step::Fmt,
     Step::Spdx,
     Step::Tables,
@@ -113,7 +111,6 @@ const ALL: [Step; 30] = [
     Step::EnvReads,
     Step::Clippy,
     Step::Deny,
-    Step::TestBuild,
     Step::Test,
     Step::Converter,
     Step::Libcxx,
@@ -148,7 +145,6 @@ impl Step {
             Step::EnvReads => "env-reads",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
-            Step::TestBuild => "test-build",
             Step::Test => "test",
             Step::Converter => "converter",
             Step::Libcxx => "libcxx",
@@ -170,7 +166,6 @@ impl Step {
             // tables: its scenario half builds the harness
             Step::Tables
             | Step::Clippy
-            | Step::TestBuild
             | Step::Test
             | Step::Bootstrap
             | Step::Converter
@@ -414,12 +409,17 @@ impl Step {
                     .context("cargo-deny not installed: cargo install --locked cargo-deny")?;
                 cargo(root, &["deny", "--locked", "check"], Units::Plain)
             }
-            Step::TestBuild => cargo(
-                root,
-                &["test", "--no-run", "--workspace", "--locked"],
-                Units::Recorded,
-            ),
-            Step::Test => crate::test_run::run(root),
+            // both halves under the step's one grant: a second step would queue again between them
+            Step::Test => {
+                let started = Instant::now();
+                cargo(
+                    root,
+                    &["test", "--no-run", "--workspace", "--locked"],
+                    Units::Recorded,
+                )?;
+                eprintln!("test: compile {}", timing::secs(started.elapsed()));
+                crate::test_run::run(root)
+            }
             Step::Converter => converter::check(root),
             Step::Libcxx => libcxx_gate::check(root),
             Step::Runtimes => crate::runtimes::check(root),
