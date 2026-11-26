@@ -97,8 +97,7 @@ fn run_in(root: &Path, scratch: &Path) -> Result<()> {
     )?;
     let started = Instant::now();
     let (beside, alone) = split(&binaries)?;
-    let mut done = run_all(&beside, slots, scratch, &show);
-    done.extend(run_all(&alone, 1, scratch, &show));
+    let done = run_sets(&beside, &alone, slots, scratch, &show);
     let binaries_took = started.elapsed();
     let started = Instant::now();
     // `--doc` runs the doc tests of a lib that sets `doctest = false` too: excluded, as `cargo test` leaves them out
@@ -294,23 +293,38 @@ impl Done {
     }
 }
 
-/// One binary's block as one write; a closed stdout loses the echo, not the verdict.
+/// One binary's block as one write under the stdout lock, so blocks of binaries at once never mix; a closed stdout loses the echo, not the verdict.
 fn show(done: &Done) {
     let _ = std::io::stdout().lock().write_all(&done.block());
 }
 
-/// Runs `binaries`, `at_once` at a time, each shown whole as it ends.
+/// `beside` at most `slots` at a time, then `alone` one by one.
+fn run_sets(
+    beside: &[&Binary],
+    alone: &[&Binary],
+    slots: usize,
+    scratch: &Path,
+    show: &(dyn Fn(&Done) + Sync),
+) -> Vec<Done> {
+    let mut done = run_all(beside, 0, slots, scratch, show);
+    done.extend(run_all(alone, beside.len(), 1, scratch, show));
+    done
+}
+
+/// Runs `binaries`, `at_once` at a time, each shown whole as it ends; `first` numbers their output files.
 fn run_all(
     binaries: &[&Binary],
+    first: usize,
     at_once: usize,
     scratch: &Path,
     show: &(dyn Fn(&Done) + Sync),
 ) -> Vec<Done> {
-    let shown = Mutex::new(());
-    let numbered: Vec<(usize, &&Binary)> = binaries.iter().enumerate().collect();
+    let numbered: Vec<(usize, &&Binary)> =
+        binaries.iter().zip(first..).map(|(b, i)| (i, b)).collect();
     par::map(&numbered, at_once, |(i, binary)| {
         let started = Instant::now();
-        let log = scratch.join(format!("{at_once}-{i}.log"));
+        // one file per binary: outputs of binaries at once never share one
+        let log = scratch.join(format!("{i}.log"));
         let (status, output) = match execute(&binary.run, &log) {
             Ok((status, output)) => (Ok(status), output),
             Err(e) => (Err(format!("{e:#}")), Vec::new()),
@@ -324,7 +338,6 @@ fn run_all(
             counts,
             cut_short,
         };
-        let _one = shown.lock().unwrap_or_else(|p| p.into_inner());
         show(&done);
         done
     })
@@ -416,7 +429,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("test dir");
         let log = Mutex::new(Vec::new());
         let refs: Vec<&Binary> = binaries.iter().collect();
-        let done = run_all(&refs, at_once, &dir, &|d| {
+        let done = run_all(&refs, 0, at_once, &dir, &|d| {
             log.lock().expect("log").extend(d.block());
         });
         fs::remove_dir_all(&dir).expect("test dir cleanup");
@@ -483,6 +496,33 @@ mod tests {
         let (done, log) = run_shells("bound", &vec![hold; 4], 1);
         assert!(done.iter().all(|d| d.problem().is_none()), "{log}");
         fs::remove_dir_all(&dir).expect("test dir cleanup");
+    }
+
+    /// The serial set runs after the rest and one at a time, though slots are free.
+    #[test]
+    fn the_serial_set_runs_alone() {
+        let dir = std::env::temp_dir().join(format!("xtask-test-run-alone-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("test dir");
+        let at = dir.display();
+        let rest = shell(
+            "rest",
+            &format!("cd {at}; [ -e alone-ran ] && exit 6; touch rest-$$; sleep 0.1; rm rest-$$"),
+        );
+        let alone = shell(
+            "alone",
+            &format!(
+                "cd {at}; ls rest-* 2>/dev/null && exit 5; mkdir one || exit 4; touch alone-ran; sleep 0.05; rmdir one"
+            ),
+        );
+        let (beside, serial) = (vec![&rest; 3], vec![&alone; 3]);
+        let log = Mutex::new(Vec::new());
+        let done = run_sets(&beside, &serial, 8, &dir, &|d| {
+            log.lock().expect("log").extend(d.block());
+        });
+        let log = String::from_utf8(log.into_inner().expect("log")).expect("utf-8");
+        fs::remove_dir_all(&dir).expect("test dir cleanup");
+        assert_eq!(done.len(), 6);
+        assert!(done.iter().all(|d| d.problem().is_none()), "{log}");
     }
 
     #[test]
