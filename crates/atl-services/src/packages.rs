@@ -565,11 +565,11 @@ impl Permissions {
 
     /// The install-order step of a batch: `names` are the batch's packages, already in `next`; one lock for the whole step.
     /// (1) their definitions (addPermissions :442-598, trimPermissions :600): a new name is defined, first definer wins; a batch member's own changed definition replaces the old one;
-    /// a definition no longer declared, or one that becomes runtime, drops every app id's state of it. (2) each one's initial states into its app id, pooled as [`Permissions::new`] pools
+    /// a definition no longer declared, or one whose protection base changes, drops every app id's state of it. (2) each one's initial states into its app id, pooled as [`Permissions::new`] pools
     /// them; a kept request keeps its state (grant and flags). (3) per batch app id: trimPermissionStates (:682), and a REVIEW_REQUIRED grant is not kept by a targetSdk >= M update (:1103).
     /// (4) each permission the batch defined or changed that a package outside the batch requests gets its initial state there, except a NORMAL one for a non-system package: AOSP marks it INSTALL_REVOKED.
     /// One batch of every package equals `new` over `next` (boot's start-with-all).
-    /// Not modelled: group-change revoke (addPermissions :517-551), storage / media revoke (:703); a non-runtime definition change keeps the states (AOSP re-evaluates each one).
+    /// Not modelled: group-change revoke (addPermissions :517-551), storage / media revoke (:703); a definition change that keeps its base keeps the states (AOSP re-evaluates each one).
     pub fn packages_added(&self, next: &Packages, names: &[String]) {
         let mut table = self.table();
         let Table { registry, states } = &mut *table;
@@ -601,8 +601,12 @@ impl Permissions {
                 if permission::define(registry, p.name(), name, level) {
                     defined.insert(name);
                 } else if let Some(old) = permission::redefine(registry, p.name(), name, level) {
-                    // addPermissions :520-551: a definition that becomes runtime drops every app id's state of it (the requesters are re-evaluated below)
-                    if !old.is_runtime() && registry.get(name).is_some_and(|def| def.is_runtime()) {
+                    // addPermissions :521-548 (a protection change revokes) with :144-146 (changed names re-evaluated): a changed base drops every app id's state of it; the
+                    // requesters are re-derived below
+                    if registry
+                        .get(name)
+                        .is_some_and(|def| def.base() != old.base())
+                    {
                         drop_states(states, name);
                     }
                     defined.insert(name);
@@ -1519,6 +1523,26 @@ mod tests {
         );
         assert_eq!(view(&p, 10_001, "org.n"), (false, 0, Some(false)));
         assert_eq!(view(&p, 10_002, "org.n"), (false, 0, Some(false)));
+    }
+
+    /// A definition that changes its protection from NORMAL to SIGNATURE re-evaluates every requester (AppIdPermissionPolicy.kt :144-146): the unrelated requester `b` loses its
+    /// install grant (a non-owner gets no signature state, initial_states), and the definer keeps its grant (same package, same certificate). Before the change, `or_insert` kept the NORMAL state.
+    #[test]
+    fn a_normal_definition_that_becomes_signature_drops_an_unrelated_grant() {
+        let a1 = pkg("org.a", 10_001, 30, false, &[("org.n", 0)], &["org.n"]);
+        let b = pkg("org.b", 10_002, 30, false, &[], &["org.n"]);
+        let a2 = pkg("org.a", 10_001, 30, false, &[("org.n", 2)], &["org.n"]);
+        let p = Permissions::new(
+            &Packages::new(vec![a1, b.clone()], BTreeMap::new()),
+            &platform_decls(),
+        );
+        assert_eq!(view(&p, 10_002, "org.n"), (true, 0, None));
+        p.packages_added(
+            &Packages::new(vec![a2, b], BTreeMap::new()),
+            &names(&["org.a"]),
+        );
+        assert_eq!(view(&p, 10_002, "org.n"), (false, 0, None));
+        assert_eq!(view(&p, 10_001, "org.n"), (true, 0, None));
     }
 
     /// A legacy app's runtime grant of a platform permission carries REVIEW_REQUIRED (AOSP's LEGACY_GRANTED + IMPLICIT, API view). A targetSdk >= M update does not keep that grant

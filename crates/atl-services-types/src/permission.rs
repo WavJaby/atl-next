@@ -85,6 +85,11 @@ pub struct Definition {
 }
 
 impl Definition {
+    /// The base protection: the level without its flags (PROTECTION_MASK_BASE).
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+
     /// Permission.isRuntime: base protection DANGEROUS.
     pub fn is_runtime(&self) -> bool {
         self.base == PROTECTION_DANGEROUS
