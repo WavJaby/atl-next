@@ -183,7 +183,10 @@ const REFUSE_VALIST: i64 = 2;
 const REFUSE_FORGED: i64 = 3;
 /// The R-1 case (`downstack`): not a fixture value; its child refuses a down call of `R1_INTS` integers before the guest runs it.
 const REFUSE_DOWN_STACK: i64 = 4;
-const R1_INTS: usize = 23;
+/// AAPCS64's integer argument registers x0..x7 (LP64D's a0..a7): the words a call places before its stack.
+const INT_ARG_REGS: usize = 8;
+/// The first count whose stack words (`R1_INTS - INT_ARG_REGS`) exceed the 16-word lane window on LP64D and AAPCS64; SysV (six registers) overflows at 23 already, so one count serves all three hosts. `R1Fn` and the call in the `downstack` branch take this many words: keep them in step.
+const R1_INTS: usize = INT_ARG_REGS + atl_engine_api::LANE_STACK + 1;
 /// The refusal cases: name (`ATL_QJ_CASE`), the check letter, the value `qj_run` takes for it, and the words its named abort must carry.
 const CASES: &[(&str, char, i64, &str)] = &[
     ("reserved", 'r', REFUSE_RESERVED, "is reserved"),
@@ -317,6 +320,8 @@ type MixFn =
     extern "C" fn(usize, usize, i32, f64, i64, i32, f64, i64, i32, f64, i64, i32, f64, i64) -> f64;
 type ScaleFn = extern "C" fn(usize, usize, f32, i32) -> f32;
 type R1Fn = extern "C" fn(
+    usize,
+    usize,
     usize,
     usize,
     usize,
@@ -629,14 +634,15 @@ fn started(r: Result<Guest, String>) -> u64 {
         set_method_shorty(method_shorty);
     }
     if refuse == REFUSE_DOWN_STACK {
-        // R-1 (Q6-4): 23 integers take six SysV registers and seventeen stack words, one more than the shell's window of sixteen (AAPCS64's side, fifteen words, fits): the shell refuses the call by name before the guest runs it
+        // R-1 (Q6-4): R1_INTS integers take eight registers and seventeen stack words (LP64D, AAPCS64) or nineteen (SysV, six registers), each more than the shell's window of sixteen: the shell refuses the call by name before the guest runs it
         let mut shorty = vec![b'I'; R1_INTS + 1];
         shorty[0] = b'V';
         let entry = bind_down(x.on_load, bias, Down::Plain, Some(&shorty));
         // SAFETY: `entry` is a down shell with R1_INTS integer parameters (R1Fn); the shell refuses the call and the process aborts, so the guest never runs it
         let r1 = unsafe { std::mem::transmute::<usize, R1Fn>(entry) };
         let _ = r1(
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25,
         );
         println!("qemu-jni: FAIL refusal case {refuse} returned: the down call was not refused");
         return 1;
