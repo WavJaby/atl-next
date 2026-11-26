@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * `fast: state=<n>`: a low-latency track; the server refuses FAST and the track must still initialise on the normal path.
  * `static: state=<n> frames=<n>`: a shared-buffer track (MODE_STATIC): the frames are the requested ones, not rounded.
  * `props: rate=<s> frames=<s>`: AudioManager's PROPERTY_OUTPUT_SAMPLE_RATE and PROPERTY_OUTPUT_FRAMES_PER_BUFFER (the primary output's rate and HAL frame count).
+ * `group: media=<n> ringtone=<n>`: AudioManager.getVolumeGroupIdForAttributes of USAGE_MEDIA and of USAGE_NOTIFICATION_RINGTONE (the strategy list policy.rs serves).
+ * `tts: flags=<n>`: the flags (AudioAttributes.getAllFlags, read reflectively) of a legacy TTS stream's attributes: FLAG_BEACON.
  * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink. Then the silent adaptive AAudio client (`pcm: aaudio-adaptive ...`).
  * `done`: the end of the run.
  * The volume run (asset `volume` present, audio_app.rs `--volume`) logs only `volume: ...` lines (volumeRun) and `done`.
@@ -73,6 +75,8 @@ public class Main extends Activity {
     private static final int AAUDIO_TONE_HZ = 250;
     private static final int NATIVE_RATE_HZ = 48000;
     private static final int NATIVE_FRAMES = 72000;
+    /** AudioSystem.STREAM_TTS (AudioSystem.java:107, @hide): the speaker stream the flags probe builds from. */
+    private static final int STREAM_TTS = 9;
 
     /** OpenSL ES simple buffer queue player (jni/atl_audio_tone.c): "sles enqueued=<n> callbacks=<n> failed=<n>". */
     private static native String slesTone(int hz, int rate, int frames, double dbfs);
@@ -181,6 +185,32 @@ public class Main extends Activity {
     }
 
     /**
+     * The policy probe: AudioManager's volume group of USAGE_MEDIA and of USAGE_NOTIFICATION_RINGTONE, through the strategy list policy.rs serves (AudioProductStrategy.java:184, :353);
+     * and the flags of a legacy TTS stream's attributes (AudioAttributes.java:1223 sets FLAG_BEACON). getAllFlags is @SystemApi (AudioAttributes.java:656): read reflectively.
+     * Each part reports its own failure, so the focus probe and the tracks still run.
+     */
+    private void policyProbe(AudioManager audio) {
+        try {
+            AudioAttributes media = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA).build();
+            AudioAttributes ringtone = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).build();
+            Log.i(TAG, "group: media=" + audio.getVolumeGroupIdForAttributes(media)
+                    + " ringtone=" + audio.getVolumeGroupIdForAttributes(ringtone));
+        } catch (Throwable e) {
+            Log.i(TAG, "group: " + e);
+        }
+        try {
+            AudioAttributes tts = new AudioAttributes.Builder()
+                    .setLegacyStreamType(STREAM_TTS).build();
+            Object flags = AudioAttributes.class.getMethod("getAllFlags").invoke(tts);
+            Log.i(TAG, "tts: flags=" + flags);
+        } catch (Throwable e) {
+            Log.i(TAG, "tts: " + e);
+        }
+    }
+
+    /**
      * The focus probe, public AudioManager API only: a foreground media gain is GRANTED, its identical repeat is GRANTED, a DELAY_OK
      * request with no lock is GRANTED (never DELAYED), and each abandon succeeds. The first listener must receive LOSS_TRANSIENT when the
      * delayed transient gain takes focus. Its callback runs on a handler thread; the probe waits for it (bounded) before abandoning the top,
@@ -263,6 +293,7 @@ public class Main extends Activity {
         // the output properties FMOD and OpenSL users size their buffers by (AudioSystem.getPrimaryOutput*; null when the server answers 0)
         Log.i(TAG, "props: rate=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
                 + " frames=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER));
+        policyProbe(audio);
         focusProbe(audio);
         AudioAttributes attributes = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_GAME).build();

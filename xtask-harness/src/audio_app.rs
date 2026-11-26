@@ -4,7 +4,7 @@
 //! The served profile is the PCM output's granted rate and quantum (game audio A2), which on this host are PipeWire's defaults: [`SPEC_RATE_HZ`] and the others copy them, so a different graph must change these too (a mismatch is a red gate).
 //! PCM (A2): the fixture plays a static track, a streaming track, a float streaming track, then from its NDK library (jni/atl_audio_tone.c) an OpenSL ES buffer-queue player and an AAudio callback stream, each a tone (Main.java `pcm`); the native two are also checked on their own counts and the `sles-flow:` counters (`native_verdicts`). `--break-tone` builds that library silent: the two native runs must be missing. The output's sink is the run's own null sink, which its streams target (audio_pcm.rs Routing), and its monitor is recorded with `pw-record` (audio_pcm.rs). The recording must hold five runs of tone with the frequency, length and level the fixture's input gives, and no sample beyond full scale. Expected values come from the constants below, never from the server.
 //! Then a silent adaptive AAudio client (`adaptive_verdicts`): its buffer starts at one burst, below a quantum, and must grow on the xruns the server's underrun tally reports until the mix is full.
-//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process.
+//! Checks: session ids nonzero and distinct; getMinBufferSize equals the expected bytes (stereo, 16-bit); AudioManager's output rate and frames-per-buffer properties are the served profile's; a track reaches STATE_INITIALIZED with a nonzero piid (AudioTrack calls baseRegisterPlayer only after native_setup succeeds, AudioTrack.java:912) and the expected frame count; the low-latency track initialises although the server refuses FAST (counted); AudioFlinger's and AudioPolicyService's calls were answered in-process; the policy engine's answers through AudioManager are judged by `policy_verdicts` (the media and ring volume groups found and distinct, the TTS legacy stream's flags FLAG_BEACON).
 //! `--break-serve` starts the app with `--no-audio-service` (atld, then the launcher): it serves neither name, so the session line must go red. `--break-cblk` starts it with `--break-cblk`: each streaming track's region is one buffer short, createTrack refuses it, and both streaming tracks fail to initialise (a static track has no buffer of its own to be short of). `--break-mix` starts it with `--break-mix`: the mixer plays silence, so the PCM checks find no tone and must go red. `--unreachable` makes the desktop's server a stale socket file (`PIPEWIRE_REMOTE` for atld): the app must still reach `done` (the launch is not fatal), its track must fail with STATE_UNINITIALIZED and a counted refusal, and no tone may reach the sink.
 //! `--volume`: the app volume on the app's host stream instead of the PCM checks (app_volume.rs).
 
@@ -212,6 +212,35 @@ fn adaptive_verdicts(app: &str, services: &str) -> bool {
     ok
 }
 
+/// The policy engine's answers through AudioManager and AudioAttributes (policy.rs serves the strategy list built from the engine's default config, EngineDefaultConfig.h).
+/// AudioManager.getVolumeGroupIdForAttributes walks that list (AudioProductStrategy.java:184-195, :353-362): USAGE_MEDIA is in STRATEGY_MEDIA (EngineDefaultConfig.h:89-91), the ring usage in STRATEGY_SONIFICATION (:43-47), listed before it.
+/// Both must be found (not VOLUME_GROUP_NONE) and distinct. The TTS legacy stream's flags are FLAG_BEACON alone (AudioAttributes.java:1223-1225).
+fn policy_verdicts(app: &str) -> bool {
+    let group = line_value(app, "group: ");
+    let media = field(group, "media");
+    let ringtone = field(group, "ringtone");
+    let found = |g: Option<i64>| g.is_some_and(|g| g != VOLUME_GROUP_NONE);
+    let mut ok = verdict(
+        "volume group",
+        found(media) && found(ringtone) && media != ringtone,
+        &format!(
+            "media {media:?}, ringtone {ringtone:?}, want both found (not {VOLUME_GROUP_NONE}) and distinct, line: {}",
+            group.unwrap_or("no line")
+        ),
+    );
+    let tts = line_value(app, "tts: ");
+    let flags = field(tts, "flags");
+    ok &= verdict(
+        "tts flags",
+        flags == Some(TTS_FLAGS),
+        &format!(
+            "flags {flags:?}, want {TTS_FLAGS} (FLAG_BEACON), line: {}",
+            tts.unwrap_or("no line")
+        ),
+    );
+    ok
+}
+
 /// The fixture's dir.
 const FIXTURE: &str = "xtask-harness/testdata/audio";
 /// Main.onCreate's log tag and the line that ends the run.
@@ -293,6 +322,10 @@ const ADAPTIVE_STABLE_MS: i64 = 1_000;
 const FOCUS_LOSS_TRANSIENT: i64 = -2;
 /// AudioManager.AUDIOFOCUS_GAIN (AudioManager.java:4296): the first listener's regain when the top abandons (notifyTopOfAudioFocusStack -> handleFocusGain).
 const FOCUS_GAIN: i64 = 1;
+/// AudioVolumeGroup.DEFAULT_VOLUME_GROUP (AudioVolumeGroup.java:47): the answer when no strategy matches (AudioProductStrategy.java:194, :350).
+const VOLUME_GROUP_NONE: i64 = -1;
+/// AudioAttributes.FLAG_BEACON (AudioAttributes.java:404, `0x1 << 3`): the TTS legacy stream's flags, set by its case (:1225) and carried by the default TTS attributes (EngineDefaultConfig.h:132).
+const TTS_FLAGS: i64 = 1 << 3;
 const TONE_DBFS: f64 = -12.0;
 /// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
 const GAP_SECONDS: f64 = 0.2;
@@ -760,6 +793,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     );
     ok &= native_verdicts(&app, &services);
     ok &= adaptive_verdicts(&app, &services);
+    ok &= policy_verdicts(&app);
     // the app's desktop identity: the desktop file ID rule `atl.<package>` (the window's app_id too), from the fixture's manifest
     let want_id = format!("atl.{}", m.name);
     let identity = streams.and_then(|s| identity_check(&s, &want_id, true));
