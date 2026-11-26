@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! The resource ledger: one machine-wide store of measured inputs that admission decides on (gate_need.rs reads the gate kind).
-//! One file, `<workspace>/out/pool/resource-ledger.tsv`, one line per record: `kind name wait run took_ms stall` (tab-separated; `stall` = host stall share, percent, `-` unknown).
-//! Several kinds share the file. The reader skips a line whose first column is another kind, and a rewrite keeps such a line as written, so a binary that knows fewer kinds neither fails on nor drops another's lines. A malformed line of a known kind is an error naming its line.
-//! Key = (kind, name, wait, run). The same key again is one record with the largest took, so a replay changes nothing. Line order is age (appends are serialized).
-//! Retention: per (kind, name, wait), the newest `keep_runs` distinct runs and every record of them.
+//! The resource ledger: one machine-wide store of measured inputs that admission decides on (gate_need.rs reads the gate kind, test_run.rs the test kind).
+//! One file, `<workspace>/out/pool/resource-ledger.tsv`, one tab-separated line per record:
+//! - gate wait: `gate name wait run took_ms stall` (`stall` = host stall share, percent, `-` unknown);
+//! - test attempt: `test name <empty> run mem_peak oom cpu_usec wall_ms` (`mem_peak` bytes, `oom` 0/1; an OOM's peak is a lower bound only).
+//!
+//! A line whose first column is another kind is skipped by the readers and kept as written by a rewrite, so a binary that knows fewer kinds neither fails on nor drops it. A malformed line of a known kind is an error naming its line.
+//! Key = (kind, name, wait, run). A gate wait under one key keeps the largest took, so a replay changes nothing; a test attempt keeps its first record (an attempt is measured once). Line order is age (appends are serialized).
+//! Retention: per (kind, name, wait), the newest `keep_runs` distinct runs and every record of them. Another kind's lines are not keyed and not cut.
 //! Writes take the exclusive flock [`LOCK`] (beside the pool's locks, `build_pool::dir`), reload under it, merge, retain and replace the file by rename (temp in the same dir, fsync, rename, fsync dir).
 //! Reads take the shared flock.
 
@@ -24,8 +27,13 @@ pub const LEDGER: &str = "resource-ledger.tsv";
 pub const LOCK: &str = "resource-ledger.lock";
 /// The kind of a gate row's wait samples: `name` = the row, `wait` = the wait's name.
 pub const GATE: &str = "gate";
+/// The kind of a test binary's attempts: `name` = the binary's identity, `wait` empty, `run` = the attempt.
+pub const TEST: &str = "test";
 
-/// One ledger line of a known kind. `run` is an opaque attempt id (a check run's name, `.rerun` suffixed for a rerun).
+/// (kind, name, wait, run): the key a record is stored under.
+type Key = (String, String, String, String);
+
+/// One gate wait of one attempt. `run` is an opaque attempt id (a check run's name, `.rerun` suffixed for a rerun).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     pub kind: String,
@@ -38,15 +46,6 @@ pub struct Record {
 }
 
 impl Record {
-    fn key(&self) -> (String, String, String, String) {
-        (
-            self.kind.clone(),
-            self.name.clone(),
-            self.wait.clone(),
-            self.run.clone(),
-        )
-    }
-
     fn line(&self) -> String {
         let stall = self.stall.map_or("-".to_owned(), |s| format!("{s:.2}"));
         format!(
@@ -55,9 +54,8 @@ impl Record {
         )
     }
 
-    fn parse(line: &str) -> Option<Self> {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let &[kind, name, wait, run, took, stall] = cols.as_slice() else {
+    fn parse(cols: &[&str]) -> Option<Self> {
+        let &[kind, name, wait, run, took, stall] = cols else {
             return None;
         };
         if kind != GATE || name.is_empty() || wait.is_empty() || run.is_empty() {
@@ -78,11 +76,97 @@ impl Record {
     }
 }
 
-/// One line of the file: a record of a known kind, or a line of another kind kept as written.
+/// One attempt of a test binary, measured once per run id: `mem_peak` bytes (the leaf's peak; a lower bound when `oom`), `cpu_usec`, `wall_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRecord {
+    pub name: String,
+    pub run: String,
+    pub mem_peak: u64,
+    pub oom: bool,
+    pub cpu_usec: u64,
+    pub wall_ms: u64,
+}
+
+impl RunRecord {
+    fn line(&self) -> String {
+        format!(
+            "{TEST}\t{}\t\t{}\t{}\t{}\t{}\t{}\n",
+            self.name,
+            self.run,
+            self.mem_peak,
+            u8::from(self.oom),
+            self.cpu_usec,
+            self.wall_ms
+        )
+    }
+
+    fn parse(cols: &[&str]) -> Option<Self> {
+        let &[kind, name, wait, run, mem, oom, cpu, wall] = cols else {
+            return None;
+        };
+        if kind != TEST || !wait.is_empty() || name.is_empty() || run.is_empty() {
+            return None;
+        }
+        Some(Self {
+            name: name.to_owned(),
+            run: run.to_owned(),
+            mem_peak: mem.parse().ok()?,
+            oom: match oom {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
+            cpu_usec: cpu.parse().ok()?,
+            wall_ms: wall.parse().ok()?,
+        })
+    }
+}
+
+/// One ledger line: a gate wait, a test attempt, or another kind's line kept as written.
 #[derive(Debug, Clone, PartialEq)]
-enum Line {
-    Gate(Record),
+enum Row {
+    Wait(Record),
+    Run(RunRecord),
     Other(String),
+}
+
+impl Row {
+    /// The key a record is stored under; None for another kind's line (not keyed, never merged or cut).
+    fn key(&self) -> Option<Key> {
+        match self {
+            Row::Wait(r) => Some((
+                r.kind.clone(),
+                r.name.clone(),
+                r.wait.clone(),
+                r.run.clone(),
+            )),
+            Row::Run(r) => Some((
+                TEST.to_owned(),
+                r.name.clone(),
+                String::new(),
+                r.run.clone(),
+            )),
+            Row::Other(_) => None,
+        }
+    }
+
+    fn line(&self) -> String {
+        match self {
+            Row::Wait(r) => r.line(),
+            Row::Run(r) => r.line(),
+            Row::Other(text) => format!("{text}\n"),
+        }
+    }
+
+    /// None: a malformed line of a known kind (the caller names its line).
+    fn parse(line: &str) -> Option<Self> {
+        let cols: Vec<&str> = line.split('\t').collect();
+        match cols.first().copied() {
+            Some(GATE) => Record::parse(&cols).map(Row::Wait),
+            Some(TEST) => RunRecord::parse(&cols).map(Row::Run),
+            _ => Some(Row::Other(line.to_owned())),
+        }
+    }
 }
 
 /// The ledger's path under workspace `ws`.
@@ -95,90 +179,114 @@ pub fn lock_path(ws: &Path) -> PathBuf {
     build_pool::dir(ws).join(LOCK)
 }
 
-/// Parses `text` (the file at `path`, for the error): a line of another kind is kept as written; a malformed line of a known kind fails the whole read.
-fn parse_text(path: &Path, text: &str) -> Result<Vec<Line>> {
+/// Parses `text` (the file at `path`, for the error); a malformed line of a known kind fails the whole read.
+fn parse_text(path: &Path, text: &str) -> Result<Vec<Row>> {
     text.lines()
         .enumerate()
         .map(|(i, line)| {
-            if line.split('\t').next() != Some(GATE) {
-                return Ok(Line::Other(line.to_owned()));
-            }
-            Record::parse(line).map(Line::Gate).with_context(|| {
+            Row::parse(line).with_context(|| {
                 format!("{}:{}: not a ledger line: {line:?}", path.display(), i + 1)
             })
         })
         .collect()
 }
 
-/// The ledger's records of the known kind, oldest first; lines of other kinds are skipped. No file yet: empty.
-pub fn read(ws: &Path) -> Result<Vec<Record>> {
+/// Every line of the ledger of workspace `ws`, oldest first. No file yet: empty.
+fn load(ws: &Path) -> Result<Vec<Row>> {
     let path = ledger_path(ws);
     let text = read_text(&path, &lock_path(ws))?;
-    Ok(parse_text(&path, &text)?
+    parse_text(&path, &text)
+}
+
+/// The gate waits of the ledger of workspace `ws`, oldest first.
+pub fn read(ws: &Path) -> Result<Vec<Record>> {
+    Ok(load(ws)?
         .into_iter()
-        .filter_map(|line| match line {
-            Line::Gate(r) => Some(r),
-            Line::Other(_) => None,
+        .filter_map(|r| match r {
+            Row::Wait(r) => Some(r),
+            Row::Run(_) | Row::Other(_) => None,
         })
         .collect())
 }
 
-/// Adds `records` to the ledger of workspace `ws` under the exclusive lock, then keeps each key's newest `keep_runs` runs.
+/// The test attempts of the ledger of workspace `ws`, oldest first.
+pub fn read_runs(ws: &Path) -> Result<Vec<RunRecord>> {
+    Ok(load(ws)?
+        .into_iter()
+        .filter_map(|r| match r {
+            Row::Run(r) => Some(r),
+            Row::Wait(_) | Row::Other(_) => None,
+        })
+        .collect())
+}
+
+/// Adds gate waits to the ledger of workspace `ws` under the exclusive lock, then keeps each window's newest `keep_runs` runs.
 pub fn append(ws: &Path, records: &[Record], keep_runs: usize) -> Result<()> {
+    append_rows(
+        ws,
+        records.iter().cloned().map(Row::Wait).collect(),
+        keep_runs,
+    )
+}
+
+/// [`append`] for test attempts.
+pub fn append_runs(ws: &Path, runs: &[RunRecord], keep_runs: usize) -> Result<()> {
+    append_rows(ws, runs.iter().cloned().map(Row::Run).collect(), keep_runs)
+}
+
+fn append_rows(ws: &Path, rows: Vec<Row>, keep_runs: usize) -> Result<()> {
     let path = ledger_path(ws);
     rewrite(&path, &lock_path(ws), |text| {
         let snapshot = parse_text(&path, text)?;
-        Ok(render(&retain(merge(snapshot, records), keep_runs)))
+        Ok(render(&retain(merge(snapshot, &rows), keep_runs)))
     })
 }
 
-/// `batch` merged into `snapshot` by key: a new key is appended (age order), a known key keeps its place and the larger took. Lines of other kinds are not keyed.
-fn merge(snapshot: Vec<Line>, batch: &[Record]) -> Vec<Line> {
+/// `batch` merged into `snapshot` by key: a new key is appended (age order). A known gate wait keeps its place and the larger took; a known test attempt keeps its first record.
+fn merge(snapshot: Vec<Row>, batch: &[Row]) -> Vec<Row> {
     let mut out = snapshot;
-    let mut at: BTreeMap<(String, String, String, String), usize> = out
+    let mut at: BTreeMap<Key, usize> = out
         .iter()
         .enumerate()
-        .filter_map(|(i, line)| match line {
-            Line::Gate(r) => Some((r.key(), i)),
-            Line::Other(_) => None,
-        })
+        .filter_map(|(i, r)| Some((r.key()?, i)))
         .collect();
     for r in batch {
-        match at.get(&r.key()).copied() {
+        let key = r
+            .key()
+            .expect("a batch row is a gate wait or a test attempt");
+        match at.get(&key).copied() {
             Some(i) => {
-                if let Line::Gate(old) = &mut out[i]
-                    && r.took_ms > old.took_ms
+                if let (Row::Wait(old), Row::Wait(new)) = (&mut out[i], r)
+                    && new.took_ms > old.took_ms
                 {
-                    old.took_ms = r.took_ms;
-                    old.stall = r.stall;
+                    old.took_ms = new.took_ms;
+                    old.stall = new.stall;
                 }
             }
             None => {
-                at.insert(r.key(), out.len());
-                out.push(Line::Gate(r.clone()));
+                at.insert(key, out.len());
+                out.push(r.clone());
             }
         }
     }
     out
 }
 
-/// `lines` (age order) with each (kind, name, wait) cut to its newest `keep_runs` distinct runs; every record of a kept run stays. Lines of other kinds are kept.
-fn retain(lines: Vec<Line>, keep_runs: usize) -> Vec<Line> {
+/// `rows` (age order) with each (kind, name, wait) cut to its newest `keep_runs` distinct runs; every row of a kept run stays. Another kind's lines are kept.
+fn retain(rows: Vec<Row>, keep_runs: usize) -> Vec<Row> {
     let mut runs: BTreeMap<(String, String, String), BTreeSet<String>> = BTreeMap::new();
-    let mut kept: Vec<Line> = lines
+    let mut kept: Vec<Row> = rows
         .into_iter()
         .rev()
-        .filter(|line| {
-            let Line::Gate(r) = line else {
+        .filter(|r| {
+            let Some((kind, name, wait, run)) = r.key() else {
                 return true;
             };
-            let seen = runs
-                .entry((r.kind.clone(), r.name.clone(), r.wait.clone()))
-                .or_default();
-            if seen.contains(&r.run) {
+            let seen = runs.entry((kind, name, wait)).or_default();
+            if seen.contains(&run) {
                 true
             } else if seen.len() < keep_runs {
-                seen.insert(r.run.clone());
+                seen.insert(run);
                 true
             } else {
                 false
@@ -189,15 +297,9 @@ fn retain(lines: Vec<Line>, keep_runs: usize) -> Vec<Line> {
     kept
 }
 
-/// The file text of `lines`, one line each; a line of another kind is written as it was read.
-fn render(lines: &[Line]) -> String {
-    lines
-        .iter()
-        .map(|line| match line {
-            Line::Gate(r) => r.line(),
-            Line::Other(text) => format!("{text}\n"),
-        })
-        .collect()
+/// The file text of `rows`, one line each; another kind's line is written as it was read.
+fn render(rows: &[Row]) -> String {
+    rows.iter().map(Row::line).collect()
 }
 
 /// Takes the lock at `lock_path`: exclusive to rewrite, shared to read. Creates the lock file on first use.
@@ -281,32 +383,43 @@ mod tests {
         }
     }
 
+    fn run(name: &str, run: &str, mem_peak: u64, wall_ms: u64) -> RunRecord {
+        RunRecord {
+            name: name.to_owned(),
+            run: run.to_owned(),
+            mem_peak,
+            oom: false,
+            cpu_usec: 2_000_000,
+            wall_ms,
+        }
+    }
+
     #[test]
     fn a_record_line_round_trips_and_an_unknown_stall_is_a_dash() {
         let mut r = rec("r1", "app", "marker", 100);
         let path = Path::new("x.tsv");
         assert_eq!(
             parse_text(path, &r.line()).expect("parse"),
-            vec![Line::Gate(r.clone())]
+            vec![Row::Wait(r.clone())]
         );
         r.stall = None;
         assert_eq!(r.line(), "gate\tapp\tmarker\tr1\t100\t-\n");
         assert_eq!(
             parse_text(path, &r.line()).expect("parse"),
-            vec![Line::Gate(r)]
+            vec![Row::Wait(r)]
         );
     }
 
     /// The same key twice is one record with the largest took; a replay of the batch changes nothing.
     #[test]
     fn a_repeated_key_is_one_record_with_the_largest_took() {
-        let snapshot = vec![Line::Gate(rec("r1", "app", "marker", 100))];
+        let snapshot = vec![Row::Wait(rec("r1", "app", "marker", 100))];
         let batch = [
-            rec("r1", "app", "marker", 300),
-            rec("r1", "app", "marker", 200),
+            Row::Wait(rec("r1", "app", "marker", 300)),
+            Row::Wait(rec("r1", "app", "marker", 200)),
         ];
         let once = merge(snapshot, &batch);
-        assert_eq!(once, vec![Line::Gate(rec("r1", "app", "marker", 300))]);
+        assert_eq!(once, vec![Row::Wait(rec("r1", "app", "marker", 300))]);
         assert_eq!(
             merge(once.clone(), &batch),
             once,
@@ -317,15 +430,15 @@ mod tests {
     /// 21 runs of `marker` and one of `other`: the newest 20 runs of `marker` stay, the oldest goes; `other` has its own window.
     #[test]
     fn retention_cuts_each_wait_to_its_newest_runs() {
-        let mut lines: Vec<Line> = (1..=21)
-            .map(|i| Line::Gate(rec(&format!("r{i}"), "app", "marker", i)))
+        let mut rows: Vec<Row> = (1..=21)
+            .map(|i| Row::Wait(rec(&format!("r{i}"), "app", "marker", i)))
             .collect();
-        lines.insert(0, Line::Gate(rec("r1", "app", "other", 5)));
-        let kept = retain(lines, 20);
+        rows.insert(0, Row::Wait(rec("r1", "app", "other", 5)));
+        let kept = retain(rows, 20);
         let runs = |wait: &str| -> Vec<String> {
             kept.iter()
-                .filter_map(|line| match line {
-                    Line::Gate(r) if r.wait == wait => Some(r.run.clone()),
+                .filter_map(|r| match r {
+                    Row::Wait(r) if r.wait == wait => Some(r.run.clone()),
                     _ => None,
                 })
                 .collect()
@@ -335,6 +448,25 @@ mod tests {
             (2..=21).map(|i| format!("r{i}")).collect::<Vec<_>>()
         );
         assert_eq!(runs("other"), ["r1"]);
+    }
+
+    /// 21 attempts of one binary: the newest 20 stay; the gate wait keeps its own window.
+    #[test]
+    fn run_retention_cuts_each_name_to_its_newest_runs() {
+        let mut rows: Vec<Row> = (1..=21)
+            .map(|i| Row::Run(run("app", &format!("r{i}"), i, 1_000)))
+            .collect();
+        rows.insert(0, Row::Wait(rec("r1", "app", "marker", 5)));
+        let kept = retain(rows, 20);
+        let runs: Vec<String> = kept
+            .iter()
+            .filter_map(|r| match r {
+                Row::Run(r) => Some(r.run.clone()),
+                Row::Wait(_) | Row::Other(_) => None,
+            })
+            .collect();
+        assert_eq!(runs, (2..=21).map(|i| format!("r{i}")).collect::<Vec<_>>());
+        assert_eq!(kept.len(), 21, "the gate wait stays with the runs");
     }
 
     /// Eight writers, distinct keys, started together: each key is in the file once after all of them.
@@ -383,12 +515,12 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    /// A line of another kind is skipped by the reader and kept as written by a rewrite; a malformed line of a known kind still fails the read, naming its line.
+    /// A line of another kind is skipped by both readers and kept as written by a rewrite of either kind; a malformed line of a known kind still fails the read, naming its line.
     #[test]
     fn another_kinds_lines_are_skipped_and_kept() {
         let ws = scratch("mixed");
         fs::create_dir_all(ledger_path(&ws).parent().expect("pool dir")).expect("pool dir");
-        let other = "test\tbin\t\tr1\t7\t0\t9\t3";
+        let other = "future\tbin\t\tr1\t7\t0\t9\t3";
         fs::write(
             ledger_path(&ws),
             format!("gate\tapp\tmarker\tr1\t100\t0.10\n{other}\n"),
@@ -398,12 +530,15 @@ mod tests {
             read(&ws).expect("read"),
             vec![rec("r1", "app", "marker", 100)]
         );
+        assert!(read_runs(&ws).expect("runs").is_empty());
         append(&ws, &[rec("r2", "app", "marker", 200)], 20).expect("append");
+        append_runs(&ws, &[run("bin", "r1", 7, 50)], 20).expect("append runs");
         let text = fs::read_to_string(ledger_path(&ws)).expect("ledger text");
         assert_eq!(
             text,
             format!(
-                "gate\tapp\tmarker\tr1\t100\t0.10\n{other}\ngate\tapp\tmarker\tr2\t200\t0.10\n"
+                "gate\tapp\tmarker\tr1\t100\t0.10\n{other}\ngate\tapp\tmarker\tr2\t200\t0.10\n\
+                 test\tbin\t\tr1\t7\t0\t2000000\t50\n"
             )
         );
         fs::write(
@@ -432,6 +567,74 @@ mod tests {
         assert_eq!(text, "gate\tapp\tmarker\tr1\t100\t0.10\n");
         assert_eq!(read(&ws).expect("read").len(), 2);
         assert!(!path.with_extension("tsv.tmp").exists());
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A test attempt is eight columns with an empty wait; `oom` is 0 or 1.
+    #[test]
+    fn a_run_line_round_trips_with_an_empty_wait() {
+        let mut r = run("xtask lib t", "r1", 4_294_967_296, 2_000);
+        r.oom = true;
+        assert_eq!(
+            r.line(),
+            "test\txtask lib t\t\tr1\t4294967296\t1\t2000000\t2000\n"
+        );
+        let path = Path::new("x.tsv");
+        assert_eq!(
+            parse_text(path, &r.line()).expect("parse"),
+            vec![Row::Run(r.clone())]
+        );
+        assert!(
+            parse_text(path, "test\tapp\t\tr1\t1\t2\t3\t4\n").is_err(),
+            "oom 2"
+        );
+        assert!(
+            parse_text(path, "test\tapp\t\tr1\t1\t0\t3\n").is_err(),
+            "short"
+        );
+    }
+
+    /// One attempt is measured once: a replay of its run changes nothing, the first record stands.
+    #[test]
+    fn a_repeated_run_keeps_its_first_record() {
+        let first = run("app", "r1", 100, 1_000);
+        let replay = run("app", "r1", 999, 9_000);
+        let once = merge(vec![Row::Run(first.clone())], &[Row::Run(replay.clone())]);
+        assert_eq!(once, vec![Row::Run(first)]);
+        assert_eq!(merge(once.clone(), &[Row::Run(replay)]), once);
+    }
+
+    /// Gate waits and test attempts share the file: each read sees its own kind, and no append drops the other.
+    #[test]
+    fn waits_and_runs_share_one_file() {
+        let ws = scratch("shared");
+        append(&ws, &[rec("r1", "app", "marker", 100)], 20).expect("append");
+        append_runs(&ws, &[run("bin", "r1", 7, 50)], 20).expect("append runs");
+        assert_eq!(
+            read(&ws).expect("waits"),
+            vec![rec("r1", "app", "marker", 100)]
+        );
+        assert_eq!(read_runs(&ws).expect("runs"), vec![run("bin", "r1", 7, 50)]);
+        append(&ws, &[rec("r2", "app", "marker", 200)], 20).expect("append");
+        assert_eq!(
+            read_runs(&ws).expect("runs").len(),
+            1,
+            "a gate append keeps the runs"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    #[test]
+    fn a_malformed_run_line_names_its_line() {
+        let ws = scratch("malformed-run");
+        fs::create_dir_all(ledger_path(&ws).parent().expect("pool dir")).expect("pool dir");
+        fs::write(
+            ledger_path(&ws),
+            "gate\tapp\tmarker\tr1\t100\t0.10\ntest\tbin\t\tr1\tbig\t0\t1\n",
+        )
+        .expect("ledger");
+        let msg = format!("{:#}", read_runs(&ws).expect_err("line 2 is malformed"));
+        assert!(msg.contains("resource-ledger.tsv:2:"), "{msg}");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }
