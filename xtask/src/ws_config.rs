@@ -48,7 +48,7 @@ pub const FILE: &str = "workspace.toml";
 
 /// Keys that no longer exist, refused by name with what replaces them: `(table, key, replacement)`.
 /// Condition: some workspace.toml still carries one. Delete this list once none does; the unknown-key refusal then covers them.
-const RETIRED: [(&str, &str, &str); 4] = [
+const RETIRED: [(&str, &str, &str); 5] = [
     (
         "build",
         "slots",
@@ -68,6 +68,11 @@ const RETIRED: [(&str, &str, &str); 4] = [
         "build",
         "parallel_builds",
         "the machine pool replaces the token count: `[pool]` cpu_slots and mem_gib, and the class weights under `[pool.<class>]`",
+    ),
+    (
+        "pool",
+        "harness-heavy",
+        "gate rows claim their learned demand (check_gates.rs `plan_of`): delete the table",
     ),
 ];
 
@@ -667,6 +672,11 @@ mod tests {
         let m = err("[build]\nparallel_builds = 2\n");
         assert!(
             m.contains("`build.parallel_builds` is retired") && m.contains("`[pool]` cpu_slots"),
+            "{m}"
+        );
+        let m = err("[pool.harness-heavy]\ncpu_min = 2\n");
+        assert!(
+            m.contains("`pool.harness-heavy` is retired") && m.contains("learned demand"),
             "{m}"
         );
     }
