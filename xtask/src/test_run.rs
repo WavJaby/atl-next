@@ -8,7 +8,6 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -408,6 +407,8 @@ fn slowest(done: &[Done]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     fn shell(label: &str, script: &str) -> Binary {
