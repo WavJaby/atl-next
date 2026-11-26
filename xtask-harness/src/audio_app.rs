@@ -143,21 +143,23 @@ fn native_verdicts(app: &str, services: &str) -> bool {
             aaudio.unwrap_or("no line")
         ),
     );
-    // AudioManager's public focus API through AudioService's ordinary stack: the foreground gain and its identical repeat are GRANTED (1), a DELAY_OK request is GRANTED not DELAYED (2), each abandon succeeds; the first listener sees LOSS_TRANSIENT when the transient gain takes focus, before its abandon (lost)
+    // AudioManager's public focus API through AudioService's ordinary stack: the foreground gain and its identical repeat are GRANTED (1), a DELAY_OK request is GRANTED not DELAYED (2), each abandon succeeds (the top's, then the restored owner's and its repeat); the first listener sees LOSS_TRANSIENT when the transient gain takes focus (lost), then GAIN when the top abandons (restored)
     let focus = line_value(app, "focus: ");
     let want = [
         ("first", 1),
         ("repeat", 1),
         ("delayed", 1),
         ("abandon", 1),
+        ("released", 1),
         ("again", 1),
         ("lost", FOCUS_LOSS_TRANSIENT),
+        ("restored", FOCUS_GAIN),
     ];
     ok &= verdict(
         "audio focus",
         want.iter().all(|&(k, v)| field(focus, k) == Some(v)),
         &format!(
-            "want first, repeat, delayed, abandon, again = 1 (GRANTED), lost = {FOCUS_LOSS_TRANSIENT} (LOSS_TRANSIENT), line: {}",
+            "want first, repeat, delayed, abandon, released, again = 1 (GRANTED), lost = {FOCUS_LOSS_TRANSIENT} (LOSS_TRANSIENT), restored = {FOCUS_GAIN} (GAIN), line: {}",
             focus.unwrap_or("no line")
         ),
     );
@@ -289,6 +291,8 @@ const FAST_DENIED_NOTIFY_MS: i64 = 20;
 const ADAPTIVE_STABLE_MS: i64 = 1_000;
 /// AudioManager.AUDIOFOCUS_LOSS_TRANSIENT (-1 * AUDIOFOCUS_GAIN_TRANSIENT, AudioManager.java:4333): the first listener's loss when the transient gain takes focus (FocusRequester.focusLossForGainRequest).
 const FOCUS_LOSS_TRANSIENT: i64 = -2;
+/// AudioManager.AUDIOFOCUS_GAIN (AudioManager.java:4296): the first listener's regain when the top abandons (notifyTopOfAudioFocusStack -> handleFocusGain).
+const FOCUS_GAIN: i64 = 1;
 const TONE_DBFS: f64 = -12.0;
 /// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
 const GAP_SECONDS: f64 = 0.2;

@@ -183,8 +183,8 @@ public class Main extends Activity {
     /**
      * The focus probe, public AudioManager API only: a foreground media gain is GRANTED, its identical repeat is GRANTED, a DELAY_OK
      * request with no lock is GRANTED (never DELAYED), and each abandon succeeds. The first listener must receive LOSS_TRANSIENT when the
-     * delayed transient gain takes focus. Its callback runs on a handler thread; the probe waits for it (bounded) before the abandons,
-     * since an abandon unregisters the listener. The listeners log what they receive; the summary's lost is that change, or 0 when none came.
+     * delayed transient gain takes focus. Its callback runs on a handler thread; the probe waits for it (bounded) before abandoning the top,
+     * since an abandon unregisters the listener. The listeners log what they receive; the summary's lost and restored are those changes, or 0 when none came.
      */
     private void focusProbe(AudioManager audio) {
         AudioAttributes media = new AudioAttributes.Builder()
@@ -193,13 +193,18 @@ public class Main extends Activity {
         thread.start();
         Handler callbacks = new Handler(thread.getLooper());
         CountDownLatch lossSeen = new CountDownLatch(1);
+        CountDownLatch regainSeen = new CountDownLatch(1);
         AtomicInteger lost = new AtomicInteger(AudioManager.AUDIOFOCUS_NONE);
+        AtomicInteger regained = new AtomicInteger(AudioManager.AUDIOFOCUS_NONE);
         AudioManager.OnAudioFocusChangeListener first = new AudioManager.OnAudioFocusChangeListener() {
             public void onAudioFocusChange(int change) {
                 Log.i(TAG, "focus: first change=" + change);
                 if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
                     lost.set(change);
                     lossSeen.countDown();
+                } else if (change == AudioManager.AUDIOFOCUS_GAIN && lossSeen.getCount() == 0) {
+                    regained.set(change);
+                    regainSeen.countDown();
                 }
             }
         };
@@ -225,10 +230,18 @@ public class Main extends Activity {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        int abandon = audio.abandonAudioFocusRequest(request);
+        // the top (delayed) leaves: the first listener, now on top again, gets GAIN
+        int abandon = audio.abandonAudioFocusRequest(delayed);
+        try {
+            regainSeen.await(FOCUS_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        int released = audio.abandonAudioFocusRequest(request);
         int again = audio.abandonAudioFocusRequest(request);
         Log.i(TAG, "focus: first=" + granted + " repeat=" + repeat + " delayed=" + delay
-                + " abandon=" + abandon + " again=" + again + " lost=" + lost.get());
+                + " abandon=" + abandon + " released=" + released + " again=" + again
+                + " lost=" + lost.get() + " restored=" + regained.get());
         thread.quitSafely();
     }
 
