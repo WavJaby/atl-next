@@ -147,10 +147,14 @@ fn cpu_fits(free: f64, running_cores: f64, running: usize, cores: f64) -> bool {
     running == 0 || running_cores + cores <= free
 }
 
-/// The holder record of a demand: the holder's record and its cores (`record_cores` reads them back).
+/// Demand grants made by this process, numbered: a holder record names one grant. `snapshot` keys holders by record, so grants that shared one (checkout, pid, class) were counted once.
+static DEMAND_GRANTS: AtomicU64 = AtomicU64::new(0);
+
+/// The holder record of a demand: the holder's record, the grant's number and its cores (`record_cores` reads them back).
 fn demand_record(who: &Path, cores: f64) -> String {
+    let grant = DEMAND_GRANTS.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{} cores {cores:.2}",
+        "{} grant {grant} cores {cores:.2}",
         holder_record(who, Class::Test.name())
     )
 }
@@ -1077,6 +1081,43 @@ mod demand_tests {
         .expect("2 fits");
         let snap = snapshot(&dir, &pool).expect("snapshot");
         assert_eq!(snap.running_cores(), (3.5, 1));
+        drop(held);
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// Two demands of one checkout in one process are two holders: the snapshot counts both cores. (Records named by checkout, pid and class alone made them one holder, so the CPU target never saw the second.)
+    #[test]
+    fn two_demands_of_one_checkout_count_twice() {
+        let (ws, pool) = pool("two-demands", 8, 10);
+        let dir = dir(&ws);
+        let who = Path::new("/nowhere/checkout");
+        let (first, second) = (demand_record(who, 3.5), demand_record(who, 3.5));
+        let held = [
+            try_demand(
+                &dir,
+                &pool,
+                Demand {
+                    mem_gib: 2,
+                    cores: 3.5,
+                },
+                &first,
+            )
+            .expect("probe")
+            .expect("2 fits"),
+            try_demand(
+                &dir,
+                &pool,
+                Demand {
+                    mem_gib: 2,
+                    cores: 3.5,
+                },
+                &second,
+            )
+            .expect("probe")
+            .expect("2 more fit"),
+        ];
+        let snap = snapshot(&dir, &pool).expect("snapshot");
+        assert_eq!(snap.running_cores(), (7.0, 2));
         drop(held);
         std::fs::remove_dir_all(&ws).expect("cleanup");
     }
