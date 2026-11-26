@@ -636,6 +636,7 @@ mod tests {
         assert_eq!(out[1].1, Err(late("draw", "the fixture never drew")));
     }
 
+    /// Callers end their child with `kill`: a script ends in `exec` so that the process killed is the sleep itself, not a sh that orphans it.
     fn sh(script: &str) -> Child {
         std::process::Command::new("sh")
             .args(["-c", script])
@@ -649,7 +650,7 @@ mod tests {
         let w = Wait::exit("quick", "never exited", Duration::from_secs(5), POLL);
         assert!(until_child(&w, &mut quick).is_ok());
         assert_eq!(quick.wait().expect("status").code(), Some(3));
-        let mut slow = sh("sleep 30");
+        let mut slow = sh("exec sleep 30");
         let w = Wait::exit("slow", "still running", Duration::from_millis(100), POLL);
         assert_eq!(
             bare(until_child(&w, &mut slow).unwrap_err()),
@@ -689,7 +690,7 @@ mod tests {
             }
         );
         // the text arrives while the child still runs: the wait ends on the text, not on the child
-        let mut alive = sh("sleep 30");
+        let mut alive = sh("exec sleep 30");
         std::fs::write(&file, "starting\nfinished\n").unwrap();
         assert!(until_child(&w, &mut alive).is_ok());
         alive.kill().expect("kill");
@@ -763,7 +764,7 @@ mod tests {
 
     #[test]
     fn settle_for_is_settled_on_its_bound_and_a_death_when_its_child_exits() {
-        let mut slow = sh("sleep 30");
+        let mut slow = sh("exec sleep 30");
         assert!(settle_for("settle", Duration::from_millis(60), &mut slow).is_ok());
         slow.kill().expect("kill");
         slow.wait().expect("reap");

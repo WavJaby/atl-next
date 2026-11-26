@@ -1946,6 +1946,8 @@ mod tests {
         let got = program_pid(i32::try_from(init.id()).expect("pid"));
         let _ = init.kill();
         let _ = init.wait();
+        // init's kill leaves its background `sleep` (the program) running: end it here, not at its 5 s
+        let _ = std::process::Command::new("kill").arg(line.trim()).status();
         assert_eq!(
             got.expect("program_pid"),
             line.trim().parse::<i32>().expect("$!")

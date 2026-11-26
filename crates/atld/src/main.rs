@@ -3679,7 +3679,7 @@ mod tests {
     #[test]
     fn reap_died_after_last_poll() {
         let mut dead = daemon("exit 3");
-        let mut alive = daemon("sleep 30");
+        let mut alive = daemon("exec sleep 30");
         assert!(dead.ended(Some(Duration::from_secs(10))).expect("poll"));
         let mut died = Vec::new();
         for _ in 0..2 {
