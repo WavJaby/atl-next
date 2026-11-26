@@ -74,6 +74,7 @@ pub mod providers;
 pub mod prune;
 pub mod qemu;
 pub mod red_logs;
+pub mod resource_ledger;
 pub mod runpath_gate;
 pub mod runtimes;
 pub mod seam_gate;
