@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! The `audio` service (Context.AUDIO_SERVICE): the converter's IAudioService stub. View.performClick reaches it on every click: ViewRootImpl.playSoundEffect -> getAudioManager ->
 //! AudioManager.areNavigationRepeatSoundEffectsEnabled, which throws NullPointerException without the service (AudioManager.getService does not check the lookup).
-//! ATL has no audio policy yet, so the two click calls are answered and no sound plays. Player tracking is served on piids only (`players`): trackPlayer hands out an id, releasePlayer ends it,
-//! and the calls in between check the caller and are counted; they keep no state of the player (playerAttributes' usage check and playerEvent's focus logic wait for the audio policy).
+//! ATL has no audio policy yet, so the two click calls are answered and no sound plays. Players (`players`) keep their IPlayer, type, content type and state (PlaybackActivityMonitor); the focus stack ducks a cross-uid
+//! loser's started players through their IPlayer and restores them (`ducking`, [`PlayerEnforcer`]); a player that starts under a duck is ducked at once. playerAttributes' system-usage check waits for the audio policy.
 //! Stream volumes are kept per app uid (`volume`: the stated deviation from AOSP's device-wide volume); STREAM_MUSIC's alias group is the app's host volume through the absolute-volume device
 //! its process registers (registerDeviceVolumeDispatcherForAbsoluteVolume, atl-audioflinger), other groups stay the app's own remembered gain. Each change is broadcast to the app's uid
 //! (VOLUME_CHANGED_ACTION, STREAM_MUTE_CHANGED_ACTION) through the activity manager's delivery. Ringer mode and audio mode are a healthy unlocked device's: RINGER_MODE_NORMAL, MODE_NORMAL
@@ -16,6 +16,7 @@ use atl_aidl::aidl::android::media::IAudioFocusDispatcher::IAudioFocusDispatcher
 use atl_aidl::aidl::android::media::IAudioService::{
     BnAudioService, EnforcePermission, IAudioService,
 };
+use atl_aidl::aidl::android::media::IPlayer::IPlayer;
 use atl_aidl::aidl::android::media::audiopolicy::IAudioPolicyCallback::IAudioPolicyCallback;
 use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::media::{
@@ -28,13 +29,21 @@ use atl_services_types::{app_ops, permission};
 use atl_services_wire::audio_volume::{
     ALIAS, DEVICE_OUT_SPEAKER, DEVICE_VOLUME_BEHAVIOR_ABSOLUTE, ROLE_OUTPUT,
 };
+use av_types_aidl::mangled::{
+    _7_android_5_media_16_InterpolatorType as InterpolatorType,
+    _7_android_5_media_18_InterpolatorConfig as InterpolatorConfig,
+    _7_android_5_media_21_VolumeShaperOperation as VolumeShaperOperation,
+    _7_android_5_media_25_VolumeShaperConfiguration as VolumeShaperConfiguration,
+    _7_android_5_media_29_VolumeShaperConfigurationType as VolumeShaperConfigurationType,
+};
 use binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
     ThreadState,
 };
 
 use crate::appops::AppOps;
-use crate::audio_focus::{self, Request, Stack};
+use crate::audio_focus::{self, Enforcer, Request, Stack};
+use crate::ducking::{Ducking, Shaper};
 use crate::packages::{PackageTable, Permissions};
 use crate::players::{Access, PIID_INVALID, Players};
 use crate::uid_state::UidViews;
@@ -177,9 +186,76 @@ impl Drop for FocusLink {
     }
 }
 
+/// The players and the duck state under one lock (PlaybackActivityMonitor's mPlayerLock). The focus lock is taken first when both are held.
+#[derive(Default)]
+struct PlayerState {
+    players: Players<Strong<dyn IPlayer>>,
+    ducking: Ducking,
+}
+
+type SharedPlayers = Arc<Mutex<PlayerState>>;
+
+fn lock_players(players: &SharedPlayers) -> MutexGuard<'_, PlayerState> {
+    // a poisoned table still holds plain player records
+    players.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// IPlayer.applyVolumeShaper (oneway) with the shaper as VolumeShaper's parcelables carry it (VolumeShaper.java toParcelable :491-511, :1277-1283). A failed call is counted and not recorded as ducked (DuckedApp.addDuck's catch).
+fn apply_shaper(player: &Strong<dyn IPlayer>, s: Shaper) -> bool {
+    let config = VolumeShaperConfiguration {
+        r#type: VolumeShaperConfigurationType(s.config.config_type),
+        r#id: s.config.id,
+        r#optionFlags: s.config.option_flags,
+        r#durationMs: s.config.duration_ms,
+        r#interpolatorConfig: s.config.curve.map(|c| InterpolatorConfig {
+            r#type: InterpolatorType(s.config.interpolator),
+            // toInterpolatorParcelable: both slopes 0 (VolumeShaper.java:506-507)
+            r#firstSlope: 0.0,
+            r#lastSlope: 0.0,
+            r#xy: c.iter().flat_map(|&(x, y)| [x, y]).collect(),
+        }),
+    };
+    let op = VolumeShaperOperation {
+        r#flags: s.op.flags,
+        r#replaceId: s.op.replace_id,
+        r#xOffset: s.op.x_offset,
+    };
+    match player.r#applyVolumeShaper(Some(&config), Some(&op)) {
+        Ok(()) => {
+            atl_diag::sent("IPlayer", "applyVolumeShaper");
+            true
+        }
+        Err(e) => {
+            crate::activity::log(format_args!(
+                "applyVolumeShaper {} not sent: {e}",
+                s.config.id
+            ));
+            atl_diag::refused("IPlayer", "applyVolumeShaper");
+            false
+        }
+    }
+}
+
+/// The focus stack's enforcer: duckPlayers and restoreVShapedPlayers over the service's players.
+struct PlayerEnforcer(SharedPlayers);
+
+impl Enforcer for PlayerEnforcer {
+    fn duck_players(&mut self, winner_uid: u32, loser_uid: u32, strong: bool) -> bool {
+        let mut st = lock_players(&self.0);
+        let PlayerState { players, ducking } = &mut *st;
+        ducking.duck_players(players, winner_uid, loser_uid, strong, &mut apply_shaper)
+    }
+
+    fn restore(&mut self, uid: u32) {
+        let mut st = lock_players(&self.0);
+        let PlayerState { players, ducking } = &mut *st;
+        ducking.unduck_uid(uid, players, &mut apply_shaper);
+    }
+}
+
 struct AudioService {
     permissions: Arc<Permissions>,
-    players: Mutex<Players>,
+    players: SharedPlayers,
     volumes: Mutex<VolumeState>,
     broadcast: Broadcast,
     /// AppOps' policy: the hardening check reads TAKE_AUDIO_FOCUS through it (noteOperation's path)
@@ -189,10 +265,17 @@ struct AudioService {
     listeners: Shared,
 }
 
+/// The players and a focus stack whose enforcer ducks them.
+fn players_and_focus() -> (SharedPlayers, Arc<Mutex<FocusStack>>) {
+    let players = SharedPlayers::default();
+    let enforcer = PlayerEnforcer(Arc::clone(&players));
+    let focus = Arc::new(Mutex::new(FocusStack::new(Box::new(enforcer))));
+    (players, focus)
+}
+
 impl AudioService {
-    fn players(&self) -> MutexGuard<'_, Players> {
-        // a poisoned table still holds plain ids
-        self.players.lock().unwrap_or_else(|e| e.into_inner())
+    fn players(&self) -> MutexGuard<'_, PlayerState> {
+        lock_players(&self.players)
     }
 
     fn volumes(&self) -> MutexGuard<'_, VolumeState> {
@@ -670,6 +753,8 @@ impl IAudioService for AudioService {
             client: client_id.unwrap_or_default().to_owned(),
             binder: cb.clone(),
             uid: caller,
+            // admit_request refuses a null AudioAttributes
+            usage: aa.map_or(0, |aa| aa.usage),
             gain: focus_req_type,
             flags,
             sdk,
@@ -746,13 +831,23 @@ impl IAudioService for AudioService {
 
     /// trackPlayer (AudioService.trackPlayer -> PlaybackActivityMonitor.trackPlayer): a new piid for the caller's player. The PlayerIdCard came through its codec; a refusal never reaches here.
     fn r#trackPlayer(&self, pic: Option<&PlayerBase_PlayerIdCard>) -> binder::Result<i32> {
-        if pic.is_none() {
+        let Some(pic) = pic else {
             return Err(Status::new_exception_str(
                 ExceptionCode::NULL_POINTER,
                 Some("trackPlayer: null PlayerIdCard".to_owned()),
             ));
-        }
-        let piid = self.players().track(ThreadState::get_calling_uid());
+        };
+        // AudioPlaybackConfiguration(pic): IPlayerShell over the card's IPlayer (:393-394); a binder of another interface keeps no handle
+        let proxy = pic
+            .player
+            .clone()
+            .and_then(|b| b.into_interface::<dyn IPlayer>().ok());
+        let piid = self.players().players.track(
+            ThreadState::get_calling_uid(),
+            pic.player_type,
+            pic.attributes.content_type,
+            proxy,
+        );
         if piid == PIID_INVALID {
             atl_diag::refused(INTERFACE, "trackPlayer");
         } else {
@@ -761,21 +856,31 @@ impl IAudioService for AudioService {
         Ok(piid)
     }
 
-    /// playerAttributes (AudioService.playerAttributes): AOSP checks a system usage against MODIFY_AUDIO_ROUTING and keeps the attributes. Here: the caller check only.
-    fn r#playerAttributes(&self, piid: i32, _attr: Option<&AudioAttributes>) -> binder::Result<()> {
-        let access = self.players().access(piid, ThreadState::get_calling_uid());
+    /// playerAttributes (AudioService.playerAttributes): AOSP checks a system usage against MODIFY_AUDIO_ROUTING and keeps the attributes. Here: the caller check and the content type the duck policy reads.
+    fn r#playerAttributes(&self, piid: i32, attr: Option<&AudioAttributes>) -> binder::Result<()> {
+        let uid = ThreadState::get_calling_uid();
+        let mut st = self.players();
+        let access = match attr {
+            Some(attr) => st.players.set_content_type(piid, uid, attr.content_type),
+            None => st.players.access(piid, uid),
+        };
         count_player_call("playerAttributes", access);
         Ok(())
     }
 
-    /// playerEvent (AudioService.playerEvent): AOSP keeps the state and follows it with focus and ducking. Here: the caller check only.
-    fn r#playerEvent(
-        &self,
-        piid: i32,
-        _event: i32,
-        _event_id: Option<&[i32]>,
-    ) -> binder::Result<()> {
-        let access = self.players().access(piid, ThreadState::get_calling_uid());
+    /// playerEvent (AudioService.playerEvent -> PlaybackActivityMonitor.playerEvent:364-418): the state; a player that starts while its uid is ducked is ducked at once (DuckingManager.checkDuck).
+    fn r#playerEvent(&self, piid: i32, event: i32, event_id: Option<&[i32]>) -> binder::Result<()> {
+        let mut st = self.players();
+        let PlayerState { players, ducking } = &mut *st;
+        let (access, started) = players.event(
+            piid,
+            ThreadState::get_calling_uid(),
+            event,
+            event_id.unwrap_or_default(),
+        );
+        if started {
+            ducking.check_duck(piid, players, &mut apply_shaper);
+        }
         count_player_call("playerEvent", access);
         Ok(())
     }
@@ -788,14 +893,21 @@ impl IAudioService for AudioService {
                 Some(format!("invalid session Id {session_id}")),
             ));
         }
-        let access = self.players().access(piid, ThreadState::get_calling_uid());
+        let access = self
+            .players()
+            .players
+            .access(piid, ThreadState::get_calling_uid());
         count_player_call("playerSessionId", access);
         Ok(())
     }
 
-    /// releasePlayer (AudioService.releasePlayer -> PlaybackActivityMonitor.releasePlayer): ends the player. Oneway: no reply reaches the caller.
+    /// releasePlayer (AudioService.releasePlayer -> PlaybackActivityMonitor.releasePlayer:515-540): ends the player and drops it from its uid's ducked list. Oneway: no reply reaches the caller.
     fn r#releasePlayer(&self, piid: i32) -> binder::Result<()> {
-        let access = self.players().release(piid, ThreadState::get_calling_uid());
+        let mut st = self.players();
+        let (access, gone) = st.players.release(piid, ThreadState::get_calling_uid());
+        if let Some(gone) = gone {
+            st.ducking.remove_released(piid, gone.uid);
+        }
         count_player_call("releasePlayer", access);
         Ok(())
     }
@@ -810,13 +922,14 @@ pub fn new_binder(
     listeners: Shared,
 ) -> SpIBinder {
     let appops = AppOps::new(Arc::clone(&permissions), packages, uids);
+    let (players, focus) = players_and_focus();
     let service = AudioService {
         permissions,
-        players: Mutex::new(Players::default()),
+        players,
         volumes: Mutex::new(VolumeState::default()),
         broadcast,
         appops,
-        focus: Arc::new(Mutex::new(FocusStack::default())),
+        focus,
         listeners,
     };
     BnAudioService::new_binder(service, BinderFeatures::default()).as_binder()
@@ -842,13 +955,14 @@ mod tests {
             BTreeMap::new(),
         )));
         let permissions = Arc::new(Permissions::new(&table.snapshot(), &[]));
+        let (players, focus) = players_and_focus();
         AudioService {
             appops: AppOps::new(Arc::clone(&permissions), table, uids),
             permissions,
-            players: Mutex::new(Players::default()),
+            players,
             volumes: Mutex::new(VolumeState::default()),
             broadcast: Arc::new(|_, _| {}),
-            focus: Arc::new(Mutex::new(FocusStack::default())),
+            focus,
             listeners: volume_listeners::shared(),
         }
     }

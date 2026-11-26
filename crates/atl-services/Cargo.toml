@@ -13,7 +13,7 @@ publish.workspace = true
 # plain workspace builds take the policy modules (permission, packages) and their tests, counting into cargo's atl-diag (dependency `atl-diag-plain`, lib.rs).
 # The stubs' module is named too: a package's link arguments reach only its own links (atl-bridgegen converter.rs), and the stubs' cc libraries (libnativewindow, libcutils, ...) come from their rlib closure.
 [package.metadata.atl]
-converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libatl_diag", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils"]
+converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/libatl_diag", "device/atl-aidl-stubs-rust", "device/libgui_aidl_types_rs", "device/librustutils", "device/av-types-aidl-rust"]
 
 [features]
 converter = ["atl-aidl/converter", "atl-libinput/converter", "atl-services-wire/converter"]

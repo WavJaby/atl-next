@@ -57,6 +57,8 @@ include_dirs = [
     "system/vold/binder",
     # android.security.aaid_aidl (frameworks/base/keystore/aaid/Android.bp): IKeyAttestationApplicationIdProvider and its parcelables (key_attestation.rs)
     "frameworks/base/keystore/aaid/aidl",
+    # IPlayer (the player handle PlayerBase gives trackPlayer; audio.rs ducks through it): libaudioclient's AIDL root, where frameworks/av declares it
+    "frameworks/av/media/libaudioclient/aidl",
 ]
 types = [
     "android.hardware.display.IDisplayManager",
@@ -110,6 +112,8 @@ types = [
     "android.content.pm.IPackageManager",
     "android.content.IContentService",
     "android.media.IAudioService",
+    # the player handle the audio service ducks through (audio.rs, PlaybackActivityMonitor DuckedApp.addDuck)
+    "android.media.IPlayer",
     "android.app.IActivityClientController",
     "android.app.IRequestFinishCallback",
     "com.android.internal.view.IInputMethodManager",

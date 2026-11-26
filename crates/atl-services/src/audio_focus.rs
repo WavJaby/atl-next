@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! The ordinary audio focus stack: AOSP MediaFocusControl's one stack with multi-audio-focus off (its default), FocusRequester's loss table and its callbacks.
 //! Pure state. audio.rs runs the eligibility checks and links the death recipient, then calls [`Stack::request`]; each owner's dispatch is a oneway IAudioFocusDispatcher call, made under the caller's stack lock in mutation order.
-//! Top removal (abandon, death) restores the next owner with GAIN (AOSP notifyTopOfAudioFocusStack); buried removal is silent.
-//! Not modelled, counted where AOSP would act: player attenuation (duckPlayers) and fade-out (fadeOutPlayers) have no tracked player, so CAN_DUCK and LOSS go out as plain callbacks.
+//! Top removal (abandon, death) restores the next owner (AOSP notifyTopOfAudioFocusStack): GAIN when its loss was notified, and its players are restored; buried removal is silent.
+//! The stack's [`Enforcer`] is MediaFocusControl's mFocusEnforcer (PlaybackActivityMonitor): a cross-uid CAN_DUCK it handles (duckPlayers) is not dispatched (FocusRequester.handleFocusLoss:425-438).
+//! Not modelled, counted where AOSP would act: fade-out before a cross-uid LOSS (fadeOutPlayers), so LOSS goes out at once.
 
 /// AudioManager.AUDIOFOCUS_NONE (AudioManager.java:4289).
 pub const NONE: i32 = 0;
@@ -44,21 +45,34 @@ pub const DUCKING_IN_APP_SDK_LEVEL: i32 = 25;
 /// The counted-refusal family of this module (`atl-diag`, interface name as IAudioService's counters).
 const INTERFACE: &str = "IAudioService";
 
+/// AudioAttributes.USAGE_ASSISTANT (AudioAttributes.java:210): a MAY_DUCK request with it ducks strongly (PlaybackActivityMonitor.reqCausesStrongDuck:861-870).
+pub const USAGE_ASSISTANT: i32 = 16;
+
 /// Delivers one owner's focus change: (focusChange, clientId).
 pub type Dispatch = Box<dyn Fn(i32, &str) + Send>;
 
-/// A focus request after the binder layer's eligibility checks (the caller's uid, its AudioAttributes-derived gain, flags and target sdk).
+/// The players' side of focus (PlaybackActivityMonitor as MediaFocusControl's mFocusEnforcer).
+pub trait Enforcer: Send {
+    /// duckPlayers(winner, loser, forceDuck=false): whether the framework handled the loser's CAN_DUCK by ducking its players.
+    fn duck_players(&mut self, winner_uid: u32, loser_uid: u32, strong: bool) -> bool;
+    /// restoreVShapedPlayers(owner): the uid's ducked players are restored.
+    fn restore(&mut self, uid: u32);
+}
+
+/// A focus request after the binder layer's eligibility checks (the caller's uid, its AudioAttributes usage, the gain, flags and target sdk).
 pub struct Request<B> {
     pub client: String,
     pub binder: B,
     pub uid: u32,
+    pub usage: i32,
     pub gain: i32,
     pub flags: i32,
     pub sdk: i32,
     pub dispatch: Option<Dispatch>,
 }
 
-/// One focus owner (FocusRequester): `binder` identifies the requesting binder (death removes by it), `link` is its death link (released with the owner, unlinking it), `loss` the strongest loss received so far.
+/// One focus owner (FocusRequester): `binder` identifies the requesting binder (death removes by it), `link` is its death link (released with the owner, unlinking it), `loss` the strongest loss received so far,
+/// `notified` whether that loss was dispatched (mFocusLossWasNotified: a loss the framework handled was not).
 pub struct Owner<B, L> {
     client: String,
     binder: B,
@@ -67,6 +81,7 @@ pub struct Owner<B, L> {
     flags: i32,
     sdk: i32,
     loss: i32,
+    notified: bool,
     dispatch: Option<Dispatch>,
     link: L,
 }
@@ -74,15 +89,18 @@ pub struct Owner<B, L> {
 /// The focus stack, bottom to top; the last owner holds focus. Removed links are returned so the caller releases them outside its lock.
 pub struct Stack<B, L> {
     owners: Vec<Owner<B, L>>,
-}
-
-impl<B: PartialEq, L> Default for Stack<B, L> {
-    fn default() -> Self {
-        Stack { owners: Vec::new() }
-    }
+    enforcer: Box<dyn Enforcer>,
 }
 
 impl<B: PartialEq, L> Stack<B, L> {
+    /// An empty stack whose losses go through `enforcer`.
+    pub fn new(enforcer: Box<dyn Enforcer>) -> Self {
+        Stack {
+            owners: Vec::new(),
+            enforcer,
+        }
+    }
+
     /// Number of owners.
     pub fn len(&self) -> usize {
         self.owners.len()
@@ -148,18 +166,23 @@ impl<B: PartialEq, L> Stack<B, L> {
         }
         // a buried entry of the same client leaves silently (:1249)
         gone.extend(self.remove_client(&r.client));
-        gone.extend(self.propagate(r.gain, r.uid));
+        let strong = r.gain == GAIN_TRANSIENT_MAY_DUCK && r.usage == USAGE_ASSISTANT;
+        gone.extend(self.propagate(r.gain, r.uid, strong));
+        let uid = r.uid;
         self.owners.push(Owner {
             client: r.client,
             binder: r.binder,
-            uid: r.uid,
+            uid,
             gain: r.gain,
             flags: r.flags,
             sdk: r.sdk,
             loss: NONE,
+            notified: false,
             dispatch: r.dispatch,
             link,
         });
+        // handleFocusGainFromRequest (MediaFocusControl:1294-1296, FocusRequester:385-389): the new top's own ducked players are restored
+        self.enforcer.restore(uid);
         (REQUEST_GRANTED, gone)
     }
 
@@ -190,17 +213,20 @@ impl<B: PartialEq, L> Stack<B, L> {
         self.take_where(|o| o.client == client)
     }
 
-    /// notifyTopOfAudioFocusStack -> FocusRequester.handleFocusGain: the owner now on top regains focus, GAIN answering the loss it holds.
-    /// A buried owner always holds a loss (propagate gave it one when the owner above was pushed), so the GAIN answers a loss that was sent.
+    /// notifyTopOfAudioFocusStack -> FocusRequester.handleFocusGain (:362-383): the owner now on top regains focus. GAIN goes out only when its loss was dispatched; a loss the framework handled gets none. Then its players are restored.
     fn restore_top(&mut self) {
         let Some(top) = self.owners.last_mut() else {
             return;
         };
         debug_assert!(top.loss != NONE, "a buried owner holds a loss");
         top.loss = NONE;
-        if let Some(dispatch) = &top.dispatch {
+        if top.notified
+            && let Some(dispatch) = &top.dispatch
+        {
             dispatch(GAIN, &top.client);
         }
+        let uid = top.uid;
+        self.enforcer.restore(uid);
     }
 
     /// Removes the owners `gone` selects, returning their links in stack order.
@@ -219,31 +245,29 @@ impl<B: PartialEq, L> Stack<B, L> {
     }
 
     /// MediaFocusControl.propagateFocusLossFromGain_syncAf: each owner, bottom up, receives the loss `gain` causes; a loss is notified once per change (FocusRequester.handleFocusLoss); owners that lost definitively (LOSS) leave the stack.
-    fn propagate(&mut self, gain: i32, winner_uid: u32) -> Vec<L> {
+    /// `strong`: the winner's request ducks strongly (reqCausesStrongDuck).
+    fn propagate(&mut self, gain: i32, winner_uid: u32, strong: bool) -> Vec<L> {
         let mut lost: Vec<String> = Vec::new();
         for owner in &mut self.owners {
             let loss = focus_loss_for_gain(owner.loss, gain);
             if loss != owner.loss {
                 owner.loss = loss;
+                owner.notified = false;
                 let cross_uid = owner.uid != winner_uid;
-                // frameworkHandleFocusLoss: AOSP would attenuate (CAN_DUCK) or fade (LOSS) a cross-uid owner first; neither exists here
-                if loss == LOSS_TRANSIENT_CAN_DUCK
-                    && cross_uid
+                // frameworkHandleFocusLoss (FocusRequester:470-525): within one uid never; CAN_DUCK of an owner that does not pause and targets above N_MR1 goes to duckPlayers
+                let handled = cross_uid
+                    && loss == LOSS_TRANSIENT_CAN_DUCK
                     && (owner.flags & FLAG_PAUSES_ON_DUCKABLE_LOSS) == 0
                     && owner.sdk > DUCKING_IN_APP_SDK_LEVEL
-                {
-                    atl_diag::refused(
-                        INTERFACE,
-                        "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)",
-                    );
-                }
+                    && self.enforcer.duck_players(winner_uid, owner.uid, strong);
                 if loss == LOSS && cross_uid {
                     atl_diag::refused(
                         INTERFACE,
                         "requestAudioFocus (LOSS: no fade-out of active players, sent at once)",
                     );
                 }
-                if let Some(dispatch) = &owner.dispatch {
+                if !handled && let Some(dispatch) = &owner.dispatch {
+                    owner.notified = true;
                     dispatch(loss, &owner.client);
                 }
             }
@@ -315,11 +339,66 @@ mod tests {
         }))
     }
 
+    /// What the stack asked its enforcer: Duck(winner, loser, strong) or Restore(uid).
+    #[derive(Debug, Clone, PartialEq)]
+    enum Asked {
+        Duck(u32, u32, bool),
+        Restore(u32),
+    }
+
+    type Asks = Arc<Mutex<Vec<Asked>>>;
+
+    /// An enforcer that answers duckPlayers with `handles` and records each call.
+    struct Fake {
+        handles: bool,
+        asks: Asks,
+    }
+
+    impl Enforcer for Fake {
+        fn duck_players(&mut self, winner_uid: u32, loser_uid: u32, strong: bool) -> bool {
+            self.asks
+                .lock()
+                .expect("asks")
+                .push(Asked::Duck(winner_uid, loser_uid, strong));
+            self.handles
+        }
+        fn restore(&mut self, uid: u32) {
+            self.asks.lock().expect("asks").push(Asked::Restore(uid));
+        }
+    }
+
+    /// A stack whose enforcer never handles a loss (the loser has a speaking or unshapeable player): every loss is a callback.
+    fn stack<L>() -> Stack<u32, L> {
+        stack_with(false).0
+    }
+
+    fn stack_with<L>(handles: bool) -> (Stack<u32, L>, Asks) {
+        let asks = Asks::default();
+        let fake = Fake {
+            handles,
+            asks: Arc::clone(&asks),
+        };
+        (Stack::new(Box::new(fake)), asks)
+    }
+
+    fn ducks(asks: &Asks) -> Vec<Asked> {
+        asks.lock()
+            .expect("asks")
+            .iter()
+            .filter(|a| matches!(a, Asked::Duck(..)))
+            .cloned()
+            .collect()
+    }
+
+    /// AudioAttributes.USAGE_MEDIA (AudioAttributes.java:180).
+    const USAGE_MEDIA: i32 = 1;
+
     fn req(client: &str, binder: u32, uid: u32, gain: i32, flags: i32, log: &Log) -> Request<u32> {
         Request {
             client: client.to_owned(),
             binder,
             uid,
+            usage: USAGE_MEDIA,
             gain,
             flags,
             sdk: 35,
@@ -421,7 +500,7 @@ mod tests {
     #[test]
     fn grant_is_granted_without_initial_callback() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         assert_eq!(code, REQUEST_GRANTED);
         assert!(gone.is_empty());
@@ -438,7 +517,7 @@ mod tests {
     fn identical_repeat_has_one_owner() {
         let log = log();
         // link ids: the owner keeps link 100, the repeat's own link 200 is the one released
-        let mut s: Stack<u32, u32> = Stack::default();
+        let mut s: Stack<u32, u32> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(100));
         let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(200));
         assert_eq!(code, REQUEST_GRANTED);
@@ -450,7 +529,7 @@ mod tests {
     #[test]
     fn repeated_abandon_succeeds() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         assert_eq!(s.abandon("a").len(), 1);
         assert!(s.is_empty());
@@ -465,7 +544,7 @@ mod tests {
     #[test]
     fn delay_ok_unlocked_is_granted() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let (code, _) = s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT, FLAG_DELAY_OK, &log),
@@ -480,7 +559,7 @@ mod tests {
     #[test]
     fn dead_binder_is_refused_without_state_change() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let mut linked = 0;
         let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), false, || {
@@ -498,7 +577,7 @@ mod tests {
     #[test]
     fn failed_death_link_allocates_no_owner() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || None);
         assert_eq!(code, REQUEST_FAILED);
@@ -512,7 +591,7 @@ mod tests {
     fn permanent_gain_evicts_with_loss() {
         let _serial = serial();
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || Some(()));
         assert_eq!(code, REQUEST_GRANTED);
@@ -525,7 +604,7 @@ mod tests {
     #[test]
     fn transient_gain_keeps_owner_with_loss_transient() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let (code, _) = s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -539,7 +618,7 @@ mod tests {
     #[test]
     fn exclusive_gain_sends_loss_transient() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_EXCLUSIVE, 0, &log),
@@ -550,40 +629,139 @@ mod tests {
         assert_eq!(s.len(), 2);
     }
 
-    /// MAY_DUCK to the same uid: CAN_DUCK is a callback and nothing is counted (AOSP does not duck within one app).
+    /// MAY_DUCK to the same uid: CAN_DUCK is a callback, the enforcer is not asked (frameworkHandleFocusLoss:473-477), and the abandon's GAIN answers it.
     #[test]
     fn may_duck_within_one_uid_is_a_callback() {
-        let _serial = serial();
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let (mut s, asks) = stack_with::<()>(true);
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
-        let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
-        let before = counted(key);
         s.request(
             req("b", 2, 10_001, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
             || Some(()),
         );
-        assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
-        assert_eq!(counted(key), before);
+        s.abandon("b");
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT_CAN_DUCK, "a".to_owned()),
+                (GAIN, "a".to_owned())
+            ]
+        );
+        assert!(ducks(&asks).is_empty());
     }
 
-    /// MAY_DUCK to another uid: AOSP attenuates the owner's players; here the owner gets CAN_DUCK and the refusal is counted.
+    /// MAY_DUCK to another uid whose players the enforcer ducks: neither CAN_DUCK nor the restoring GAIN is dispatched (handleFocusLoss:425-438, handleFocusGain:368); the restore reaches the loser's players.
     #[test]
-    fn may_duck_across_uids_counts_the_missing_attenuation() {
-        let _serial = serial();
+    fn handled_duck_sends_no_callbacks_and_restores_the_players() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let (mut s, asks) = stack_with::<()>(true);
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
-        let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
-        let before = counted(key);
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
             || Some(()),
         );
-        assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
-        assert_eq!(counted(key), before + 1);
+        assert_eq!(s.loss_of("a"), Some(LOSS_TRANSIENT_CAN_DUCK));
+        s.abandon("b");
+        assert!(calls(&log).is_empty(), "{:?}", calls(&log));
+        let asked = asks.lock().expect("asks").clone();
+        assert_eq!(
+            asked,
+            vec![
+                Asked::Restore(10_001),
+                Asked::Duck(10_002, 10_001, false),
+                Asked::Restore(10_002),
+                Asked::Restore(10_001),
+            ]
+        );
+    }
+
+    /// MAY_DUCK to another uid whose players the enforcer does not duck (a started speech player): CAN_DUCK and the later GAIN are dispatched.
+    #[test]
+    fn unhandled_duck_is_a_callback() {
+        let log = log();
+        let (mut s, asks) = stack_with::<()>(false);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(
+            req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
+            true,
+            || Some(()),
+        );
+        s.abandon("b");
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT_CAN_DUCK, "a".to_owned()),
+                (GAIN, "a".to_owned())
+            ]
+        );
+        assert_eq!(ducks(&asks), vec![Asked::Duck(10_002, 10_001, false)]);
+    }
+
+    /// An owner flagged PAUSES_ON_DUCKABLE_LOSS, or targeting N_MR1 (25) or lower, gets the callbacks without the enforcer being asked (frameworkHandleFocusLoss:484-496).
+    #[test]
+    fn pausing_or_legacy_owner_is_not_ducked() {
+        for (flags, sdk) in [
+            (FLAG_PAUSES_ON_DUCKABLE_LOSS, 35),
+            (0, DUCKING_IN_APP_SDK_LEVEL),
+        ] {
+            let log = log();
+            let (mut s, asks) = stack_with::<()>(true);
+            let mut a = req("a", 1, 10_001, GAIN, flags, &log);
+            a.sdk = sdk;
+            s.request(a, true, || Some(()));
+            s.request(
+                req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
+                true,
+                || Some(()),
+            );
+            s.abandon("b");
+            assert_eq!(
+                calls(&log),
+                vec![
+                    (LOSS_TRANSIENT_CAN_DUCK, "a".to_owned()),
+                    (GAIN, "a".to_owned())
+                ],
+                "flags {flags} sdk {sdk}"
+            );
+            assert!(ducks(&asks).is_empty());
+        }
+    }
+
+    /// A MAY_DUCK request with USAGE_ASSISTANT asks for the strong duck (reqCausesStrongDuck).
+    #[test]
+    fn assistant_request_ducks_strongly() {
+        let log = log();
+        let (mut s, asks) = stack_with::<()>(true);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        let mut b = req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log);
+        b.usage = USAGE_ASSISTANT;
+        s.request(b, true, || Some(()));
+        assert_eq!(ducks(&asks), vec![Asked::Duck(10_002, 10_001, true)]);
+    }
+
+    /// A handled duck escalated to LOSS_TRANSIENT is dispatched, and its GAIN then is too (the new loss resets mFocusLossWasNotified, :398-400).
+    #[test]
+    fn escalated_handled_duck_is_notified() {
+        let log = log();
+        let (mut s, _asks) = stack_with::<()>(true);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(
+            req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
+            true,
+            || Some(()),
+        );
+        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, || {
+            Some(())
+        });
+        s.abandon("c");
+        s.abandon("b");
+        let a: Vec<_> = calls(&log).into_iter().filter(|(_, c)| c == "a").collect();
+        assert_eq!(
+            a,
+            vec![(LOSS_TRANSIENT, "a".to_owned()), (GAIN, "a".to_owned())]
+        );
     }
 
     /// Permanent loss to another uid: AOSP would fade active players first; none are tracked, so LOSS goes out at once and the refusal is counted.
@@ -591,7 +769,7 @@ mod tests {
     fn cross_uid_loss_counts_the_missing_fade() {
         let _serial = serial();
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let key = "requestAudioFocus (LOSS: no fade-out of active players, sent at once)";
         let before = counted(key);
@@ -604,7 +782,7 @@ mod tests {
     #[test]
     fn death_removes_every_entry_of_the_binder_silently() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
@@ -627,7 +805,7 @@ mod tests {
     fn full_callback_sequence_restores_the_next_owner() {
         let _serial = serial();
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -656,7 +834,7 @@ mod tests {
     #[test]
     fn buried_removal_emits_nothing() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -676,7 +854,7 @@ mod tests {
     fn permanent_gain_eviction_leaves_nothing_to_restore() {
         let _serial = serial();
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -699,7 +877,7 @@ mod tests {
     #[test]
     fn same_uid_distinct_ids_restore_on_abandon() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(req("b", 2, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -716,7 +894,7 @@ mod tests {
     #[test]
     fn restored_owner_is_notified_of_its_next_loss() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
@@ -739,7 +917,7 @@ mod tests {
     #[test]
     fn death_restores_the_next_owner_once() {
         let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
+        let mut s: Stack<u32, ()> = stack();
         s.request(req("x", 2, 10_003, GAIN, 0, &log), true, || Some(()));
         s.request(req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())

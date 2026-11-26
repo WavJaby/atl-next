@@ -7,6 +7,8 @@ use anyhow::Result;
 use atl_bridgegen::converter;
 
 fn main() -> Result<()> {
+    // the converter list is read from Cargo.toml: a changed list must rerun this script (link_package's own rerun lines turn off cargo's whole-package default)
+    println!("cargo::rerun-if-changed=Cargo.toml");
     // libbinder_rs's declare_binder_interface! (token.rs, settings.rs) tests these cfgs in the expanding crate (libs/binder/rust/src/binder.rs); unset here, as for a host build
     println!("cargo::rustc-check-cfg=cfg(android_vndk, android_ndk)");
     if std::env::var_os("CARGO_FEATURE_CONVERTER").is_none() {

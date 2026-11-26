@@ -9,6 +9,9 @@
 extern crate atl_diag;
 #[cfg(feature = "converter")]
 extern crate atl_parcelables;
+// the VolumeShaper parcelables IPlayer takes: atl-aidl's stubs import them from av-types-aidl and keep them crate-private
+#[cfg(feature = "converter")]
+extern crate av_types_aidl;
 #[cfg(feature = "converter")]
 extern crate binder;
 // One atl_diag per process: the converter's, which the AIDL crates' reply hook and atl_parcelables link (a cargo copy beside it would split the counts and the cause).
@@ -27,6 +30,7 @@ pub mod broadcast;
 pub mod broadcast_dispatch;
 pub mod config_diff;
 pub mod desktop_bounds;
+pub mod ducking;
 pub mod focus;
 pub mod ime_bind;
 pub mod memory_levels;
