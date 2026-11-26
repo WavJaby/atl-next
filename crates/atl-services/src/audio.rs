@@ -396,13 +396,20 @@ fn abandon_refusal(aa: Option<&AudioAttributes>) -> Option<&'static str> {
     None
 }
 
-/// The death link of a focus owner: when `binder` dies, its owners leave the stack silently. Holds the stack weakly (no cycle through the link).
-fn link_death(stack: &Arc<Mutex<FocusStack>>, binder: &SpIBinder) -> Option<FocusLink> {
+/// The death link of the focus owner `serial` on `binder`: when `binder` dies, the stack drops the binder's owners and restores the next top once; a link whose owner already left is stale and changes nothing. Holds the stack weakly (no cycle through the link).
+fn link_death(
+    stack: &Arc<Mutex<FocusStack>>,
+    binder: &SpIBinder,
+    serial: u64,
+) -> Option<FocusLink> {
     let stack = Arc::downgrade(stack);
     let owner = binder.clone();
     let mut recipient = DeathRecipient::new(move || {
         if let Some(stack) = stack.upgrade() {
-            let gone = stack.lock().unwrap_or_else(|e| e.into_inner()).die(&owner);
+            let gone = stack
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .die(&owner, serial);
             // the links unlink outside the lock (the obituary may be delivering)
             drop(gone);
         }
@@ -672,7 +679,7 @@ impl IAudioService for AudioService {
         };
         let (code, gone) = self
             .focus()
-            .request(request, alive, || link_death(&self.focus, cb));
+            .request(request, alive, |serial| link_death(&self.focus, cb, serial));
         // the released links unlink outside the stack lock
         drop(gone);
         Ok(code)

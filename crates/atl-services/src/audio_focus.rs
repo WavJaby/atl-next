@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The ordinary audio focus stack: AOSP MediaFocusControl's one stack with multi-audio-focus off (its default), FocusRequester's loss table and its callbacks.
-//! Pure state. audio.rs runs the eligibility checks and links the death recipient, then calls [`Stack::request`]; each owner's dispatch is a oneway IAudioFocusDispatcher call there.
-//! Removal (abandon, death) is silent and does not restore the next owner: restoration (AOSP notifyTopOfAudioFocusStack) is slice 2.
+//! Pure state. audio.rs runs the eligibility checks and links the death recipient, then calls [`Stack::request`]; each owner's dispatch is a oneway IAudioFocusDispatcher call, made under the caller's stack lock in mutation order.
+//! Top removal (abandon, death) restores the next owner with GAIN (AOSP notifyTopOfAudioFocusStack); buried removal is silent.
 //! Not modelled, counted where AOSP would act: player attenuation (duckPlayers) and fade-out (fadeOutPlayers) have no tracked player, so CAN_DUCK and LOSS go out as plain callbacks.
 
 /// AudioManager.AUDIOFOCUS_NONE (AudioManager.java:4289).
@@ -59,6 +59,7 @@ pub struct Request<B> {
 }
 
 /// One focus owner (FocusRequester): `binder` identifies the requesting binder (death removes by it), `link` is its death link (released with the owner, unlinking it), `loss` the strongest loss received so far.
+/// `serial` names the link: a death for a link whose owner already left is stale.
 pub struct Owner<B, L> {
     client: String,
     binder: B,
@@ -68,17 +69,22 @@ pub struct Owner<B, L> {
     sdk: i32,
     loss: i32,
     dispatch: Option<Dispatch>,
+    serial: u64,
     link: L,
 }
 
 /// The focus stack, bottom to top; the last owner holds focus. Removed links are returned so the caller releases them outside its lock.
 pub struct Stack<B, L> {
     owners: Vec<Owner<B, L>>,
+    next_serial: u64,
 }
 
 impl<B: PartialEq, L> Default for Stack<B, L> {
     fn default() -> Self {
-        Stack { owners: Vec::new() }
+        Stack {
+            owners: Vec::new(),
+            next_serial: 0,
+        }
     }
 }
 
@@ -106,13 +112,13 @@ impl<B: PartialEq, L> Stack<B, L> {
             .map(|o| o.loss)
     }
 
-    /// MediaFocusControl.requestAudioFocus after the binder checks. `alive` is pingBinder (dead client refused first); `link` runs only once the request is admissible, so no owner exists without its live link.
+    /// MediaFocusControl.requestAudioFocus after the binder checks. `alive` is pingBinder (dead client refused first); `link` runs only once the request is admissible, given the serial its owner will hold, so no owner exists without its live link.
     /// Returns the result and the links this request released (the same client's replaced owner, a silent removal, the losers that left, its own unused link): the caller drops them after releasing its lock.
     pub fn request(
         &mut self,
         r: Request<B>,
         alive: bool,
-        link: impl FnOnce() -> Option<L>,
+        link: impl FnOnce(u64) -> Option<L>,
     ) -> (i32, Vec<L>) {
         if !alive {
             atl_diag::refused(INTERFACE, "requestAudioFocus (client binder dead)");
@@ -126,7 +132,10 @@ impl<B: PartialEq, L> Stack<B, L> {
             atl_diag::refused(INTERFACE, "requestAudioFocus (stack full)");
             return (REQUEST_FAILED, Vec::new());
         }
-        let Some(link) = link() else {
+        // spent even when the link is released unused: a stale death of that link never matches a later owner
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        let Some(link) = link(serial) else {
             atl_diag::refused(INTERFACE, "requestAudioFocus (linkToDeath failed)");
             return (REQUEST_FAILED, Vec::new());
         };
@@ -158,24 +167,53 @@ impl<B: PartialEq, L> Stack<B, L> {
             sdk: r.sdk,
             loss: NONE,
             dispatch: r.dispatch,
+            serial,
             link,
         });
         (REQUEST_GRANTED, gone)
     }
 
-    /// MediaFocusControl.abandonAudioFocus: removes every owner of `client`, silently (restoring the next owner is slice 2). Returns the removed links.
+    /// MediaFocusControl.abandonAudioFocus -> removeFocusStackEntry(clientId, signal=true): every owner of `client` leaves, matched by clientId alone (AOSP hasSameClient, no uid check).
+    /// Leaving the top restores the next owner; a buried owner leaves silently. Returns the removed links.
     pub fn abandon(&mut self, client: &str) -> Vec<L> {
-        self.remove_client(client)
+        let top_left = self.owners.last().is_some_and(|o| o.client == client);
+        let links = self.take_where(|o| o.client == client);
+        if top_left {
+            self.restore_top();
+        }
+        links
     }
 
-    /// MediaFocusControl.removeFocusStackEntryOnDeath: removes every owner of `binder`, silently: a dead client gets no callback. Returns the removed links.
-    pub fn die(&mut self, binder: &B) -> Vec<L> {
-        self.take_where(|o| o.binder == *binder)
+    /// MediaFocusControl.removeFocusStackEntryOnDeath for the link `serial` on `binder`. A serial no owner holds is stale (its owner already left): nothing changes, so a re-requested owner survives.
+    /// Otherwise every owner of `binder` leaves at once, and the top is restored once if the top was among them: a dead client gets no callback. Returns the removed links.
+    pub fn die(&mut self, binder: &B, serial: u64) -> Vec<L> {
+        if !self.owners.iter().any(|o| o.serial == serial) {
+            return Vec::new();
+        }
+        let top_died = self.owners.last().is_some_and(|o| o.binder == *binder);
+        let links = self.take_where(|o| o.binder == *binder);
+        if top_died {
+            self.restore_top();
+        }
+        links
     }
 
-    /// removeFocusStackEntry(client, signal=false): every owner of `client`, top or buried.
+    /// removeFocusStackEntry(client, signal=false): every owner of `client`, top or buried, silently (a request replacing its own entry).
     fn remove_client(&mut self, client: &str) -> Vec<L> {
         self.take_where(|o| o.client == client)
+    }
+
+    /// notifyTopOfAudioFocusStack -> FocusRequester.handleFocusGain: the owner now on top regains focus, GAIN answering the loss it holds.
+    /// A buried owner always holds a loss (propagate gave it one when the owner above was pushed), so the GAIN answers a loss that was sent.
+    fn restore_top(&mut self) {
+        let Some(top) = self.owners.last_mut() else {
+            return;
+        };
+        debug_assert!(top.loss != NONE, "a buried owner holds a loss");
+        top.loss = NONE;
+        if let Some(dispatch) = &top.dispatch {
+            dispatch(GAIN, &top.client);
+        }
     }
 
     /// Removes the owners `gone` selects, returning their links in stack order.
@@ -238,16 +276,37 @@ fn is_gain(gain: i32) -> bool {
     )
 }
 
-/// FocusRequester.focusLossForGainRequest: the loss `gain` causes for an owner that has received `current`. A loss never weakens: the table keeps the strongest.
+/// FocusRequester.focusLossForGainRequest: the loss `gain` causes an owner that holds `current`, the stronger of the held loss and the new one (a loss never weakens).
 pub fn focus_loss_for_gain(current: i32, gain: i32) -> i32 {
-    match (gain, current) {
-        (GAIN, _) => LOSS,
-        (GAIN_TRANSIENT | GAIN_TRANSIENT_EXCLUSIVE, LOSS) => LOSS,
-        (GAIN_TRANSIENT | GAIN_TRANSIENT_EXCLUSIVE, _) => LOSS_TRANSIENT,
-        (GAIN_TRANSIENT_MAY_DUCK, LOSS) => LOSS,
-        (GAIN_TRANSIENT_MAY_DUCK, LOSS_TRANSIENT) => LOSS_TRANSIENT,
-        (GAIN_TRANSIENT_MAY_DUCK, _) => LOSS_TRANSIENT_CAN_DUCK,
+    stronger(current, loss_for_gain(gain))
+}
+
+/// The loss a gain causes an owner holding none (focusLossForGainRequest before the held loss is considered).
+fn loss_for_gain(gain: i32) -> i32 {
+    match gain {
+        GAIN => LOSS,
+        GAIN_TRANSIENT | GAIN_TRANSIENT_EXCLUSIVE => LOSS_TRANSIENT,
+        GAIN_TRANSIENT_MAY_DUCK => LOSS_TRANSIENT_CAN_DUCK,
         _ => NONE,
+    }
+}
+
+/// The stronger of two losses: larger severity wins, a tie keeps `held`.
+fn stronger(held: i32, new: i32) -> i32 {
+    if severity(new) > severity(held) {
+        new
+    } else {
+        held
+    }
+}
+
+/// LOSS > LOSS_TRANSIENT > LOSS_TRANSIENT_CAN_DUCK > NONE.
+fn severity(loss: i32) -> i32 {
+    match loss {
+        LOSS => 3,
+        LOSS_TRANSIENT => 2,
+        LOSS_TRANSIENT_CAN_DUCK => 1,
+        _ => 0,
     }
 }
 
@@ -376,7 +435,7 @@ mod tests {
     fn grant_is_granted_without_initial_callback() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         assert_eq!(code, REQUEST_GRANTED);
         assert!(gone.is_empty());
         assert_eq!(s.len(), 1);
@@ -393,8 +452,8 @@ mod tests {
         let log = log();
         // link ids: the owner keeps link 100, the repeat's own link 200 is the one released
         let mut s: Stack<u32, u32> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(100));
-        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(200));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(100));
+        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(200));
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(s.len(), 1, "one owner after an identical repeat");
         assert_eq!(gone, vec![200], "the repeat's own new link is released");
@@ -405,7 +464,7 @@ mod tests {
     fn repeated_abandon_succeeds() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         assert_eq!(s.abandon("a").len(), 1);
         assert!(s.is_empty());
         assert!(
@@ -420,11 +479,11 @@ mod tests {
     fn delay_ok_unlocked_is_granted() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         let (code, _) = s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT, FLAG_DELAY_OK, &log),
             true,
-            || Some(()),
+            |_| Some(()),
         );
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(s.top(), Some("b"));
@@ -435,9 +494,9 @@ mod tests {
     fn dead_binder_is_refused_without_state_change() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         let mut linked = 0;
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), false, || {
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), false, |_| {
             linked += 1;
             Some(())
         });
@@ -453,8 +512,8 @@ mod tests {
     fn failed_death_link_allocates_no_owner() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || None);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| None);
         assert_eq!(code, REQUEST_FAILED);
         assert_eq!(s.len(), 1);
         assert_eq!(s.top(), Some("a"));
@@ -467,8 +526,8 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| Some(()));
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(calls(&log), vec![(LOSS, "a".to_owned())]);
         assert_eq!(s.len(), 1);
@@ -480,8 +539,8 @@ mod tests {
     fn transient_gain_keeps_owner_with_loss_transient() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
             Some(())
         });
         assert_eq!(code, REQUEST_GRANTED);
@@ -494,11 +553,11 @@ mod tests {
     fn exclusive_gain_sends_loss_transient() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_EXCLUSIVE, 0, &log),
             true,
-            || Some(()),
+            |_| Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT, "a".to_owned())]);
         assert_eq!(s.len(), 2);
@@ -510,13 +569,13 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
         let before = counted(key);
         s.request(
             req("b", 2, 10_001, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
-            || Some(()),
+            |_| Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
         assert_eq!(counted(key), before);
@@ -528,13 +587,13 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
         let before = counted(key);
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
-            || Some(()),
+            |_| Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
         assert_eq!(counted(key), before + 1);
@@ -546,10 +605,10 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
         let key = "requestAudioFocus (LOSS: no fade-out of active players, sent at once)";
         let before = counted(key);
-        s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| Some(()));
         assert_eq!(calls(&log), vec![(LOSS, "a".to_owned())]);
         assert_eq!(counted(key), before + 1);
     }
@@ -559,19 +618,200 @@ mod tests {
     fn death_removes_every_entry_of_the_binder_silently() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
+        let mut serial_a = 0;
+        s.request(
+            req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log),
+            true,
+            |serial| {
+                serial_a = serial;
+                Some(())
+            },
+        );
+        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
             Some(())
         });
-        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
-            Some(())
-        });
-        s.request(req("c", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
+        s.request(req("c", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
             Some(())
         });
         let before = calls(&log);
-        assert_eq!(s.die(&1).len(), 2);
+        assert_eq!(s.die(&1, serial_a).len(), 2);
         assert_eq!(s.len(), 1);
         assert_eq!(s.top(), Some("c"));
         assert_eq!(calls(&log), before, "a dead owner gets no callback");
+    }
+
+    /// The brief's sequence (MediaFocusControl.notifyTopOfAudioFocusStack, FocusRequester.handleFocusGain): A GAIN, B TRANSIENT, C MAY_DUCK; abandon C restores B; death of B restores A.
+    /// A keeps -2 while B is on top; MAY_DUCK does not weaken it. B's -3 goes out as a callback (no attenuation exists).
+    #[test]
+    fn full_callback_sequence_restores_the_next_owner() {
+        let _serial = serial();
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        let mut serial_b = 0;
+        s.request(
+            req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log),
+            true,
+            |serial| {
+                serial_b = serial;
+                Some(())
+            },
+        );
+        s.request(
+            req("c", 3, 10_003, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
+            true,
+            |_| Some(()),
+        );
+        assert_eq!(s.abandon("c").len(), 1);
+        assert_eq!(s.top(), Some("b"));
+        assert_eq!(s.die(&2, serial_b).len(), 1);
+        assert_eq!(s.top(), Some("a"));
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT, "a".to_owned()),
+                (LOSS_TRANSIENT_CAN_DUCK, "b".to_owned()),
+                (GAIN, "b".to_owned()),
+                (GAIN, "a".to_owned()),
+            ]
+        );
+    }
+
+    /// Removing a buried owner (abandon or death) emits nothing: the top keeps focus and nobody is restored.
+    #[test]
+    fn buried_removal_emits_nothing() {
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        let mut serial_a = 0;
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |serial| {
+            serial_a = serial;
+            Some(())
+        });
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        let before = calls(&log);
+        assert_eq!(s.abandon("b").len(), 1);
+        assert_eq!(s.die(&1, serial_a).len(), 1);
+        assert_eq!(s.top(), Some("c"));
+        assert_eq!(calls(&log), before, "buried removals send nothing");
+    }
+
+    /// A permanent gain evicts every loser (LOSS, then out of the stack); abandoning the GAIN restores nobody.
+    #[test]
+    fn permanent_gain_eviction_leaves_nothing_to_restore() {
+        let _serial = serial();
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        s.request(req("c", 3, 10_003, GAIN, 0, &log), true, |_| Some(()));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.abandon("c").len(), 1);
+        assert!(s.is_empty(), "no evicted owner comes back");
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT, "a".to_owned()),
+                (LOSS, "a".to_owned()),
+                (LOSS, "b".to_owned()),
+            ]
+        );
+    }
+
+    /// Same UID, distinct client IDs compete on one stack: abandoning the second restores the first.
+    #[test]
+    fn same_uid_distinct_ids_restore_on_abandon() {
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("b", 2, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        assert_eq!(s.abandon("b").len(), 1);
+        assert_eq!(s.top(), Some("a"));
+        assert_eq!(
+            calls(&log),
+            vec![(LOSS_TRANSIENT, "a".to_owned()), (GAIN, "a".to_owned())]
+        );
+    }
+
+    /// A restored owner holds no loss, so its next loser is notified again.
+    #[test]
+    fn restored_owner_is_notified_of_its_next_loss() {
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        s.abandon("b");
+        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT, "a".to_owned()),
+                (GAIN, "a".to_owned()),
+                (LOSS_TRANSIENT, "a".to_owned()),
+            ]
+        );
+    }
+
+    /// Stale death: the owner of this link already left (abandoned), then the same binder requested again.
+    /// The stale death must not remove the re-requested owner.
+    #[test]
+    fn stale_death_leaves_a_re_requested_owner() {
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        let mut stale = 0;
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |serial| {
+            stale = serial;
+            Some(())
+        });
+        assert_eq!(s.abandon("a").len(), 1);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.die(&1, stale);
+        assert_eq!(
+            s.top(),
+            Some("a"),
+            "the re-requested owner survives a stale death"
+        );
+    }
+
+    /// One binder's death removes all of its owners and restores the next owner once, not once per owner.
+    #[test]
+    fn death_restores_the_next_owner_once() {
+        let log = log();
+        let mut s: Stack<u32, ()> = Stack::default();
+        s.request(req("x", 2, 10_003, GAIN, 0, &log), true, |_| Some(()));
+        let mut serial_a = 0;
+        s.request(
+            req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log),
+            true,
+            |serial| {
+                serial_a = serial;
+                Some(())
+            },
+        );
+        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
+            Some(())
+        });
+        assert_eq!(s.die(&1, serial_a).len(), 2);
+        assert_eq!(s.top(), Some("x"));
+        assert_eq!(
+            calls(&log),
+            vec![
+                (LOSS_TRANSIENT, "x".to_owned()),
+                (LOSS_TRANSIENT, "a".to_owned()),
+                (GAIN, "x".to_owned()),
+            ]
+        );
     }
 }
