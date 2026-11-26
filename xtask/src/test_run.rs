@@ -126,7 +126,7 @@ fn run_in(root: &Path, scratch: &Path) -> Result<()> {
     };
     test_threads(&mut binaries, cpu)?;
     let harness = crate::harness::build(root)?;
-    let runs = resource_ledger::read_runs(&ws)?;
+    let runs = resource_ledger::read_runs(&ws, resource_ledger::TEST)?;
     let ctx = Ctx {
         ws,
         root: root.to_owned(),
@@ -606,6 +606,7 @@ fn attempt(
     let (status, oom) = match measured {
         Ok(Measured { result: Ok(c) }) => {
             let record = RunRecord {
+                kind: resource_ledger::TEST,
                 name: binary.label.clone(),
                 run: format!("{}-{}{suffix}", ctx.run, item.index),
                 mem_peak: c.mem_peak,
@@ -907,6 +908,7 @@ mod tests {
             shell("slow", "true"),
         ];
         let run = |name: &str, wall_ms: u64| RunRecord {
+            kind: resource_ledger::TEST,
             name: name.to_owned(),
             run: "r".to_owned(),
             mem_peak: 1 << 20,
@@ -1018,6 +1020,7 @@ mod tests {
     #[test]
     fn a_binary_s_demand_comes_from_its_ledger_history() {
         let run = |mem_peak: u64, oom: bool, wall_ms: u64| RunRecord {
+            kind: resource_ledger::TEST,
             name: "p lib b".to_owned(),
             run: "r".to_owned(),
             mem_peak,

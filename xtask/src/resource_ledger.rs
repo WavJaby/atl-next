@@ -2,7 +2,8 @@
 //! The resource ledger: one machine-wide store of measured inputs that admission decides on (gate_need.rs reads the gate kind, test_run.rs the test kind).
 //! One file, `<workspace>/out/pool/resource-ledger.tsv`, one tab-separated line per record:
 //! - gate wait: `gate name wait run took_ms stall` (`stall` = host stall share, percent, `-` unknown);
-//! - test attempt: `test name <empty> run mem_peak oom cpu_usec wall_ms` (`mem_peak` bytes, `oom` 0/1; an OOM's peak is a lower bound only).
+//! - test attempt: `test name <empty> run mem_peak oom cpu_usec wall_ms` (`mem_peak` bytes, `oom` 0/1; an OOM's peak is a lower bound only);
+//! - gate row attempt: `gate-run name <empty> run mem_peak oom cpu_usec wall_ms`, the same shape under its own kind (main's gate reader keeps it as another kind; the gate reader here never reads it).
 //!
 //! A line whose first column is another kind is skipped by the readers and kept as written by a rewrite, so a binary that knows fewer kinds neither fails on nor drops it. A malformed line of a known kind is an error naming its line.
 //! Key = (kind, name, wait, run). A gate wait under one key keeps the largest took, so a replay changes nothing; a test attempt keeps its first record (an attempt is measured once). Line order is age (appends are serialized).
@@ -29,6 +30,8 @@ pub const LOCK: &str = "resource-ledger.lock";
 pub const GATE: &str = "gate";
 /// The kind of a test binary's attempts: `name` = the binary's identity, `wait` empty, `run` = the attempt.
 pub const TEST: &str = "test";
+/// The kind of a gate row's attempts: `name` = the row, `wait` empty, `run` = the attempt. Eight columns, so the gate reader (`read`) keeps it as another kind; a 6-column gate line is a wait.
+pub const GATE_RUN: &str = "gate-run";
 
 /// (kind, name, wait, run): the key a record is stored under.
 type Key = (String, String, String, String);
@@ -76,9 +79,11 @@ impl Record {
     }
 }
 
-/// One attempt of a test binary, measured once per run id: `mem_peak` bytes (the leaf's peak; a lower bound when `oom`), `cpu_usec`, `wall_ms`.
+/// One attempt of a test binary or a gate row (`kind`), measured once per run id: `mem_peak` bytes (the leaf's peak; a lower bound when `oom`), `cpu_usec`, `wall_ms`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
+    /// [`TEST`] or [`GATE_RUN`]
+    pub kind: &'static str,
     pub name: String,
     pub run: String,
     pub mem_peak: u64,
@@ -90,7 +95,8 @@ pub struct RunRecord {
 impl RunRecord {
     fn line(&self) -> String {
         format!(
-            "{TEST}\t{}\t\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t\t{}\t{}\t{}\t{}\t{}\n",
+            self.kind,
             self.name,
             self.run,
             self.mem_peak,
@@ -104,10 +110,16 @@ impl RunRecord {
         let &[kind, name, wait, run, mem, oom, cpu, wall] = cols else {
             return None;
         };
-        if kind != TEST || !wait.is_empty() || name.is_empty() || run.is_empty() {
+        let kind = match kind {
+            TEST => TEST,
+            GATE_RUN => GATE_RUN,
+            _ => return None,
+        };
+        if !wait.is_empty() || name.is_empty() || run.is_empty() {
             return None;
         }
         Some(Self {
+            kind,
             name: name.to_owned(),
             run: run.to_owned(),
             mem_peak: mem.parse().ok()?,
@@ -176,7 +188,7 @@ impl Row {
                 r.run.clone(),
             )),
             Row::Run(r) => Some((
-                TEST.to_owned(),
+                r.kind.to_owned(),
                 r.name.clone(),
                 String::new(),
                 r.run.clone(),
@@ -198,7 +210,7 @@ impl Row {
         let cols: Vec<&str> = line.split('\t').collect();
         match cols.first().copied() {
             Some(GATE) => Record::parse(&cols).map(Row::Wait),
-            Some(TEST) => RunRecord::parse(&cols).map(Row::Run),
+            Some(TEST | GATE_RUN) => RunRecord::parse(&cols).map(Row::Run),
             _ => Some(Row::Other(line.to_owned())),
         }
     }
@@ -244,13 +256,13 @@ pub fn read(ws: &Path) -> Result<Vec<Record>> {
         .collect())
 }
 
-/// The test attempts of the ledger of workspace `ws`, oldest first.
-pub fn read_runs(ws: &Path) -> Result<Vec<RunRecord>> {
+/// The attempts of kind `kind` ([`TEST`] or [`GATE_RUN`]) in the ledger of workspace `ws`, oldest first.
+pub fn read_runs(ws: &Path, kind: &str) -> Result<Vec<RunRecord>> {
     Ok(load(ws)?
         .into_iter()
         .filter_map(|r| match r {
-            Row::Run(r) => Some(r),
-            Row::Wait(_) | Row::Other(_) => None,
+            Row::Run(r) if r.kind == kind => Some(r),
+            Row::Run(_) | Row::Wait(_) | Row::Other(_) => None,
         })
         .collect())
 }
@@ -420,6 +432,7 @@ mod tests {
 
     fn run(name: &str, run: &str, mem_peak: u64, wall_ms: u64) -> RunRecord {
         RunRecord {
+            kind: TEST,
             name: name.to_owned(),
             run: run.to_owned(),
             mem_peak,
@@ -565,7 +578,7 @@ mod tests {
             read(&ws).expect("read"),
             vec![rec("r1", "app", "marker", 100)]
         );
-        assert!(read_runs(&ws).expect("runs").is_empty());
+        assert!(read_runs(&ws, TEST).expect("runs").is_empty());
         append(&ws, &[rec("r2", "app", "marker", 200)], 20).expect("append");
         append_runs(&ws, &[run("bin", "r1", 7, 50)], 20).expect("append runs");
         let text = fs::read_to_string(ledger_path(&ws)).expect("ledger text");
@@ -639,6 +652,28 @@ mod tests {
         assert_eq!(merge(once.clone(), &[Row::Run(replay)]), once);
     }
 
+    /// A gate attempt is kind `gate-run`: eight columns like a test attempt, its own key (the same name and run under `test` is another record). Each reader sees its own kind; the gate waits (`read`) see neither.
+    #[test]
+    fn a_gate_run_line_is_its_own_kind() {
+        let ws = scratch("gate-run");
+        let gate = RunRecord {
+            kind: GATE_RUN,
+            ..run("window-ime", "r1", 1_073_741_824, 3_000)
+        };
+        append_runs(&ws, &[gate.clone(), run("window-ime", "r1", 9, 9)], 20).expect("append");
+        assert_eq!(
+            read_runs(&ws, GATE_RUN).expect("gate runs"),
+            std::slice::from_ref(&gate)
+        );
+        assert_eq!(read_runs(&ws, TEST).expect("test runs").len(), 1);
+        assert!(read(&ws).expect("gate waits").is_empty());
+        assert_eq!(
+            gate.line(),
+            "gate-run\twindow-ime\t\tr1\t1073741824\t0\t2000000\t3000\n"
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
     /// Gate waits and test attempts share the file: each read sees its own kind, and no append drops the other.
     #[test]
     fn waits_and_runs_share_one_file() {
@@ -649,10 +684,13 @@ mod tests {
             read(&ws).expect("waits"),
             vec![rec("r1", "app", "marker", 100)]
         );
-        assert_eq!(read_runs(&ws).expect("runs"), vec![run("bin", "r1", 7, 50)]);
+        assert_eq!(
+            read_runs(&ws, TEST).expect("runs"),
+            vec![run("bin", "r1", 7, 50)]
+        );
         append(&ws, &[rec("r2", "app", "marker", 200)], 20).expect("append");
         assert_eq!(
-            read_runs(&ws).expect("runs").len(),
+            read_runs(&ws, TEST).expect("runs").len(),
             1,
             "a gate append keeps the runs"
         );
@@ -668,7 +706,10 @@ mod tests {
             "gate\tapp\tmarker\tr1\t100\t0.10\ntest\tbin\t\tr1\tbig\t0\t1\n",
         )
         .expect("ledger");
-        let msg = format!("{:#}", read_runs(&ws).expect_err("line 2 is malformed"));
+        let msg = format!(
+            "{:#}",
+            read_runs(&ws, TEST).expect_err("line 2 is malformed")
+        );
         assert!(msg.contains("resource-ledger.tsv:2:"), "{msg}");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
