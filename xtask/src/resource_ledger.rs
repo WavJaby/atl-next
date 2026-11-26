@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::build_pool;
+use crate::build_pool::{self, Demand};
 use crate::flock::{Flock, Mode};
 use crate::out;
 
@@ -119,6 +119,41 @@ impl RunRecord {
             cpu_usec: cpu.parse().ok()?,
             wall_ms: wall.parse().ok()?,
         })
+    }
+}
+
+/// Bytes per GiB: the pool's memory unit.
+pub const GIB: u64 = 1 << 30;
+/// A unit's reservation: its largest passed peak plus this percent, rounded up to whole GiB. Initial value; to measure.
+const HEADROOM_PERCENT: u64 = 25;
+
+/// A unit's demand from its ledger attempts (test binaries and gate rows alike), oldest first: the largest passed peak plus [`HEADROOM_PERCENT`], whole GiB (at least 1, at most `budget`); cores the largest passed average; the last passed run's wall time. Cold (no passed run), or the last attempt an OOM (an unresolved lower bound): the whole budget, alone.
+pub fn demand_of(runs: &[RunRecord], budget: u32, cpu: u32) -> (Demand, u64) {
+    let whole = (
+        Demand {
+            mem_gib: budget,
+            cores: f64::from(cpu),
+        },
+        u64::MAX,
+    );
+    let passed: Vec<&RunRecord> = runs.iter().filter(|r| !r.oom).collect();
+    if passed.is_empty() || runs.last().is_some_and(|r| r.oom) {
+        return whole;
+    }
+    let peak = passed.iter().map(|r| r.mem_peak).max().unwrap_or(0);
+    let want = (peak + peak * HEADROOM_PERCENT / 100).div_ceil(GIB).max(1);
+    let mem_gib = u32::try_from(want).unwrap_or(u32::MAX).min(budget);
+    let cores = passed.iter().map(|r| cores_of(r)).fold(0.0, f64::max);
+    let wall_ms = passed.last().map_or(0, |r| r.wall_ms);
+    (Demand { mem_gib, cores }, wall_ms)
+}
+
+/// A run's average cores: its CPU time over its wall time.
+fn cores_of(r: &RunRecord) -> f64 {
+    if r.wall_ms == 0 {
+        0.0
+    } else {
+        r.cpu_usec as f64 / (r.wall_ms as f64 * 1000.0)
     }
 }
 
