@@ -76,6 +76,7 @@ mod signing;
 mod sles_bridge;
 mod starvation;
 mod system_scan;
+mod test_binary;
 mod test_fonts;
 mod tree_gate;
 mod ui_module;
@@ -166,6 +167,9 @@ enum Command {
         #[arg(last = true, required = true)]
         argv: Vec<std::ffi::OsString>,
     },
+    /// One test binary under a managed scope (test_binary.rs): its measured record goes to `--result`. No checkout, no gate.
+    #[command(hide = true)]
+    TestBinary(test_binary::Args),
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -385,6 +389,7 @@ fn main() -> Result<ExitCode> {
             return Ok(ExitCode::from(code));
         }
         Command::ScopeEnter { leaf, argv } => return Ok(atl_host_load::enter(leaf, argv)),
+        Command::TestBinary(args) => return test_binary::run(args),
         _ => {}
     }
     // a test gate runs in its own scope when the host can make one (atl-host-load): begun here, its `host load:` line printed after its verdict
@@ -557,7 +562,8 @@ fn main() -> Result<ExitCode> {
         | Command::DisplayProbe
         | Command::HostLoadChild(_)
         | Command::ScopeSupervise { .. }
-        | Command::ScopeEnter { .. } => {
+        | Command::ScopeEnter { .. }
+        | Command::TestBinary(_) => {
             unreachable!("dispatched above")
         }
     };
@@ -684,6 +690,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         | Command::DisplayProbe
         | Command::HostLoadChild(_)
         | Command::ScopeSupervise { .. }
-        | Command::ScopeEnter { .. } => return None,
+        | Command::ScopeEnter { .. }
+        | Command::TestBinary(_) => return None,
     })
 }

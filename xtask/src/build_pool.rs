@@ -501,6 +501,12 @@ pub fn acquire_rerun(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
     }
 }
 
+/// The demands' budget of workspace `ws`: the shared memory GiB a demand may reserve, and the CPU slots (`[pool]`).
+pub fn demand_budget(ws: &Path) -> Result<(u32, u32)> {
+    let pool = ws_config::load(ws)?.pool;
+    Ok((shared_mem(&pool), pool.cpu_slots.value))
+}
+
 /// The pool directory of workspace `ws`.
 pub fn dir(ws: &Path) -> PathBuf {
     ws.join("cache").join("build-pool")
@@ -1126,6 +1132,55 @@ mod tests {
             granted,
             release,
         }
+    }
+
+    /// A thread that takes a demand as checkout `who`, reports its grant as `mem N`, and holds it until `release` is sent (or dropped).
+    fn demand_contender(ws: &Path, who: &'static str, mem_gib: u32) -> Contender {
+        let (_no_waits, waits) = mpsc::channel();
+        let (gtx, granted) = mpsc::channel();
+        let (release, rrx) = mpsc::channel::<()>();
+        let ws = ws.to_owned();
+        std::thread::spawn(move || {
+            let grant = acquire_demand(
+                &ws,
+                Path::new(who),
+                Demand {
+                    mem_gib,
+                    cores: 1.0,
+                },
+            )
+            .expect("acquire_demand");
+            let _ = gtx.send(format!("mem {}", grant.mem_gib));
+            let _ = rrx.recv();
+            drop(grant);
+        });
+        Contender {
+            waits,
+            granted,
+            release,
+        }
+    }
+
+    /// Two checkouts share one pool's memory: a holds 6 GiB of 10, so b's 5 GiB waits (6 + 5 > 10) and is granted once a releases. Neither claim is refused.
+    #[test]
+    fn two_checkouts_share_the_memory_and_interleave() {
+        let ws = scratch_ws(
+            "two-checkouts",
+            Some("[pool]\ncpu_slots = 16\nmem_gib = 10\n"),
+        );
+        let a = demand_contender(&ws, "wt/a", 6);
+        assert_eq!(a.granted.recv_timeout(WAIT).expect("a is granted"), "mem 6");
+        let b = demand_contender(&ws, "wt/b", 5);
+        assert!(
+            b.granted.recv_timeout(STILL_WAITING).is_err(),
+            "b's 5 GiB ran past a's 6 of 10"
+        );
+        a.release.send(()).unwrap();
+        assert_eq!(
+            b.granted.recv_timeout(WAIT).expect("b is granted after a"),
+            "mem 5"
+        );
+        b.release.send(()).unwrap();
     }
 
     /// Every build's shared hold keeps prune out of its dir and no other: prune gets dir a only after the last hold is gone; dir b was never held.

@@ -22,7 +22,7 @@ const PACKAGE: &str = "xtask-harness";
 
 /// Builds the harness (a no-op when current) and returns its binary.
 /// The binary is in the running xtask's profile dir of the target dir cargo writes (out::cargo_target_dir).
-fn build(root: &Path) -> Result<PathBuf> {
+pub fn build(root: &Path) -> Result<PathBuf> {
     let status = crate::cargo_command()
         .args(["build", "--quiet", "--package", PACKAGE])
         .current_dir(root)

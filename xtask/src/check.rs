@@ -68,7 +68,7 @@ enum Step {
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
     Deny,
-    /// the workspace's tests under one grant: `cargo test --no-run`, then the test binaries at once, as many as the grant has slots, then the doc tests (test_run.rs)
+    /// the workspace's tests in two phases: `cargo test --no-run` under Cargo admission, then each test binary by its learned demand (run in a managed scope), the doc tests under Cargo admission (test_run.rs)
     Test,
     /// the Blueprint converter (tools/bp2ninja): go build, go vet, go test against the pinned blueprint, offline
     Converter,
@@ -162,11 +162,11 @@ impl Step {
     /// The pool class the step's leaf work takes (build_pool.rs): cargo/go compiles and the test run `cargo`, runtime gates `harness`, the rest `light`. None: `gates`, whose rows each take their own grant (check_gates.rs), so the step holds none (a holder above them would refuse their nested admission).
     fn class(self) -> Option<Class> {
         Some(match self {
-            Step::Gates => return None,
+            // each of these takes its grants in its own phases (check_gates.rs rows, test_run.rs compile, binaries and doc tests)
+            Step::Gates | Step::Test => return None,
             // tables: its scenario half builds the harness
             Step::Tables
             | Step::Clippy
-            | Step::Test
             | Step::Bootstrap
             | Step::Converter
             | Step::ConverterPackages
@@ -409,14 +409,22 @@ impl Step {
                     .context("cargo-deny not installed: cargo install --locked cargo-deny")?;
                 cargo(root, &["deny", "--locked", "check"], Units::Plain)
             }
-            // both halves under the step's one grant: a second step would queue again between them
+            // two phases: the compile under its own Cargo grant, released before the binaries take their demands (test_run.rs); no grant spans both
             Step::Test => {
+                let ws = Layout::of(root)?.workspace().to_owned();
                 let started = Instant::now();
-                cargo(
-                    root,
-                    &["test", "--no-run", "--workspace", "--locked"],
-                    Units::Recorded,
-                )?;
+                {
+                    let grant = build_pool::acquire(&ws, root, Class::Cargo)?;
+                    eprintln!(
+                        "check: test pool {} cpu {} of {} (compile)",
+                        grant.class, grant.cpu, grant.cpu_of
+                    );
+                    cargo(
+                        root,
+                        &["test", "--no-run", "--workspace", "--locked"],
+                        Units::Recorded,
+                    )?;
+                }
                 eprintln!("test: compile {}", timing::secs(started.elapsed()));
                 crate::test_run::run(root)
             }
