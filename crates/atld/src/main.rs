@@ -1249,20 +1249,27 @@ impl Host {
         }
     }
 
-    /// Request `Abandon`: staged session `session` was refused by the services: its staged entry goes, and its staging dir with it (a session parsed in place keeps the installed code).
+    /// Request `Abandon`: staged session `session` was refused by the services: its staging dir goes, then its staged entry (a session parsed in place keeps the installed code).
+    /// The dir goes first: a failed removal keeps the entry, so a second Abandon retries. Abandon runs on the installer lane, so no other request changes the entry between the two lock sections.
     fn abandon(&self, session: u32) -> Result<()> {
         let i = &self.installd;
-        let staged = i
+        let in_place = i
             .staged
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&session)
-            .with_context(|| format!("session {session}: not staged"))?;
-        if staged.in_place.is_none() {
+            .get(&session)
+            .with_context(|| format!("session {session}: not staged"))?
+            .in_place
+            .is_some();
+        if !in_place {
             let dir = self.root.data().join("app").join(staging_name(session));
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("removing the staging dir {}", dir.display()))?;
         }
+        i.staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session);
         log(format_args!("install session {session}: abandoned"));
         Ok(())
     }
