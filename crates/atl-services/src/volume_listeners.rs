@@ -262,10 +262,13 @@ mod tests {
     #[test]
     fn another_uid_gets_nothing() {
         let mut listeners = Listeners::default();
-        let (rec, got) = recorder(true);
-        assert!(listeners.insert((APP, PID), 1, rec));
-        assert_eq!(listeners.commit(OTHER_UID, STREAM_MUSIC, 0), 0);
-        assert!(got.borrow().is_empty());
+        let (app, app_got) = recorder(true);
+        let (other, other_got) = recorder(true);
+        assert!(listeners.insert((APP, PID), 1, app));
+        assert!(listeners.insert((OTHER_UID, PID), 2, other));
+        assert_eq!(listeners.commit(APP, STREAM_MUSIC, 0), 1);
+        assert_eq!(*app_got.borrow(), vec![(STREAM_MUSIC, 0)]);
+        assert!(other_got.borrow().is_empty());
     }
 
     #[test]
