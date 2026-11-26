@@ -357,9 +357,9 @@ fn resize_check(app: &str) -> Result<String, String> {
 }
 
 /// The page's viewport `(iw, ih)` (CSS px) has the view's `(w, h)` (physical px) aspect. CSS px = physical / density, unknown here: compare aspect; integer CSS sizes round, so allow one CSS px
-/// on either axis (|iw*h - ih*w| <= max(w, h)).
+/// on either axis (|iw*h - ih*w| <= max(w, h)). A zero side is no layout and fits nothing: 0x0 passes the aspect test alone (0 <= max(w, h)).
 fn viewport_fits((iw, ih): (i64, i64), (w, h): (i64, i64)) -> bool {
-    (iw * h - ih * w).abs() <= w.max(h)
+    iw > 0 && ih > 0 && (iw * h - ih * w).abs() <= w.max(h)
 }
 
 /// The resize `layouts_before` preceded is answered: the fixture logged a new layout, and after that layout the page's viewport title has its aspect and the WebView's last placement is its
@@ -497,6 +497,13 @@ pub fn drive(proxy: Proxy, app_log: &Path, origin: TapOrigin) -> Result<Liveness
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page with no layout (innerWidth 0 x innerHeight 0) fits no view: the aspect check alone passes it (|0*h - 0*w| = 0), so the gate passed a page that never laid out.
+    #[test]
+    fn a_zero_viewport_fits_no_view() {
+        assert!(!viewport_fits((0, 0), (720, 761)));
+        assert!(viewport_fits((720, 761), (720, 761)));
+    }
 
     /// The sub-gates on hand-written logs: the full answer passes with esc-back; a stale placement, a missing tap and a missing back each fail.
     #[test]
