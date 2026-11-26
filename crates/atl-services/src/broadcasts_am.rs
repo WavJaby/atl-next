@@ -895,12 +895,21 @@ pub(super) struct PackageSend {
 }
 
 /// The package broadcasts of a publish, in send order. An update: PACKAGE_REMOVED of the old version (BroadcastHelper.sendPackageRemovedBroadcasts), then ADDED, REPLACED and
-/// MY_PACKAGE_REPLACED (sendPostInstallBroadcasts :600-720). A new package: ADDED. Audiences as IPH :2447-2450: REMOVED and REPLACED the table before the publish, ADDED the one it published.
+/// MY_PACKAGE_REPLACED (sendPostInstallBroadcasts :600-720). A new package: ADDED. Audiences as IPH :2447-2450: REMOVED and REPLACED the table before the publish (`after` for a package absent from it: a boot update), ADDED the one it published.
 pub(super) fn package_sends(
     reports: &[install::Reported],
     audience: &install::Audience,
 ) -> Vec<PackageSend> {
-    let before = |r: &install::Reported| Some((Arc::clone(&audience.before), r.package.clone()));
+    // A boot Updated's package is absent from `before` (boot's table holds the system scans; install.rs refuses a name already there): REMOVED and REPLACED are judged by
+    // `after`, the table their receivers see. Judged by `before`, the lookup finds no package and every receiver is dropped.
+    let replaced = |r: &install::Reported| {
+        let table = if audience.before.by_name(&r.package).is_some() {
+            &audience.before
+        } else {
+            &audience.after
+        };
+        Some((Arc::clone(table), r.package.clone()))
+    };
     let after = |r: &install::Reported| Some((Arc::clone(&audience.after), r.package.clone()));
     let mut sends = Vec::new();
     for r in reports {
@@ -912,7 +921,7 @@ pub(super) fn package_sends(
                 after(r),
             )),
             install::Change::Updated { .. } => {
-                sends.push(removed_send(r, before(r)));
+                sends.push(removed_send(r, replaced(r)));
                 let replacing = || vec![(broadcast::EXTRA_REPLACING, Value::Bool(true))];
                 sends.push(data_send(
                     broadcast::ACTION_PACKAGE_ADDED,
@@ -924,7 +933,7 @@ pub(super) fn package_sends(
                     broadcast::ACTION_PACKAGE_REPLACED,
                     r,
                     replacing(),
-                    before(r),
+                    replaced(r),
                 ));
                 sends.push(my_package_replaced(r));
             }

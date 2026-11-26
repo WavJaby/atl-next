@@ -4198,6 +4198,62 @@ mod tests {
         );
     }
 
+    /// A boot Updated's package is absent from `before` (boot's table holds the system scans; install.rs refuses a name already there), so REMOVED is judged by `after`, the
+    /// table its receivers see. X (uid 10_060, targetSdk 29) sees every package and must get it; judged by `before`, the lookup finds no package and every receiver is dropped.
+    #[test]
+    fn a_boot_update_reaches_the_receivers_that_see_the_package_after() {
+        const PACKAGE: &str = "com.example.app";
+        const ACTIONS: [&str; 1] = [broadcast::ACTION_PACKAGE_REMOVED];
+        let world = |with_package: bool| {
+            let mut list = vec![
+                receiver_app("com.example.alpha", 10_060, 29, &ACTIONS),
+                receiver_app("com.example.beta", 10_050, 34, &ACTIONS),
+            ];
+            if with_package {
+                let mut app = fixture::record(PACKAGE);
+                app.uid = 10_070;
+                list.push(app);
+            }
+            list
+        };
+        let audience = install::Audience {
+            before: Arc::new(Packages::new(world(false), BTreeMap::new())),
+            after: Arc::new(Packages::new(world(true), BTreeMap::new())),
+        };
+        let reports = [install::Reported {
+            package: PACKAGE.to_owned(),
+            uid: 10_070,
+            version: 2,
+            change: install::Change::Updated { from: 1 },
+        }];
+        let sends = broadcasts_am::package_sends(&reports, &audience);
+        let removed = &sends[0];
+        let am = manager_over(Arc::new(NoProcesses), world(true));
+        let st = am.inner.state();
+        let key = intent_key(&removed.intent, None);
+        let spec = broadcasts_am::SendSpec {
+            intent: &removed.intent,
+            resolved_type: None,
+            sender: (1, SYSTEM_UID),
+            user: USER_SYSTEM,
+            required: None,
+            result: (-1, None, None),
+            sticky: false,
+            ordered: false,
+            result_to: None,
+            max_manifest_api: None,
+            grant: None,
+            about: removed.about.clone(),
+        };
+        let uids: Vec<u32> = am
+            .inner
+            .receivers_locked(&st, &spec, &removed.intent, &key)
+            .iter()
+            .map(|r| r.proc.uid)
+            .collect();
+        assert_eq!(uids, [10_060]);
+    }
+
     /// Records the process starts, in order, and the kills a test makes.
     #[derive(Default)]
     struct RecordingProcesses {
