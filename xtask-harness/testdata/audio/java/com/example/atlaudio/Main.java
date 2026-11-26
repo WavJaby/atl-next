@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Bundle;
@@ -173,6 +174,41 @@ public class Main extends Activity {
         Log.i(TAG, "volume: set index=" + index + " get=" + audio.getStreamVolume(AudioManager.STREAM_MUSIC));
     }
 
+    /**
+     * The focus probe, public AudioManager API only: a foreground media gain is GRANTED, its identical repeat is GRANTED, a DELAY_OK
+     * request with no lock is GRANTED (never DELAYED), and each abandon succeeds. The listeners log what they receive.
+     */
+    private void focusProbe(AudioManager audio) {
+        AudioAttributes media = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA).build();
+        AudioManager.OnAudioFocusChangeListener first = new AudioManager.OnAudioFocusChangeListener() {
+            public void onAudioFocusChange(int change) {
+                Log.i(TAG, "focus: first change=" + change);
+            }
+        };
+        AudioManager.OnAudioFocusChangeListener second = new AudioManager.OnAudioFocusChangeListener() {
+            public void onAudioFocusChange(int change) {
+                Log.i(TAG, "focus: second change=" + change);
+            }
+        };
+        AudioFocusRequest request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(media)
+                .setOnAudioFocusChangeListener(first)
+                .build();
+        int granted = audio.requestAudioFocus(request);
+        int repeat = audio.requestAudioFocus(request);
+        AudioFocusRequest delayed = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(media)
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener(second)
+                .build();
+        int delay = audio.requestAudioFocus(delayed);
+        int abandon = audio.abandonAudioFocusRequest(request);
+        int again = audio.abandonAudioFocusRequest(request);
+        Log.i(TAG, "focus: first=" + granted + " repeat=" + repeat + " delayed=" + delay
+                + " abandon=" + abandon + " again=" + again);
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -191,6 +227,7 @@ public class Main extends Activity {
         // the output properties FMOD and OpenSL users size their buffers by (AudioSystem.getPrimaryOutput*; null when the server answers 0)
         Log.i(TAG, "props: rate=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
                 + " frames=" + audio.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER));
+        focusProbe(audio);
         AudioAttributes attributes = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_GAME).build();
         AudioFormat format = new AudioFormat.Builder()

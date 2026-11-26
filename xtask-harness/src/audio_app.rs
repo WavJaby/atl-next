@@ -143,6 +143,23 @@ fn native_verdicts(app: &str, services: &str) -> bool {
             aaudio.unwrap_or("no line")
         ),
     );
+    // AudioManager's public focus API through AudioService's ordinary stack: the foreground gain and its identical repeat are GRANTED (1), a DELAY_OK request is GRANTED not DELAYED (2), each abandon succeeds
+    let focus = line_value(app, "focus: ");
+    let want = [
+        ("first", 1),
+        ("repeat", 1),
+        ("delayed", 1),
+        ("abandon", 1),
+        ("again", 1),
+    ];
+    ok &= verdict(
+        "audio focus",
+        want.iter().all(|&(k, v)| field(focus, k) == Some(v)),
+        &format!(
+            "want first, repeat, delayed, abandon, again = 1 (GRANTED), line: {}",
+            focus.unwrap_or("no line")
+        ),
+    );
     ok
 }
 
