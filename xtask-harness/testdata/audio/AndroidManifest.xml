@@ -9,8 +9,15 @@
     <!-- minSdkVersion is the app gate's default fixture API level, so the same native build serves both gates -->
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
 
+    <!-- package visibility: the duck phases' explicit broadcast reaches the ducker copy (audio_app.rs DUCKER) only when this app can see it -->
+    <queries>
+        <package android:name="com.example.atlaudio.ducker" />
+    </queries>
+
+    <!-- class names are absolute: the ducker copy renames the package, not the classes -->
     <application android:label="ATL audio test">
-        <activity android:name=".Main" android:exported="true">
+        <receiver android:name="com.example.atlaudio.Main$Ducker" android:exported="true" />
+        <activity android:name="com.example.atlaudio.Main" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -3,6 +3,7 @@ package com.example.atlaudio;
 
 import android.app.Activity;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -21,6 +22,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -34,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * `group: media=<n> ringtone=<n>`: AudioManager.getVolumeGroupIdForAttributes of USAGE_MEDIA and of USAGE_NOTIFICATION_RINGTONE (the strategy list policy.rs serves).
  * `tts: flags=<n>`: the flags (AudioAttributes.getAllFlags, read reflectively) of a legacy TTS stream's attributes: FLAG_BEACON.
  * `pcm: ...`: the PCM tones (audio_app.rs TONE_*, STREAM_*): a static track of STATIC_TONE_HZ, then a streaming track of STREAM_TONE_HZ in FMOD's shape, then a float streaming track of FLOAT_TONE_HZ, then an OpenSL ES tone and an AAudio tone (native, `pcm: sles ...` / `pcm: aaudio ...`), one after the other; the gate checks the recording of the sink. Then the silent adaptive AAudio client (`pcm: aaudio-adaptive ...`).
+ * `duck: phase=music|speech granted=<r> back=<0|1> changes=<c,...>`: the duck phases (duckPhase), the sixth and seventh tones of the recording; the ducker app logs `ducker: ...`.
  * `done`: the end of the run.
  * The volume run (asset `volume` present, audio_app.rs `--volume`) logs only `volume: ...` lines (volumeRun) and `done`.
  */
@@ -77,6 +80,138 @@ public class Main extends Activity {
     private static final int NATIVE_FRAMES = 72000;
     /** AudioSystem.STREAM_TTS (AudioSystem.java:107, @hide): the speaker stream the flags probe builds from. */
     private static final int STREAM_TTS = 9;
+    /**
+     * The duck phases (audio_app.rs DUCK_*): this app plays a streaming tone of DUCK_TONE_HZ (music) or SPEECH_TONE_HZ (speech), DUCK_LEAD_MS at full level, then asks the ducker app (this APK
+     * under DUCKER, another uid) to hold GAIN_TRANSIENT_MAY_DUCK for DUCK_HOLD_MS; after its DUCK_DONE it plays DUCK_TAIL_MS more. DUCK_WAIT_MS bounds the wait for the ducker.
+     */
+    private static final String DUCKER = "com.example.atlaudio.ducker";
+    private static final String ACTION_DUCK = "com.example.atlaudio.DUCK";
+    private static final String ACTION_DUCK_DONE = "com.example.atlaudio.DUCK_DONE";
+    private static final int DUCK_TONE_HZ = 2000;
+    private static final int SPEECH_TONE_HZ = 3000;
+    private static final long DUCK_LEAD_MS = 1000;
+    private static final long DUCK_HOLD_MS = 2000;
+    private static final long DUCK_TAIL_MS = 1000;
+    private static final long DUCK_WAIT_MS = 20000;
+
+    /**
+     * The ducker (manifest receiver; only the DUCKER copy of the APK is asked): GAIN_TRANSIENT_MAY_DUCK for a notification, held DUCK_HOLD_MS, then abandoned; logs
+     * `ducker: phase=<p> request=<r> abandon=<r>` and answers DUCK_DONE to the player app.
+     */
+    public static class Ducker extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context c, Intent i) {
+            // no lambdas: the fixture's dex has no desugaring (LambdaMetafactory)
+            final PendingResult result = goAsync();
+            final String phase = i.getStringExtra("phase");
+            new Thread(new Runnable() {
+                public void run() {
+                    AudioManager am = c.getSystemService(AudioManager.class);
+                    AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                            .setAudioAttributes(new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_NOTIFICATION).build())
+                            .setOnAudioFocusChangeListener(new AudioManager.OnAudioFocusChangeListener() {
+                                public void onAudioFocusChange(int change) {
+                                }
+                            })
+                            .build();
+                    int got = am.requestAudioFocus(req);
+                    try {
+                        Thread.sleep(DUCK_HOLD_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    int left = am.abandonAudioFocusRequest(req);
+                    Log.i(TAG, "ducker: phase=" + phase + " request=" + got + " abandon=" + left);
+                    c.sendBroadcast(new Intent(ACTION_DUCK_DONE).setPackage(Main.class.getPackage().getName()));
+                    result.finish();
+                }
+            }).start();
+        }
+    }
+
+    /**
+     * One duck phase: this app holds GAIN focus for a USAGE_MEDIA track of `contentType` that streams a `hz` tone, while the ducker holds GAIN_TRANSIENT_MAY_DUCK. Logs
+     * `duck: phase=<p> granted=<r> back=<0|1> changes=<c,...>` (the focus changes this app received, in order; empty when none).
+     */
+    private void duckPhase(AudioManager audio, final String phase, int contentType, int hz) {
+        HandlerThread thread = new HandlerThread("atl-duck");
+        thread.start();
+        Handler handler = new Handler(thread.getLooper());
+        final StringBuffer changes = new StringBuffer();
+        AudioAttributes aa = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(contentType).build();
+        AudioFocusRequest own = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(aa)
+                .setOnAudioFocusChangeListener(new AudioManager.OnAudioFocusChangeListener() {
+                    public void onAudioFocusChange(int change) {
+                        Log.i(TAG, "duck: " + phase + " change=" + change);
+                        changes.append(changes.length() == 0 ? "" : ",").append(change);
+                    }
+                }, handler)
+                .build();
+        final CountDownLatch done = new CountDownLatch(1);
+        BroadcastReceiver back = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                done.countDown();
+            }
+        };
+        Context app = getApplicationContext();
+        app.registerReceiver(back, new IntentFilter(ACTION_DUCK_DONE), null, handler, Context.RECEIVER_EXPORTED);
+        int granted = audio.requestAudioFocus(own);
+        boolean returned = false;
+        final AtomicBoolean stop = new AtomicBoolean();
+        Thread writer = null;
+        AudioTrack t = null;
+        try {
+            AudioFormat format = new AudioFormat.Builder()
+                    .setSampleRate(TONE_RATE_HZ)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build();
+            int min = AudioTrack.getMinBufferSize(
+                    TONE_RATE_HZ, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
+            final AudioTrack track = new AudioTrack(aa, format, min, AudioTrack.MODE_STREAM, 0);
+            t = track;
+            track.play();
+            // one second of the tone: a whole number of cycles (hz divides TONE_RATE_HZ's second), so repeats join without a step
+            final short[] second = tone(hz, TONE_RATE_HZ, TONE_RATE_HZ);
+            writer = new Thread(new Runnable() {
+                public void run() {
+                    while (!stop.get()) {
+                        track.write(second, 0, second.length);
+                    }
+                }
+            });
+            writer.start();
+            Thread.sleep(DUCK_LEAD_MS);
+            sendBroadcast(new Intent(ACTION_DUCK).putExtra("phase", phase)
+                    .setComponent(new ComponentName(DUCKER, Ducker.class.getName())));
+            returned = done.await(DUCK_WAIT_MS, TimeUnit.MILLISECONDS);
+            Thread.sleep(DUCK_TAIL_MS);
+        } catch (Throwable e) {
+            Log.i(TAG, "duck: phase=" + phase + " " + e);
+        }
+        // the writer ends after its current second (no flush: every written frame plays out, audio_app.rs `mixer dropped`), then the gap lets the buffer drain before release
+        stop.set(true);
+        try {
+            if (writer != null) {
+                writer.join();
+            }
+            Thread.sleep(TONE_GAP_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (t != null) {
+            t.release();
+        }
+        audio.abandonAudioFocusRequest(own);
+        app.unregisterReceiver(back);
+        Log.i(TAG, "duck: phase=" + phase + " granted=" + granted + " back=" + (returned ? 1 : 0)
+                + " changes=" + changes);
+        thread.quitSafely();
+    }
 
     /** OpenSL ES simple buffer queue player (jni/atl_audio_tone.c): "sles enqueued=<n> callbacks=<n> failed=<n>". */
     private static native String slesTone(int hz, int rate, int frames, double dbfs);
@@ -416,6 +551,9 @@ public class Main extends Activity {
         } catch (Throwable e) {
             Log.i(TAG, "pcm: native " + e);
         }
+        // the framework duck (PlaybackActivityMonitor): a music player is attenuated without callbacks; a speech player is not, and gets them
+        duckPhase(audio, "music", AudioAttributes.CONTENT_TYPE_MUSIC, DUCK_TONE_HZ);
+        duckPhase(audio, "speech", AudioAttributes.CONTENT_TYPE_SPEECH, SPEECH_TONE_HZ);
         Log.i(TAG, "done");
     }
 }

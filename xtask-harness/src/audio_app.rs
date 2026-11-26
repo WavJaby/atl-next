@@ -322,6 +322,21 @@ const ADAPTIVE_STABLE_MS: i64 = 1_000;
 const FOCUS_LOSS_TRANSIENT: i64 = -2;
 /// AudioManager.AUDIOFOCUS_GAIN (AudioManager.java:4296): the first listener's regain when the top abandons (notifyTopOfAudioFocusStack -> handleFocusGain).
 const FOCUS_GAIN: i64 = 1;
+/// AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK (AudioManager.java:4340).
+const FOCUS_LOSS_CAN_DUCK: i64 = -3;
+/// The ducker: the fixture built again under this package (another uid). It holds GAIN_TRANSIENT_MAY_DUCK while the fixture plays (Main.java duckPhase, DUCK_*).
+const DUCKER: &str = "com.example.atlaudio.ducker";
+/// The ducker's target sdk: Build.VERSION_CODES.UPSIDE_DOWN_CAKE (34), the last level the focus hardening exempts (VANILLA_ICE_CREAM, 35, and up are checked).
+const DUCKER_TARGET_SDK: u32 = 34;
+/// Main.java DUCK_TONE_HZ (a music player, CONTENT_TYPE_MUSIC) and SPEECH_TONE_HZ (CONTENT_TYPE_SPEECH): the sixth and seventh tones, each at TONE_DBFS.
+const DUCK_TONE_HZ: f64 = 2_000.0;
+const SPEECH_TONE_HZ: f64 = 3_000.0;
+/// Main.java DUCK_HOLD_MS: how long the ducker holds its focus.
+const DUCK_HOLD_MS: f64 = 2_000.0;
+/// PlaybackActivityMonitor DUCK_VSHAPE (PlaybackActivityMonitor.java:93-103): the music player's level falls to DUCK_VOLUME over DUCK_RAMP_MS (getFocusRampTimeMs(MAY_DUCK, USAGE_NOTIFICATION), MediaFocusControl.java:1082-1088),
+/// and the reverse on restore climbs back over the same time. Typed in from the pinned source, not read from atl-services.
+const DUCK_VOLUME: f64 = 0.2;
+const DUCK_RAMP_MS: f64 = 500.0;
 /// AudioVolumeGroup.DEFAULT_VOLUME_GROUP (AudioVolumeGroup.java:47): the answer when no strategy matches (AudioProductStrategy.java:194, :350).
 const VOLUME_GROUP_NONE: i64 = -1;
 /// AudioAttributes.FLAG_BEACON (AudioAttributes.java:404, `0x1 << 3`): the TTS legacy stream's flags, set by its case (:1225) and carried by the default TTS attributes (EngineDefaultConfig.h:132).
@@ -415,12 +430,13 @@ fn pcm_verdicts(rec: &Recording) -> bool {
     let runs = segments(&rec.channel(0), threshold, gap);
     let mut ok = verdict(
         "pcm tones",
-        runs.len() == 5,
+        runs.len() == 7,
         &format!(
-            "{} run(s) of tone, want 5 (static, streaming, float streaming, OpenSL ES, AAudio)",
+            "{} run(s) of tone, want 7 (static, streaming, float streaming, OpenSL ES, AAudio, ducked music, speech)",
             runs.len()
         ),
     );
+    ok &= duck_levels(rec, runs.get(5).copied(), runs.get(6).copied());
     let native = NATIVE_FRAMES * rate / NATIVE_RATE_HZ;
     for (i, (name, hz, want)) in [
         ("static", STATIC_TONE_HZ, TONE_FRAMES * rate / TONE_RATE_HZ),
@@ -475,6 +491,118 @@ fn pcm_verdicts(rec: &Recording) -> bool {
                 &format!("ch{ch} {level_db:+.2} dB re A/√2, want ±{LEVEL_TOLERANCE_DB}"),
             );
         }
+    }
+    ok
+}
+
+/// The level of each QUANTUM_FRAMES window of channel 0 in `run` (one quantum off each edge), in dB re the tone's A/√2.
+fn window_levels(rec: &Recording, (first, last): (usize, usize)) -> Vec<f64> {
+    let expected_rms = 10f64.powf(TONE_DBFS / 20.0) / std::f64::consts::SQRT_2;
+    let x = rec.channel(0);
+    if last < first + 3 * QUANTUM_FRAMES {
+        return Vec::new();
+    }
+    x[first + QUANTUM_FRAMES..=last - QUANTUM_FRAMES]
+        .as_chunks::<QUANTUM_FRAMES>()
+        .0
+        .iter()
+        .map(|w| 20.0 * (rms(w) / expected_rms).log10())
+        .collect()
+}
+
+/// The framework duck in the PCM (PlaybackActivityMonitor duckPlayers / DuckedApp): the music run starts and ends at the tone's full level (restore returns the original PCM), and in between holds the
+/// duck level 20·log10(DUCK_VOLUME) for at least DUCK_HOLD_MS - 2·DUCK_RAMP_MS (the hold less a ramp down and a ramp up), never below it. The speech run is never ducked: every window at full level.
+/// The ramps' timing is not judged here (fade timing has its own gate).
+fn duck_levels(
+    rec: &Recording,
+    music: Option<(usize, usize)>,
+    speech: Option<(usize, usize)>,
+) -> bool {
+    let duck_db = 20.0 * DUCK_VOLUME.log10();
+    let at = |level: f64, want: f64| (level - want).abs() <= LEVEL_TOLERANCE_DB;
+    let window_ms = QUANTUM_FRAMES as f64 * 1000.0 / f64::from(rec.rate);
+    let want_ms = DUCK_HOLD_MS - 2.0 * DUCK_RAMP_MS;
+    let levels = music.map(|r| window_levels(rec, r)).unwrap_or_default();
+    let (head, tail) = (levels.first().copied(), levels.last().copied());
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for &l in &levels {
+        current = if at(l, duck_db) { current + 1 } else { 0 };
+        longest = longest.max(current);
+    }
+    let lowest = levels.iter().copied().fold(f64::INFINITY, f64::min);
+    let held_ms = longest as f64 * window_ms;
+    let mut ok = verdict(
+        "pcm duck",
+        head.is_some_and(|h| at(h, 0.0))
+            && tail.is_some_and(|t| at(t, 0.0))
+            && held_ms >= want_ms
+            && lowest >= duck_db - LEVEL_TOLERANCE_DB,
+        &format!(
+            "music run: first {head:?} dB, last {tail:?} dB (want 0 ±{LEVEL_TOLERANCE_DB}), at {duck_db:.2} dB for {held_ms:.0} ms (want >= {want_ms:.0}), lowest {lowest:.2} dB (want >= {:.2})",
+            duck_db - LEVEL_TOLERANCE_DB
+        ),
+    );
+    if let Some((first, last)) = music {
+        let x = rec.channel(0);
+        let got = frequency_hz(&x[first..=last], f64::from(rec.rate));
+        ok &= verdict(
+            "pcm duck frequency",
+            got.is_some_and(|f| (f - DUCK_TONE_HZ).abs() <= FREQ_TOLERANCE_HZ),
+            &format!("{got:?} Hz, want {DUCK_TONE_HZ} ±{FREQ_TOLERANCE_HZ}"),
+        );
+    }
+    let speech_levels = speech.map(|r| window_levels(rec, r)).unwrap_or_default();
+    let off = speech_levels.iter().filter(|&&l| !at(l, 0.0)).count();
+    ok &= verdict(
+        "pcm speech undiminished",
+        !speech_levels.is_empty() && off == 0,
+        &format!(
+            "{off} of {} windows off 0 ±{LEVEL_TOLERANCE_DB} dB",
+            speech_levels.len()
+        ),
+    );
+    if let Some((first, last)) = speech {
+        let x = rec.channel(0);
+        let got = frequency_hz(&x[first..=last], f64::from(rec.rate));
+        ok &= verdict(
+            "pcm speech frequency",
+            got.is_some_and(|f| (f - SPEECH_TONE_HZ).abs() <= FREQ_TOLERANCE_HZ),
+            &format!("{got:?} Hz, want {SPEECH_TONE_HZ} ±{FREQ_TOLERANCE_HZ}"),
+        );
+    }
+    ok
+}
+
+/// The focus side of the duck phases (Main.java duckPhase): both phases granted and answered by the ducker (another uid, its own log).
+/// The music player is handled by the framework: no focus change reaches it (FocusRequester.handleFocusLoss:425-438, handleFocusGain:368). The speech player is not ducked (duckPlayers:836-843), so it gets CAN_DUCK then GAIN.
+fn duck_verdicts(app: &str, ducker: &str) -> bool {
+    let mut ok = true;
+    for (phase, want) in [
+        ("music", String::new()),
+        ("speech", format!("{FOCUS_LOSS_CAN_DUCK},{FOCUS_GAIN}")),
+    ] {
+        let line = line_value(app, &format!("duck: phase={phase} "));
+        let changes = line
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find_map(|f| f.strip_prefix("changes="))
+            })
+            .map(str::to_owned);
+        let theirs = line_value(ducker, &format!("ducker: phase={phase} "));
+        ok &= verdict(
+            &format!("duck {phase} focus"),
+            field(line, "granted") == Some(1)
+                && field(line, "back") == Some(1)
+                && changes.as_deref() == Some(want.as_str())
+                && field(theirs, "request") == Some(1)
+                && field(theirs, "abandon") == Some(1),
+            &format!(
+                "want granted=1 back=1 changes=[{want}] and the ducker's request=1 abandon=1; line: {}; ducker: {}",
+                line.unwrap_or("no line"),
+                theirs.unwrap_or("no line")
+            ),
+        );
     }
     ok
 }
@@ -595,11 +723,36 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let m = manifest::read(&rt.apk.aapt2, &apk)?;
     println!("audio-app: built {} ({})", apk.display(), m.name);
+    // the ducker: the same fixture under DUCKER, so a second uid holds the duck (Main.java duckPhase)
+    let ducker_src = work.join("ducker-src");
+    let _ = fs::remove_dir_all(&ducker_src);
+    crate::broadcast::copy_tree(&root.join(FIXTURE), &ducker_src)?;
+    let ducker_manifest = ducker_src.join("AndroidManifest.xml");
+    let text = fs::read_to_string(&ducker_manifest)?;
+    // and targeting DUCKER_TARGET_SDK: its focus request comes from a receiver, not the foreground, which AOSP's hardening blocks from target 35 on (AudioService.java:11324-11331, HardeningEnforcer.blockFocusMethod)
+    let renamed = text
+        .replace(
+            &format!("package=\"{}\"", m.name),
+            &format!("package=\"{DUCKER}\""),
+        )
+        .replace(
+            "android:targetSdkVersion=\"36\"",
+            &format!("android:targetSdkVersion=\"{DUCKER_TARGET_SDK}\""),
+        );
+    anyhow::ensure!(
+        renamed != text,
+        "{}: package not renamed",
+        ducker_manifest.display()
+    );
+    fs::write(&ducker_manifest, renamed)?;
+    let ducker = rt
+        .apk
+        .build(&ducker_src, &work.join("ducker-apk"), &[], None, None)?;
     let run = Run {
         root: work.join("root"),
         scratch: work.join("scratch"),
         launch: Some(m.name.clone()),
-        packages: vec![Package::base(apk)],
+        packages: vec![Package::base(apk), Package::base(ducker)],
         libraries: vec![],
         shell: None,
         log_tags: args.log_tags.clone(),
@@ -794,6 +947,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     ok &= native_verdicts(&app, &services);
     ok &= adaptive_verdicts(&app, &services);
     ok &= policy_verdicts(&app);
+    ok &= duck_verdicts(&app, &read(&run.log(DUCKER)));
     // the app's desktop identity: the desktop file ID rule `atl.<package>` (the window's app_id too), from the fixture's manifest
     let want_id = format!("atl.{}", m.name);
     let identity = streams.and_then(|s| identity_check(&s, &want_id, true));

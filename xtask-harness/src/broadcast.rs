@@ -122,8 +122,8 @@ const DOWNGRADE_USER_LINE: &str = "atld: install com.example.atlbcastrecv: refus
 /// The receiver's Show activity in the downgrade run: the installed version 2's code runs.
 const KEPT_V2_RUNS: &str = "AtlBcast: activity onCreate versionCode=2";
 
-/// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed).
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// Copies the fixture tree `from` to `to` (the reinstall row's version-2 receiver is the receiver fixture with its versionCode changed; audio_app.rs's ducker is its fixture under another package).
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
