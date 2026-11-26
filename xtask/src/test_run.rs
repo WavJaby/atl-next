@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -74,7 +75,11 @@ struct Binary {
     target: String,
     /// `<package> <kind> <target>`
     label: String,
+    /// cargo's target kind: `lib`, `bin`, `test`, ...
+    kind: String,
     run: Recorded,
+    /// Its test threads, and the slots it takes while it runs ([`weigh`]).
+    threads: usize,
 }
 
 /// Runs every test of the workspace; an error names each red binary.
@@ -95,8 +100,10 @@ fn run_in(root: &Path, scratch: &Path) -> Result<()> {
         |n| Ok(n as usize),
     )?;
     let started = Instant::now();
+    let binaries = weigh(binaries, slots)?;
     let (beside, alone) = split(&binaries)?;
-    let done = run_sets(&beside, &alone, slots, scratch, &show);
+    let stdout = Mutex::new(std::io::stdout());
+    let done = run_sets(&beside, &alone, slots, scratch, &|d| show_to(&stdout, d));
     let binaries_took = started.elapsed();
     let started = Instant::now();
     // `--doc` runs the doc tests of a lib that sets `doctest = false` too: excluded, as `cargo test` leaves them out
@@ -199,7 +206,9 @@ fn join(recorded: Vec<Recorded>, messages: &[Value]) -> Result<Vec<Binary>> {
             label: format!("{package} {kind} {target}"),
             package,
             target,
+            kind,
             run,
+            threads: 1,
         });
     }
     let missing: Vec<String> = named.keys().map(|p| p.display().to_string()).collect();
@@ -210,6 +219,66 @@ fn join(recorded: Vec<Recorded>, messages: &[Value]) -> Result<Vec<Binary>> {
     );
     ensure!(!binaries.is_empty(), "no test binaries");
     Ok(binaries)
+}
+
+/// Each binary's test threads = its test count, at most `slots`; a binary without libtest (`harness = false`) runs as one. Largest first, so the long ones start at once and the small ones fill the slots they leave.
+fn weigh(binaries: Vec<Binary>, slots: usize) -> Result<Vec<Binary>> {
+    let counts = par::map(&binaries, slots, |b| -> Result<usize> {
+        if !libtest(b)? {
+            return Ok(1);
+        }
+        let out = Command::new(&b.run.argv[0])
+            .args(&b.run.argv[1..])
+            .args(["--list", "--format", "terse"])
+            .current_dir(&b.run.cwd)
+            .env_clear()
+            .envs(&b.run.env)
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("listing {}", b.label))?;
+        ensure!(out.status.success(), "listing {}: {}", b.label, out.status);
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.ends_with(": test"))
+            .count())
+    });
+    let mut weighed = binaries
+        .into_iter()
+        .zip(counts)
+        .map(|(mut b, n)| {
+            b.threads = n?.clamp(1, slots);
+            Ok(b)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    weighed.sort_by_key(|b| std::cmp::Reverse(b.threads));
+    Ok(weighed)
+}
+
+/// Whether the binary runs libtest: its manifest sets no `harness = false` for the target (a `harness = false` binary would run its gate on `--list`).
+fn libtest(b: &Binary) -> Result<bool> {
+    let dir = b
+        .run
+        .env
+        .get("CARGO_MANIFEST_DIR")
+        .with_context(|| format!("{}: no CARGO_MANIFEST_DIR", b.label))?;
+    let path = Path::new(dir).join("Cargo.toml");
+    let manifest: toml::Table =
+        toml::from_str(&fs::read_to_string(&path)?).with_context(|| path.display().to_string())?;
+    Ok(!manifest_says_no_harness(&manifest, &b.kind, &b.target))
+}
+
+/// `harness = false` on target `name` of `kind`: `[lib]`, or the `[[bin]]` / `[[test]]` / `[[bench]]` / `[[example]]` entry of that name.
+fn manifest_says_no_harness(manifest: &toml::Table, kind: &str, name: &str) -> bool {
+    let off = |t: &toml::Value| t.get("harness").and_then(toml::Value::as_bool) == Some(false);
+    if kind == "lib" {
+        return manifest.get("lib").is_some_and(off);
+    }
+    manifest
+        .get(kind)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|t| t.get("name").and_then(toml::Value::as_str) == Some(name) && off(t))
 }
 
 /// (run at once, run alone), by [`SERIAL`].
@@ -292,12 +361,13 @@ impl Done {
     }
 }
 
-/// One binary's block as one write under the stdout lock, so blocks of binaries at once never mix; a closed stdout loses the echo, not the verdict.
-fn show(done: &Done) {
-    let _ = std::io::stdout().lock().write_all(&done.block());
+/// One binary's block as one write under `out`'s lock, so blocks of binaries at once never mix; a closed stdout loses the echo, not the verdict.
+fn show_to<W: Write>(out: &Mutex<W>, done: &Done) {
+    let mut out = out.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = out.write_all(&done.block()).and_then(|()| out.flush());
 }
 
-/// `beside` at most `slots` at a time, then `alone` one by one.
+/// `beside` within `slots` test threads at a time, then `alone` one by one.
 fn run_sets(
     beside: &[&Binary],
     alone: &[&Binary],
@@ -310,21 +380,35 @@ fn run_sets(
     done
 }
 
-/// Runs `binaries`, `at_once` at a time, each shown whole as it ends; `first` numbers their output files.
+/// Runs `binaries` in order, each started once its threads (at most `slots`) fit in the `slots` free: test threads at once never exceed `slots`. Each is shown whole as it ends; `first` numbers their output files.
 fn run_all(
     binaries: &[&Binary],
     first: usize,
-    at_once: usize,
+    slots: usize,
     scratch: &Path,
     show: &(dyn Fn(&Done) + Sync),
 ) -> Vec<Done> {
     let numbered: Vec<(usize, &&Binary)> =
         binaries.iter().zip(first..).map(|(b, i)| (i, b)).collect();
-    par::map(&numbered, at_once, |(i, binary)| {
+    let free = (Mutex::new(slots), Condvar::new());
+    // a worker per slot: every binary takes one at least, so no more can run at once
+    par::map(&numbered, slots, |(i, binary)| {
+        let threads = binary.threads.clamp(1, slots);
+        let (left, freed) = &free;
+        {
+            let mut left = left.lock().unwrap_or_else(PoisonError::into_inner);
+            while *left < threads {
+                left = freed.wait(left).unwrap_or_else(PoisonError::into_inner);
+            }
+            *left -= threads;
+        }
         let started = Instant::now();
         // one file per binary: outputs of binaries at once never share one
         let log = scratch.join(format!("{i}.log"));
-        let (status, output) = match execute(&binary.run, &log) {
+        let ran = execute(&binary.run, threads, &log);
+        *left.lock().unwrap_or_else(PoisonError::into_inner) += threads;
+        freed.notify_all();
+        let (status, output) = match ran {
             Ok((status, output)) => (Ok(status), output),
             Err(e) => (Err(format!("{e:#}")), Vec::new()),
         };
@@ -343,13 +427,16 @@ fn run_all(
 }
 
 /// Output to a file, not a pipe: one open file keeps the order of both streams, and a process the test leaves behind cannot hold us.
-fn execute(run: &Recorded, log: &Path) -> Result<(ExitStatus, Vec<u8>)> {
+fn execute(run: &Recorded, threads: usize, log: &Path) -> Result<(ExitStatus, Vec<u8>)> {
     let file = fs::File::create(log).with_context(|| log.display().to_string())?;
     let status = Command::new(&run.argv[0])
         .args(&run.argv[1..])
         .current_dir(&run.cwd)
         .env_clear()
         .envs(&run.env)
+        // the slots it holds (run_all), not the grant's count cargo's env carries: binaries at once would run slots^2 test threads
+        .env("RUST_TEST_THREADS", threads.to_string())
+        // no input: check runs unattended, and a test reading stdin must see EOF, not the terminal
         .stdin(Stdio::null())
         .stdout(Stdio::from(file.try_clone()?))
         .stderr(Stdio::from(file))
@@ -407,15 +494,32 @@ fn slowest(done: &[Done]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
+
+    /// A sink that counts its write calls: [`show_to`] gives each block one call under the lock, so blocks never mix (std's Mutex is not fair, so a mixed write shows only by chance; the count shows it always).
+    #[derive(Default)]
+    struct Slow(Vec<u8>, usize);
+
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            self.0.extend_from_slice(buf);
+            self.1 += 1;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn shell(label: &str, script: &str) -> Binary {
         Binary {
             package: "p".to_owned(),
             target: label.to_owned(),
             label: label.to_owned(),
+            kind: "test".to_owned(),
+            threads: 1,
             run: Recorded {
                 argv: ["sh", "-c", script].map(str::to_owned).to_vec(),
                 cwd: std::env::temp_dir(),
@@ -428,14 +532,14 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("xtask-test-run-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("test dir");
-        let log = Mutex::new(Vec::new());
+        let log = Mutex::new(Slow::default());
         let refs: Vec<&Binary> = binaries.iter().collect();
-        let done = run_all(&refs, 0, at_once, &dir, &|d| {
-            log.lock().expect("log").extend(d.block());
-        });
+        let done = run_all(&refs, 0, at_once, &dir, &|d| show_to(&log, d));
         fs::remove_dir_all(&dir).expect("test dir cleanup");
-        let log = log.into_inner().expect("log");
-        (done, String::from_utf8(log).expect("utf-8"))
+        let Slow(log, writes) = log.into_inner().expect("log");
+        let log = String::from_utf8(log).expect("utf-8");
+        assert_eq!(writes, done.len(), "one write per block:\n{log}");
+        (done, log)
     }
 
     #[test]
@@ -499,6 +603,74 @@ mod tests {
         fs::remove_dir_all(&dir).expect("test dir cleanup");
     }
 
+    /// Binaries that end together: each block comes out whole through the writer, though the sink takes one slow write at a time.
+    #[test]
+    fn blocks_that_end_together_stay_whole() {
+        let dir = std::env::temp_dir().join(format!("xtask-test-run-ends-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("test dir");
+        let at = dir.display();
+        let binaries: Vec<Binary> = (0..6)
+            .map(|n| {
+                shell(
+                    &format!("b{n}"),
+                    &format!(
+                        "for i in 1 2 3 4 5 6 7 8; do echo b{n} line $i; done; cd {at}; touch {n}; i=0; while [ $(ls | wc -l) -lt 6 ]; do i=$((i+1)); [ $i -gt 500 ] && exit 3; sleep 0.01; done"
+                    ),
+                )
+            })
+            .collect();
+        let (done, log) = run_shells("together", &binaries, 6);
+        fs::remove_dir_all(&dir).expect("test dir cleanup");
+        assert!(done.iter().all(|d| d.problem().is_none()), "{log}");
+        for n in 0..6 {
+            let want: String = (1..=8).map(|i| format!("b{n} line {i}\n")).collect();
+            assert!(log.contains(&want), "{log}");
+        }
+    }
+
+    /// Test threads at once stay within the slots: `slots` binaries in flight (each takes one of `slots` directories), each with one test thread.
+    #[test]
+    fn test_threads_stay_within_the_slots() {
+        let dir =
+            std::env::temp_dir().join(format!("xtask-test-run-budget-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("test dir");
+        let at = dir.display();
+        // a binary claims one of four token directories per test thread it was given; fewer free than it needs = the budget was overrun
+        let take = format!(
+            "[ \"$RUST_TEST_THREADS\" = \"$WANT\" ] || exit 8; cd {at}; got=; for n in 1 2 3 4; do [ $(echo $got | wc -w) -ge $WANT ] && break; mkdir t$n 2>/dev/null && got=\"$got t$n\"; done; [ $(echo $got | wc -w) -ge $WANT ] || exit 7; sleep 0.05; rmdir $got"
+        );
+        let binaries: Vec<Binary> = [3, 2, 1, 4, 1, 2, 3, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(i, threads)| {
+                let mut b = shell(&format!("t{i}"), &take);
+                b.threads = threads;
+                b.run.env.insert("WANT".to_owned(), threads.to_string());
+                // the grant's count as cargo's env gives it: the runner must replace it
+                b.run
+                    .env
+                    .insert("RUST_TEST_THREADS".to_owned(), "16".to_owned());
+                b
+            })
+            .collect();
+        let (done, log) = run_shells("slots", &binaries, 4);
+        fs::remove_dir_all(&dir).expect("test dir cleanup");
+        assert!(done.iter().all(|d| d.problem().is_none()), "{log}");
+    }
+
+    #[test]
+    fn harness_false_is_read_from_the_manifest() {
+        let manifest: toml::Table = toml::from_str(
+            "[lib]\nharness = false\n[[test]]\nname = \"g1\"\nharness = false\n[[test]]\nname = \"plain\"\n[[bin]]\nname = \"g1\"\n",
+        )
+        .expect("manifest");
+        assert!(manifest_says_no_harness(&manifest, "lib", "x"));
+        assert!(manifest_says_no_harness(&manifest, "test", "g1"));
+        assert!(!manifest_says_no_harness(&manifest, "test", "plain"));
+        assert!(!manifest_says_no_harness(&manifest, "test", "unlisted"));
+        assert!(!manifest_says_no_harness(&manifest, "bin", "g1"));
+    }
+
     /// The serial set runs after the rest and one at a time, though slots are free.
     #[test]
     fn the_serial_set_runs_alone() {
@@ -516,11 +688,9 @@ mod tests {
             ),
         );
         let (beside, serial) = (vec![&rest; 3], vec![&alone; 3]);
-        let log = Mutex::new(Vec::new());
-        let done = run_sets(&beside, &serial, 8, &dir, &|d| {
-            log.lock().expect("log").extend(d.block());
-        });
-        let log = String::from_utf8(log.into_inner().expect("log")).expect("utf-8");
+        let log = Mutex::new(Slow::default());
+        let done = run_sets(&beside, &serial, 8, &dir, &|d| show_to(&log, d));
+        let log = String::from_utf8(log.into_inner().expect("log").0).expect("utf-8");
         fs::remove_dir_all(&dir).expect("test dir cleanup");
         assert_eq!(done.len(), 6);
         assert!(done.iter().all(|d| d.problem().is_none()), "{log}");
