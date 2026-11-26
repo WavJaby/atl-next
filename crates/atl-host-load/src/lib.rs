@@ -35,6 +35,8 @@ enum Tier {
     Scoped {
         scope: scope::Scope,
         sampler: Sampler,
+        /// the scope is a managed row's leaf: its other workloads share it
+        shared: bool,
     },
     Unscoped {
         why: String,
@@ -51,7 +53,11 @@ impl Gate {
                     let sampler =
                         Sampler::start_for(Some(scope.dir.as_path()), allowed_cpus().as_deref());
                     sampler.publish();
-                    Tier::Scoped { sampler, scope }
+                    Tier::Scoped {
+                        sampler,
+                        scope,
+                        shared: scope::in_managed_leaf(),
+                    }
                 }
                 Err(why) => Tier::Unscoped { why },
             }
@@ -64,10 +70,12 @@ impl Gate {
         Self { tier }
     }
 
-    /// The processes the gate leaves running: everything in its scope but this process, whoever its parent is now. Called once the gate's work is over. Empty without a scope: not measured there.
+    /// The processes the gate leaves running: everything in its scope but this process, whoever its parent is now. In a managed row's leaf (shared): only its own descendants, the leaf's other workloads are not its. Called once the gate's work is over. Empty without a scope: not measured there.
     pub fn leftovers(&self) -> Result<Vec<String>, String> {
         match &self.tier {
-            Tier::Scoped { scope, .. } => scope::leftovers(&scope.dir, LEFTOVER_SETTLE),
+            Tier::Scoped { scope, shared, .. } => {
+                scope::leftovers(&scope.dir, LEFTOVER_SETTLE, *shared)
+            }
             Tier::Unscoped { .. } => Ok(Vec::new()),
         }
     }
@@ -75,7 +83,7 @@ impl Gate {
     /// Ends the gate and returns its record.
     pub fn finish(self) -> Report {
         match self.tier {
-            Tier::Scoped { scope, sampler } => {
+            Tier::Scoped { scope, sampler, .. } => {
                 let samples = sampler.stop();
                 Report::Scoped {
                     unit: scope.unit().to_owned(),

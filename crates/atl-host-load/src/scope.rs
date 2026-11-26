@@ -101,17 +101,24 @@ pub fn peak_bytes(dir: &Path) -> Option<u64> {
 
 /// The other processes in the scope at `dir`, as `<pid> <command line>`, once none is left or `settle` has passed. Zombies are not listed (cgroup v2 `cgroup.procs`).
 /// This process's ancestors in the scope are not listed: a gate nested in a managed row shares the row's leaf, and the row waits on it, alive.
-pub fn leftovers(dir: &Path, settle: Duration) -> Result<Vec<String>, String> {
+/// `shared` (the leaf is a managed row's, with its other workloads in it): only this process's descendants count; a sibling's process is not one this gate left.
+pub fn leftovers(dir: &Path, settle: Duration, shared: bool) -> Result<Vec<String>, String> {
     let path = dir.join("cgroup.procs");
-    let own = std::process::id().to_string();
-    let ancestors = ancestors(std::process::id());
+    let own_pid = std::process::id();
+    let own = own_pid.to_string();
+    let above = ancestors(own_pid);
     let until = Instant::now() + settle;
     loop {
         let text =
             fs::read_to_string(&path).map_err(|e| format!("{} unreadable: {e}", path.display()))?;
         let pids: Vec<&str> = text
             .lines()
-            .filter(|p| *p != own && !ancestors.iter().any(|a| a == p))
+            .filter(|p| *p != own && !above.iter().any(|a| a == p))
+            .filter(|p| {
+                !shared
+                    || p.parse::<u32>()
+                        .is_ok_and(|pid| ancestors(pid).contains(&own))
+            })
             .collect();
         if pids.is_empty() {
             return Ok(Vec::new());
@@ -553,8 +560,11 @@ fn measure(
         ));
     }
     if leftover > 0 {
+        // the names are read now: a process may have gone since the count
+        let names = leftovers(&tree.workload, Duration::ZERO, false).unwrap_or_default();
         return Err(format!(
-            "leftover: {leftover} process(es) still in the workload's leaf {SETTLE:?} after it exited"
+            "leftover: {leftover} process(es) still in the workload's leaf {SETTLE:?} after it exited: {}",
+            names.join("; ")
         ));
     }
     Ok(Record {
