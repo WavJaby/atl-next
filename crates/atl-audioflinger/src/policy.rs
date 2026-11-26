@@ -3,7 +3,7 @@
 //! model: one output device, the built-in speaker (the host's default sink stands behind it; the same device dispatcher.rs registers with AudioService and createTrack reports as the routed device).
 //! No input device is modelled. Other methods keep the stub's default (UNKNOWN_TRANSACTION, counted). getOutputForAttr is not served: its only server-side caller is AudioFlinger::createTrack
 //! (AudioFlinger.cpp:1120), which this server replaces, and no client path calls it (AudioTrack gets its output from createTrack's response). Routing is one output for every stream.
-//! The primary output mix (a SOURCE MIX port whose I/O handle is getOutput's) and its patch to the speaker are listed from startup, as the route is fixed (no hotplug, no reroute). AOSP lists a mix only while its output is open.
+//! The primary output mix (a SOURCE MIX port; its active config carries getOutput's I/O handle) and its patch to the speaker are listed from startup, as the route is fixed (no hotplug, no reroute). AOSP lists a mix only while its output is open.
 
 use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_3_Int as Int,
@@ -141,10 +141,9 @@ fn speaker_port() -> AudioPortFw {
     }
 }
 
-/// The mix ext, hal side: the I/O handle (AudioOutputDescriptor::toAudioPort sets ext.mix.handle) and the open and active counts, which AudioPort.h:133,139 default to 1 (the primary configuration sets neither). The module is on the sys side (AudioPortMixExtSys).
+/// The mix ext, hal side: the open and active counts, which AudioPort.h:133,139 default to 1 (the primary configuration sets neither). No I/O handle: AOSP's port-level AudioPortMixExt carries none (AudioPort.cpp:249-256); the handle is on the active config (mix_config). The module is on the sys side (AudioPortMixExtSys).
 fn mix_ext() -> AudioPortMixExt {
     AudioPortMixExt {
-        r#handle: output_handle(),
         r#maxOpenStreamCount: 1,
         r#maxActiveStreamCount: 1,
         ..Default::default()
@@ -455,7 +454,7 @@ mod tests {
         assert_eq!(err.transaction_error(), StatusCode::BAD_VALUE);
     }
 
-    /// The primary output: a SOURCE MIX port on the speaker's module whose I/O handle is the one getOutput answers (AudioOutputDescriptor.cpp:226-229, SwAudioOutputDescriptor.cpp:491-498).
+    /// The primary output: a SOURCE MIX port on the speaker's module. Its mix ext has no I/O handle: AOSP's port-level AudioPortMixExt carries the counts only (AudioPort.cpp:249-256); the handle is on the active config (topology test).
     #[test]
     fn mix_port_is_the_primary_output() {
         let mix = port(MIX_ID);
@@ -466,10 +465,8 @@ mod tests {
         let AudioPortExt::Mix(ext) = &mix.hal.ext else {
             panic!("the mix port carries a mix ext");
         };
-        let output = AudioPolicy
-            .r#getOutput(AudioStreamType::MUSIC)
-            .expect("getOutput");
-        assert_eq!(ext.r#handle, output);
+        // AUDIO_IO_HANDLE_NONE (audio.h:71) is 0: the port-level ext names no handle
+        assert_eq!(ext.r#handle, 0);
         let AudioPortExtSys::Mix(sys) = &mix.sys.r#ext else {
             panic!("the mix port's sys ext is Mix");
         };
@@ -517,6 +514,14 @@ mod tests {
         assert_eq!(patch.sources.len(), 1);
         let source = &patch.sources[0];
         assert_eq!(source.hal.portId, MIX_ID);
+        // the I/O handle rides on the active config (AidlConversion.cpp:233-243) and is the one getOutput answers
+        let AudioPortExt::Mix(config_ext) = &source.hal.ext else {
+            panic!("the source config carries a mix ext");
+        };
+        let output = AudioPolicy
+            .r#getOutput(AudioStreamType::MUSIC)
+            .expect("getOutput");
+        assert_eq!(config_ext.r#handle, output);
         assert_eq!(source.sys.role, AudioPortRole::SOURCE);
         assert_eq!(source.sys.r#type, AudioPortType::MIX);
         assert_eq!(patch.sinks.len(), 1);
