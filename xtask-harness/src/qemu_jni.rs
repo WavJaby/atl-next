@@ -3,7 +3,7 @@
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`), as `qemu-thread` uses it. Fixture: `xtask-harness/testdata/qemu-jni/fixture.c` (PIE, NDK clang, DT_NEEDED libc.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`), built as for `test qemu-linker`.
-//! Harness: `tests/qemu_jni.rs` (harness-less; checks s, v, e, c, j, t, d, f, a, p, the `...V` calls V (Q6-7), the down calls o, m, x (Q6-4), 3,000 growable down shells n, and the refusals r, l, g and the down-call refusal R, each refusal run in a child process) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `va_fp_gp` (a va_list's fp arguments read from its integer save area, check V),`jni_guest_env` (the host function gets the guest env, check e), `jni_swap` (x3 and x4 exchanged, check c), `v_drop` (fp lanes zeroed, check p: the snprintf binding's double), `ret_int` (fp results read from x0, checks d and f), `al_zero` (host calls with %al = 0, check p), `down_drop_stack` (a down call's stack words start one word late, check m), `down_swap_v` (a down call's %xmm0 and %xmm1 exchanged, checks m and x), `shorty_swap` (the first shorty parameter's class flipped, checks m, x and R), `down_noenv` (a down call's first argument is the host's env or vm, checks o, m and x), `down_cap` (the QEMU engine refuses shells past the retired 1,024-slot pool, check n).
+//! Harness: `tests/qemu_jni.rs` (harness-less; checks s, v, e, c, j, t, d, f, a, p, q (x86_64 only), the `...V` calls V (Q6-7), the down calls o, m, x (Q6-4), 3,000 growable down shells n, and the refusals r, l, g and the down-call refusal R, each refusal run in a child process) run through `qemu_linker::harness`. Breaks (`ATL_NB_BREAK`): `va_fp_gp` (a va_list's fp arguments read from its integer save area, check V),`jni_guest_env` (the host function gets the guest env, check e), `jni_swap` (x3 and x4 exchanged, check c), `v_drop` (fp lanes zeroed, check q: the snprintf binding's double), `ret_int` (fp results read from x0, checks d and f), `al_zero` (host calls with %al = 0, check q), `down_drop_stack` (a down call's stack words start one word late, check m), `down_swap_v` (a down call's %xmm0 and %xmm1 exchanged, checks m and x), `shorty_swap` (the first shorty parameter's class flipped, checks m, x and R), `down_noenv` (a down call's first argument is the host's env or vm, checks o, m and x), `down_cap` (the QEMU engine refuses shells past the retired 1,024-slot pool, check n).
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-jni/`, one log per run.
 
 use std::path::{Path, PathBuf};
@@ -17,14 +17,21 @@ use crate::qemu_linker::{self, Harness};
 use crate::qemu_spike;
 use crate::verdict::{Failure, Verdict};
 
+/// The check letters a run must print ok. `q` (the fp-tail row, tests/qemu_jni.rs) is checked only where the host has the SysV `%al` convention, so riscv64 runs do not expect it.
+#[cfg(target_arch = "x86_64")]
+const CHECKS: &[char] = &[
+    's', 'v', 'e', 'c', 'j', 't', 'd', 'f', 'a', 'p', 'q', 'V', 'o', 'm', 'x', 'n', 'r', 'l', 'g',
+    'R',
+];
+#[cfg(not(target_arch = "x86_64"))]
+const CHECKS: &[char] = &[
+    's', 'v', 'e', 'c', 'j', 't', 'd', 'f', 'a', 'p', 'V', 'o', 'm', 'x', 'n', 'r', 'l', 'g', 'R',
+];
 const TESTDATA: &str = "xtask-harness/testdata/qemu-jni";
 const HARNESS: Harness = Harness {
     test: "qemu_jni",
     prefix: "qemu-jni",
-    checks: &[
-        's', 'v', 'e', 'c', 'j', 't', 'd', 'f', 'a', 'p', 'V', 'o', 'm', 'x', 'n', 'r', 'l', 'g',
-        'R',
-    ],
+    checks: CHECKS,
     breaks: &[
         "va_fp_gp",
         "jni_guest_env",

@@ -262,17 +262,30 @@ pub enum Route {
     Mapped(Vec<(usize, LaneMap)>),
     /// a callback parameter whose typedef is not reviewed: trapped by this reason
     Pending(&'static str),
+    /// refused by this reason before any lane analysis ([`variadic_refusal`])
+    Refused(&'static str),
 }
 
 /// Trap reason of a callback parameter whose type `route`'s caller has not reviewed.
 pub const UNREVIEWED_CALLBACK: &str =
     "pending: callback-param, callback type not reviewed (build.rs CALLBACKS)";
 
+/// Trap reason of a prototype with a `...` tail. The tail has no lane shape: a fixed-only binding would drop it silently. JNI `...` slots are not prototypes routed here (they cross by their shorty, dispatch.rs `call_object`).
+pub const VARIADIC_TAIL: &str = "refused: variadic tail has no shape";
+
+/// The one rule for a `...` prototype, shared by every generated row that carries its lanes (proxy routes, PROTOTYPES descriptors, LP64 and ILP32 libc rows): Some(reason) = trap by it, None = no tail to refuse.
+pub fn variadic_refusal(sig: &Signature) -> Option<&'static str> {
+    sig.variadic.then_some(VARIADIC_TAIL)
+}
+
 /// How proxy function `name` with prototype `sig` binds.
 /// JNI types (`JNIEnv*`, `JavaVM*`, a jni.h reference typedef): a generic row would hand the host library the guest's env, which the host cannot use (tr-first blocker 3: `ANativeWindow_fromSurface` -> SEGV in `android_view_Surface_getSurface`), so such a prototype binds only with its `JNIEnv*` mapped, and only when `env_listed` (the caller's reviewed list) names it.
 /// A function-pointer parameter (GS2.2 callback-param): the host would call a guest address. Mapped to a down shell when its typedef is in `callbacks` (the caller's reviewed list: every argument the host passes the callback is a value or guest data, nothing the guest would dereference in host-only memory), else [`Route::Pending`].
 /// Mapped rows forward every parameter as an int lane, at most [`MAPPED_LANES`], the result an int lane or void. Err: why not, naming `name`.
 pub fn route(name: &str, sig: &Signature, env_listed: bool, callbacks: &[&str]) -> Result<Route> {
+    if let Some(why) = variadic_refusal(sig) {
+        return Ok(Route::Refused(why));
+    }
     let mut maps = Vec::new();
     if let Some(i) = env_param(name, sig, env_listed)? {
         maps.push((i, LaneMap::Env));
@@ -576,6 +589,21 @@ mod tests {
                 "{name}: {r:?}"
             );
         }
+    }
+
+    /// A `...` prototype refuses by name before lane analysis; a fixed one routes as before. Expected from the rule (the reason text is the contract), not from `route`'s output.
+    #[test]
+    fn route_refuses_a_variadic_tail() {
+        let iface = parse("variadic", "int f(int, ...);\nint g(int);\n");
+        let view = &iface.arches["x86_64"];
+        assert_eq!(
+            route("f", &view.functions["f"], false, &[]).unwrap(),
+            Route::Refused("refused: variadic tail has no shape")
+        );
+        assert_eq!(
+            route("g", &view.functions["g"], false, &[]).unwrap(),
+            Route::Plain
+        );
     }
 
     /// tr-first blocker 3, the build-time refusal: NDK-shaped prototypes in a fixture header. Expected outcomes are written from the C shapes and `route`'s rule, not from running it: a JNI-typed prototype not listed fails naming itself; listed, its `JNIEnv*` is mapped at its position; JavaVM*, two envs, an fp lane, seven lanes and a reference without an env each fail by their own reason; a plain prototype stays generic, and listing it is stale.

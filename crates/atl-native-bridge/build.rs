@@ -934,6 +934,20 @@ const LIBC_HEADERS: &[&str] = &[
     "stdlib.h",
     "signal.h",
 ];
+/// [`LIBC_HEADERS`] plus the headers declaring the rest of the LP64 libc rows: `malloc.h` (`malloc_usable_size`, `memalign`), `time.h` (`time`, `clock_gettime`, `clock_getres`), `sys/time.h` (`gettimeofday`). Read only for the LP64 `...` check ([`lp64_libc_protos`]).
+const LP64_LIBC_HEADERS: &[&str] = &[
+    "string.h",
+    "pthread.h",
+    "netdb.h",
+    "sys/system_properties.h",
+    "android/set_abort_message.h",
+    "bionic/malloc.h",
+    "malloc.h",
+    "stdlib.h",
+    "signal.h",
+    "time.h",
+    "sys/time.h",
+];
 /// The prototype name of libc stub `name`: NBS names a stub whose guest-libc wrapper keeps the public name `native_bridge_<public>` (exit.c `exit` -> `native_bridge_exit`; the trampoline json's `custom_thunk` for the malloc family), so its prototype is the public function's.
 fn libc_prototype_name(name: &str) -> &str {
     name.strip_prefix("native_bridge_").unwrap_or(name)
@@ -962,28 +976,47 @@ fn libc_prototypes(
     host: &buildscript::ArchRow,
     out: &std::path::Path,
 ) -> Result<atl_bridgegen::ir::Interface> {
-    let view = |row: &buildscript::ArchRow, name: &str| -> Result<Target> {
-        let mut t = buildscript::bionic_platform_target(
-            up,
-            row,
-            buildscript::future_level(up, row)?,
-            Some(&buildscript::libcxx_include_dir()?),
-        );
-        t.args
-            .push(format!("-I{}", up.aosp("bionic/libc/platform").display()));
-        t.arch = name.to_owned();
-        Ok(t)
-    };
-    let unit = out.join(format!("libc_prototypes_{}.cc", guest.arch));
-    let mut text: String = LIBC_HEADERS
+    libc_interface(
+        up,
+        &out.join(format!("libc_prototypes_{}.cc", guest.arch)),
+        LIBC_HEADERS,
+        &[libc_view(up, guest, "guest")?, libc_view(up, host, "host")?],
+        "libc_prototypes",
+        "bionic libc headers, guest and host views",
+    )
+}
+
+/// Bionic's view `name` of `row` for the libc headers: the platform level, `bionic/libc/platform` on the include path.
+fn libc_view(up: &Upstreams, row: &buildscript::ArchRow, name: &str) -> Result<Target> {
+    let mut t = buildscript::bionic_platform_target(
+        up,
+        row,
+        buildscript::future_level(up, row)?,
+        Some(&buildscript::libcxx_include_dir()?),
+    );
+    t.args
+        .push(format!("-I{}", up.aosp("bionic/libc/platform").display()));
+    t.arch = name.to_owned();
+    Ok(t)
+}
+
+/// One libc unit: `headers` and the NBS `__cxa_thread_atexit_impl` declaration in `unit`, parsed in `views`. Declarations count only from the headers themselves (`Source::also`), each in bionic's public or platform include dir.
+fn libc_interface(
+    up: &Upstreams,
+    unit: &std::path::Path,
+    headers: &[&str],
+    views: &[Target],
+    name: &str,
+    label: &str,
+) -> Result<atl_bridgegen::ir::Interface> {
+    let mut text: String = headers
         .iter()
         .map(|h| format!("#include <{h}>\n"))
         .collect();
     text.push_str(&cxa_thread_atexit_decl(up)?);
-    std::fs::write(&unit, text)?;
-    // declarations count only from the headers themselves (`Source::also`), each in bionic's public or platform include dir
+    std::fs::write(unit, text)?;
     let mut also = Vec::new();
-    for h in LIBC_HEADERS {
+    for h in headers {
         let path = ["bionic/libc/include", "bionic/libc/platform"]
             .iter()
             .map(|d| up.aosp(&format!("{d}/{h}")))
@@ -993,18 +1026,28 @@ fn libc_prototypes(
         also.push(path);
     }
     let src = Source {
-        path: &unit,
+        path: unit,
         lang: Lang::Cxx,
         also: &also,
         macros: DATA_MODEL,
     };
-    atl_bridgegen::interface(
-        "libc_prototypes",
-        "bionic libc headers, guest and host views",
-        &src,
-        &[view(guest, "guest")?, view(host, "host")?],
+    atl_bridgegen::interface(name, label, &src, views).context("libc prototypes")
+}
+
+/// The LP64 libc rows' prototypes in the host view over [`LP64_LIBC_HEADERS`], read for their `...` check only ([`lp64_tail`]). Own unit and header set: [`libc_prototypes`] is the ILP32 classifier's, and growing it would bind rows the ILP32 tables trap today.
+fn lp64_libc_protos(
+    up: &Upstreams,
+    host: &buildscript::ArchRow,
+    out: &std::path::Path,
+) -> Result<atl_bridgegen::ir::Interface> {
+    libc_interface(
+        up,
+        &out.join(format!("libc_lp64_{}.cc", host.arch)),
+        LP64_LIBC_HEADERS,
+        &[libc_view(up, host, "host")?],
+        "libc_lp64",
+        "bionic libc headers, LP64 host view",
     )
-    .context("libc prototypes")
 }
 
 /// An ILP32 libc row's entry for a stub `name` whose LP64 entry is `lp64` (a `Generic` or `Shim` literal without lanes, `{sig}` where they go): bound with the guest view's lanes when every position is carried by its lane class (a pointer result included: dispatch.rs refuses one at or above 4 GiB, counted) or the shim converts itself ([`ILP32_SHIMS`]); else trapped with its heaviest kind's reason, or [`ILP32_LIBC`] without a prototype. Also its `ilp32_rows.txt` row.
@@ -1037,6 +1080,10 @@ fn ilp32_libc_entry(
             Err(why) => trap(name, why),
         });
     };
+    // a `...` prototype has no lane shape: refused by name on the guest view the row binds by (`atl_bridgegen::jni::variadic_refusal`)
+    if let Some(why) = atl_bridgegen::jni::variadic_refusal(g) {
+        return Ok(trap(name, why));
+    }
     let views = atl_bridgegen::ilp32::Views {
         guest,
         host,
@@ -1157,9 +1204,10 @@ fn libc_entries(
     names: &[String],
     qemu: bool,
     ilp32: Option<(&atl_bridgegen::ir::Interface, &mut Ilp32Rows)>,
+    lp64_protos: Option<&atl_bridgegen::ir::Interface>,
     trap: &mut dyn FnMut(&str, &'static str) -> String,
 ) -> Result<Vec<String>> {
-    let lp64 = libc_lp64_entries(names, qemu, ilp32.is_none())?;
+    let lp64 = libc_lp64_entries(names, qemu, ilp32.is_none(), lp64_protos)?;
     match ilp32 {
         None => Ok(names
             .iter()
@@ -1202,6 +1250,7 @@ fn libc_lp64_entries(
     names: &[String],
     qemu: bool,
     stale: bool,
+    protos: Option<&atl_bridgegen::ir::Interface>,
 ) -> Result<Vec<std::result::Result<String, &'static str>>> {
     let provider: Vec<&str> = PROVIDER_APIS
         .iter()
@@ -1235,7 +1284,7 @@ fn libc_lp64_entries(
     let herr_trap = selected_breaks()?.contains(&"atl_nb_dns_herr_trap");
     let exit_unbound = selected_breaks()?.contains(&"atl_nb_main_exit_unbound");
     let tls_dtor_unbound = selected_breaks()?.contains(&"atl_nb_main_tls_dtor_unbound");
-    Ok(names
+    let entries: Vec<std::result::Result<String, &'static str>> = names
         .iter()
         .map(|name| {
             if tls_dtor_unbound && name == "native_bridge___cxa_thread_atexit_impl" {
@@ -1258,7 +1307,29 @@ fn libc_lp64_entries(
                 Err("unbound: no host side")
             }
         })
-        .collect())
+        .collect();
+    // a bound row whose prototype is variadic traps by name (LP64 tables; ILP32 rows check theirs in ilp32_libc_entry)
+    let mut out = Vec::with_capacity(entries.len());
+    for (name, e) in names.iter().zip(entries) {
+        let e = match protos {
+            Some(p) if e.is_ok() => lp64_tail(name, p)?.map_or(e, Err),
+            _ => e,
+        };
+        out.push(e);
+    }
+    Ok(out)
+}
+
+/// A bound LP64 libc row's `...` check: `Some(reason)` when its prototype in `protos` is variadic. A bound row that no LP64 header declares is a build error: its tail would be unknown.
+fn lp64_tail(name: &str, protos: &atl_bridgegen::ir::Interface) -> Result<Option<&'static str>> {
+    let host = protos.arches.get("host").context("no host view")?;
+    let sig = host
+        .functions
+        .get(libc_prototype_name(name))
+        .with_context(|| {
+            format!("libc.so: {name} is bound but declared in no LP64_LIBC_HEADERS header (its variadic tail is unknown)")
+        })?;
+    Ok(atl_bridgegen::jni::variadic_refusal(sig))
 }
 
 /// Why a stub with no prototype in the set traps. The NDK proxies: every public NDK header of theirs is in [`NDK_HEADERS`], so a stub without a prototype is platform API no NDK header declares (measured 2026-11-13: `*ForTesting`, `*ForClient`, the LL-NDK `ANativeWindow_dequeueBuffer` family, `AActivityManager_*`); libandroid_runtime is C++ internals no app calls.
@@ -1905,7 +1976,7 @@ fn ilp32_maps(
         Route::Mapped(m) => m
             .iter()
             .all(|(at, x)| matches!(x, LaneMap::Down { .. }) && maps.iter().any(|(p, _)| p == at)),
-        Route::Pending(_) => false,
+        Route::Pending(_) | Route::Refused(_) => false,
     };
     if !routed {
         return Err("pending: ilp32 converted row with a JNI or callback lane");
@@ -2355,6 +2426,11 @@ fn bindings_table(
                 ilp32_rows.push(((*soname).to_owned(), name.clone(), row.describe(), waits));
             }
             // ILP32: a row with a position its lane class cannot convert binds lane-mapped when every such position has a generated converter ([`ilp32_maps`]), else traps naming the conversion it waits for (p4b s3-s4), before any route: no truncated value passes
+            // a `...` prototype refuses before any lane route (`atl_bridgegen::jni::variadic_refusal`)
+            if let Route::Refused(why) = route {
+                entries.push((name.clone(), trap(why)));
+                continue;
+            }
             let entry =
                 if ilp32.is_some() && !equal_model && ILP32_PROXY_SHIMS.contains(&name.as_str()) {
                     if let Some(last) = ilp32_rows.last_mut() {
@@ -2609,10 +2685,17 @@ fn bindings_table(
     } else {
         Some(libc_prototypes(up, guest.row, host, out)?)
     };
+    // LP64 tables read their bound rows' prototypes for the `...` check (LP64_LIBC_HEADERS)
+    let lp64_protos = if equal_model {
+        Some(lp64_libc_protos(up, host, out)?)
+    } else {
+        None
+    };
     let libc = libc_entries(
         &libc_names,
         qemu,
         libc_protos.as_ref().map(|p| (p, &mut ilp32_rows)),
+        lp64_protos.as_ref(),
         &mut |name, why| {
             traps.push(("libc.so".to_owned(), name.to_owned(), why));
             format!("Entry::Trap({})", traps.len() - 1)
@@ -2654,7 +2737,9 @@ fn bindings_table(
         ) else {
             continue;
         };
-        let pending = if equal_model {
+        // a `...` prototype refuses by name on every engine; the classifier sees fixed prototypes only
+        let refused = atl_bridgegen::jni::variadic_refusal(sig);
+        let pending = if equal_model || refused.is_some() {
             None
         } else {
             match atl_bridgegen::ilp32::classify(name, sig, host_sig, &views, &mut used_handles) {
@@ -2665,7 +2750,9 @@ fn bindings_table(
                 }
             }
         };
-        let why = pending.or_else(|| atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu));
+        let why = refused
+            .or(pending)
+            .or_else(|| atl_bridgegen::jni::lane_refusal(&params).filter(|_| qemu));
         code.push_str(&format!(
             "    ({name:?}, {}, {why:?}),\n",
             sig_literal(ret, &params)

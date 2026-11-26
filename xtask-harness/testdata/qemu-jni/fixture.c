@@ -71,7 +71,7 @@ static jobject v_new(JNIEnv *env, jclass cls, jmethodID mid, ...) {
     return r;
 }
 
-// out[8] (in) the pool address of the snprintf binding, out[9] (in) its buffer, out[11] (in) the buffer size, out[10] (out) snprintf's result: the `p` row.
+// out[8] (in) the pool address of the snprintf binding, out[9] (in) its buffer, out[11] (in) the buffer size, out[10] (out) snprintf's result: the `p` row; out[26] (in) the `q` row's buffer (its size is out[11]), out[27] (out) its result.
 // out[0] GetVersion, out[1] CallStaticIntMethod(ADD_A, ADD_B),out[2] GetJavaVM's result, out[3] the vm it gave, out[4] 1 when NewStringUTF("abc") reads back "abc",
 // out[5] the bits of CallStaticDoubleMethod's result, out[6] the bits of CallStaticFloatMethod's result, out[7] (refuse == REFUSE_FORGED) the address of a JNI stub past the table; out[21..24] the V calls (below)
 void qj_run(JNIEnv *env, long long *out, long long refuse) {
@@ -112,8 +112,10 @@ void qj_run(JNIEnv *env, long long *out, long long refuse) {
     } fu;
     fu.f = f;
     out[6] = fu.i;
-    // Q6-3 part 2b, the snprintf row (p): glibc's snprintf through the binding the host made (out[8]); its buffer (out[9]) and size (out[11]) are host memory the host call writes; the double vararg needs the host call's %al
-    out[10] = ((int (*)(char *, unsigned long, const char *, ...))(intptr_t)out[8])((char *)(intptr_t)out[9], (unsigned long)out[11], "%d %.2f", 7, 2.5);
+    // the snprintf row (p): glibc's snprintf through the binding the host made (out[8]); its buffer (out[9]) and size (out[11]) are host memory the host call writes. Integer tail only: no production binding is a variadic host function with an fp tail (the generator refuses one)
+    out[10] = ((int (*)(char *, unsigned long, const char *, ...))(intptr_t)out[8])((char *)(intptr_t)out[9], (unsigned long)out[11], "%d %d", 7, 25);
+    // the fp-tail row (q), checked on x86_64 only: its double vararg crosses the host's variadic call, which needs %al = 8 (variadic.rs; the al_zero break)
+    out[27] = ((int (*)(char *, unsigned long, const char *, ...))(intptr_t)out[8])((char *)(intptr_t)out[26], (unsigned long)out[11], "%d %.2f", 7, 2.5);
     // the atof row (a): glibc's atof through the binding the host made with result class Fp (out[12]); its argument (out[13]) is host memory; the double comes back in v0
     double a = ((double (*)(const char *))(intptr_t)out[12])((const char *)(intptr_t)out[13]);
     union {

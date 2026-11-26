@@ -66,7 +66,7 @@ const CALLS: usize = 11;
 /// The words of `out`: fixture.c's results at 0..7; the snprintf row (`p`) takes the pool address of its binding at 8, the buffer's address at 9, its size at 11 and returns snprintf's result at 10; the atof row (`a`) takes its binding at 12 and its argument at 13 and returns the result's bits at 14.
 /// Q6-4: the down calls' records (fixture.c `qj_seen`, copied by qj_run): JNI_OnLoad's vm at 15 and reserved at 16, nativeMix's env at 17 and class at 18, nativeScale's env at 19 and class at 20.
 /// Q6-7: the V calls' results at 21..24, the `...` call of V_ARGS at 25 (fixture.c `qj_run`).
-const OUT_WORDS: usize = 26;
+const OUT_WORDS: usize = 28;
 /// Q6-7, the `...V` calls (check V): fixture.c passes V_ARGS through a va_list with method V_MID; the engine reads them by V_MID's shorty and calls these `...A` slots (jni.h order), which check each jvalue and answer their V_RET_*.
 /// The `...` calls (checks c, d, f, and V_ARGS' `...` call of check V) reach the `...A` slot of their id (jni.h: `XA` = X + 2): CallStaticIntMethod 129 -> 131, CallStaticFloatMethod 135 -> 137, CallStaticDoubleMethod 138 -> 140, which the `...V` route shares.
 const NEW_OBJECT_A: usize = 30;
@@ -131,8 +131,10 @@ const V_RET_D: f64 = 0.375;
 const V_RET_J: i64 = 0x1234_5678_9abc_def0;
 const V_RET_I: i32 = -77;
 const V_RET_OBJ: usize = 0x0b0b;
-/// The snprintf row (`p`): glibc's `snprintf("%d %.2f", 7, 2.5)` (C99 7.21.6.1: `%d` writes 7, `%.2f` writes 2.50), so the text and its length. The buffer has room for it and its NUL.
-const SNPRINTF_EXPECT: &str = "7 2.50";
+/// The snprintf row (`p`): glibc's `snprintf("%d %d", 7, 25)` (C99 7.21.6.1: each `%d` writes its int), so the text and its length. Integer tail only: production binds no variadic host function, and a prototype's `...` has no lane shape (generator VARIADIC_TAIL). The buffer has room for it and its NUL.
+const SNPRINTF_EXPECT: &str = "7 25";
+/// The fp-tail row (`q`, x86_64 only): glibc's `snprintf("%d %.2f", 7, 2.5)` (`%.2f` writes 2.50): the double crosses the host's variadic call with %al = 8 (variadic.rs), the one row the al_zero break turns red.
+const SNPRINTF_FP_EXPECT: &str = "7 2.50";
 const SNP_CAP: usize = 16;
 /// The atof row (`a`): glibc's `atof("2.5")`, a double result in xmm0 that the binding answers in v0 (class Fp).
 const ATOF_TEXT: &[u8] = b"2.5\0";
@@ -659,6 +661,9 @@ fn started(r: Result<Guest, String>) -> u64 {
     out[8] = qemu::bind(snprintf as *const () as usize).expect("a free pool slot") as i64;
     out[9] = text.as_mut_ptr() as i64;
     out[11] = SNP_CAP as i64;
+    // the fp-tail row (`q`): the same binding with its own buffer (in: out[26] its address, its size is out[11]; out[27] its result)
+    let mut fp_text = [0u8; SNP_CAP];
+    out[26] = fp_text.as_mut_ptr() as i64;
     // the atof row (`a`): glibc's atof bound with result class F64 (the proxy table's fp rows need the GL front this gate does not load); its argument is host memory
     out[12] = qemu::bind_result(atof as *const () as usize, Sig::ret(Class::F64))
         .expect("a free pool slot") as i64;
@@ -823,6 +828,26 @@ fn started(r: Result<Guest, String>) -> u64 {
             ))
         },
     );
+    // the fp-tail row (`q`), x86_64 only: a double vararg through the host's variadic call (variadic.rs sets %al = 8); riscv64 has no such convention to check
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fp_printed = CStr::from_bytes_until_nul(&fp_text)
+            .map_or_else(|_| String::new(), |c| c.to_string_lossy().into_owned());
+        ok &= check(
+            'q',
+            if usize::try_from(out[27]).ok() == Some(SNPRINTF_FP_EXPECT.len())
+                && fp_printed == SNPRINTF_FP_EXPECT
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "snprintf with an fp tail returned {}, wrote {fp_printed:?}; expected {}, {SNPRINTF_FP_EXPECT:?}",
+                    out[27],
+                    SNPRINTF_FP_EXPECT.len()
+                ))
+            },
+        );
+    }
     let v_seen = V_SEEN.load(Ordering::Relaxed);
     let v_bad = V_BAD.load(Ordering::Relaxed);
     let v_want = [
