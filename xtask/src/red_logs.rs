@@ -179,9 +179,9 @@ pub fn trailing_undecided(task: &Path) -> Result<Trailing> {
     Ok(trailing)
 }
 
-/// The check log of waits: one line per (attempt, row, wait, commit, bound), `attempt row wait commit bound_ms`, tab-separated.
-/// Holds only what neither store has: the resource ledger keeps took and stall, gate-ledger.tsv keeps the outcome.
-/// `attempt` = the check run's name, `.rerun` suffixed for a rerun (gate_need.rs `attempt`). `gate-need` joins on (attempt, row, wait); a logged wait with no ledger record is counted there, not logged twice.
+/// The check log of waits: one line per (attempt, row, wait, bound), `attempt row wait bound_ms`, tab-separated.
+/// Holds only what neither store has: the resource ledger keeps took and stall; gate-ledger.tsv keeps the outcome and the commit, by (run, row).
+/// `attempt` = the check run's name, `.rerun` suffixed for a rerun (gate_need.rs `attempt`). `gate-need` joins on (attempt, row, wait) for the bound and takes the commit from gate-ledger.tsv; a logged wait with no ledger record is counted there, not shown.
 /// Written before the step's logs are cleaned up; the newest [`KEEP_RUNS`] check runs stay.
 pub const WAITS: &str = "gate-waits.tsv";
 /// The lock beside [`WAITS`].
@@ -193,7 +193,6 @@ pub struct WaitEntry {
     pub attempt: String,
     pub row: String,
     pub wait: String,
-    pub commit: String,
     pub bound_ms: u64,
 }
 
@@ -212,12 +211,11 @@ pub fn waits_append(task: &Path, entries: &[WaitEntry], keep_runs: usize) -> Res
             }
             lines.push(line.to_owned());
         }
-        lines.extend(entries.iter().map(|e| {
-            format!(
-                "{}\t{}\t{}\t{}\t{}",
-                e.attempt, e.row, e.wait, e.commit, e.bound_ms
-            )
-        }));
+        lines.extend(
+            entries
+                .iter()
+                .map(|e| format!("{}\t{}\t{}\t{}", e.attempt, e.row, e.wait, e.bound_ms)),
+        );
         Ok(newest_runs(&lines, keep_runs))
     })
 }
@@ -243,13 +241,13 @@ pub fn read_waits(task: &Path) -> Result<BTreeMap<(String, String, String), u64>
     Ok(bounds)
 }
 
-/// A check-log line's (attempt, row, wait, bound_ms). Strict: five columns, no empty name or commit, a number bound.
+/// A check-log line's (attempt, row, wait, bound_ms). Strict: four columns, no empty name, a number bound.
 fn parse_wait_line(line: &str) -> Option<(String, String, String, u64)> {
     let cols: Vec<&str> = line.split('\t').collect();
-    let &[attempt, row, wait, commit, bound] = cols.as_slice() else {
+    let &[attempt, row, wait, bound] = cols.as_slice() else {
         return None;
     };
-    if [attempt, row, wait, commit].iter().any(|c| c.is_empty()) {
+    if [attempt, row, wait].iter().any(|c| c.is_empty()) {
         return None;
     }
     Some((
@@ -260,14 +258,14 @@ fn parse_wait_line(line: &str) -> Option<(String, String, String, u64)> {
     ))
 }
 
-/// The check run an attempt belongs to: its name without the `.rerun` suffix (gate_need.rs `attempt`).
-fn base_run(attempt: &str) -> &str {
+/// The check run an attempt belongs to: its name without the `.rerun` suffix (gate_need.rs `attempt`). Keys gate-ledger.tsv's run column.
+pub fn check_run(attempt: &str) -> &str {
     attempt.strip_suffix(".rerun").unwrap_or(attempt)
 }
 
 /// The lines of the newest `keep_runs` check runs, in file order. A run's age is its last line.
 fn newest_runs(lines: &[String], keep_runs: usize) -> String {
-    let run_of = |line: &str| base_run(line.split('\t').next().unwrap_or_default()).to_owned();
+    let run_of = |line: &str| check_run(line.split('\t').next().unwrap_or_default()).to_owned();
     let mut order: Vec<String> = Vec::new();
     for line in lines {
         let run = run_of(line);
@@ -326,6 +324,39 @@ pub fn retries(task: &Path, runs: usize) -> Result<BTreeMap<String, Retries>> {
         }
     }
     Ok(totals)
+}
+
+/// gate-ledger.tsv's commits of this checkout, per (run, row). `malformed`: lines that are no ledger line, skipped (a torn append; trailing_undecided counts them too).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Commits {
+    pub by_run_row: BTreeMap<(String, String), String>,
+    pub malformed: usize,
+}
+
+/// gate-ledger.tsv's commits of checkout `task`, per (run, row); no ledger yet: empty.
+pub fn commits(task: &Path) -> Result<Commits> {
+    let path = task.join(LEDGER);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Commits::default()),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    let decided = [Outcome::Pass, Outcome::Fail, Outcome::Undecided].map(word);
+    let mut commits = Commits::default();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let well_formed = cols.len() == COLUMNS
+            && decided.contains(&cols[3])
+            && cols[..3].iter().all(|c| !c.is_empty());
+        if well_formed {
+            commits
+                .by_run_row
+                .insert((cols[0].to_owned(), cols[2].to_owned()), cols[1].to_owned());
+        } else {
+            commits.malformed += 1;
+        }
+    }
+    Ok(commits)
 }
 
 /// The run dirs of one bucket, newest first.
@@ -549,14 +580,13 @@ mod tests {
             attempt: attempt.to_owned(),
             row: "app".to_owned(),
             wait: wait.to_owned(),
-            commit: "c0ffee".to_owned(),
             bound_ms,
         }
     }
 
-    /// The check log keeps each sample's commit and bound; a rerun's samples are apart from its first attempt's.
+    /// The check log keeps each attempt's bound; a rerun's bound is apart from its first attempt's.
     #[test]
-    fn the_waits_log_keeps_commit_and_bound_per_attempt() {
+    fn the_waits_log_keeps_the_bound_per_attempt() {
         let ws = scratch("waits-bound");
         let entries = [
             wait_entry("r1", "marker", 60_000),
@@ -568,7 +598,7 @@ mod tests {
         assert_eq!(bounds.get(&key("r1")), Some(&60_000));
         assert_eq!(bounds.get(&key("r1.rerun")), Some(&60_000));
         let text = fs::read_to_string(ws.join(WAITS)).expect("log");
-        assert_eq!(text.lines().next(), Some("r1\tapp\tmarker\tc0ffee\t60000"));
+        assert_eq!(text.lines().next(), Some("r1\tapp\tmarker\t60000"));
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -637,7 +667,53 @@ mod tests {
         let ws = scratch("waits-bounds-only");
         waits_append(&ws, &[wait_entry("r1", "marker", 60_000)], 50).expect("append");
         let text = fs::read_to_string(ws.join(WAITS)).expect("log");
-        assert_eq!(text, "r1\tapp\tmarker\tc0ffee\t60000\n");
+        assert_eq!(text, "r1\tapp\tmarker\t60000\n");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// gate-ledger.tsv's commits per (run, row): a rerun's row is its run's line. A line that is no ledger line is counted, not read.
+    #[test]
+    fn gate_ledger_commits_are_keyed_by_run_and_row() {
+        let ws = scratch("ledger-commits");
+        let entry = |run: &'static str,
+                     commit: &'static str,
+                     row: &'static str,
+                     outcome: Outcome,
+                     first: Option<Outcome>| Entry {
+            run,
+            commit,
+            row,
+            outcome,
+            first,
+            stall: None,
+            grant: "quiet",
+            supply: None,
+        };
+        ledger_append(
+            &ws,
+            &[
+                entry("r1", "aaa111", "app", Outcome::Pass, None),
+                entry("r1", "aaa111", "ime", Outcome::Fail, None),
+                entry(
+                    "r2",
+                    "bbb222",
+                    "app",
+                    Outcome::Pass,
+                    Some(Outcome::Undecided),
+                ),
+            ],
+        )
+        .expect("ledger");
+        let path = ws.join(LEDGER);
+        let text = fs::read_to_string(&path).expect("ledger");
+        fs::write(&path, format!("{text}torn\tline")).expect("torn line");
+        let commits = commits(&ws).expect("commits");
+        assert_eq!(commits.by_run_row.len(), 3);
+        assert_eq!(
+            commits.by_run_row[&("r2".to_owned(), "app".to_owned())],
+            "bbb222"
+        );
+        assert_eq!(commits.malformed, 1);
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

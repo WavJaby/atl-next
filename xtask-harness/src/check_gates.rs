@@ -336,13 +336,8 @@ fn need_records(run: &str, rows: &[(&Row, &Done)]) -> Vec<resource_ledger::Recor
         .collect()
 }
 
-/// The check log's entries of one step: each wait's bound per attempt (red_logs.rs `waits_append`). Took and outcome are not logged: the ledger and gate-ledger.tsv hold them. A rerun's first attempt is kept too. Samples of one wait with one bound are one line.
-fn wait_entries(
-    run: &str,
-    commit: &str,
-    names: &[String],
-    done: &[Done],
-) -> Vec<red_logs::WaitEntry> {
+/// The check log's entries of one step: each wait's bound per attempt (red_logs.rs `waits_append`). Took, outcome and commit are not logged: the ledger and gate-ledger.tsv hold them. A rerun's first attempt is kept too. Samples of one wait with one bound are one line.
+fn wait_entries(run: &str, names: &[String], done: &[Done]) -> Vec<red_logs::WaitEntry> {
     let mut bounds: BTreeSet<(String, String, String, u64)> = BTreeSet::new();
     for (name, d) in names.iter().zip(done) {
         let deciding = (gate_need::attempt(run, d.first.is_some()), d);
@@ -362,7 +357,6 @@ fn wait_entries(
             attempt,
             row,
             wait,
-            commit: commit.to_owned(),
             bound_ms,
         })
         .collect()
@@ -415,7 +409,7 @@ fn judge_rows(task: &Path, run: &str, commit: &str, names: &[String], done: &[Do
         }
     };
     // the check log of waits (red_logs.rs): every attempt's samples with commit and bound, written before the step's logs are cleaned up
-    let waits = wait_entries(run, commit, names, done);
+    let waits = wait_entries(run, names, done);
     if let Err(e) = red_logs::waits_append(task, &waits, red_logs::KEEP_RUNS) {
         broken.push(format!("gate waits log: {e:#}"));
     }
@@ -1163,7 +1157,7 @@ mod tests {
             .collect();
         assert_eq!(got, [("r1.rerun", 40)]);
         let names = ["app".to_owned()];
-        let entries = wait_entries("r1", "c0ffee", &names, std::slice::from_ref(&rerun));
+        let entries = wait_entries("r1", &names, std::slice::from_ref(&rerun));
         let got: Vec<(&str, &str, u64)> = entries
             .iter()
             .map(|e| (e.attempt.as_str(), e.wait.as_str(), e.bound_ms))
@@ -1192,7 +1186,7 @@ mod tests {
             ..Done::bare(Outcome::Pass, String::new(), String::new())
         };
         let names = ["app".to_owned()];
-        let entries = wait_entries("r1", "c0ffee", &names, std::slice::from_ref(&passed));
+        let entries = wait_entries("r1", &names, std::slice::from_ref(&passed));
         assert_eq!(entries.len(), 1, "{entries:?}");
     }
 

@@ -3,7 +3,7 @@
 //! Kept in the resource ledger (resource_ledger.rs, kind `gate`): one record per (row, wait, attempt) = the attempt's largest took, of a quiet passing attempt. Only a deciding pass enters, so a row adds at most one run per check step.
 //! `attempt` = the check run's name, `.rerun` suffixed for a rerun ([`attempt`]).
 //! Quiet = stall <= [`QUIET_STALL_PCT`]. A wait's `need` in a row = the largest took of its newest [`WINDOW`] distinct quiet runs there, once [`MIN_PASSES`] hold it; below that unset.
-//! The bound stays out of the ledger: the check log (red_logs.rs `gate-waits.tsv`) keeps it per (attempt, row, wait), and `cargo xtask gate-need` joins it for display. Took stays here; the outcome stays in gate-ledger.tsv.
+//! The bound stays out of the ledger: the check log (red_logs.rs `gate-waits.tsv`) keeps it per (attempt, row, wait). The commit and the outcome stay in gate-ledger.tsv, which `cargo xtask gate-need` joins by (run, row) for display. Took stays here.
 //! `--migrate` moves the old `out/pool/gate-need.tsv` into the ledger once ([`migrate`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,6 +120,13 @@ pub fn window(records: &[Record]) -> Vec<&Record> {
 /// A check log's bounds: (attempt, row, wait) -> bound_ms (red_logs.rs `read_waits`).
 pub type Bounds = BTreeMap<(String, String, String), u64>;
 
+/// The check-side inputs of the display: the check log's bounds, and gate-ledger.tsv's commits by (run, row).
+#[derive(Debug, Default)]
+pub struct Joins {
+    pub bounds: Bounds,
+    pub commits: red_logs::Commits,
+}
+
 /// One (row, wait)'s line over its window.
 #[derive(Debug, PartialEq)]
 pub struct Stat {
@@ -137,10 +144,12 @@ pub struct Stat {
     pub ratio: Option<f64>,
     /// smallest and largest logged bound
     pub bounds: Option<(u64, u64)>,
+    /// the commit of the largest took's run, from gate-ledger.tsv by (run, row); None when that run has no line there
+    pub commit: Option<String>,
 }
 
 /// Every (row, wait) of the window, largest took / bound first (unlogged bounds last).
-pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
+pub fn stats(records: &[Record], joins: &Joins) -> Vec<Stat> {
     let mut groups: BTreeMap<(&str, &str), Vec<&Record>> = BTreeMap::new();
     for r in window(records) {
         groups
@@ -156,7 +165,7 @@ pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
             let known: Vec<(f64, u64)> = group
                 .iter()
                 .filter_map(|r| {
-                    let bound = *bounds.get(&bound_key(r))?;
+                    let bound = *joins.bounds.get(&bound_key(r))?;
                     Some((r.took_ms as f64 / bound as f64, bound))
                 })
                 .collect();
@@ -164,6 +173,10 @@ pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
             let range = known.iter().fold(None, |acc: Option<(u64, u64)>, (_, b)| {
                 Some(acc.map_or((*b, *b), |(lo, hi)| (lo.min(*b), hi.max(*b))))
             });
+            let commit = group
+                .iter()
+                .max_by_key(|r| r.took_ms)
+                .and_then(|r| joins.commits.by_run_row.get(&commit_key(r)).cloned());
             Stat {
                 row: row.to_owned(),
                 wait: wait.to_owned(),
@@ -173,6 +186,7 @@ pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
                 need: (passes.len() >= MIN_PASSES).then_some(max_ms),
                 ratio,
                 bounds: range,
+                commit,
             }
         })
         .collect();
@@ -192,6 +206,8 @@ pub struct JoinGaps {
     pub unbounded: usize,
     /// logged waits with no ledger record: not quiet, not the deciding pass, or past the window; not shown
     pub unledgered: usize,
+    /// window records whose (run, row) has no gate-ledger.tsv line: commit shown as -
+    pub uncommitted: usize,
 }
 
 /// The check-log key of a ledger record: its attempt, row and wait (the join key of [`stats`]).
@@ -199,30 +215,41 @@ fn bound_key(r: &Record) -> (String, String, String) {
     (r.run.clone(), r.name.clone(), r.wait.clone())
 }
 
+/// The gate-ledger.tsv key of a ledger record: its check run (a rerun maps to its run) and row.
+fn commit_key(r: &Record) -> (String, String) {
+    (red_logs::check_run(&r.run).to_owned(), r.name.clone())
+}
+
 /// What the join could not show: window records with no logged bound, and logged waits that no ledger record backs.
-pub fn join_gaps(records: &[Record], bounds: &Bounds) -> JoinGaps {
+pub fn join_gaps(records: &[Record], joins: &Joins) -> JoinGaps {
     let unbounded = window(records)
         .into_iter()
-        .filter(|r| !bounds.contains_key(&bound_key(r)))
+        .filter(|r| !joins.bounds.contains_key(&bound_key(r)))
+        .count();
+    let uncommitted = window(records)
+        .into_iter()
+        .filter(|r| !joins.commits.by_run_row.contains_key(&commit_key(r)))
         .count();
     let ledgered: BTreeSet<(&str, &str, &str)> = records
         .iter()
         .filter(|r| r.kind == GATE)
         .map(|r| (r.run.as_str(), r.name.as_str(), r.wait.as_str()))
         .collect();
-    let unledgered = bounds
+    let unledgered = joins
+        .bounds
         .keys()
         .filter(|(run, row, wait)| !ledgered.contains(&(run.as_str(), row.as_str(), wait.as_str())))
         .count();
     JoinGaps {
         unbounded,
         unledgered,
+        uncommitted,
     }
 }
 
 /// Each wait's derived `need` (ms) in `row`. A wait below [`MIN_PASSES`] quiet passes there has no entry (unset).
 pub fn needs(records: &[Record], row: &str) -> BTreeMap<String, u64> {
-    stats(records, &Bounds::new())
+    stats(records, &Joins::default())
         .into_iter()
         .filter(|s| s.row == row)
         .filter_map(|s| Some((s.wait, s.need?)))
@@ -343,15 +370,18 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         bail!("--execute goes with --migrate");
     }
     let records = resource_ledger::read(&ws)?;
-    let bounds = red_logs::read_waits(&task)?;
+    let joins = Joins {
+        bounds: red_logs::read_waits(&task)?,
+        commits: red_logs::commits(&task)?,
+    };
     println!(
         "gate-need: {} records, {} in the windows (newest {WINDOW} passes, stall <= {QUIET_STALL_PCT} %); {}",
         records.len(),
         window(&records).len(),
         resource_ledger::ledger_path(&ws).display()
     );
-    println!("row\twait\tsamples\tpasses\tmax_ms\tneed_ms\tmax/bound\tbound_ms");
-    for st in stats(&records, &bounds) {
+    println!("row\twait\tsamples\tpasses\tmax_ms\tneed_ms\tmax/bound\tbound_ms\tcommit");
+    for st in stats(&records, &joins) {
         let need = st
             .need
             .map_or_else(|| "unset".to_owned(), |n| n.to_string());
@@ -361,15 +391,20 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let bound = st
             .bounds
             .map_or_else(|| "-".to_owned(), |(lo, hi)| format!("{lo}-{hi}"));
+        let commit = st.commit.as_deref().unwrap_or("-");
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{need}\t{ratio}\t{bound}",
+            "{}\t{}\t{}\t{}\t{}\t{need}\t{ratio}\t{bound}\t{commit}",
             st.row, st.wait, st.samples, st.passes, st.max_ms
         );
     }
-    let gaps = join_gaps(&records, &bounds);
+    let gaps = join_gaps(&records, &joins);
     println!(
-        "gate-need: {} window records with no logged bound (max/bound shown as -); {} logged waits with no ledger record (not quiet, not the deciding pass, or past the window): not shown",
-        gaps.unbounded, gaps.unledgered
+        "gate-need: {} window records with no logged bound (max/bound shown as -); {} logged waits with no ledger record (not quiet, not the deciding pass, or past the window): not shown; {} window records whose (run, row) is not in gate-ledger.tsv (commit shown as -)",
+        gaps.unbounded, gaps.unledgered, gaps.uncommitted
+    );
+    println!(
+        "gate-need: {} malformed gate-ledger.tsv lines skipped",
+        joins.commits.malformed
     );
     let retries = red_logs::retries(&task, WINDOW)?;
     println!(
@@ -476,7 +511,7 @@ mod tests {
         let records: Vec<Record> = (1..=20)
             .map(|i| rec("r1", "app", "marker", i, Some(0.1)))
             .collect();
-        let stat = stats(&records, &Bounds::new())
+        let stat = stats(&records, &Joins::default())
             .into_iter()
             .find(|s| s.wait == "marker")
             .expect("marker");
@@ -595,7 +630,11 @@ mod tests {
             ("r2".to_owned(), "app".to_owned(), "marker".to_owned()),
             600,
         );
-        let stat = stats(&records, &bounds).into_iter().next().expect("marker");
+        let joins = Joins {
+            bounds,
+            ..Joins::default()
+        };
+        let stat = stats(&records, &joins).into_iter().next().expect("marker");
         assert_eq!(stat.bounds, Some((600, 1_000)));
         assert_eq!(stat.ratio, Some(0.5), "300 / 600");
         assert_eq!(stat.max_ms, 900, "the unlogged pass still counts its took");
@@ -727,13 +766,45 @@ mod tests {
             ("r9".to_owned(), "app".to_owned(), "marker".to_owned()),
             600,
         );
+        let mut commits = red_logs::Commits::default();
+        commits
+            .by_run_row
+            .insert(("r1".to_owned(), "app".to_owned()), "aaa111".to_owned());
+        let joins = Joins { bounds, commits };
         assert_eq!(
-            join_gaps(&records, &bounds),
+            join_gaps(&records, &joins),
             JoinGaps {
                 unbounded: 1,
-                unledgered: 1
+                unledgered: 1,
+                uncommitted: 1,
             },
-            "r2 has no bound; r9 has no record"
+            "r2 has no bound and no commit; r9 has no record"
+        );
+    }
+
+    /// gate-need takes each row's commit from gate-ledger.tsv by (run, row): a rerun's record maps to its run's line; the commit shown is the one of the window's largest took.
+    #[test]
+    fn the_query_takes_each_commit_from_the_gate_ledger_by_run_and_row() {
+        let records = vec![
+            rec("r1", "app", "marker", 300, Some(0.1)),
+            rec("r2.rerun", "app", "marker", 900, Some(0.1)),
+        ];
+        let mut commits = red_logs::Commits::default();
+        commits
+            .by_run_row
+            .insert(("r1".to_owned(), "app".to_owned()), "aaa111".to_owned());
+        commits
+            .by_run_row
+            .insert(("r2".to_owned(), "app".to_owned()), "bbb222".to_owned());
+        let joins = Joins {
+            bounds: Bounds::new(),
+            commits,
+        };
+        let stat = stats(&records, &joins).into_iter().next().expect("marker");
+        assert_eq!(
+            stat.commit.as_deref(),
+            Some("bbb222"),
+            "the largest took is the rerun of r2"
         );
     }
 
@@ -750,7 +821,11 @@ mod tests {
             ("r1.rerun".to_owned(), "app".to_owned(), "marker".to_owned()),
             600,
         );
-        let stat = stats(&records, &bounds).into_iter().next().expect("marker");
+        let joins = Joins {
+            bounds,
+            ..Joins::default()
+        };
+        let stat = stats(&records, &joins).into_iter().next().expect("marker");
         assert_eq!(stat.bounds, Some((600, 600)));
         assert_eq!(stat.ratio, Some(0.5), "300 / 600");
     }
