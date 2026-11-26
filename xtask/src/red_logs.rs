@@ -9,12 +9,13 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use atl_layout::Layout;
 
 use crate::build_pool;
 use crate::harness::Supply;
 use crate::out;
+use crate::resource_ledger;
 use crate::verdict::Outcome;
 
 /// A red gate's logs: `<checkout's kept dir>/check-gates-red/<run>/`.
@@ -176,6 +177,164 @@ pub fn trailing_undecided(task: &Path) -> Result<Trailing> {
         }
     }
     Ok(trailing)
+}
+
+/// The check log of waits: one line per wait sample of every attempt of a check step, `attempt commit row outcome wait took_ms bound_ms`, tab-separated.
+/// `attempt` = the check run's name, `.rerun` suffixed for a rerun (gate_need.rs `attempt`). It keeps commit and bound, which the resource ledger does not store; `gate-need` joins them for display.
+/// Written before the step's logs are cleaned up; the newest [`KEEP_RUNS`] check runs stay.
+pub const WAITS: &str = "gate-waits.tsv";
+/// The lock beside [`WAITS`].
+pub const WAITS_LOCK: &str = "gate-waits.lock";
+
+/// One wait sample of one attempt, as [`waits_append`] writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitEntry {
+    pub attempt: String,
+    pub commit: String,
+    pub row: String,
+    pub outcome: Outcome,
+    pub wait: String,
+    pub took_ms: u64,
+    pub bound_ms: u64,
+}
+
+/// Appends `entries` to the check log of checkout `task`, then keeps the newest `keep_runs` check runs; under the log's exclusive lock.
+pub fn waits_append(task: &Path, entries: &[WaitEntry], keep_runs: usize) -> Result<()> {
+    let path = task.join(WAITS);
+    resource_ledger::rewrite(&path, &task.join(WAITS_LOCK), |text| {
+        let mut lines: Vec<String> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if parse_wait_line(line).is_none() {
+                bail!(
+                    "{}:{}: not a check-log line: {line:?}",
+                    path.display(),
+                    i + 1
+                );
+            }
+            lines.push(line.to_owned());
+        }
+        lines.extend(entries.iter().map(|e| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                e.attempt,
+                e.commit,
+                e.row,
+                word(e.outcome),
+                e.wait,
+                e.took_ms,
+                e.bound_ms
+            )
+        }));
+        Ok(newest_runs(&lines, keep_runs))
+    })
+}
+
+/// The check log's bounds: (attempt, row, wait) -> bound_ms. No log yet: empty.
+pub fn read_waits(task: &Path) -> Result<BTreeMap<(String, String, String), u64>> {
+    let path = task.join(WAITS);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = resource_ledger::read_text(&path, &task.join(WAITS_LOCK))?;
+    let mut bounds = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let (attempt, row, wait, bound) = parse_wait_line(line).with_context(|| {
+            format!(
+                "{}:{}: not a check-log line: {line:?}",
+                path.display(),
+                i + 1
+            )
+        })?;
+        bounds.insert((attempt, row, wait), bound);
+    }
+    Ok(bounds)
+}
+
+/// A check-log line's (attempt, row, wait, bound_ms). Strict: seven columns, a known outcome, numbers where numbers belong.
+fn parse_wait_line(line: &str) -> Option<(String, String, String, u64)> {
+    let cols: Vec<&str> = line.split('\t').collect();
+    let &[attempt, commit, row, outcome, wait, took, bound] = cols.as_slice() else {
+        return None;
+    };
+    let known = [Outcome::Pass, Outcome::Fail, Outcome::Undecided].map(word);
+    if [attempt, commit, row, wait].iter().any(|c| c.is_empty()) || !known.contains(&outcome) {
+        return None;
+    }
+    took.parse::<u64>().ok()?;
+    Some((
+        attempt.to_owned(),
+        row.to_owned(),
+        wait.to_owned(),
+        bound.parse().ok()?,
+    ))
+}
+
+/// The check run an attempt belongs to: its name without the `.rerun` suffix (gate_need.rs `attempt`).
+fn base_run(attempt: &str) -> &str {
+    attempt.strip_suffix(".rerun").unwrap_or(attempt)
+}
+
+/// The lines of the newest `keep_runs` check runs, in file order. A run's age is its last line.
+fn newest_runs(lines: &[String], keep_runs: usize) -> String {
+    let run_of = |line: &str| base_run(line.split('\t').next().unwrap_or_default()).to_owned();
+    let mut order: Vec<String> = Vec::new();
+    for line in lines {
+        let run = run_of(line);
+        order.retain(|r| *r != run);
+        order.push(run);
+    }
+    let keep: BTreeSet<String> = order.iter().rev().take(keep_runs).cloned().collect();
+    lines
+        .iter()
+        .filter(|line| keep.contains(&run_of(line)))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// One row's reruns over the selected check runs: `reruns` attempts that reran, by the rerun's outcome.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Retries {
+    pub reruns: usize,
+    pub pass: usize,
+    pub fail: usize,
+    pub undecided: usize,
+}
+
+/// Each row's retries in the newest `runs` check runs of the outcome ledger: a row whose first attempt ended undecided reran.
+pub fn retries(task: &Path, runs: usize) -> Result<BTreeMap<String, Retries>> {
+    let path = task.join(LEDGER);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    };
+    // lines that are no ledger line are not read here (trailing_undecided counts them)
+    let lines: Vec<Vec<&str>> = text
+        .lines()
+        .map(|line| line.split('\t').collect::<Vec<&str>>())
+        .filter(|cols| cols.len() == COLUMNS)
+        .collect();
+    let mut order: Vec<&str> = Vec::new();
+    for cols in &lines {
+        order.retain(|r| *r != cols[0]);
+        order.push(cols[0]);
+    }
+    let keep: BTreeSet<&str> = order.iter().rev().take(runs).copied().collect();
+    let mut totals: BTreeMap<String, Retries> = BTreeMap::new();
+    for cols in lines.iter().filter(|cols| keep.contains(cols[0])) {
+        let row = totals.entry(cols[2].to_owned()).or_default();
+        // column 4 `first`: the attempt before a rerun, `-` when the row ran once; column 3 is the deciding outcome
+        if cols[4] != "-" {
+            row.reruns += 1;
+            match cols[3] {
+                "pass" => row.pass += 1,
+                "fail" => row.fail += 1,
+                "undecided" => row.undecided += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok(totals)
 }
 
 /// The run dirs of one bucket, newest first.
@@ -391,6 +550,98 @@ mod tests {
         let trailing = trailing_undecided(&ws).expect("streaks");
         assert_eq!(trailing.streaks["app"], ["r4"]);
         assert_eq!(trailing.malformed, 3);
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    fn wait_entry(attempt: &str, wait: &str, took_ms: u64, bound_ms: u64) -> WaitEntry {
+        WaitEntry {
+            attempt: attempt.to_owned(),
+            commit: "c0ffee".to_owned(),
+            row: "app".to_owned(),
+            outcome: Outcome::Pass,
+            wait: wait.to_owned(),
+            took_ms,
+            bound_ms,
+        }
+    }
+
+    /// The check log keeps each sample's commit and bound; a rerun's samples are apart from its first attempt's.
+    #[test]
+    fn the_waits_log_keeps_commit_and_bound_per_attempt() {
+        let ws = scratch("waits-bound");
+        let entries = [
+            wait_entry("r1", "marker", 120, 60_000),
+            wait_entry("r1.rerun", "marker", 300, 60_000),
+        ];
+        waits_append(&ws, &entries, 50).expect("append");
+        let bounds = read_waits(&ws).expect("read");
+        let key = |attempt: &str| (attempt.to_owned(), "app".to_owned(), "marker".to_owned());
+        assert_eq!(bounds.get(&key("r1")), Some(&60_000));
+        assert_eq!(bounds.get(&key("r1.rerun")), Some(&60_000));
+        let text = fs::read_to_string(ws.join(WAITS)).expect("log");
+        assert_eq!(
+            text.lines().next(),
+            Some("r1\tc0ffee\tapp\tpass\tmarker\t120\t60000")
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The log keeps the newest `keep_runs` check runs, a rerun with its run.
+    #[test]
+    fn the_waits_log_keeps_the_newest_check_runs() {
+        let ws = scratch("waits-keep");
+        for run in [
+            "20261126-100000-000",
+            "20261126-110000-000",
+            "20261126-120000-000",
+        ] {
+            let rerun = format!("{run}.rerun");
+            let entries = [
+                wait_entry(run, "marker", 1, 9),
+                wait_entry(&rerun, "marker", 2, 9),
+            ];
+            waits_append(&ws, &entries, 2).expect("append");
+        }
+        let runs: BTreeSet<String> = read_waits(&ws)
+            .expect("read")
+            .into_keys()
+            .map(|(attempt, _, _)| attempt.trim_end_matches(".rerun").to_owned())
+            .collect();
+        assert_eq!(
+            runs,
+            BTreeSet::from([
+                "20261126-110000-000".to_owned(),
+                "20261126-120000-000".to_owned()
+            ])
+        );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A row whose first attempt ended undecided reran; the totals read the newest `runs` check runs only.
+    #[test]
+    fn retries_count_the_reruns_of_the_newest_runs() {
+        let ws = scratch("retries");
+        let entry = |run: &'static str, outcome: Outcome, first: Option<Outcome>| Entry {
+            run,
+            commit: "c0ffee",
+            row: "app",
+            outcome,
+            first,
+            stall: None,
+            grant: "quiet",
+            supply: None,
+        };
+        ledger_append(&ws, &[entry("r1", Outcome::Pass, Some(Outcome::Undecided))]).expect("r1");
+        ledger_append(&ws, &[entry("r2", Outcome::Fail, Some(Outcome::Undecided))]).expect("r2");
+        ledger_append(&ws, &[entry("r3", Outcome::Pass, None)]).expect("r3");
+        let want = |reruns, pass, fail, undecided| Retries {
+            reruns,
+            pass,
+            fail,
+            undecided,
+        };
+        assert_eq!(retries(&ws, 2).expect("retries")["app"], want(1, 0, 1, 0));
+        assert_eq!(retries(&ws, 3).expect("retries")["app"], want(2, 1, 1, 0));
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

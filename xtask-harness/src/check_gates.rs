@@ -19,6 +19,7 @@ use xtask::build_pool::{self, Class};
 use xtask::gate_need;
 use xtask::harness::{Ruling, Starvation, Supply, Undecided, judged_in, undecided_verdict};
 use xtask::red_logs;
+use xtask::resource_ledger;
 
 use crate::gate_build::{self, Group, Moved, Snapshot};
 use crate::verdict::{Outcome, UNDECIDED_WORD};
@@ -324,22 +325,44 @@ fn starvation_of(done: &[Done]) -> Starvation {
     counts
 }
 
-/// The need-ledger samples of one step: each passing row's wait samples from its deciding run (the rerun, when there was one). A pass is one `run` of a row; the self-test row's waits are not gate waits.
-fn need_samples(run: &str, commit: &str, rows: &[(&Row, &Done)]) -> Vec<gate_need::Sample> {
+/// The resource-ledger records of one step: each passing row's deciding attempt (its rerun, when there was one), quiet, largest took per wait (gate_need.rs `records`). The self-test row's waits are not gate waits.
+fn need_records(run: &str, rows: &[(&Row, &Done)]) -> Vec<resource_ledger::Record> {
     rows.iter()
         .filter(|(row, d)| row.samples && d.outcome == Outcome::Pass)
         .flat_map(|(row, d)| {
-            d.waits.iter().map(move |w| gate_need::Sample {
-                run: run.to_owned(),
+            let attempt = gate_need::attempt(run, d.first.is_some());
+            gate_need::records(&attempt, &row.name(), d.stall, &d.waits)
+        })
+        .collect()
+}
+
+/// The check log's entries of one step: every wait sample of every attempt, with its attempt id, commit and bound (red_logs.rs `waits_append`). A rerun's first attempt is kept too.
+fn wait_entries(
+    run: &str,
+    commit: &str,
+    names: &[String],
+    done: &[Done],
+) -> Vec<red_logs::WaitEntry> {
+    let mut entries = Vec::new();
+    for (name, d) in names.iter().zip(done) {
+        let deciding = (gate_need::attempt(run, d.first.is_some()), d);
+        let first = d
+            .first
+            .as_deref()
+            .map(|f| (gate_need::attempt(run, false), f));
+        for (attempt, a) in std::iter::once(deciding).chain(first) {
+            entries.extend(a.waits.iter().map(|w| red_logs::WaitEntry {
+                attempt: attempt.clone(),
                 commit: commit.to_owned(),
-                row: row.name(),
+                row: name.clone(),
+                outcome: a.outcome,
                 wait: w.name.clone(),
                 took_ms: w.took_ms,
                 bound_ms: w.bound_ms,
-                stall: d.stall,
-            })
-        })
-        .collect()
+            }));
+        }
+    }
+    entries
 }
 
 /// The failure note of a row undecided in [`red_logs::CEILING`] consecutive runs of this checkout, its last runs named. None below the ceiling.
@@ -380,13 +403,19 @@ fn judge_rows(task: &Path, run: &str, commit: &str, names: &[String], done: &[Do
         .collect();
     let ledger =
         red_logs::ledger_append(task, &entries).and_then(|()| red_logs::trailing_undecided(task));
-    let (trailing, broken) = match ledger {
-        Ok(trailing) => (trailing, None),
-        Err(e) => (
-            red_logs::Trailing::default(),
-            Some(format!("outcome ledger: {e:#}")),
-        ),
+    let mut broken: Vec<String> = Vec::new();
+    let trailing = match ledger {
+        Ok(trailing) => trailing,
+        Err(e) => {
+            broken.push(format!("outcome ledger: {e:#}"));
+            red_logs::Trailing::default()
+        }
     };
+    // the check log of waits (red_logs.rs): every attempt's samples with commit and bound, written before the step's logs are cleaned up
+    let waits = wait_entries(run, commit, names, done);
+    if let Err(e) = red_logs::waits_append(task, &waits, red_logs::KEEP_RUNS) {
+        broken.push(format!("gate waits log: {e:#}"));
+    }
     eprintln!(
         "gates: outcome ledger malformed lines {}",
         trailing.malformed
@@ -554,12 +583,12 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
         undecided,
         starvation,
     } = judge_rows(&task, &run, commit.trim(), &names, &done);
-    // the need ledger (gate_need.rs): every passing row's wait samples, machine-wide, after the step's rows ended
+    // the resource ledger (gate_need.rs): every passing row's deciding attempt's quiet waits, machine-wide, after the step's rows ended
     let pairs: Vec<(&Row, &Done)> = ROWS.iter().zip(&done).collect();
-    let samples = need_samples(&run, commit.trim(), &pairs);
-    match gate_need::append(&ws, &samples) {
-        Ok(()) => eprintln!("gates: need ledger +{} samples", samples.len()),
-        Err(e) => failed.push(format!("need ledger: {e:#}")),
+    let records = need_records(&run, &pairs);
+    match resource_ledger::append(&ws, &records, gate_need::WINDOW) {
+        Ok(()) => eprintln!("gates: resource ledger +{} records", records.len()),
+        Err(e) => failed.push(format!("resource ledger: {e:#}")),
     }
     let mut ends = WatchTally::default();
     for d in &done {
@@ -1050,7 +1079,7 @@ mod tests {
 
     /// A step's need samples: each passing row's own waits, from its deciding run; a red row and the self-test row add none. Expected values written out.
     #[test]
-    fn need_samples_are_the_passing_rows_waits_and_the_self_test_is_not_one() {
+    fn need_records_are_the_passing_rows_quiet_waits_and_the_self_test_is_not_one() {
         let wait = |name: &str, took_ms: u64| gate_need::WaitLine {
             name: name.to_owned(),
             took_ms,
@@ -1076,16 +1105,16 @@ mod tests {
             (&ime, &red),
             (&self_test, &quiet_self_test),
         ];
-        let samples = need_samples("20261124-120000-000", "c0ffee", &pairs);
-        let got: Vec<(&str, &str, &str, u64, Option<f64>)> = samples
+        let records = need_records("20261124-120000-000", &pairs);
+        let got: Vec<(&str, &str, &str, u64, Option<f64>)> = records
             .iter()
-            .map(|s| {
+            .map(|r| {
                 (
-                    s.run.as_str(),
-                    s.row.as_str(),
-                    s.wait.as_str(),
-                    s.took_ms,
-                    s.stall,
+                    r.run.as_str(),
+                    r.name.as_str(),
+                    r.wait.as_str(),
+                    r.took_ms,
+                    r.stall,
                 )
             })
             .collect();
@@ -1102,6 +1131,41 @@ mod tests {
                 ("20261124-120000-000", "app", "marker", 11_773, Some(0.04)),
             ]
         );
+    }
+
+    /// A rerun is its own attempt: the ledger keeps its deciding pass as `<run>.rerun`; the check log keeps each attempt's waits under its own id and outcome.
+    #[test]
+    fn a_rerun_is_its_own_attempt_in_the_ledger_and_the_check_log() {
+        let wait = |name: &str, took_ms: u64| gate_need::WaitLine {
+            name: name.to_owned(),
+            took_ms,
+            bound_ms: 60_000,
+        };
+        let first = Done {
+            stall: Some(0.1),
+            waits: vec![wait("marker", 900)],
+            ..Done::bare(Outcome::Undecided, String::new(), String::new())
+        };
+        let rerun = Done {
+            stall: Some(0.1),
+            waits: vec![wait("marker", 40)],
+            first: Some(Box::new(first)),
+            ..Done::bare(Outcome::Pass, String::new(), String::new())
+        };
+        let app = Row::new(&["app"], true, true);
+        let records = need_records("r1", &[(&app, &rerun)]);
+        let got: Vec<(&str, u64)> = records
+            .iter()
+            .map(|r| (r.run.as_str(), r.took_ms))
+            .collect();
+        assert_eq!(got, [("r1.rerun", 40)]);
+        let names = ["app".to_owned()];
+        let entries = wait_entries("r1", "c0ffee", &names, std::slice::from_ref(&rerun));
+        let got: Vec<(&str, &str, u64)> = entries
+            .iter()
+            .map(|e| (e.attempt.as_str(), e.wait.as_str(), e.took_ms))
+            .collect();
+        assert_eq!(got, [("r1.rerun", "marker", 40), ("r1", "marker", 900)]);
     }
 
     /// Lines as the window and composer gates printed them (job rgm-done1).
@@ -1563,10 +1627,15 @@ mod tests {
         ];
         let judged = judge_rows(&task, "r1", "c0ffee", &names, &done);
         std::fs::remove_file(&task).expect("cleanup");
-        assert_eq!(judged.failed.len(), 2, "{:?}", judged.failed);
+        assert_eq!(judged.failed.len(), 3, "{:?}", judged.failed);
         assert_eq!(judged.failed[0], "app: FAILED");
         assert!(
             judged.failed[1].starts_with("outcome ledger: "),
+            "{:?}",
+            judged.failed
+        );
+        assert!(
+            judged.failed[2].starts_with("gate waits log: "),
             "{:?}",
             judged.failed
         );
