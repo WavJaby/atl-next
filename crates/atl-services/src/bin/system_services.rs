@@ -335,7 +335,7 @@ fn main() -> Result<()> {
         a.hw_timeouts,
     );
     // the boot's sessions: one batch, published once (Installer::publish); the permissions and the table are the ones the services already hold
-    let reports = install::Installer::new(
+    let installed = install::Installer::new(
         control,
         config,
         ids,
@@ -345,7 +345,7 @@ fn main() -> Result<()> {
         Arc::new(activity.clone()),
     )
     .boot(&a.sessions)?;
-    for r in &reports {
+    for r in &installed.reports {
         writeln!(
             std::io::stderr(),
             "services: install {} version {} {:?}",
@@ -731,7 +731,7 @@ fn main() -> Result<()> {
     exit_totals_on_terminate()?;
     writeln!(std::io::stderr(), "services: ready")?;
     // the start-time broadcasts: the install's package broadcasts, then the boot ones (UserController's order); processes are ready here, so no before-boot flag
-    activity.package_broadcasts(&reports);
+    activity.package_broadcasts(&installed.reports, &installed.audience);
     activity.boot_completed();
     if let Some(package) = &a.launch {
         activity

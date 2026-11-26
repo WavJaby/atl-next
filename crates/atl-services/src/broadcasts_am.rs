@@ -79,6 +79,8 @@ pub(super) struct SendSpec<'a> {
     pub(super) max_manifest_api: Option<i32>,
     /// the BroadcastOptions temp allowlist of the send (uid_state::grant_of); None = none
     pub(super) grant: Option<TempGrant>,
+    /// the package the send is about and the table its receivers must see it in (receivers_locked, Packages::visible per receiver uid); None = every receiver
+    pub(super) about: Option<(Arc<Packages>, String)>,
 }
 
 /// The dispatch-time skip (BroadcastSkipPolicy.shouldSkipMessage's start-mode part, :229-246): a manifest receiver whose uid is restricted (uid_state::start_mode DELAYED_RIGID) is
@@ -461,7 +463,8 @@ impl Inner {
 
     /// The receivers of a send in delivery-list order: an explicit component's manifest receiver, else the implicit manifest receivers and the registered ones (not for
     /// FLAG_RECEIVER_REGISTERED_ONLY, which keeps only the registered), merged by priority. Registered receivers of a process that is not attached are not receivers here.
-    fn receivers_locked(
+    /// With `about`, a receiver uid that may not see the package in that table is dropped, counted `broadcast skipped: package not visible`.
+    pub(super) fn receivers_locked(
         &self,
         st: &State,
         spec: &SendSpec<'_>,
@@ -527,7 +530,21 @@ impl Inner {
                 });
             }
         }
-        merge_by_priority(registered, manifest)
+        let receivers = merge_by_priority(registered, manifest);
+        // BroadcastHelper's visibility allow list (IPH :2447-2450): Packages::visible per receiver uid in the send's table
+        let Some((table, package)) = &spec.about else {
+            return receivers;
+        };
+        receivers
+            .into_iter()
+            .filter(|r| {
+                let seen = table.visible(r.proc.uid, package).is_some();
+                if !seen {
+                    atl_diag::answered(AM, "broadcast skipped: package not visible");
+                }
+                seen
+            })
+            .collect()
     }
 
     /// The send path (BroadcastController.broadcastIntentLocked after verifyBroadcastLocked): a sticky is checked and stored (:1415-1495), then the receivers (receivers_locked) become
@@ -712,6 +729,7 @@ impl Inner {
             ordered: true,
             result_to: Some((ReceiverHandle::System(result_to), own_pid())),
             max_manifest_api: None,
+            about: None,
             grant: uid_state::grant_of(
                 broadcast::BOOT_TIME_TEMP_ALLOWLIST_MS,
                 uid_state::TEMP_TYPE_FGS_ALLOWED,
@@ -868,6 +886,115 @@ impl Inner {
     }
 }
 
+/// One package broadcast of a publish as the send path takes it: the intent, its audience (None: every receiver) and its temp allowlist.
+pub(super) struct PackageSend {
+    pub(super) package: String,
+    pub(super) intent: Intent,
+    pub(super) about: Option<(Arc<Packages>, String)>,
+    pub(super) grant: Option<TempGrant>,
+}
+
+/// The package broadcasts of a publish, in send order. An update: PACKAGE_REMOVED of the old version (BroadcastHelper.sendPackageRemovedBroadcasts), then ADDED, REPLACED and
+/// MY_PACKAGE_REPLACED (sendPostInstallBroadcasts :600-720). A new package: ADDED. Audiences as IPH :2447-2450: REMOVED and REPLACED the table before the publish, ADDED the one it published.
+pub(super) fn package_sends(
+    reports: &[install::Reported],
+    audience: &install::Audience,
+) -> Vec<PackageSend> {
+    let before = |r: &install::Reported| Some((Arc::clone(&audience.before), r.package.clone()));
+    let after = |r: &install::Reported| Some((Arc::clone(&audience.after), r.package.clone()));
+    let mut sends = Vec::new();
+    for r in reports {
+        match r.change {
+            install::Change::New => sends.push(data_send(
+                broadcast::ACTION_PACKAGE_ADDED,
+                r,
+                Vec::new(),
+                after(r),
+            )),
+            install::Change::Updated { .. } => {
+                sends.push(removed_send(r, before(r)));
+                let replacing = || vec![(broadcast::EXTRA_REPLACING, Value::Bool(true))];
+                sends.push(data_send(
+                    broadcast::ACTION_PACKAGE_ADDED,
+                    r,
+                    replacing(),
+                    after(r),
+                ));
+                sends.push(data_send(
+                    broadcast::ACTION_PACKAGE_REPLACED,
+                    r,
+                    replacing(),
+                    before(r),
+                ));
+                sends.push(my_package_replaced(r));
+            }
+            install::Change::Unchanged => {}
+        }
+    }
+    sends
+}
+
+/// PACKAGE_REMOVED of an update's replace (BroadcastHelper.sendPackageRemovedBroadcasts :1082-1095, from the replace call :593-595): killApp (DONT_KILL_APP false), not
+/// removed by the system (USER_INITIATED true), REMOVED_FOR_ALL_USERS (the replace's delete takes the package out of mPackages: IPH :2484-2485), REPLACING. No temp allowlist.
+fn removed_send(r: &install::Reported, about: Option<(Arc<Packages>, String)>) -> PackageSend {
+    data_send(
+        broadcast::ACTION_PACKAGE_REMOVED,
+        r,
+        vec![
+            (broadcast::EXTRA_DATA_REMOVED, Value::Bool(false)),
+            (broadcast::EXTRA_DONT_KILL_APP, Value::Bool(false)),
+            (broadcast::EXTRA_REMOVED_FOR_ALL_USERS, Value::Bool(true)),
+            (broadcast::EXTRA_REPLACING, Value::Bool(true)),
+            (broadcast::EXTRA_SYSTEM_UPDATE_UNINSTALL, Value::Bool(false)),
+            (broadcast::EXTRA_USER_INITIATED, Value::Bool(true)),
+        ],
+        about,
+    )
+}
+
+/// One data broadcast (sendPackageBroadcast): data `package:<pkg>` and EXTRA_UID, then `extras`, to the receivers `about` admits.
+fn data_send(
+    action: &str,
+    r: &install::Reported,
+    extras: Vec<(&str, Value)>,
+    about: Option<(Arc<Packages>, String)>,
+) -> PackageSend {
+    let mut entries = vec![(
+        broadcast::EXTRA_UID.to_owned(),
+        Value::Int(i32::try_from(r.uid).unwrap_or(i32::MAX)),
+    )];
+    entries.extend(extras.into_iter().map(|(k, v)| (k.to_owned(), v)));
+    PackageSend {
+        package: r.package.clone(),
+        intent: Intent {
+            action: Some(action.to_owned()),
+            data: Some(format!("package:{}", r.package)),
+            extras: Some(Bundle::from_entries(entries)),
+            ..Intent::default()
+        },
+        about,
+        grant: None,
+    }
+}
+
+/// MY_PACKAGE_REPLACED to the package's own receivers alone (setPackage, no data, no extras) with the REASON_PACKAGE_REPLACED temp allowlist; no audience (the allow list is null, BroadcastHelper :714-720).
+fn my_package_replaced(r: &install::Reported) -> PackageSend {
+    PackageSend {
+        package: r.package.clone(),
+        intent: Intent {
+            action: Some(broadcast::ACTION_MY_PACKAGE_REPLACED.to_owned()),
+            package: Some(r.package.clone()),
+            ..Intent::default()
+        },
+        about: None,
+        grant: uid_state::grant_of(
+            broadcast::BOOT_TIME_TEMP_ALLOWLIST_MS,
+            uid_state::TEMP_TYPE_FGS_ALLOWED,
+            broadcast::REASON_PACKAGE_REPLACED,
+        ),
+    }
+}
+
 impl ActivityManager {
     /// A broadcast the services send as the system uid to the registered receivers, of `only_uid` alone when given (see [`Self::broadcast_registered`]'s callers). Returns the receivers queued.
     pub fn broadcast_registered(&self, intent: &Intent, only_uid: Option<u32>) -> usize {
@@ -957,87 +1084,37 @@ impl ActivityManager {
                 result_to: finished.map(|(h, caller)| (ReceiverHandle::Binder(h.clone()), caller)),
                 max_manifest_api: None,
                 grant,
+                about: None,
             })
             .map(|_| ())
     }
 
-    /// The start-time package broadcasts of the install's reports (BroadcastHelper.sendPostInstallBroadcasts :600-720), before the boot ones: a new package gets PACKAGE_ADDED; an updated
-    /// one PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED to every receiver, and MY_PACKAGE_REPLACED to its own receivers alone with the REASON_PACKAGE_REPLACED temp allowlist.
-    /// Unchanged packages send nothing; a refused downgrade comes as Unchanged (install.rs install keeps the installed package).
-    pub fn package_broadcasts(&self, reports: &[install::Reported]) {
-        for r in reports {
-            match r.change {
-                install::Change::New => {
-                    self.send_package(broadcast::ACTION_PACKAGE_ADDED, r, false, None)
-                }
-                install::Change::Updated { .. } => {
-                    self.send_package(broadcast::ACTION_PACKAGE_ADDED, r, true, None);
-                    self.send_package(broadcast::ACTION_PACKAGE_REPLACED, r, true, None);
-                    self.send_package(
-                        broadcast::ACTION_MY_PACKAGE_REPLACED,
-                        r,
-                        false,
-                        Some(r.package.as_str()),
-                    );
-                }
-                install::Change::Unchanged => {}
+    /// The start-time package broadcasts of the install's reports, before the boot ones (`package_sends`): a new package gets PACKAGE_ADDED; an updated one PACKAGE_REMOVED of the old
+    /// version first, then PACKAGE_ADDED (EXTRA_REPLACING), PACKAGE_REPLACED, and MY_PACKAGE_REPLACED to its own receivers alone with the REASON_PACKAGE_REPLACED temp allowlist.
+    /// Each receiver must see the package in its send's audience (`receivers_locked`). Unchanged packages send nothing; a refused downgrade comes as Unchanged (install.rs install keeps the installed package).
+    pub fn package_broadcasts(&self, reports: &[install::Reported], audience: &install::Audience) {
+        for send in package_sends(reports, audience) {
+            let spec = SendSpec {
+                intent: &send.intent,
+                resolved_type: None,
+                sender: (own_pid(), SYSTEM_UID),
+                user: USER_SYSTEM,
+                required: None,
+                result: (BROADCAST_RESULT_OK, None, None),
+                sticky: false,
+                ordered: false,
+                result_to: None,
+                max_manifest_api: None,
+                grant: send.grant,
+                about: send.about,
+            };
+            if let Err(e) = self.inner.send_broadcast(spec) {
+                let action = send.intent.action.as_deref().unwrap_or_default();
+                log(format_args!(
+                    "package broadcast {action} {}: {e}",
+                    send.package
+                ));
             }
-        }
-    }
-
-    /// One package broadcast as the system (sendPackageBroadcast): data `package:<pkg>` and EXTRA_UID (EXTRA_REPLACING on an update) to every receiver, or with `target` the
-    /// package alone (setPackage, no data, no extras: MY_PACKAGE_REPLACED). Unordered, no flags, the user 0 receivers.
-    fn send_package(
-        &self,
-        action: &str,
-        r: &install::Reported,
-        replacing: bool,
-        target: Option<&str>,
-    ) {
-        let mut intent = Intent {
-            action: Some(action.to_owned()),
-            ..Intent::default()
-        };
-        let grant = match target {
-            Some(package) => {
-                intent.package = Some(package.to_owned());
-                uid_state::grant_of(
-                    broadcast::BOOT_TIME_TEMP_ALLOWLIST_MS,
-                    uid_state::TEMP_TYPE_FGS_ALLOWED,
-                    broadcast::REASON_PACKAGE_REPLACED,
-                )
-            }
-            None => {
-                intent.data = Some(format!("package:{}", r.package));
-                let mut extras = vec![(
-                    broadcast::EXTRA_UID.to_owned(),
-                    Value::Int(i32::try_from(r.uid).unwrap_or(i32::MAX)),
-                )];
-                if replacing {
-                    extras.push((broadcast::EXTRA_REPLACING.to_owned(), Value::Bool(true)));
-                }
-                intent.extras = Some(Bundle::from_entries(extras));
-                None
-            }
-        };
-        let spec = SendSpec {
-            intent: &intent,
-            resolved_type: None,
-            sender: (own_pid(), SYSTEM_UID),
-            user: USER_SYSTEM,
-            required: None,
-            result: (BROADCAST_RESULT_OK, None, None),
-            sticky: false,
-            ordered: false,
-            result_to: None,
-            max_manifest_api: None,
-            grant,
-        };
-        if let Err(e) = self.inner.send_broadcast(spec) {
-            log(format_args!(
-                "package broadcast {action} {}: {e}",
-                r.package
-            ));
         }
     }
 
@@ -1085,6 +1162,7 @@ impl ActivityManager {
             result_to: None,
             max_manifest_api,
             grant: None,
+            about: None,
         }) {
             log(format_args!("system broadcast {:?}: {e}", intent.action));
         }
@@ -1160,6 +1238,7 @@ impl ActivityManager {
             result_to: result_to.map(|handle| (handle, pid)),
             max_manifest_api: None,
             grant: None,
+            about: None,
         })
     }
 }

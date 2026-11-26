@@ -663,6 +663,13 @@ pub const ACTION_LOCKED_BOOT_COMPLETED: &str = "android.intent.action.LOCKED_BOO
 pub const ACTION_PACKAGE_ADDED: &str = "android.intent.action.PACKAGE_ADDED";
 pub const ACTION_PACKAGE_REPLACED: &str = "android.intent.action.PACKAGE_REPLACED";
 pub const ACTION_MY_PACKAGE_REPLACED: &str = "android.intent.action.MY_PACKAGE_REPLACED";
+/// Intent.java :2776 (action) and the PACKAGE_REMOVED extras :6512-6581 (BroadcastHelper.sendPackageRemovedBroadcasts :1082-1095).
+pub const ACTION_PACKAGE_REMOVED: &str = "android.intent.action.PACKAGE_REMOVED";
+pub const EXTRA_DATA_REMOVED: &str = "android.intent.extra.DATA_REMOVED";
+pub const EXTRA_DONT_KILL_APP: &str = "android.intent.extra.DONT_KILL_APP";
+pub const EXTRA_USER_INITIATED: &str = "android.intent.extra.USER_INITIATED";
+pub const EXTRA_REMOVED_FOR_ALL_USERS: &str = "android.intent.extra.REMOVED_FOR_ALL_USERS";
+pub const EXTRA_SYSTEM_UPDATE_UNINSTALL: &str = "android.intent.extra.SYSTEM_UPDATE_UNINSTALL";
 pub const EXTRA_UID: &str = "android.intent.extra.UID";
 pub const EXTRA_REPLACING: &str = "android.intent.extra.REPLACING";
 pub const EXTRA_USER_HANDLE: &str = "android.intent.extra.user_handle";

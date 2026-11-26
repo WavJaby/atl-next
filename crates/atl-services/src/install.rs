@@ -21,7 +21,7 @@ use crate::app_id::AppIds;
 use crate::installed::Installed as Decoded;
 use crate::package::same_signers;
 use crate::package_state::PackageUserStates;
-use crate::packages::{InstallFields, PackageRecord, PackageTable, Permissions};
+use crate::packages::{InstallFields, PackageRecord, PackageTable, Packages, Permissions};
 use crate::process_control::{ControlSocket, ScanReply};
 
 /// The diag interface the install's counts go under (PackageManagerService's binder name).
@@ -96,7 +96,7 @@ impl Installer {
     }
 
     /// Boot's sessions as one batch: a refusal fails the start (the boot scan's refusals always did), so nothing is published.
-    pub fn boot(&self, sessions: &[u32]) -> Result<Vec<Reported>> {
+    pub fn boot(&self, sessions: &[u32]) -> Result<Published> {
         ensure!(!self.config.abis.is_empty(), "no device ABI");
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         let mut batch = Vec::with_capacity(sessions.len());
@@ -310,11 +310,17 @@ impl Installer {
 
     /// The batch becomes visible at once, under the install lock: its permission states, then the table, then each recorded version, its component overrides pruned, and the state
     /// saved. Before the table publish nothing of it was visible.
-    fn publish(&self, batch: Vec<Installed>) -> Vec<Reported> {
-        if batch.is_empty() {
-            return Vec::new();
-        }
+    fn publish(&self, batch: Vec<Installed>) -> Published {
         let snapshot = self.table.snapshot();
+        if batch.is_empty() {
+            return Published {
+                reports: Vec::new(),
+                audience: Audience {
+                    before: Arc::clone(&snapshot),
+                    after: snapshot,
+                },
+            };
+        }
         let names: Vec<String> = batch.iter().map(|i| i.record.name().to_owned()).collect();
         let mut frozen = Vec::with_capacity(batch.len());
         let (records, reports): (Vec<PackageRecord>, Vec<Reported>) = batch
@@ -342,7 +348,13 @@ impl Installer {
         }
         // the freezes end last: a package starts again only once its version is recorded and its state saved (D6)
         drop(frozen);
-        reports
+        Published {
+            reports,
+            audience: Audience {
+                before: snapshot,
+                after: published,
+            },
+        }
     }
 }
 
@@ -407,6 +419,21 @@ pub struct Reported {
     pub uid: u32,
     pub version: i64,
     pub change: Change,
+}
+
+/// The tables a publish's package broadcasts are judged against (BroadcastHelper's visibility allow lists, IPH :2447-2450): `before` = the table the publish
+/// replaced (REMOVED, REPLACED), `after` = the table it published (ADDED, NEW). Membership is `Packages::visible` on the table, evaluated per receiver.
+#[derive(Debug, Clone)]
+pub struct Audience {
+    pub before: Arc<Packages>,
+    pub after: Arc<Packages>,
+}
+
+/// What one publish made visible: its reports, and the audience of their package broadcasts.
+#[derive(Debug)]
+pub struct Published {
+    pub reports: Vec<Reported>,
+    pub audience: Audience,
 }
 
 /// What an install does to a package against its recorded version (see [`change_of`]).
@@ -822,7 +849,8 @@ mod tests {
         let installer = installer_over(&control, &table, &state);
         let reports = installer
             .boot(&[0])
-            .expect("the boot goes on with the installed package");
+            .expect("the boot goes on with the installed package")
+            .reports;
         drop(installer);
         drop(control);
         assert_eq!(
@@ -1207,7 +1235,7 @@ mod tests {
         });
         let before = table.snapshot();
         let installer = installer_over(&control, &table, &state);
-        let reports = installer.boot(&[0, 1]).expect("boot");
+        let reports = installer.boot(&[0, 1]).expect("boot").reports;
         drop(installer);
         drop(control);
         server.join().expect("server");
@@ -1347,7 +1375,7 @@ mod tests {
         let accepted = installer
             .install_one(&mut ids, 0, Origin::Session, &[])
             .expect("the update is accepted");
-        let reports = installer.publish(vec![accepted]);
+        let reports = installer.publish(vec![accepted]).reports;
         drop(installer);
         drop(control);
         server.join().expect("server");
@@ -1394,7 +1422,7 @@ mod tests {
         let accepted = installer
             .install_one(&mut ids, 0, Origin::Session, &[])
             .expect("the install is accepted");
-        let reports = installer.publish(vec![accepted]);
+        let reports = installer.publish(vec![accepted]).reports;
         drop(installer);
         drop(control);
         server.join().expect("server");

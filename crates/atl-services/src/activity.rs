@@ -3801,8 +3801,15 @@ mod tests {
     use atl_services_types::display_model::Declaration;
     use binder::{BinderFeatures, Interface, StatusCode};
 
+    use std::collections::BTreeMap;
+
+    use atl_parcelables::codecs::android::os::Bundle::Value;
+    use atl_services_types::installer_output::Kind;
+
     use super::*;
     use crate::appops;
+    use crate::install;
+    use crate::installed::ComponentIntents;
     use crate::packages::fixture;
 
     /// A process control that starts nothing: the broadcast tests below send to no receiver.
@@ -3828,10 +3835,12 @@ mod tests {
 
     /// An empty manager whose processes go through `control`.
     fn manager_with(control: Arc<dyn ProcessControl>) -> ActivityManager {
-        let packages = Arc::new(PackageTable::new(Packages::new(
-            Vec::new(),
-            Default::default(),
-        )));
+        manager_over(control, Vec::new())
+    }
+
+    /// A manager whose live table holds `list`, its processes going through `control`.
+    fn manager_over(control: Arc<dyn ProcessControl>, list: Vec<PackageRecord>) -> ActivityManager {
+        let packages = Arc::new(PackageTable::new(Packages::new(list, Default::default())));
         let permissions = Arc::new(Permissions::new(&packages.snapshot(), &[]));
         ActivityManager::new(
             packages,
@@ -3972,6 +3981,203 @@ mod tests {
             *control.kills.lock().expect("kills"),
             [43],
             "only the headless process is killed"
+        );
+    }
+
+    /// The extras of `intent` as sorted `key=type value` text (`int 10001`, `bool true`).
+    fn extras_text(intent: &Intent) -> Vec<String> {
+        let Some(extras) = &intent.extras else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = extras
+            .entries()
+            .expect("extras")
+            .into_iter()
+            .map(|(k, v)| match v {
+                Value::Int(i) => format!("{k}=int {i}"),
+                Value::Bool(b) => format!("{k}=bool {b}"),
+                _ => format!("{k}=other"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A package of `uid` and targetSdk `sdk` with an exported receiver (`.Receiver`) that filters `actions` on the `package` scheme: a package broadcast's data is
+    /// `package:<name>`, and a filter with no data specs matches no data (IntentFilter.matchData).
+    fn receiver_app(package: &str, uid: u32, sdk: i32, actions: &[&str]) -> PackageRecord {
+        let mut p = fixture::record(package);
+        p.uid = uid;
+        if let Some(app) = p.info.application_info.as_mut() {
+            app.target_sdk_version = sdk;
+        }
+        let mut component = fixture::component(package, ".Receiver");
+        component.exported = true;
+        p.info.receivers = Some(vec![Some(ActivityInfo {
+            component,
+            ..Default::default()
+        })]);
+        let mut filter = fixture::filter(actions, &[]);
+        if let Some(f) = filter.intent_filter.as_mut() {
+            f.data_schemes = Some(vec![Some("package".to_owned())]);
+        }
+        p.intents.push(ComponentIntents {
+            kind: Kind::ReceiverIntents,
+            name: ".Receiver".to_owned(),
+            intents: vec![filter],
+        });
+        p
+    }
+
+    /// An update's package broadcasts in send order, each judged by its audience: REMOVED and REPLACED the table before the publish, ADDED the one it published, MY_PACKAGE_REPLACED
+    /// none. The extras are AOSP's, not the code's: BroadcastHelper.sendPackageRemovedBroadcasts :1082-1095 on the replace call :593-595, killApp true (INSTALL_DONT_KILL_APP unset,
+    /// handlePackagePostInstall :3054-3055), removedBySystem false; REMOVED_FOR_ALL_USERS true, since the replace's delete takes the package out of mPackages (IPH :2484-2485,
+    /// RemovePackageHelper :396, DeletePackageHelper :563).
+    #[test]
+    fn update_sends_removed_added_replaced_my_replaced() {
+        const PACKAGE: &str = "com.example.app";
+        let table = || {
+            Arc::new(Packages::new(
+                vec![fixture::record(PACKAGE)],
+                BTreeMap::new(),
+            ))
+        };
+        let (before, after) = (table(), table());
+        let audience = install::Audience {
+            before: Arc::clone(&before),
+            after: Arc::clone(&after),
+        };
+        let reports = [install::Reported {
+            package: PACKAGE.to_owned(),
+            uid: 10_001,
+            version: 2,
+            change: install::Change::Updated { from: 1 },
+        }];
+        let sends = broadcasts_am::package_sends(&reports, &audience);
+        let actions: Vec<&str> = sends
+            .iter()
+            .map(|s| s.intent.action.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                broadcast::ACTION_PACKAGE_REMOVED,
+                broadcast::ACTION_PACKAGE_ADDED,
+                broadcast::ACTION_PACKAGE_REPLACED,
+                broadcast::ACTION_MY_PACKAGE_REPLACED,
+            ]
+        );
+        assert_eq!(
+            extras_text(&sends[0].intent),
+            [
+                "android.intent.extra.DATA_REMOVED=bool false",
+                "android.intent.extra.DONT_KILL_APP=bool false",
+                "android.intent.extra.REMOVED_FOR_ALL_USERS=bool true",
+                "android.intent.extra.REPLACING=bool true",
+                "android.intent.extra.SYSTEM_UPDATE_UNINSTALL=bool false",
+                "android.intent.extra.UID=int 10001",
+                "android.intent.extra.USER_INITIATED=bool true",
+            ]
+        );
+        assert_eq!(
+            sends[0].intent.data.as_deref(),
+            Some("package:com.example.app")
+        );
+        assert_eq!(
+            extras_text(&sends[1].intent),
+            [
+                "android.intent.extra.REPLACING=bool true",
+                "android.intent.extra.UID=int 10001",
+            ]
+        );
+        assert_eq!(extras_text(&sends[2].intent), extras_text(&sends[1].intent));
+        assert_eq!(sends[3].intent.package.as_deref(), Some(PACKAGE));
+        assert!(extras_text(&sends[3].intent).is_empty());
+        assert!(sends[3].intent.data.is_none());
+        assert!(
+            sends[3].grant.is_some(),
+            "MY_PACKAGE_REPLACED: the temp allowlist"
+        );
+        let judge = |i: usize| match &sends[i].about {
+            None => "none",
+            Some((t, _)) if Arc::ptr_eq(t, &before) => "before",
+            Some((t, _)) if Arc::ptr_eq(t, &after) => "after",
+            Some(_) => "other",
+        };
+        assert_eq!(
+            [judge(0), judge(1), judge(2), judge(3)],
+            ["before", "after", "before", "none"]
+        );
+    }
+
+    /// A package broadcast reaches only the receivers whose uid may see the package in its audience table (receivers_locked; counted `broadcast skipped: package not
+    /// visible`). X (uid 10_060, targetSdk 29: sees every package) is admitted by the table before the update; Y (uid 10_050, targetSdk 34, no <queries>) never is. ADDED is
+    /// judged by the table after the update, where X is targetSdk 34 too: no receiver is admitted.
+    #[test]
+    fn package_broadcast_reaches_only_uids_that_see_it() {
+        const PACKAGE: &str = "com.example.app";
+        const ACTIONS: [&str; 2] = [
+            broadcast::ACTION_PACKAGE_REMOVED,
+            broadcast::ACTION_PACKAGE_ADDED,
+        ];
+        let world = |x_sdk: i32| {
+            let mut app = fixture::record(PACKAGE);
+            app.uid = 10_070;
+            vec![
+                // names sort X first: the resolver's delivery order is by package name (the red line reads [X, Y])
+                receiver_app("com.example.alpha", 10_060, x_sdk, &ACTIONS),
+                receiver_app("com.example.beta", 10_050, 34, &ACTIONS),
+                app,
+            ]
+        };
+        let before = Arc::new(Packages::new(world(29), BTreeMap::new()));
+        let after = Arc::new(Packages::new(world(34), BTreeMap::new()));
+        let am = manager_over(Arc::new(NoProcesses), world(29));
+        let skipped = || {
+            // the api key is `<interface>.<what>` (atl_diag::answered)
+            let api = format!("{AM}.broadcast skipped: package not visible");
+            atl_diag::counts()
+                .into_iter()
+                .find(|(o, a, _)| o == "answered" && a == &api)
+                .map_or(0, |(_, _, n)| n)
+        };
+        let receivers = |action: &str, judge: &Arc<Packages>| -> Vec<u32> {
+            let intent = Intent {
+                action: Some(action.to_owned()),
+                data: Some(format!("package:{PACKAGE}")),
+                ..Intent::default()
+            };
+            let key = intent_key(&intent, None);
+            let spec = broadcasts_am::SendSpec {
+                intent: &intent,
+                resolved_type: None,
+                sender: (1, SYSTEM_UID),
+                user: USER_SYSTEM,
+                required: None,
+                result: (-1, None, None),
+                sticky: false,
+                ordered: false,
+                result_to: None,
+                max_manifest_api: None,
+                grant: None,
+                about: Some((Arc::clone(judge), PACKAGE.to_owned())),
+            };
+            let st = am.inner.state();
+            am.inner
+                .receivers_locked(&st, &spec, &intent, &key)
+                .iter()
+                .map(|r| r.proc.uid)
+                .collect()
+        };
+        let skipped_before = skipped();
+        assert_eq!(
+            receivers(broadcast::ACTION_PACKAGE_REMOVED, &before),
+            [10_060]
+        );
+        assert_eq!(skipped() - skipped_before, 1, "Y is counted once");
+        assert_eq!(
+            receivers(broadcast::ACTION_PACKAGE_ADDED, &after),
+            Vec::<u32>::new()
         );
     }
 
