@@ -16,7 +16,10 @@ pub use report::{Load, Report, Seen};
 pub use sampler::{
     GateReading, SAMPLE_PERIOD, Sample, Sampler, Samples, Span, allowed_cpus, live, monotonic_ns,
 };
-pub use scope::cgroup_dir;
+pub use scope::{
+    Events, Exit, INCOMPLETE_EXIT, RECORD_TAG, Record, cgroup_dir, enter, in_managed_leaf,
+    local_oom, new_unit, scoped_command, stop, supervise,
+};
 
 use std::time::Duration;
 
@@ -40,8 +43,9 @@ enum Tier {
 
 impl Gate {
     /// Begins the gate. Its own unit is the only scope it measures: a process not yet in `atl-gate-<pid>.scope` relaunches into it (the call then returns there, as the same process; see `scope::relaunch_self`). An enclosing scope is the job's, not the gate's, so it is never used.
+    /// A managed row's leaf is its scope already: the gate measures it and never relaunches (a relaunch would leave the leaf and its counters).
     pub fn begin() -> Self {
-        let tier = if scope::relaunched() {
+        let tier = if scope::relaunched() || scope::in_managed_leaf() {
             match scope::own() {
                 Ok(scope) => {
                     let sampler =

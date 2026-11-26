@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Instant;
@@ -796,11 +796,18 @@ impl RowRun<'_> {
         let file = std::fs::File::create(&log).with_context(|| log.display().to_string())?;
         let argv = row.argv(self.host, self.out);
         let started = Instant::now();
-        let mut cmd = Command::new(self.exe);
+        // the row runs in a managed scope (atl-host-load): the supervisor is the scope's main process, runs the row in the scope's leaf and appends the row's `scope-record:` to the log
+        let unit = atl_host_load::new_unit();
+        let mut cmd = atl_host_load::scoped_command(&unit);
         xtask::grant_jobs(&mut cmd);
         // the products are the prebuild's (`--prebuilt`); cargo is the guard's: a cargo call from the row or its tree is refused (refuse_cargo)
         let mut child = cmd
             .current_dir(self.root)
+            .arg(self.exe)
+            .args(["scope-supervise", "--record"])
+            .arg(&log)
+            .arg("--")
+            .arg(self.exe)
             .arg("test")
             .arg("--prebuilt")
             .arg(self.record)
@@ -811,9 +818,18 @@ impl RowRun<'_> {
             .stderr(file)
             .spawn()
             .with_context(|| format!("spawning xtask-harness test {}", argv.join(" ")))?;
-        let status = child.wait().context("waiting for the gate")?;
+        let supervisor = child.wait().context("waiting for the gate")?;
+        atl_host_load::stop(&unit);
         let took = started.elapsed().as_secs_f64();
         let text = std::fs::read_to_string(&log).unwrap_or_default();
+        // the workload's exit and counters come from the supervisor's record; no record, or an incomplete one, is an infrastructure red
+        let record = match atl_host_load::Record::read_last(&text) {
+            Ok(record) => record,
+            Err(why) => {
+                let e = anyhow::anyhow!("scope record: {why} (supervisor {supervisor})");
+                return Ok(errored(row, &e));
+            }
+        };
         let phases = phases_field(&text);
         // the gate's own record (atl-host-load), its last `host load:` line: the scope's peak and the stall share of its span
         let seen = atl_host_load::Seen::read(&text);
@@ -831,8 +847,12 @@ impl RowRun<'_> {
         );
         // a refused cargo call fails the row whatever its exit status: the row ran cargo, which no row may
         let refused = refused_calls(&text);
+        let code = match record.exit {
+            atl_host_load::Exit::Code(code) => Some(code),
+            atl_host_load::Exit::Signal(_) | atl_host_load::Exit::NotRun => None,
+        };
         let outcome = if refused.is_empty() {
-            Outcome::of_exit(status.code())
+            Outcome::of_exit(code)
         } else {
             Outcome::Fail
         };

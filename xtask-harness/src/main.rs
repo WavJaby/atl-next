@@ -145,6 +145,27 @@ enum Command {
     /// The worker and burner processes of `test host-load` (host_load.rs `child`); no checkout, no gate scope.
     #[command(hide = true)]
     HostLoadChild(host_load::ChildArgs),
+    /// The supervisor of a managed row (atl-host-load `supervise`): the main process of the row's scope. It runs the workload through the placer and appends the workload's `scope-record:` line to `--record`; exit 3 when that record is incomplete. No checkout, no gate.
+    #[command(hide = true)]
+    ScopeSupervise {
+        /// The workload's log: the record line is appended to it.
+        #[arg(long)]
+        record: PathBuf,
+        /// A test fixture: the leaf's `memory.max` in bytes (swap off, group kill on), so the leaf can OOM.
+        #[arg(long)]
+        memory_max: Option<u64>,
+        /// The workload's program and arguments, after `--`.
+        #[arg(last = true, required = true)]
+        workload: Vec<std::ffi::OsString>,
+    },
+    /// The placer of a managed row (atl-host-load `enter`): moves its process into `--leaf` and execs the workload there, so the workload is in its leaf from its first instruction. No checkout, no gate.
+    #[command(hide = true)]
+    ScopeEnter {
+        #[arg(long)]
+        leaf: PathBuf,
+        #[arg(last = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -350,6 +371,20 @@ fn main() -> Result<ExitCode> {
         Command::WindowLive(args) => return window::agent(args),
         Command::DisplayProbe => return window::display_probe(),
         Command::HostLoadChild(args) => return host_load::child(args),
+        Command::ScopeSupervise {
+            record,
+            memory_max,
+            workload,
+        } => {
+            let mut cmd = std::process::Command::new(&workload[0]);
+            cmd.args(&workload[1..]);
+            let code = match atl_host_load::supervise(&cmd, record, *memory_max) {
+                Ok(_) => 0,
+                Err(_) => atl_host_load::INCOMPLETE_EXIT,
+            };
+            return Ok(ExitCode::from(code));
+        }
+        Command::ScopeEnter { leaf, argv } => return Ok(atl_host_load::enter(leaf, argv)),
         _ => {}
     }
     // a test gate runs in its own scope when the host can make one (atl-host-load): begun here, its `host load:` line printed after its verdict
@@ -518,7 +553,11 @@ fn main() -> Result<ExitCode> {
             test: Test::HostLoad(args),
         } => host_load::run(&args),
         Command::CheckStep { step, out } => check_step(&root, step, &out),
-        Command::WindowLive(_) | Command::DisplayProbe | Command::HostLoadChild(_) => {
+        Command::WindowLive(_)
+        | Command::DisplayProbe
+        | Command::HostLoadChild(_)
+        | Command::ScopeSupervise { .. }
+        | Command::ScopeEnter { .. } => {
             unreachable!("dispatched above")
         }
     };
@@ -643,6 +682,8 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
         Command::CheckStep { .. }
         | Command::WindowLive(_)
         | Command::DisplayProbe
-        | Command::HostLoadChild(_) => return None,
+        | Command::HostLoadChild(_)
+        | Command::ScopeSupervise { .. }
+        | Command::ScopeEnter { .. } => return None,
     })
 }
