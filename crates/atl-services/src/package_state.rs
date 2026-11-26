@@ -206,11 +206,13 @@ impl PackageUserStates {
         let Some(file) = &self.file else {
             return Ok(());
         };
+        // Concurrent savers of this instance serialize on this guard through the rename: keep it bound across state_file::save (an innocent `let s = self.packages().clone();` refactor drops it silently).
+        let packages = self.packages();
         state_file::save(
             file,
             VERSION,
             &Stored {
-                packages: self.packages().clone(),
+                packages: packages.clone(),
             },
         )
     }
