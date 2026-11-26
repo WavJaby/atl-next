@@ -237,6 +237,16 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_members_change_alone_is_not_a_write_of_the_stream() {
+        let changes = Changes {
+            volume: vec![(STREAM_TTS, 1, 2)],
+            mute: Vec::new(),
+        };
+        assert!(!written(STREAM_MUSIC, &changes));
+        assert!(written(STREAM_TTS, &changes));
+    }
+
+    #[test]
     fn alias_members_move_but_only_the_written_stream_is_delivered() {
         let mut v = Volumes::default();
         let changes = v.set(STREAM_MUSIC, 2).expect("MUSIC is a stream");
