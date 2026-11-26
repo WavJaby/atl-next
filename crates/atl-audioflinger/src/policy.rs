@@ -5,6 +5,7 @@
 //! (AudioFlinger.cpp:1120), which this server replaces, and no client path calls it (AudioTrack gets its output from createTrack's response). Routing is one output for every stream.
 //! The primary output mix (a SOURCE MIX port; its active config carries getOutput's I/O handle) and its patch to the speaker are listed from startup, as the route is fixed (no hotplug, no reroute). AOSP lists a mix only while its output is open.
 //! The product strategy and volume group transactions are AOSP's engine's answers (atl-audio-bridge engine.rs): this file unparcels the attributes and the answer, and maps the engine's status to the binder's error.
+//! The service rules of AudioPolicyInterfaceImpl.cpp are here too, at the overrides that implement those calls: the public stream range, and NONE with the fallback as BAD_VALUE.
 
 use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_3_Int as Int,
@@ -72,6 +73,12 @@ const SPEAKER_NAME: &str = "Speaker";
 const MIX_NAME: &str = "primary output";
 /// `AUDIO_OUTPUT_FLAG_PRIMARY` (audio-hal-enums.h:438): the module's primary output.
 const AUDIO_OUTPUT_FLAG_PRIMARY: i32 = 0x2;
+/// `STRATEGY_NONE` (policy.h:46, V(STRATEGY_NONE, -1)): PRODUCT_STRATEGY_NONE is the same value (AudioCommonTypes.h:93).
+const PRODUCT_STRATEGY_NONE: i32 = -1;
+/// VOLUME_GROUP_NONE (AudioCommonTypes.h:148): no volume group.
+const VOLUME_GROUP_NONE: i32 = -1;
+/// AUDIO_STREAM_PUBLIC_CNT (audio-base-utils.h:32, ASSISTANT + 1; AUDIO_STREAM_ASSISTANT is 11, audio-hal-enums.h:773): the streams with a public number.
+const AUDIO_STREAM_PUBLIC_CNT: u32 = 12;
 
 /// The primary HAL module's handle: a unique id of use MODULE (AudioFlinger::loadHwModule), made at first use and kept.
 fn module_handle() -> i32 {
@@ -256,6 +263,11 @@ fn mmap_type(policy_type: AudioMMapPolicyType) -> binder::Result<()> {
     }
 }
 
+/// AudioPolicyInterfaceImpl.cpp:1384 compares the stream as uint32_t, so a negative stream is past the public range too.
+fn is_public_stream(stream: i32) -> bool {
+    u32::try_from(stream).is_ok_and(|s| s < AUDIO_STREAM_PUBLIC_CNT)
+}
+
 /// The engine this process answers from: AOSP's default-config engine, loaded at first use. A failed load is every answer's error (AOSP has no policy manager then, NO_INIT-like).
 fn engine() -> binder::Result<MutexGuard<'static, PolicyEngine>> {
     static ENGINE: std::sync::OnceLock<Result<Mutex<PolicyEngine>, i32>> =
@@ -402,11 +414,15 @@ impl IAudioPolicyService for AudioPolicy {
         Ok(())
     }
 
-    /// AudioPolicyService::getStrategyForStream (AudioPolicyInterfaceImpl.cpp:1379): the engine's strategy for the stream.
+    /// AudioPolicyService::getStrategyForStream (AudioPolicyInterfaceImpl.cpp:1379): NONE past the public range (1384-1387), else the engine's strategy for the stream.
     fn r#getStrategyForStream(&self, stream: AudioStreamType) -> binder::Result<i32> {
-        let strategy = engine()?
-            .product_strategy_for_stream(stream.0)
-            .map_err(status_error)?;
+        let strategy = if is_public_stream(stream.0) {
+            engine()?
+                .product_strategy_for_stream(stream.0)
+                .map_err(status_error)?
+        } else {
+            PRODUCT_STRATEGY_NONE
+        };
         atl_diag::answered(INTERFACE, "getStrategyForStream");
         Ok(strategy)
     }
@@ -431,6 +447,10 @@ impl IAudioPolicyService for AudioPolicy {
         let strategy = engine()?
             .product_strategy_for_attributes(&attributes, fallback_on_default)
             .map_err(status_error)?;
+        // AudioPolicyManager.h:389-391: NONE with the fallback is BAD_VALUE; AudioPolicyInterfaceImpl.cpp:2466-2468 returns the manager's status
+        if fallback_on_default && strategy == PRODUCT_STRATEGY_NONE {
+            return Err(StatusCode::BAD_VALUE.into());
+        }
         atl_diag::answered(INTERFACE, "getProductStrategyFromAudioAttributes");
         Ok(strategy)
     }
@@ -453,6 +473,10 @@ impl IAudioPolicyService for AudioPolicy {
         let group = engine()?
             .volume_group_for_attributes(&attributes, fallback_on_default)
             .map_err(status_error)?;
+        // AudioPolicyManager.h:401-405: VOLUME_GROUP_NONE with the fallback is BAD_VALUE; AudioPolicyInterfaceImpl.cpp:2500-2504 returns the manager's status
+        if fallback_on_default && group == VOLUME_GROUP_NONE {
+            return Err(StatusCode::BAD_VALUE.into());
+        }
         atl_diag::answered(INTERFACE, "getVolumeGroupFromAudioAttributes");
         Ok(group)
     }

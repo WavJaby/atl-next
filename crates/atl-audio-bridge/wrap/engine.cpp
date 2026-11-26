@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The five calls of wrap/engine.h. Each body is AOSP's own sequence for that IAudioPolicyService call (AudioPolicyInterfaceImpl.cpp, its AudioPolicyManager method in AudioPolicyManager.h): the AIDL conversions are AOSP's, the status is returned as AOSP's status_t.
-//! Forward only: the engine answers, the parcel is the binder's encoding of the answer.
+//! The five calls of wrap/engine.h: forwards to the engine, AOSP's AIDL conversions, and the parcel encoding of the answers. Status is AOSP's status_t, unchanged.
+//! The service rules (the public stream range, NONE with the fallback) are policy.rs's, at the overrides that AudioPolicyInterfaceImpl.cpp implements.
 #include "wrap/engine.h"
 
 #include <EngineInterface.h>
@@ -8,9 +8,6 @@
 #include <media/AidlConversion.h>
 #include <media/AudioProductStrategy.h>
 #include <media/AudioVolumeGroup.h>
-#include <media/PolicyAidlConversion.h>
-#include <policy.h>
-#include <system/audio-base-utils.h>
 #include <utils/Errors.h>
 
 namespace atl::audio {
@@ -89,26 +86,18 @@ int32_t list_product_strategies(const PolicyEngine& policy, rust::Vec<uint8_t>& 
 
 int32_t product_strategy_for_attributes(const PolicyEngine& policy, rust::Slice<const uint8_t> attributes,
                                         bool fallback_on_default, int32_t& out) {
-    // AudioPolicyService::getProductStrategyFromAudioAttributes (AudioPolicyInterfaceImpl.cpp:2455) over AudioPolicyManager::getProductStrategyFromAudioAttributes (AudioPolicyManager.h:385-392): NONE with the fallback is BAD_VALUE
+    // AudioPolicyManager::getProductStrategyFromAudioAttributes (AudioPolicyManager.h:385) forwarded. Its NONE-with-fallback BAD_VALUE is policy.rs's (AudioPolicyManager.h:389-391).
     audio_attributes_t aa{};
     if (android::status_t status = attributes_from(attributes, aa); status != android::NO_ERROR) {
         return status;
     }
-    const android::product_strategy_t strategy = policy.engine->getProductStrategyForAttributes(aa, fallback_on_default);
-    if (fallback_on_default && strategy == android::PRODUCT_STRATEGY_NONE) {
-        return android::BAD_VALUE;
-    }
-    out = static_cast<int32_t>(strategy);
+    out = static_cast<int32_t>(policy.engine->getProductStrategyForAttributes(aa, fallback_on_default));
     return android::NO_ERROR;
 }
 
 int32_t product_strategy_for_stream(const PolicyEngine& policy, int32_t stream, int32_t& out) {
-    // AudioPolicyService::getStrategyForStream (AudioPolicyInterfaceImpl.cpp:1379): a stream past the public range has no strategy
-    if (uint32_t(stream) >= AUDIO_STREAM_PUBLIC_CNT) {
-        out = static_cast<int32_t>(android::PRODUCT_STRATEGY_NONE);
-        return android::NO_ERROR;
-    }
-    // AudioPolicyManager::getStrategyForStream = streamToStrategy (AudioPolicyManager.h:204-208): the stream's attributes, then their strategy with the fallback on
+    // AudioPolicyManager::getStrategyForStream = streamToStrategy (AudioPolicyManager.h:204-208): the stream's attributes, then their strategy with the fallback on.
+    // `stream` is public: policy.rs answers NONE past the range (AudioPolicyInterfaceImpl.cpp:1384). EngineInterface has no stream-to-strategy call: EngineBase::getProductStrategyForStream (EngineBase.h:129) is off the interface, and a different lookup (first strategy listing the stream, else the default; ProductStrategy.cpp:214-223), so the two calls stay here.
     const audio_attributes_t aa =
             policy.engine->getAttributesForStreamType(static_cast<audio_stream_type_t>(stream));
     out = static_cast<int32_t>(policy.engine->getProductStrategyForAttributes(aa, true));
@@ -141,16 +130,12 @@ int32_t list_volume_groups(const PolicyEngine& policy, rust::Vec<uint8_t>& out) 
 
 int32_t volume_group_for_attributes(const PolicyEngine& policy, rust::Slice<const uint8_t> attributes,
                                     bool fallback_on_default, int32_t& out) {
-    // AudioPolicyService::getVolumeGroupFromAudioAttributes (AudioPolicyInterfaceImpl.cpp:2489) over AudioPolicyManager::getVolumeGroupFromAudioAttributes (AudioPolicyManager.h:399-405): VOLUME_GROUP_NONE with the fallback is BAD_VALUE
+    // AudioPolicyManager::getVolumeGroupFromAudioAttributes (AudioPolicyManager.h:399) forwarded. Its VOLUME_GROUP_NONE-with-fallback BAD_VALUE is policy.rs's (AudioPolicyManager.h:401-405).
     audio_attributes_t aa{};
     if (android::status_t status = attributes_from(attributes, aa); status != android::NO_ERROR) {
         return status;
     }
-    const android::volume_group_t group = policy.engine->getVolumeGroupForAttributes(aa, fallback_on_default);
-    if (fallback_on_default && group == android::VOLUME_GROUP_NONE) {
-        return android::BAD_VALUE;
-    }
-    out = static_cast<int32_t>(group);
+    out = static_cast<int32_t>(policy.engine->getVolumeGroupForAttributes(aa, fallback_on_default));
     return android::NO_ERROR;
 }
 

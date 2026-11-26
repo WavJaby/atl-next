@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! AOSP's audio policy engine (libaudiopolicyenginedefault, EngineInterface) with its default config, behind the cxx bridge in src/bridge.rs.
-//! The five IAudioPolicyService queries policy.rs serves: each function is the AOSP service or AudioPolicyManager body for that call (engine.cpp names them); the engine decides the answer. No table, no matcher.
+//! The five IAudioPolicyService queries policy.rs serves: each function forwards to the engine, with AOSP's conversions, and the engine decides the answer. No table, no matcher. The service rules are policy.rs's.
 //! Errors are AOSP's status_t, unchanged. Attributes come in as the AudioAttributes parcelable's bytes; a list goes out as an AIDL parcel: int32 count, then each parcelable (Parcel::writeParcelable).
 #pragma once
 
@@ -31,7 +31,7 @@ int32_t list_product_strategies(const PolicyEngine& policy, rust::Vec<uint8_t>& 
 /// getProductStrategyFromAudioAttributes: `out` holds the strategy id on NO_ERROR. `attributes` is the AudioAttributes parcelable's bytes.
 int32_t product_strategy_for_attributes(const PolicyEngine& policy, rust::Slice<const uint8_t> attributes,
                                         bool fallback_on_default, int32_t& out);
-/// getStrategyForStream: `out` holds the strategy id on NO_ERROR.
+/// getStrategyForStream: `stream` must be public (policy.rs checks the range); `out` holds the strategy id on NO_ERROR.
 int32_t product_strategy_for_stream(const PolicyEngine& policy, int32_t stream, int32_t& out);
 /// listAudioVolumeGroups: the status; `out` holds the parcel of the groups on NO_ERROR.
 int32_t list_volume_groups(const PolicyEngine& policy, rust::Vec<uint8_t>& out);
