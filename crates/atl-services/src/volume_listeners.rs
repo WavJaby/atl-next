@@ -19,6 +19,8 @@ use crate::volume::Changes;
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAudioVolumeRegistry";
+/// The name the registry is registered under (services.toml atl.audio_volume). The app's policy names it too (atl-audioflinger policy.rs): an app process cannot depend on this crate.
+pub const SERVICE: &str = "atl.audio_volume";
 
 /// One listener's delivery: false when the listener is gone (its process died or its binder refused).
 pub trait Deliver {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The volume-change seam (A23 slice 5): AudioService (atl-services, the system side) tells an app process's policy (atl-audioflinger) about each committed stream change, over the guest Binder seam.
 //! `IAudioVolumeListener` (descriptor `atl.IAudioVolumeListener`) is the app's binder: VOLUME_COMMITTED (oneway) carries the written stream and the change's flags, the setStreamVolume / adjustStreamVolume flags as given.
-//! `IAudioVolumeRegistry` (descriptor `atl.IAudioVolumeRegistry`, registered as [`SERVICE`]) is AudioService's: REGISTER hands in the calling process's listener; the calling (uid, pid) keys it.
+//! `IAudioVolumeRegistry` (descriptor `atl.IAudioVolumeRegistry`, registered as `atl.audio_volume`: atl-services volume_listeners) is AudioService's: REGISTER hands in the calling process's listener; the calling (uid, pid) keys it.
 //! No group id is on this seam: the policy maps the stream to AOSP's engine group (atl-audio-bridge), so the system side holds no group catalogue. The pinned IAudioVolumeChangeDispatcher carries a group, so it would need that catalogue here.
 
 use binder::binder_impl::{Binder, BorrowedParcel, IBinderInternal, TransactionCode};
@@ -11,8 +11,6 @@ use binder::{Interface, StatusCode, Strong, declare_binder_interface};
 pub const LISTENER_DESCRIPTOR: &str = "atl.IAudioVolumeListener";
 /// The registry's interface descriptor.
 pub const REGISTRY_DESCRIPTOR: &str = "atl.IAudioVolumeRegistry";
-/// The name AudioService's registry is registered under.
-pub const SERVICE: &str = "atl.audio_volume";
 /// The written stream and the change's flags in (oneway: the change does not wait for the app); nothing out.
 pub const VOLUME_COMMITTED: TransactionCode = 1;
 /// The calling process's listener in; nothing out.

@@ -487,7 +487,7 @@ fn main() -> Result<()> {
     )
     .context("addService audio")?;
     binder::add_service(
-        atl_services_wire::audio_listener::SERVICE,
+        atl_services::volume_listeners::SERVICE,
         atl_services::volume_listeners::new_binder(volume_listeners),
     )
     .context("addService audio volume registry")?;

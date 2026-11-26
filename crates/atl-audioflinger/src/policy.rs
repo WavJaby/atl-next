@@ -39,7 +39,7 @@ use atl_audioflinger_stubs::mangled::{
     _7_android_5_media_22_AudioPolicyDeviceState as AudioPolicyDeviceState,
 };
 use atl_services_wire::audio_listener::{
-    BnAudioVolumeListener, IAudioVolumeListener, IAudioVolumeRegistry, SERVICE as VOLUME_REGISTRY,
+    BnAudioVolumeListener, IAudioVolumeListener, IAudioVolumeRegistry,
 };
 use audioclient_types_aidl::mangled::{
     _7_android_5_media_11_AudioPortFw as AudioPortFw,
@@ -65,6 +65,8 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const INTERFACE: &str = "IAudioPolicyService";
+/// The name the services register the volume registry under (services.toml atl.audio_volume; atl-services volume_listeners::SERVICE, which an app process cannot name).
+const VOLUME_REGISTRY: &str = "atl.audio_volume";
 
 /// The speaker's audio_port_handle_t. Policy port handles are their own namespace, not AudioFlinger's unique ids (PolicyAudioPort.cpp:43 getNextUniqueId -> getNextHandle); the speaker takes the first, the mix the second.
 pub(crate) const SPEAKER_PORT_ID: i32 = 1;

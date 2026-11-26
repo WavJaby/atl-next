@@ -600,6 +600,14 @@ src = [
 mirrors = []
 reason = "ATL's own interface (ICompositorRegistry): registers each app's in-process SurfaceFlinger and UI agent (plan C3); AOSP has no counterpart, its one SurfaceFlinger is a separate process"
 
+["atl.audio_volume"]
+src = [
+    "crates/atl-services/src/volume_listeners.rs",
+    "crates/atl-services-wire/src/audio_listener.rs",
+]
+mirrors = []
+reason = "ATL's private volume-change seam (A23 slice 5): AudioService tells each app process's policy of a write's stream; AOSP's policy registers in-process (IAudioPolicyService.registerClient) and its volume callbacks ride the system server's own binder"
+
 [account]
 src = ["crates/atl-services/src/account.rs", "crates/atl-parcelables/src/codecs/android/accounts/Account.rs"]
 mirrors = [

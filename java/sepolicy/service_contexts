@@ -5,5 +5,8 @@
 # atld's compositor registry (services.toml atl.compositor_registry): each app process registers its SurfaceFlinger and UI agent with it; served by atl-system-services
 atl.compositor_registry    u:object_r:atl_compositor_registry_service:s0
 
+# atl.audio_volume (services.toml): the volume-change seam; each app process registers its listener with it, atl-system-services serves it (A23 slice 5)
+atl.audio_volume    u:object_r:atl_audio_volume_service:s0
+
 # ATL's IMapper v5 instance (atl-gralloc vintf.rs MAPPER_SUFFIX), which libui's openDeclaredPassthroughHal checks with isDeclared: a device row (public/service.te hal_graphics_mapper_service); found by hal_graphics_allocator_client, which non-isolated apps are (private/technical_debt.cil)
 mapper/atl                 u:object_r:hal_graphics_mapper_service:s0

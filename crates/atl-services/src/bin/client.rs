@@ -19,6 +19,7 @@ use atl_aidl::aidl::android::app::IActivityClientController::IActivityClientCont
 use atl_aidl::aidl::android::app::IActivityManager::IActivityManager;
 use atl_aidl::aidl::android::app::IApplicationThread::{BnApplicationThread, IApplicationThread};
 use atl_aidl::aidl::android::content::pm::IPackageManager::{IPackageManager, transactions};
+use atl_aidl::aidl::android::media::IAudioService::IAudioService;
 use atl_parcelables::android::app::servertransaction::ClientTransaction;
 use atl_parcelables::android::content::pm::{ApplicationInfo, InstrumentationInfo};
 use atl_parcelables::android::content::{ComponentName, Intent};
@@ -26,6 +27,11 @@ use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::app::servertransaction::ClientTransaction::ClientTransactionItem;
 use atl_parcelables::codecs::android::os::Bundle::BUNDLE_MAGIC;
 use atl_parcelables::java::util::{Map, TypedMap};
+use atl_services::volume_listeners::SERVICE as VOLUME_REGISTRY;
+use atl_services_wire::audio_listener::{
+    BnAudioVolumeListener, IAudioVolumeListener, IAudioVolumeRegistry,
+};
+use atl_services_wire::audio_volume::{FLAG_ABSOLUTE_VOLUME, STREAM_MUSIC};
 use binder::binder_impl::{Parcel, UnstructuredParcelable};
 use binder::{
     BinderFeatures, ExceptionCode, Interface, ParcelFileDescriptor, ProcessState, StatusCode,
@@ -56,6 +62,8 @@ enum Mode {
         start_seq: i64,
     },
     System,
+    /// The volume listener (A23 slice 5): registers with atl.audio_volume and checks the commits its writes produce.
+    Volume,
     Codes,
 }
 
@@ -463,6 +471,79 @@ fn system() -> Result<usize> {
     Ok(r.failed)
 }
 
+/// AudioSystem.STREAM_NOTIFICATION (AudioSystem.java:94): a second stream, in a group of its own.
+const STREAM_NOTIFICATION: i32 = 5;
+/// The quiet time after the last expected commit. Oneway calls keep their order, so a stray duplicate's commit would arrive before this ends.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// The volume listener's sink: each commit the registry delivers goes to the channel.
+struct VolumeListener(Mutex<Sender<(i32, i32)>>);
+
+impl Interface for VolumeListener {}
+
+impl IAudioVolumeListener for VolumeListener {
+    fn volume_committed(&self, stream: i32, flags: i32) -> Result<(), StatusCode> {
+        if let Ok(tx) = self.0.lock() {
+            let _ = tx.send((stream, flags));
+        }
+        Ok(())
+    }
+}
+
+/// The volume listener over binderd (A23 slice 5): registers this process's listener with atl.audio_volume, then four writes through IAudioService. The commits: the first write, the host write (FLAG_ABSOLUTE_VOLUME, its flags kept), the notification write. The duplicate of the first write commits nothing.
+fn volume() -> Result<usize> {
+    ProcessState::start_thread_pool();
+    let mut r = Report { failed: 0 };
+    let (tx, rx) = channel();
+    let listener = BnAudioVolumeListener::new_binder(
+        VolumeListener(Mutex::new(tx)),
+        BinderFeatures::default(),
+    );
+    let registry: Strong<dyn IAudioVolumeRegistry> =
+        binder::check_interface(VOLUME_REGISTRY).context("getService atl.audio_volume")?;
+    let registered = registry.register(listener);
+    r.check(
+        "volume:register",
+        registered.is_ok(),
+        format!("{registered:?}"),
+    );
+    let audio: Strong<dyn IAudioService> =
+        binder::check_interface("audio").context("getService audio")?;
+    let writes = [
+        (STREAM_MUSIC, 2, 0),
+        (STREAM_MUSIC, 2, 0),
+        (STREAM_MUSIC, 4, FLAG_ABSOLUTE_VOLUME),
+        (STREAM_NOTIFICATION, 3, 0),
+    ];
+    for (stream, index, flags) in writes {
+        let sent = audio.r#setStreamVolume(stream, index, flags, None);
+        r.check(
+            "volume:write",
+            sent.is_ok(),
+            format!("stream {stream} index {index} flags {flags} {sent:?}"),
+        );
+    }
+    let mut got = Vec::new();
+    while got.len() < 3 {
+        let Ok(event) = rx.recv_timeout(CALLBACK) else {
+            break;
+        };
+        got.push(event);
+    }
+    let extra = rx.recv_timeout(QUIET).ok();
+    let want = [
+        (STREAM_MUSIC, 0),
+        (STREAM_MUSIC, FLAG_ABSOLUTE_VOLUME),
+        (STREAM_NOTIFICATION, 0),
+    ];
+    r.check(
+        "volume:events",
+        got == want && extra.is_none(),
+        format!("{got:?} then {extra:?}"),
+    );
+    Ok(r.failed)
+}
+
 fn main() -> Result<()> {
     let failed = match Args::parse().mode {
         Mode::App {
@@ -472,6 +553,7 @@ fn main() -> Result<()> {
             start_seq,
         } => app(&package, uid, &activity, start_seq)?,
         Mode::System => system()?,
+        Mode::Volume => volume()?,
         Mode::Codes => {
             println_out(&format!(
                 "code getApplicationInfo {}",

@@ -4,3 +4,6 @@
 # atl.compositor_registry: no AOSP counterpart (on a device SurfaceFlinger is one system process; here each app process runs its own and registers it, plus its UI agent, with atld's registry).
 # Apps must find and call it, as they do surfaceflinger_service (public/service.te: app_api_service); atl-system-services registers it in system_server's role (system_server_service: add_service rule of private/system_server.te).
 type atl_compositor_registry_service, app_api_service, system_server_service, service_manager_type;
+
+# atl.audio_volume: no AOSP counterpart. Apps find it (the app's policy registers its listener), the system server adds it (atl-system-services), as for the compositor registry.
+type atl_audio_volume_service, app_api_service, system_server_service, service_manager_type;

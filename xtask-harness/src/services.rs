@@ -144,6 +144,20 @@ fn list_verdict(list: &Run) -> Vec<String> {
 }
 
 /// The same command as an app uid: AOSP's shell check refuses it (`Failure calling service package` from cmd, exit non-zero) and no `package:` line is printed.
+/// The volume listener (client `volume`): the registry took the listener, and the writes came back as their commits, the duplicate write none.
+fn volume_verdict(volume: &Run) -> Vec<String> {
+    let mut fails = Vec::new();
+    if !volume.0 {
+        fails.push(format!("volume client exited unsuccessfully: {}", volume.1));
+    }
+    for want in ["client: pass volume:register", "client: pass volume:events"] {
+        if !volume.1.lines().any(|l| l.starts_with(want)) {
+            fails.push(format!("volume: no `{want}` line in {}", volume.1));
+        }
+    }
+    fails
+}
+
 fn refusal_verdict(refused: &Run) -> Vec<String> {
     let listed = refused.1.lines().any(|l| l.starts_with("package:"));
     if !refused.0 && !listed && refused.1.contains("Failure calling service package") {
@@ -374,6 +388,16 @@ pub fn stage(
             &test_root.join("client-system.log"),
             CLIENT_LIMIT,
         )?;
+        // the volume listener (A23 slice 5): a system uid client registers with atl.audio_volume and gets the commits of its writes
+        let mut volume_cmd = Command::new(&client);
+        volume_cmd.envs(env.iter().cloned()).arg("volume");
+        let volume = run(
+            b,
+            volume_cmd,
+            (AID_SYSTEM, atl_sepolicy::domains::SYSTEM_APP),
+            &test_root.join("client-volume.log"),
+            CLIENT_LIMIT,
+        )?;
         let call = |method: &str, args: &[&str], log: &str| -> Result<Run> {
             let Some(c) = code(&codes, method) else {
                 return Ok((
@@ -436,6 +460,7 @@ pub fn stage(
             .1
             .lines()
             .chain(system.1.lines())
+            .chain(volume.1.lines())
             .filter(|l| l.starts_with("client: pass"))
         {
             println!("binder: services {}", l.trim_start_matches("client: "));
@@ -443,6 +468,7 @@ pub fn stage(
         let mut fails = verdict(&app, &system, &feature, &info, &log);
         fails.extend(list_verdict(&list));
         fails.extend(refusal_verdict(&refused));
+        fails.extend(volume_verdict(&volume));
         if fails.is_empty() {
             println!(
                 "binder: services pass (the services started the app through process control; null String in, null parcelable out through `service call`; unimplemented calls counted; `cmd package list packages` lists the package, and an app uid is refused)"
