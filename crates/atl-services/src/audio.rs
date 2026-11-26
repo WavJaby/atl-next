@@ -360,7 +360,15 @@ fn admit_request(
         );
     if !privileged {
         let uid = i32::try_from(caller).unwrap_or(-1);
-        let denied = ops.note_mode(caller, OP_TAKE_AUDIO_FOCUS, uid, package)? != app_ops::ALLOWED;
+        // blockFocusMethod:199-201: an empty package is the uid's first package; none gives "[uid]" (getPackNameForUid), a name no package has, so the op reads ERRORED
+        let resolved = match package {
+            "" => ops
+                .package_of_uid(caller)
+                .unwrap_or_else(|| format!("[{uid}]")),
+            p => p.to_owned(),
+        };
+        let denied =
+            ops.note_mode(caller, OP_TAKE_AUDIO_FOCUS, uid, &resolved)? != app_ops::ALLOWED;
         if denied && a.sdk >= VANILLA_ICE_CREAM {
             return Ok(refuse(
                 "requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)",
@@ -979,6 +987,31 @@ mod tests {
             Some("requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)")
         );
         assert_eq!(counted(key), before + 1);
+    }
+
+    /// An empty calling package is the uid's first package (HardeningEnforcer.blockFocusMethod:199-201, getPackNameForUid): org.app, ALLOWED in the foreground, so target 35 is admitted.
+    #[test]
+    fn empty_package_resolves_to_the_uids_package() {
+        let s = app_service(ProcessState::Top);
+        let aa = media();
+        let mut args = request(&aa, 35);
+        args.calling_package_name = Some("");
+        let admitted = admit_request(&args, 10_001, &s.appops, &s.permissions);
+        assert_eq!(admitted.expect("no exception"), None);
+    }
+
+    /// The same empty package with TAKE_AUDIO_FOCUS denied (a cached app, target 35): org.app reads IGNORED, so the request is refused as the hardening refusal.
+    #[test]
+    fn empty_package_with_denied_take_audio_focus_is_refused() {
+        let s = app_service(ProcessState::CachedEmpty);
+        let aa = media();
+        let mut args = request(&aa, 35);
+        args.calling_package_name = Some("");
+        let refused = admit_request(&args, 10_001, &s.appops, &s.permissions);
+        assert_eq!(
+            refused.expect("no exception"),
+            Some("requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)")
+        );
     }
 
     /// The same denial from a target 34 is exempt under default hardening (blockFocusMethod: unblockedBySdk).

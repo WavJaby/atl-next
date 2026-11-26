@@ -170,6 +170,15 @@ impl AppOps {
         })
     }
 
+    /// HardeningEnforcer.getPackNameForUid's lookup: the uid's first package, read with the caller cleared (no visibility filter); None when its app id has none.
+    pub fn package_of_uid(&self, uid: u32) -> Option<String> {
+        self.packages
+            .snapshot()
+            .by_app_id(permission::app_id(uid))
+            .next()
+            .map(|p| p.name().to_owned())
+    }
+
     /// The uid's mode with MODE_FOREGROUND evaluated against its state now (evaluateForegroundMode).
     fn evaluated(&self, code: i32, uid: i32) -> binder::Result<i32> {
         let mode = self.mode(code, uid)?;
