@@ -4,16 +4,13 @@
 //! `attempt` = the check run's name, `.rerun` suffixed for a rerun ([`attempt`]).
 //! Quiet = stall <= [`QUIET_STALL_PCT`]. A wait's `need` in a row = the largest took of its newest [`WINDOW`] distinct quiet runs there, once [`MIN_PASSES`] hold it; below that unset.
 //! The bound stays out of the ledger: the check log (red_logs.rs `gate-waits.tsv`) keeps it per (attempt, row, wait). The commit and the outcome stay in gate-ledger.tsv, which `cargo xtask gate-need` joins by (run, row) for display. Took stays here.
-//! `--migrate` moves the old `out/pool/gate-need.tsv` into the ledger once ([`migrate`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 
-use crate::out;
 use crate::red_logs;
 use crate::resource_ledger::{self, GATE, Record};
 
@@ -23,10 +20,6 @@ pub const QUIET_STALL_PCT: f64 = 5.0;
 pub const MIN_PASSES: usize = 20;
 /// Newest quiet passes of a (row, wait) its `need` is the maximum of. Basis: the rule asks for at least [`MIN_PASSES`]. Every pass more keeps an outlier longer and raises the need, which excuses more reds; a need too low only leaves a red standing, the rule's default. So the smallest window the rule allows.
 pub const WINDOW: usize = MIN_PASSES;
-/// The old ledger's file name under [`out::POOL`]: read by [`migrate`] only, removed with it.
-pub const OLD_LEDGER: &str = "gate-need.tsv";
-/// Where [`migrate`] archives the old file: the checkout's task dir, outside the pool (the scheduler path).
-pub const MIGRATED: &str = "gate-need.migrated.tsv";
 
 /// A `wait:` line of a log (wait.rs `record`): `wait: <name> took=<ms> bound=<ms> need=<ms|unset>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +195,7 @@ pub fn stats(records: &[Record], joins: &Joins) -> Vec<Stat> {
 /// What the join could not show, counted for the display (`gate-need` prints both).
 #[derive(Debug, PartialEq, Eq)]
 pub struct JoinGaps {
-    /// window records (quiet deciding passes) with no logged bound: migrated, or past the check log's runs
+    /// window records (quiet deciding passes) with no logged bound: past the check log's runs
     pub unbounded: usize,
     /// logged waits with no ledger record: not quiet, not the deciding pass, or past the window; not shown
     pub unledgered: usize,
@@ -261,114 +254,10 @@ pub fn derived(ws: &Path, row: &str) -> Result<BTreeMap<String, u64>> {
     Ok(needs(&resource_ledger::read(ws)?, row))
 }
 
-/// `--migrate`: the old `out/pool/gate-need.tsv` (`run commit row wait took_ms bound_ms stall`) into the ledger, once. Quiet lines become records; commit and bound are projected away (the archive keeps them). Retired seed lines (`seed:*` run, row `-`) and not-quiet lines are dropped; a malformed line refuses the whole file. Dry run unless `execute`: reports, writes nothing. Execute: merges in front of the ledger's records (the migrated runs are older; a repeat changes nothing), then renames the old file to `<task>/`[`MIGRATED`].
-pub fn migrate(ws: &Path, task: &Path, execute: bool) -> Result<String> {
-    let old = ws.join(out::POOL).join(OLD_LEDGER);
-    let text = match fs::read_to_string(&old) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(format!("migrate: no {} to migrate", old.display()));
-        }
-        Err(e) => return Err(e).with_context(|| old.display().to_string()),
-    };
-    let (mut kept, mut retired, mut busy, mut malformed) = (Vec::new(), 0, 0, 0);
-    for line in text.lines() {
-        match OldLine::parse(line) {
-            None => malformed += 1,
-            Some(o) if o.row == "-" || o.run.starts_with("seed:") => retired += 1,
-            Some(o) if !quiet(o.stall) => busy += 1,
-            Some(o) => kept.push(Record {
-                kind: GATE.to_owned(),
-                name: o.row,
-                wait: o.wait,
-                run: o.run,
-                took_ms: o.took_ms,
-                stall: o.stall,
-            }),
-        }
-    }
-    if malformed > 0 {
-        bail!(
-            "migrate: {malformed} malformed line(s) in {}; nothing written",
-            old.display()
-        );
-    }
-    let before = resource_ledger::read(ws)?;
-    let after = resource_ledger::older_first(&kept, before.clone(), WINDOW);
-    let report = format!(
-        "migrate: {} quiet records kept ({retired} retired and {busy} not quiet dropped); ledger {} -> {} records",
-        kept.len(),
-        before.len(),
-        after.len()
-    );
-    if !execute {
-        return Ok(format!(
-            "{report}; dry run, nothing written (--execute writes)"
-        ));
-    }
-    resource_ledger::append_older(ws, &kept, WINDOW)?;
-    fs::create_dir_all(task).with_context(|| format!("creating {}", task.display()))?;
-    let archive = task.join(MIGRATED);
-    fs::rename(&old, &archive)
-        .with_context(|| format!("archiving {} to {}", old.display(), archive.display()))?;
-    Ok(format!(
-        "{report}; written; old file archived to {}",
-        archive.display()
-    ))
-}
-
-/// One line of the old ledger, read by [`migrate`] only: `run commit row wait took_ms bound_ms stall`. Commit and bound are checked, then dropped.
-struct OldLine {
-    run: String,
-    row: String,
-    wait: String,
-    took_ms: u64,
-    stall: Option<f64>,
-}
-
-impl OldLine {
-    fn parse(line: &str) -> Option<Self> {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let &[run, _commit, row, wait, took, bound, stall] = cols.as_slice() else {
-            return None;
-        };
-        bound.parse::<u64>().ok()?;
-        let stall = match stall {
-            "-" => None,
-            s => Some(s.parse::<f64>().ok().filter(|v| v.is_finite())?),
-        };
-        Some(Self {
-            run: run.to_owned(),
-            row: row.to_owned(),
-            wait: wait.to_owned(),
-            took_ms: took.parse().ok()?,
-            stall,
-        })
-    }
-}
-
-/// `cargo xtask gate-need` arguments.
-#[derive(clap::Args)]
-pub struct Args {
-    /// One-time migration of the old `out/pool/gate-need.tsv` into the resource ledger. A dry run without `--execute`.
-    #[arg(long)]
-    migrate: bool,
-    /// With `--migrate`: write the ledger and archive the old file under the checkout's task dir.
-    #[arg(long)]
-    execute: bool,
-}
-
-/// `cargo xtask gate-need`: each (row, wait)'s window (samples, passes, largest took, need or unset, largest took / bound), then each row's reruns in the newest check runs. Read-only, except `--migrate --execute`.
-pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
+/// `cargo xtask gate-need`: each (row, wait)'s window (samples, passes, largest took, need or unset, largest took / bound), then each row's reruns in the newest check runs. Read-only.
+pub fn run(root: &Path) -> Result<ExitCode> {
     let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
     let task = red_logs::task_dir(root)?;
-    if args.migrate {
-        println!("{}", migrate(&ws, &task, args.execute)?);
-        return Ok(ExitCode::SUCCESS);
-    }
-    if args.execute {
-        bail!("--execute goes with --migrate");
-    }
     let records = resource_ledger::read(&ws)?;
     let joins = Joins {
         bounds: red_logs::read_waits(&task)?,
@@ -421,6 +310,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use super::*;
@@ -638,115 +528,6 @@ mod tests {
         assert_eq!(stat.bounds, Some((600, 1_000)));
         assert_eq!(stat.ratio, Some(0.5), "300 / 600");
         assert_eq!(stat.max_ms, 900, "the unlogged pass still counts its took");
-    }
-
-    /// `--migrate`: quiet old lines become records (commit and bound projected away); seed, busy and unknown-stall lines are dropped; a malformed line refuses the file; a dry run writes nothing; execute writes, archives the old file, and a repeat changes nothing.
-    #[test]
-    fn migration_keeps_the_quiet_records_and_archives_the_old_file() {
-        let ws = scratch("migrate");
-        let task = ws.join("task");
-        let old = ws.join(out::POOL).join(OLD_LEDGER);
-        fs::create_dir_all(old.parent().expect("pool dir")).expect("pool dir");
-        let text = "r1\tc0ffee\tapp\tmarker\t100\t60000\t0.10\n\
-                    seed:out/a.log\tseed\t-\tconfigure-ack\t8755\t60000\t0.04\n\
-                    r1\tc0ffee\tapp\tbusy\t5\t10\t9.00\n\
-                    r2\tc0ffee\tapp\tmarker\t200\t60000\t-\n\
-                    r2\tc0ffee\tapp\tmarker\t300\t60000\t0.20\n";
-        fs::write(&old, text).expect("old ledger");
-        let dry = migrate(&ws, &task, false).expect("dry run");
-        assert!(dry.contains("2 quiet records"), "{dry}");
-        assert!(
-            old.exists() && !resource_ledger::ledger_path(&ws).exists(),
-            "a dry run writes nothing"
-        );
-        migrate(&ws, &task, true).expect("execute");
-        let got = resource_ledger::read(&ws).expect("ledger");
-        assert_eq!(
-            got,
-            vec![
-                rec("r1", "app", "marker", 100, Some(0.10)),
-                rec("r2", "app", "marker", 300, Some(0.20)),
-            ]
-        );
-        assert!(!old.exists(), "the old file left the pool");
-        assert_eq!(
-            fs::read_to_string(task.join(MIGRATED)).expect("archive"),
-            text
-        );
-        fs::write(&old, text).expect("old ledger again");
-        migrate(&ws, &task, true).expect("repeat");
-        assert_eq!(resource_ledger::read(&ws).expect("ledger"), got);
-        fs::write(&old, format!("{text}oops\n")).expect("bad old ledger");
-        assert!(
-            migrate(&ws, &task, true).is_err(),
-            "a malformed line refuses"
-        );
-        assert_eq!(
-            resource_ledger::read(&ws).expect("ledger"),
-            got,
-            "nothing written on refusal"
-        );
-        fs::remove_dir_all(&ws).expect("cleanup");
-    }
-
-    /// The new binary's verify check ran first, so the ledger holds r20..r25. The migrated runs are older: they go first, in age order; a shared key keeps one record, the larger took.
-    #[test]
-    fn migration_into_a_nonempty_ledger_puts_the_older_runs_first_and_dedupes() {
-        let ws = scratch("migrate-nonempty");
-        let task = ws.join("task");
-        let old = ws.join(out::POOL).join(OLD_LEDGER);
-        fs::create_dir_all(old.parent().expect("pool dir")).expect("pool dir");
-        let fresh: Vec<Record> = (20..=25)
-            .map(|i| rec(&format!("r{i}"), "app", "marker", 100 + i, Some(0.1)))
-            .collect();
-        resource_ledger::append(&ws, &fresh, WINDOW).expect("fresh records");
-        let mut text: String = (1..=5)
-            .map(|i| format!("r{i}\tc0ffee\tapp\tmarker\t{}\t60000\t0.10\n", 10 + i))
-            .collect();
-        text.push_str("r20\tc0ffee\tapp\tmarker\t999\t60000\t0.10\n");
-        fs::write(&old, &text).expect("old ledger");
-        migrate(&ws, &task, true).expect("migrate");
-        let got = resource_ledger::read(&ws).expect("ledger");
-        let runs: Vec<&str> = got.iter().map(|r| r.run.as_str()).collect();
-        assert_eq!(
-            runs,
-            [
-                "r1", "r2", "r3", "r4", "r5", "r20", "r21", "r22", "r23", "r24", "r25"
-            ],
-            "the older runs come first, in age order"
-        );
-        let r20: Vec<u64> = got
-            .iter()
-            .filter(|r| r.run == "r20")
-            .map(|r| r.took_ms)
-            .collect();
-        assert_eq!(r20, [999], "a shared key is one record, the larger took");
-        fs::remove_dir_all(&ws).expect("cleanup");
-    }
-
-    /// A full window: the migrated runs are older than the ledger's twenty, so the window cuts them, not the fresh ones.
-    #[test]
-    fn migration_into_a_full_window_cuts_the_migrated_runs_first() {
-        let ws = scratch("migrate-full");
-        let task = ws.join("task");
-        let old = ws.join(out::POOL).join(OLD_LEDGER);
-        fs::create_dir_all(old.parent().expect("pool dir")).expect("pool dir");
-        let fresh: Vec<Record> = (6..=25)
-            .map(|i| rec(&format!("r{i}"), "app", "marker", i, Some(0.1)))
-            .collect();
-        resource_ledger::append(&ws, &fresh, WINDOW).expect("fresh records");
-        let text: String = (1..=5)
-            .map(|i| format!("r{i}\tc0ffee\tapp\tmarker\t{i}\t60000\t0.10\n"))
-            .collect();
-        fs::write(&old, &text).expect("old ledger");
-        migrate(&ws, &task, true).expect("migrate");
-        let runs: Vec<String> = resource_ledger::read(&ws)
-            .expect("ledger")
-            .into_iter()
-            .map(|r| r.run)
-            .collect();
-        assert_eq!(runs, (6..=25).map(|i| format!("r{i}")).collect::<Vec<_>>());
-        fs::remove_dir_all(&ws).expect("cleanup");
     }
 
     /// The join shows what it can and counts the rest: a window record with no logged bound, and a logged wait with no ledger record.
