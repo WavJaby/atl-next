@@ -17,7 +17,9 @@ use atl_platform_ui_api::abi::{
     self, BytesOut, CookieList, CookieView, EvalResultView, ReplyAbi, SendCallback, Str,
     WebEventView, WebViewVtable, web_event,
 };
-use atl_platform_ui_api::webview::{Cookie, CookiePolicy, LoadError, WebSetting};
+use atl_platform_ui_api::webview::{
+    Cookie, CookiePolicy, LoadError, NavigationReply, PromptReply, WebSetting,
+};
 use webkit6::glib;
 use webkit6::prelude::*;
 
@@ -197,9 +199,30 @@ struct Events {
     load_uri: RefCell<String>,
     /// The location last reported ([`Self::location_changed`]).
     location: RefCell<Option<Location>>,
+    /// False once the view is retired ([`Self::retire`]): no event reaches the sink from then on ([`Self::push`]).
+    active: std::cell::Cell<bool>,
 }
 
 impl Events {
+    /// A view's sink, live until [`Self::retire`].
+    fn new(sink: SendCallback<WebEventView>) -> Rc<Self> {
+        Rc::new(Self {
+            sink: RefCell::new(sink),
+            title: RefCell::default(),
+            provider_load: std::cell::Cell::new(false),
+            main_loading: std::cell::Cell::new(false),
+            navigating: RefCell::default(),
+            load_uri: RefCell::default(),
+            location: RefCell::default(),
+            active: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Silences the view: [`Self::push`] delivers nothing from here on. [`retire_view`] calls it before the widget is detached or closed.
+    fn retire(&self) {
+        self.active.set(false);
+    }
+
     /// Reports `w`'s location if it differs from the last one reported. Called on every change WebKit notifies (uri, back-forward list) and before each load event, so the receiver's copy is current
     /// when that event's callback runs.
     fn location_changed(&self, w: &webkit6::WebView) {
@@ -259,7 +282,17 @@ impl Events {
         });
     }
 
+    /// The one submission point. A retired view delivers nothing; a reply-bearing event gets the terminal its kind means here: navigation taken (ignored, the page stays), prompt cancelled (JS gets null).
+    /// Dropped unfinished, a navigation would load its URL.
     fn push(&self, p: Pending) {
+        if !self.active.get() {
+            match (p.kind, p.reply) {
+                (web_event::NAVIGATION, Some(r)) => NavigationReply::finish(Box::new(r), true),
+                (web_event::PROMPT, Some(r)) => PromptReply::finish(Box::new(r), None),
+                _ => {}
+            }
+            return;
+        }
         let handed = p.reply.is_some();
         let ev = WebEventView {
             kind: p.kind,
@@ -433,6 +466,17 @@ fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<
             webkit6::functions::micro_version()
         );
     });
+    let (web, events) = build_view(events);
+    connect_view(&web, &events);
+    use webkit6::glib::translate::ToGlibPtr;
+    let widget: *mut webkit6::gtk::ffi::GtkWidget =
+        web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
+    shown.call(&widget.cast());
+    VIEWS.with_borrow_mut(|m| m.insert(key, View { web, events, shown }));
+}
+
+/// The engine defaults and the event sink; no signal connected yet ([`connect_view`]).
+fn build_view(events: SendCallback<WebEventView>) -> (webkit6::WebView, Rc<Events>) {
     // autoplay is the app's setting alone (WebSettings.setMediaPlaybackRequiresUserGesture -> media-playback-requires-user-gesture): WebKit's own policy, ALLOW_WITHOUT_SOUND by default,
     // would refuse an audible play() the app allowed (NotAllowedError), which Android's WebView plays. Construct-only on the view, so set here once.
     let web = webkit6::WebView::builder()
@@ -446,15 +490,11 @@ fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<
         s.set_enable_javascript(false);
         s.set_enable_html5_local_storage(false);
     }
-    let events = Rc::new(Events {
-        sink: RefCell::new(events),
-        title: RefCell::default(),
-        provider_load: std::cell::Cell::new(false),
-        main_loading: std::cell::Cell::new(false),
-        navigating: RefCell::default(),
-        load_uri: RefCell::default(),
-        location: RefCell::default(),
-    });
+    (web, Events::new(events))
+}
+
+/// Connects every engine signal of `web` to `events`; [`Events::retire`] silences them all.
+fn connect_view(web: &webkit6::WebView, events: &Rc<Events>) {
     let ev = events.clone();
     web.connect_uri_notify(move |w| ev.location_changed(w));
     if let Some(list) = web.back_forward_list() {
@@ -584,22 +624,23 @@ fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<
         ev.emit(web_event::PROMPT, &message, &default, 0, 0, Some(reply));
         true
     });
-    use webkit6::glib::translate::ToGlibPtr;
-    let widget: *mut webkit6::gtk::ffi::GtkWidget =
-        web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
-    shown.call(&widget.cast());
-    VIEWS.with_borrow_mut(|m| m.insert(key, View { web, events, shown }));
 }
 
 unsafe extern "C" fn view_drop(key: i32) {
     on_display(move || {
         // out of the map before anything runs: the detach and the close may run GTK code
-        let Some(mut v) = VIEWS.with_borrow_mut(|m| m.remove(&key)) else {
+        let Some(v) = VIEWS.with_borrow_mut(|m| m.remove(&key)) else {
             return tracing::warn!("webview[{key}]: drop for no view; ignored");
         };
-        v.shown.call(&std::ptr::null_mut());
-        v.web.try_close();
+        retire_view(v);
     });
+}
+
+/// Retires `v` on D: its sources go silent first, then the widget is detached (`shown(null)`) and the page closed, so nothing from `v` reaches the sink after the detach.
+fn retire_view(mut v: View) {
+    v.events.retire();
+    v.shown.call(&std::ptr::null_mut());
+    v.web.try_close();
 }
 
 unsafe extern "C" fn view_load_uri(key: i32, uri: Str) {
@@ -965,5 +1006,58 @@ mod tests {
         assert_eq!(scheme("1abc:x"), None);
         assert_eq!(scheme("a b:x"), None);
         assert_eq!(scheme("no-colon"), None);
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    /// An [`Events`] whose sink records each delivered kind, in order.
+    fn recording_events() -> (Rc<Events>, Arc<Mutex<Vec<u32>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let sink =
+            SendCallback::new(move |e: &WebEventView| log.lock().expect("sink log").push(e.kind));
+        (Events::new(sink), seen)
+    }
+
+    /// A reply recording how it was finished: `Some` = taken (navigation), `None` = cancelled or loaded.
+    fn recording_reply() -> (ReplyAbi, Arc<Mutex<Vec<Option<String>>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&log);
+        let reply = ReplyAbi::new(move |taken| seen.lock().expect("reply log").push(taken));
+        (reply, log)
+    }
+
+    /// A view retired between two emits: the first reaches the sink, the late one does not.
+    #[test]
+    fn retired_view_drops_late_events() {
+        let (ev, seen) = recording_events();
+        ev.emit(web_event::LOAD_STARTED, "http://a.test/", "", 0, 0, None);
+        ev.retire();
+        ev.emit(web_event::TITLE, "late", "", 0, 0, None);
+        assert_eq!(*seen.lock().expect("sink log"), [web_event::LOAD_STARTED]);
+    }
+
+    /// A retired view finishes each reply once with its cancel terminal and delivers nothing: navigation taken (`Some`, the page stays), prompt cancelled (`None`, JS gets null).
+    #[test]
+    fn retired_view_finishes_replies() {
+        let (ev, seen) = recording_events();
+        ev.retire();
+        let (nav, nav_log) = recording_reply();
+        ev.push(Pending {
+            kind: web_event::NAVIGATION,
+            reply: Some(nav),
+            ..Pending::default()
+        });
+        let (prompt, prompt_log) = recording_reply();
+        ev.push(Pending {
+            kind: web_event::PROMPT,
+            reply: Some(prompt),
+            ..Pending::default()
+        });
+        let nav_log = nav_log.lock().expect("reply log");
+        assert_eq!(nav_log.len(), 1, "one terminal per navigation");
+        assert!(nav_log[0].is_some(), "navigation ignored, not loaded");
+        assert_eq!(*prompt_log.lock().expect("reply log"), [None::<String>]);
+        assert!(seen.lock().expect("sink log").is_empty());
     }
 }
