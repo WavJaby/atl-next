@@ -179,22 +179,21 @@ pub fn trailing_undecided(task: &Path) -> Result<Trailing> {
     Ok(trailing)
 }
 
-/// The check log of waits: one line per wait sample of every attempt of a check step, `attempt commit row outcome wait took_ms bound_ms`, tab-separated.
-/// `attempt` = the check run's name, `.rerun` suffixed for a rerun (gate_need.rs `attempt`). It keeps commit and bound, which the resource ledger does not store; `gate-need` joins them for display.
+/// The check log of waits: one line per (attempt, row, wait, commit, bound), `attempt row wait commit bound_ms`, tab-separated.
+/// Holds only what neither store has: the resource ledger keeps took and stall, gate-ledger.tsv keeps the outcome.
+/// `attempt` = the check run's name, `.rerun` suffixed for a rerun (gate_need.rs `attempt`). `gate-need` joins on (attempt, row, wait); a logged wait with no ledger record is counted there, not logged twice.
 /// Written before the step's logs are cleaned up; the newest [`KEEP_RUNS`] check runs stay.
 pub const WAITS: &str = "gate-waits.tsv";
 /// The lock beside [`WAITS`].
 pub const WAITS_LOCK: &str = "gate-waits.lock";
 
-/// One wait sample of one attempt, as [`waits_append`] writes it.
+/// One wait's bound of one attempt, as [`waits_append`] writes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitEntry {
     pub attempt: String,
-    pub commit: String,
     pub row: String,
-    pub outcome: Outcome,
     pub wait: String,
-    pub took_ms: u64,
+    pub commit: String,
     pub bound_ms: u64,
 }
 
@@ -215,14 +214,8 @@ pub fn waits_append(task: &Path, entries: &[WaitEntry], keep_runs: usize) -> Res
         }
         lines.extend(entries.iter().map(|e| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                e.attempt,
-                e.commit,
-                e.row,
-                word(e.outcome),
-                e.wait,
-                e.took_ms,
-                e.bound_ms
+                "{}\t{}\t{}\t{}\t{}",
+                e.attempt, e.row, e.wait, e.commit, e.bound_ms
             )
         }));
         Ok(newest_runs(&lines, keep_runs))
@@ -250,17 +243,15 @@ pub fn read_waits(task: &Path) -> Result<BTreeMap<(String, String, String), u64>
     Ok(bounds)
 }
 
-/// A check-log line's (attempt, row, wait, bound_ms). Strict: seven columns, a known outcome, numbers where numbers belong.
+/// A check-log line's (attempt, row, wait, bound_ms). Strict: five columns, no empty name or commit, a number bound.
 fn parse_wait_line(line: &str) -> Option<(String, String, String, u64)> {
     let cols: Vec<&str> = line.split('\t').collect();
-    let &[attempt, commit, row, outcome, wait, took, bound] = cols.as_slice() else {
+    let &[attempt, row, wait, commit, bound] = cols.as_slice() else {
         return None;
     };
-    let known = [Outcome::Pass, Outcome::Fail, Outcome::Undecided].map(word);
-    if [attempt, commit, row, wait].iter().any(|c| c.is_empty()) || !known.contains(&outcome) {
+    if [attempt, row, wait, commit].iter().any(|c| c.is_empty()) {
         return None;
     }
-    took.parse::<u64>().ok()?;
     Some((
         attempt.to_owned(),
         row.to_owned(),
@@ -553,14 +544,12 @@ mod tests {
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
-    fn wait_entry(attempt: &str, wait: &str, took_ms: u64, bound_ms: u64) -> WaitEntry {
+    fn wait_entry(attempt: &str, wait: &str, bound_ms: u64) -> WaitEntry {
         WaitEntry {
             attempt: attempt.to_owned(),
-            commit: "c0ffee".to_owned(),
             row: "app".to_owned(),
-            outcome: Outcome::Pass,
             wait: wait.to_owned(),
-            took_ms,
+            commit: "c0ffee".to_owned(),
             bound_ms,
         }
     }
@@ -570,8 +559,8 @@ mod tests {
     fn the_waits_log_keeps_commit_and_bound_per_attempt() {
         let ws = scratch("waits-bound");
         let entries = [
-            wait_entry("r1", "marker", 120, 60_000),
-            wait_entry("r1.rerun", "marker", 300, 60_000),
+            wait_entry("r1", "marker", 60_000),
+            wait_entry("r1.rerun", "marker", 60_000),
         ];
         waits_append(&ws, &entries, 50).expect("append");
         let bounds = read_waits(&ws).expect("read");
@@ -579,10 +568,7 @@ mod tests {
         assert_eq!(bounds.get(&key("r1")), Some(&60_000));
         assert_eq!(bounds.get(&key("r1.rerun")), Some(&60_000));
         let text = fs::read_to_string(ws.join(WAITS)).expect("log");
-        assert_eq!(
-            text.lines().next(),
-            Some("r1\tc0ffee\tapp\tpass\tmarker\t120\t60000")
-        );
+        assert_eq!(text.lines().next(), Some("r1\tapp\tmarker\tc0ffee\t60000"));
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 
@@ -597,8 +583,8 @@ mod tests {
         ] {
             let rerun = format!("{run}.rerun");
             let entries = [
-                wait_entry(run, "marker", 1, 9),
-                wait_entry(&rerun, "marker", 2, 9),
+                wait_entry(run, "marker", 9),
+                wait_entry(&rerun, "marker", 9),
             ];
             waits_append(&ws, &entries, 2).expect("append");
         }
@@ -642,6 +628,16 @@ mod tests {
         };
         assert_eq!(retries(&ws, 2).expect("retries")["app"], want(1, 0, 1, 0));
         assert_eq!(retries(&ws, 3).expect("retries")["app"], want(2, 1, 1, 0));
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The check log holds what neither store has: `attempt row wait commit bound_ms`. No took (the resource ledger has it), no outcome (gate-ledger.tsv has it).
+    #[test]
+    fn the_waits_log_holds_bounds_only() {
+        let ws = scratch("waits-bounds-only");
+        waits_append(&ws, &[wait_entry("r1", "marker", 60_000)], 50).expect("append");
+        let text = fs::read_to_string(ws.join(WAITS)).expect("log");
+        assert_eq!(text, "r1\tapp\tmarker\tc0ffee\t60000\n");
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }

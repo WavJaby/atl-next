@@ -6,7 +6,7 @@
 //! Before the lanes the step builds every cargo product the rows run, once (gate_build.rs `ensure`, the function each gate calls itself); a product whose identity changes while the lanes run fails
 //! the step, naming it and the row whose end first saw it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -336,14 +336,14 @@ fn need_records(run: &str, rows: &[(&Row, &Done)]) -> Vec<resource_ledger::Recor
         .collect()
 }
 
-/// The check log's entries of one step: every wait sample of every attempt, with its attempt id, commit and bound (red_logs.rs `waits_append`). A rerun's first attempt is kept too.
+/// The check log's entries of one step: each wait's bound per attempt (red_logs.rs `waits_append`). Took and outcome are not logged: the ledger and gate-ledger.tsv hold them. A rerun's first attempt is kept too. Samples of one wait with one bound are one line.
 fn wait_entries(
     run: &str,
     commit: &str,
     names: &[String],
     done: &[Done],
 ) -> Vec<red_logs::WaitEntry> {
-    let mut entries = Vec::new();
+    let mut bounds: BTreeSet<(String, String, String, u64)> = BTreeSet::new();
     for (name, d) in names.iter().zip(done) {
         let deciding = (gate_need::attempt(run, d.first.is_some()), d);
         let first = d
@@ -351,18 +351,21 @@ fn wait_entries(
             .as_deref()
             .map(|f| (gate_need::attempt(run, false), f));
         for (attempt, a) in std::iter::once(deciding).chain(first) {
-            entries.extend(a.waits.iter().map(|w| red_logs::WaitEntry {
-                attempt: attempt.clone(),
-                commit: commit.to_owned(),
-                row: name.clone(),
-                outcome: a.outcome,
-                wait: w.name.clone(),
-                took_ms: w.took_ms,
-                bound_ms: w.bound_ms,
-            }));
+            for w in &a.waits {
+                bounds.insert((attempt.clone(), name.clone(), w.name.clone(), w.bound_ms));
+            }
         }
     }
-    entries
+    bounds
+        .into_iter()
+        .map(|(attempt, row, wait, bound_ms)| red_logs::WaitEntry {
+            attempt,
+            row,
+            wait,
+            commit: commit.to_owned(),
+            bound_ms,
+        })
+        .collect()
 }
 
 /// The failure note of a row undecided in [`red_logs::CEILING`] consecutive runs of this checkout, its last runs named. None below the ceiling.
@@ -1163,9 +1166,34 @@ mod tests {
         let entries = wait_entries("r1", "c0ffee", &names, std::slice::from_ref(&rerun));
         let got: Vec<(&str, &str, u64)> = entries
             .iter()
-            .map(|e| (e.attempt.as_str(), e.wait.as_str(), e.took_ms))
+            .map(|e| (e.attempt.as_str(), e.wait.as_str(), e.bound_ms))
             .collect();
-        assert_eq!(got, [("r1.rerun", "marker", 40), ("r1", "marker", 900)]);
+        assert_eq!(
+            got,
+            [("r1", "marker", 60_000), ("r1.rerun", "marker", 60_000)]
+        );
+    }
+
+    /// The check log keeps one line per wait and bound of an attempt: three samples of one wait with one bound are one line.
+    #[test]
+    fn a_wait_samples_one_line_per_bound_of_its_attempt() {
+        let wait = |name: &str, took_ms: u64| gate_need::WaitLine {
+            name: name.to_owned(),
+            took_ms,
+            bound_ms: 60_000,
+        };
+        let passed = Done {
+            stall: Some(0.1),
+            waits: vec![
+                wait("app-progress", 5),
+                wait("app-progress", 9),
+                wait("app-progress", 7),
+            ],
+            ..Done::bare(Outcome::Pass, String::new(), String::new())
+        };
+        let names = ["app".to_owned()];
+        let entries = wait_entries("r1", "c0ffee", &names, std::slice::from_ref(&passed));
+        assert_eq!(entries.len(), 1, "{entries:?}");
     }
 
     /// Lines as the window and composer gates printed them (job rgm-done1).

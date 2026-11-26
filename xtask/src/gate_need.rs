@@ -3,7 +3,7 @@
 //! Kept in the resource ledger (resource_ledger.rs, kind `gate`): one record per (row, wait, attempt) = the attempt's largest took, of a quiet passing attempt. Only a deciding pass enters, so a row adds at most one run per check step.
 //! `attempt` = the check run's name, `.rerun` suffixed for a rerun ([`attempt`]).
 //! Quiet = stall <= [`QUIET_STALL_PCT`]. A wait's `need` in a row = the largest took of its newest [`WINDOW`] distinct quiet runs there, once [`MIN_PASSES`] hold it; below that unset.
-//! Commit and bound stay out of the ledger: the check log (red_logs.rs `gate-waits.tsv`) keeps them, and `cargo xtask gate-need` joins them for display.
+//! The bound stays out of the ledger: the check log (red_logs.rs `gate-waits.tsv`) keeps it per (attempt, row, wait), and `cargo xtask gate-need` joins it for display. Took stays here; the outcome stays in gate-ledger.tsv.
 //! `--migrate` moves the old `out/pool/gate-need.tsv` into the ledger once ([`migrate`]).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -156,7 +156,7 @@ pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
             let known: Vec<(f64, u64)> = group
                 .iter()
                 .filter_map(|r| {
-                    let bound = *bounds.get(&(r.run.clone(), r.name.clone(), r.wait.clone()))?;
+                    let bound = *bounds.get(&bound_key(r))?;
                     Some((r.took_ms as f64 / bound as f64, bound))
                 })
                 .collect();
@@ -183,6 +183,41 @@ pub fn stats(records: &[Record], bounds: &Bounds) -> Vec<Stat> {
             .then_with(|| (&a.row, &a.wait).cmp(&(&b.row, &b.wait)))
     });
     stats
+}
+
+/// What the join could not show, counted for the display (`gate-need` prints both).
+#[derive(Debug, PartialEq, Eq)]
+pub struct JoinGaps {
+    /// window records (quiet deciding passes) with no logged bound: migrated, or past the check log's runs
+    pub unbounded: usize,
+    /// logged waits with no ledger record: not quiet, not the deciding pass, or past the window; not shown
+    pub unledgered: usize,
+}
+
+/// The check-log key of a ledger record: its attempt, row and wait (the join key of [`stats`]).
+fn bound_key(r: &Record) -> (String, String, String) {
+    (r.run.clone(), r.name.clone(), r.wait.clone())
+}
+
+/// What the join could not show: window records with no logged bound, and logged waits that no ledger record backs.
+pub fn join_gaps(records: &[Record], bounds: &Bounds) -> JoinGaps {
+    let unbounded = window(records)
+        .into_iter()
+        .filter(|r| !bounds.contains_key(&bound_key(r)))
+        .count();
+    let ledgered: BTreeSet<(&str, &str, &str)> = records
+        .iter()
+        .filter(|r| r.kind == GATE)
+        .map(|r| (r.run.as_str(), r.name.as_str(), r.wait.as_str()))
+        .collect();
+    let unledgered = bounds
+        .keys()
+        .filter(|(run, row, wait)| !ledgered.contains(&(run.as_str(), row.as_str(), wait.as_str())))
+        .count();
+    JoinGaps {
+        unbounded,
+        unledgered,
+    }
 }
 
 /// Each wait's derived `need` (ms) in `row`. A wait below [`MIN_PASSES`] quiet passes there has no entry (unset).
@@ -331,6 +366,11 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             st.row, st.wait, st.samples, st.passes, st.max_ms
         );
     }
+    let gaps = join_gaps(&records, &bounds);
+    println!(
+        "gate-need: {} window records with no logged bound (max/bound shown as -); {} logged waits with no ledger record (not quiet, not the deciding pass, or past the window): not shown",
+        gaps.unbounded, gaps.unledgered
+    );
     let retries = red_logs::retries(&task, WINDOW)?;
     println!(
         "retries: row\treruns\tpass\tfail\tundecided (newest {WINDOW} check runs of this checkout)"
@@ -668,5 +708,50 @@ mod tests {
             .collect();
         assert_eq!(runs, (6..=25).map(|i| format!("r{i}")).collect::<Vec<_>>());
         fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The join shows what it can and counts the rest: a window record with no logged bound, and a logged wait with no ledger record.
+    #[test]
+    fn the_join_counts_what_it_cannot_show() {
+        let records = vec![
+            rec("r1", "app", "marker", 100, Some(0.1)),
+            rec("r2", "app", "marker", 300, Some(0.1)),
+        ];
+        let mut bounds = Bounds::new();
+        bounds.insert(
+            ("r1".to_owned(), "app".to_owned(), "marker".to_owned()),
+            1_000,
+        );
+        // a busy pass: logged, no ledger record
+        bounds.insert(
+            ("r9".to_owned(), "app".to_owned(), "marker".to_owned()),
+            600,
+        );
+        assert_eq!(
+            join_gaps(&records, &bounds),
+            JoinGaps {
+                unbounded: 1,
+                unledgered: 1
+            },
+            "r2 has no bound; r9 has no record"
+        );
+    }
+
+    /// A rerun's bound is its own: the join keys on the attempt, so `<run>.rerun` does not take `<run>`'s bound.
+    #[test]
+    fn a_rerun_joins_its_own_bound() {
+        let records = vec![rec("r1.rerun", "app", "marker", 300, Some(0.1))];
+        let mut bounds = Bounds::new();
+        bounds.insert(
+            ("r1".to_owned(), "app".to_owned(), "marker".to_owned()),
+            1_000,
+        );
+        bounds.insert(
+            ("r1.rerun".to_owned(), "app".to_owned(), "marker".to_owned()),
+            600,
+        );
+        let stat = stats(&records, &bounds).into_iter().next().expect("marker");
+        assert_eq!(stat.bounds, Some((600, 600)));
+        assert_eq!(stat.ratio, Some(0.5), "300 / 600");
     }
 }
