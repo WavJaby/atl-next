@@ -43,16 +43,19 @@ pub enum Class {
     HarnessHeavy,
     /// static checks: one CPU slot; bypasses the queue only when the head could not use it (`bypass_allowed`). Held while a check reads the checkouts' git dirs; the migrate quiet window (git_dirs.rs `migrate`) refuses on that hold.
     Light,
+    /// a test binary's claim ([`Demand`]): zero weight, each request's own demand replaces it
+    Test,
 }
 
 impl Class {
-    pub const ALL: [Class; 6] = [
+    pub const ALL: [Class; 7] = [
         Class::NativeFull,
         Class::NativeIncr,
         Class::Cargo,
         Class::Harness,
         Class::HarnessHeavy,
         Class::Light,
+        Class::Test,
     ];
 
     /// The name in `workspace.toml` (`[pool.<name>]`) and in every log line.
@@ -64,6 +67,7 @@ impl Class {
             Class::Harness => "harness",
             Class::HarnessHeavy => "harness-heavy",
             Class::Light => "light",
+            Class::Test => "test",
         }
     }
 
@@ -110,6 +114,12 @@ impl Class {
                 cpu_max: 6,
                 mem_gib: 4,
             },
+            // a test claim takes its own demand (acquire_demand); the class weight is zero so the queue's head check sees no fixed claim
+            Class::Test => ClassWeight {
+                cpu_min: 0,
+                cpu_max: 0,
+                mem_gib: 0,
+            },
             // static checks: no measurable memory, one slot
             Class::Light => ClassWeight {
                 cpu_min: 1,
@@ -118,6 +128,36 @@ impl Class {
             },
         }
     }
+}
+
+/// What one test binary asks the pool: `mem_gib` whole memory slots it reserves, and `cores` of CPU it is expected to use. CPU is soft: no CPU slot is held (`cpu_fits`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Demand {
+    pub mem_gib: u32,
+    pub cores: f64,
+}
+
+/// Memory fits: `want` GiB beside `held` GiB within `budget`.
+fn mem_fits(budget: u32, held: u32, want: u32) -> bool {
+    held.saturating_add(want) <= budget
+}
+
+/// Soft CPU: a claim of `cores` fits when the running claims' cores plus it stay within `free` CPU; a lane with nothing running always progresses, so the target alone cannot stall it.
+fn cpu_fits(free: f64, running_cores: f64, running: usize, cores: f64) -> bool {
+    running == 0 || running_cores + cores <= free
+}
+
+/// The holder record of a demand: the holder's record and its cores (`record_cores` reads them back).
+fn demand_record(who: &Path, cores: f64) -> String {
+    format!(
+        "{} cores {cores:.2}",
+        holder_record(who, Class::Test.name())
+    )
+}
+
+/// The cores a holder record carries, `None` for a record of a class claim.
+fn record_cores(record: &str) -> Option<f64> {
+    record.rsplit_once(" cores ")?.1.parse().ok()
 }
 
 /// What one grant takes: CPU slots `cpu_min..=cpu_max` (elastic) and `mem_gib` memory slots.
@@ -231,24 +271,48 @@ pub struct Queued {
     record: String,
     /// `None` for light: it queues only when it would take a slot the head needs (`bypass_allowed`)
     ticket: Option<Ticket>,
+    /// a test claim's demand ([`acquire_demand`]); `None` for a class
+    demand: Option<Demand>,
     /// the wait's start: `after N s` and the starvation bound count from here
     started: Instant,
 }
 
 /// Takes `class`'s place for checkout `who` in workspace `ws` without waiting ([`Tier::of`] `who`). Dropped unwaited, the place leaves the queue.
 pub fn enqueue(ws: &Path, who: &Path, class: Class) -> Result<Queued> {
-    enqueue_with(ws, who, class, Tier::of(who))
+    enqueue_with(ws, who, class, Tier::of(who), None)
 }
 
-fn enqueue_with(ws: &Path, who: &Path, class: Class, tier: Tier) -> Result<Queued> {
+/// Takes `d` for checkout `who` in workspace `ws`, waiting its turn in the same queue as the classes ([`Tier::of`] `who`): memory slots as `d` says, CPU as a soft claim ([`cpu_fits`]). A demand larger than the pool's shared memory is refused.
+pub fn acquire_demand(ws: &Path, who: &Path, d: Demand) -> Result<Grant> {
+    enqueue_with(ws, who, Class::Test, Tier::of(who), Some(d))?
+        .wait(POLL, &mut |line| eprintln!("{line}"))
+}
+
+fn enqueue_with(
+    ws: &Path,
+    who: &Path,
+    class: Class,
+    tier: Tier,
+    demand: Option<Demand>,
+) -> Result<Queued> {
     let pool = ws_config::load(ws)?.pool;
-    let w = pool.classes[&class];
+    let w = match demand {
+        Some(d) => ClassWeight {
+            cpu_min: 0,
+            cpu_max: 0,
+            mem_gib: d.mem_gib,
+        },
+        None => pool.classes[&class],
+    };
     fits(&pool, class, w)?;
     let dir = dir(ws);
     let queue = dir.join("queue");
     std::fs::create_dir_all(&queue).with_context(|| format!("creating {}", queue.display()))?;
     check_nesting(&pool, &dir)?;
-    let record = holder_record(who, class.name());
+    let record = match demand {
+        Some(d) => demand_record(who, d.cores),
+        None => holder_record(who, class.name()),
+    };
     // heavy work queues at once; light queues only when it would take a slot the head needs (`bypass_allowed`)
     let ticket = match class {
         Class::Light => None,
@@ -263,6 +327,7 @@ fn enqueue_with(ws: &Path, who: &Path, class: Class, tier: Tier) -> Result<Queue
         w,
         record,
         ticket,
+        demand,
         started: Instant::now(),
     })
 }
@@ -275,7 +340,7 @@ fn acquire_with(
     poll: Duration,
     report: &mut dyn FnMut(&str),
 ) -> Result<Grant> {
-    enqueue_with(ws, who, class, tier)?.wait(poll, report)
+    enqueue_with(ws, who, class, tier, None)?.wait(poll, report)
 }
 
 impl Queued {
@@ -295,6 +360,7 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
         w,
         record,
         mut ticket,
+        demand,
         started,
     } = queued;
     let starve_after = Duration::from_secs(pool.starve_after_s.value.into());
@@ -354,7 +420,7 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
         };
         // the head of the queue gathers; nobody behind it is served
         if queue_state.is_none_or(|(ahead, _)| ahead == 0)
-            && let Some((cpu, files)) = try_grant(&dir, &pool, w, &record)?
+            && let Some((cpu, files)) = granted(&dir, &pool, w, demand, &record)?
         {
             if let Some(t) = &ticket {
                 let passed = passed_earlier(&tickets, &t.name);
@@ -691,6 +757,63 @@ fn try_grant(
     Ok(Some((cpu, files)))
 }
 
+/// One attempt's grant: a class's whole request ([`try_grant`]), or a demand's ([`try_demand_grant`]).
+fn granted(
+    dir: &Path,
+    pool: &PoolConfig,
+    w: ClassWeight,
+    demand: Option<Demand>,
+    record: &str,
+) -> Result<Option<(u32, Vec<Flock>)>> {
+    match demand {
+        Some(d) => try_demand_grant(dir, pool, d, record),
+        None => try_grant(dir, pool, w, record),
+    }
+}
+
+/// The memory slots at once when the CPU target fits beside the running claims (`cpu_fits`, one snapshot). The CPU count is the claim's cores rounded up (the tool's job count); no CPU slot is held.
+fn try_demand_grant(
+    dir: &Path,
+    pool: &PoolConfig,
+    d: Demand,
+    record: &str,
+) -> Result<Option<(u32, Vec<Flock>)>> {
+    let snap = snapshot(dir, pool)?;
+    let (running_cores, running) = snap.running_cores();
+    if !cpu_fits(f64::from(snap.free_cpu), running_cores, running, d.cores) {
+        return Ok(None);
+    }
+    Ok(try_demand(dir, pool, d, record)?.map(|files| (d.cores.ceil().max(1.0) as u32, files)))
+}
+
+/// `d.mem_gib` memory slots at once, or none. Free slots are counted first, so a refused demand takes none; a take that loses a race is released with the rest.
+fn try_demand(
+    dir: &Path,
+    pool: &PoolConfig,
+    d: Demand,
+    record: &str,
+) -> Result<Option<Vec<Flock>>> {
+    let mut free = 0;
+    for i in 1..=shared_mem(pool) {
+        if probe(&slot(dir, "mem", i))?.is_none() {
+            free += 1;
+        }
+    }
+    if !mem_fits(shared_mem(pool), shared_mem(pool) - free, d.mem_gib) {
+        return Ok(None);
+    }
+    let mut files = Vec::new();
+    for i in 1..=shared_mem(pool) {
+        if files.len() == d.mem_gib as usize {
+            break;
+        }
+        if let Some(f) = try_take(&slot(dir, "mem", i), record)? {
+            files.push(f);
+        }
+    }
+    Ok((files.len() == d.mem_gib as usize).then_some(files))
+}
+
 /// What the pool holds right now: free slots per kind, and holders by record.
 #[derive(Debug, Default)]
 struct Snapshot {
@@ -701,6 +824,14 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// The running demands' cores and their count: each holder record once, however many memory slots it holds.
+    fn running_cores(&self) -> (f64, usize) {
+        self.held
+            .keys()
+            .filter_map(|rec| record_cores(rec))
+            .fold((0.0, 0), |(cores, n), c| (cores + c, n + 1))
+    }
+
     fn held_list(&self) -> String {
         if self.held.is_empty() {
             return "none".to_owned();
@@ -853,6 +984,87 @@ pub fn try_lock_dir(ws: &Path, id: &str) -> Result<Option<DirLock>> {
     Ok(Flock::try_take(file, Mode::Exclusive)
         .with_context(|| format!("flock {}", p.display()))?
         .map(|held| DirLock { _held: held }))
+}
+
+#[cfg(test)]
+mod demand_tests {
+    use super::*;
+
+    /// A pool of `cpu` slots and `mem` GiB under workspace `name`, its pool dir made.
+    fn pool(name: &str, cpu: u32, mem: u32) -> (PathBuf, PoolConfig) {
+        let ws =
+            std::env::temp_dir().join(format!("build-pool-demand-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("workspace");
+        std::fs::write(
+            ws.join("workspace.toml"),
+            format!("[pool]\ncpu_slots = {cpu}\nmem_gib = {mem}\n"),
+        )
+        .expect("workspace.toml");
+        std::fs::create_dir_all(dir(&ws)).expect("pool dir");
+        let pool = ws_config::load(&ws).expect("config").pool;
+        (ws, pool)
+    }
+
+    /// Fixture: 6 + 4 fit a budget of 10, 6 + 5 cannot.
+    #[test]
+    fn mem_fits_is_the_budget_arithmetic() {
+        assert!(mem_fits(10, 6, 4));
+        assert!(!mem_fits(10, 6, 5));
+    }
+
+    /// The CPU target is soft: a claim waits only while other claims run and their cores plus it exceed the free CPU; an idle lane always progresses.
+    #[test]
+    fn a_soft_cpu_mismatch_defers_only_while_busy() {
+        assert!(!cpu_fits(4.0, 3.5, 1, 1.0), "busy: 3.5 + 1.0 > 4.0");
+        assert!(cpu_fits(4.0, 3.5, 1, 0.5), "exactly the free CPU fits");
+        assert!(cpu_fits(4.0, 0.0, 0, 1.0), "an idle lane progresses");
+        assert!(
+            cpu_fits(4.0, 0.0, 0, 9.0),
+            "an idle lane progresses past the free CPU"
+        );
+    }
+
+    /// A demand takes whole GiB slots or none: a refused demand leaves no partial hold, so the next smaller one still fits.
+    #[test]
+    fn a_demand_takes_whole_gib_slots_or_none() {
+        let (ws, pool) = pool("slots", 4, 10);
+        let dir = dir(&ws);
+        let d = |mem_gib, cores| Demand { mem_gib, cores };
+        let six = try_demand(&dir, &pool, d(6, 1.0), "a")
+            .expect("probe")
+            .expect("6 fits 10");
+        let five = try_demand(&dir, &pool, d(5, 1.0), "b").expect("probe");
+        assert!(five.is_none(), "6 + 5 cannot");
+        let four = try_demand(&dir, &pool, d(4, 1.0), "c").expect("probe");
+        assert!(four.is_some(), "6 + 4 fit: the refused 5 held nothing");
+        drop((six, four));
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The holder record carries the demand's cores; a snapshot reads them back, once per holder however many slots it holds.
+    #[test]
+    fn a_demand_holders_cores_read_back() {
+        let (ws, pool) = pool("cores", 4, 10);
+        let dir = dir(&ws);
+        let record = demand_record(Path::new("/nowhere/checkout"), 3.5);
+        assert_eq!(record_cores(&record), Some(3.5));
+        let held = try_demand(
+            &dir,
+            &pool,
+            Demand {
+                mem_gib: 2,
+                cores: 3.5,
+            },
+            &record,
+        )
+        .expect("probe")
+        .expect("2 fits");
+        let snap = snapshot(&dir, &pool).expect("snapshot");
+        assert_eq!(snap.running_cores(), (3.5, 1));
+        drop(held);
+        std::fs::remove_dir_all(&ws).expect("cleanup");
+    }
 }
 
 #[cfg(test)]
