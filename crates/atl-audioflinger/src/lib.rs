@@ -65,5 +65,6 @@ pub fn serve(
     dispatcher::register(output.clone(), volume.current(), max, reported)?;
     atl_service_view::serve(FLINGER_NAME, flinger::new_binder(opts, output))?;
     atl_service_view::serve(POLICY_NAME, policy::new_binder())?;
+    policy::register_volume_listener();
     Ok(())
 }

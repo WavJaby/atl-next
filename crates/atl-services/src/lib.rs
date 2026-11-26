@@ -137,6 +137,8 @@ pub mod uimode;
 #[cfg(feature = "converter")]
 pub mod user;
 #[cfg(feature = "converter")]
+pub mod volume_listeners;
+#[cfg(feature = "converter")]
 pub mod webview_update;
 #[cfg(feature = "converter")]
 pub mod window;

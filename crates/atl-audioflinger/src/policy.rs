@@ -38,6 +38,9 @@ use atl_audioflinger_stubs::mangled::{
     _7_android_5_media_20_AudioProductStrategy as AudioProductStrategy,
     _7_android_5_media_22_AudioPolicyDeviceState as AudioPolicyDeviceState,
 };
+use atl_services_wire::audio_listener::{
+    BnAudioVolumeListener, IAudioVolumeListener, IAudioVolumeRegistry, SERVICE as VOLUME_REGISTRY,
+};
 use audioclient_types_aidl::mangled::{
     _7_android_5_media_11_AudioPortFw as AudioPortFw,
     _7_android_5_media_12_AudioPatchFw as AudioPatchFw,
@@ -51,10 +54,14 @@ use audioclient_types_aidl::mangled::{
     _7_android_5_media_21_AudioPortDeviceExtSys as AudioPortDeviceExtSys,
 };
 use binder::binder_impl::{Deserialize, Parcel};
-use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
+use binder::{
+    BinderFeatures, DeathRecipient, IBinder, Interface, SpIBinder, Status, StatusCode, Strong,
+    ThreadState,
+};
 
 use crate::flinger::{output_format, output_handle, output_layout};
 use crate::ids;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const INTERFACE: &str = "IAudioPolicyService";
@@ -302,6 +309,167 @@ fn attributes_bytes(aa: Option<&AudioAttributes>) -> binder::Result<Vec<u8>> {
     Ok(parcel.marshal()?)
 }
 
+/// The group event a client gets (A23 slice 5): AudioPolicyService.mNotificationClients' entry. Implemented by the client's binder, and by a log in the tests.
+pub(crate) trait GroupSink {
+    fn on_group(&self, group: i32, flags: i32);
+}
+
+/// The clients of the policy, one entry per (uid, pid). The first registration of a key wins (AudioPolicyService.registerClient:387); a client gets events only once it enabled them (NotificationClient:718).
+pub(crate) struct Clients<S> {
+    entries: BTreeMap<(u32, i32), Client<S>>,
+    registrations: u64,
+}
+
+struct Client<S> {
+    registration: u64,
+    enabled: bool,
+    sink: S,
+}
+
+impl<S> Clients<S> {
+    const fn new() -> Self {
+        Clients {
+            entries: BTreeMap::new(),
+            registrations: 0,
+        }
+    }
+}
+
+impl<S: GroupSink> Clients<S> {
+    fn next_registration(&mut self) -> u64 {
+        self.registrations += 1;
+        self.registrations
+    }
+
+    /// Keeps `sink` for `key` unless `key` registered already. Returns whether it was kept.
+    fn insert(&mut self, key: (u32, i32), registration: u64, sink: S) -> bool {
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        self.entries.insert(
+            key,
+            Client {
+                registration,
+                enabled: false,
+                sink,
+            },
+        );
+        true
+    }
+
+    /// setAudioVolumeGroupCallbacksEnabled for the caller's own entry; an unknown caller changes nothing (AudioPolicyService.cpp:425-427).
+    fn enable(&mut self, key: (u32, i32), enabled: bool) {
+        if let Some(client) = self.entries.get_mut(&key) {
+            client.enabled = enabled;
+        }
+    }
+
+    /// A death removes its own registration only.
+    fn remove(&mut self, key: (u32, i32), registration: u64) {
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|c| c.registration == registration)
+        {
+            self.entries.remove(&key);
+        }
+    }
+
+    /// One event per enabled client.
+    fn publish(&self, group: i32, flags: i32) {
+        for client in self.entries.values().filter(|c| c.enabled) {
+            client.sink.on_group(group, flags);
+        }
+    }
+}
+
+/// A registered client's binder: its events go out as IAudioPolicyServiceClient.onAudioVolumeGroupChanged (oneway, flags as given). Its death link removes the entry with the process.
+pub(crate) struct ClientBinder {
+    client: Strong<dyn IAudioPolicyServiceClient>,
+    _death: Option<DeathRecipient>,
+}
+
+impl GroupSink for ClientBinder {
+    fn on_group(&self, group: i32, flags: i32) {
+        if let Err(e) = self.client.r#onAudioVolumeGroupChanged(group, flags) {
+            tracing::warn!(error = %e, "volume group event not sent");
+        }
+    }
+}
+
+/// The policy's clients: one table for the process, which serves one policy object.
+static CLIENTS: Mutex<Clients<ClientBinder>> = Mutex::new(Clients::new());
+
+fn clients() -> MutexGuard<'static, Clients<ClientBinder>> {
+    // a poisoned table still holds plain registrations
+    CLIENTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The caller's key: its uid and pid (AudioPolicyService.cpp:383-385, token = uid << 32 | pid).
+fn caller() -> (u32, i32) {
+    (
+        ThreadState::get_calling_uid(),
+        ThreadState::get_calling_pid(),
+    )
+}
+
+/// The engine's volume group of `stream`: the catalogue group whose streams include it (AudioVolumeGroup.streams; engine.cpp volume_groups). None when no group holds it.
+fn group_of_stream(stream: i32) -> Option<i32> {
+    let parcel = engine().ok()?.volume_groups().ok()?;
+    let groups = unparcel_list::<AudioVolumeGroup>(&parcel).ok()?;
+    groups
+        .iter()
+        .find(|g| {
+            g.streams
+                .as_deref()
+                .is_some_and(|streams| streams.iter().any(|s| s.0 == stream))
+        })
+        .map(|g| g.groupId)
+}
+
+/// A committed write of `stream` with `flags`: one event for the stream's group to each enabled client. A stream no group holds publishes nothing.
+fn publish_written<S: GroupSink>(clients: &Clients<S>, stream: i32, flags: i32) {
+    if let Some(group) = group_of_stream(stream) {
+        clients.publish(group, flags);
+    }
+}
+
+/// The write AudioService reports (VolumeCommits): publishes it to this process's clients.
+pub(crate) fn publish_stream(stream: i32, flags: i32) {
+    let table = clients();
+    publish_written(&table, stream, flags);
+}
+
+/// The listener AudioService calls for each write of this process's uid (atl-services volume_listeners).
+struct VolumeCommits;
+
+impl Interface for VolumeCommits {}
+
+impl IAudioVolumeListener for VolumeCommits {
+    fn volume_committed(&self, stream: i32, flags: i32) -> Result<(), StatusCode> {
+        publish_stream(stream, flags);
+        Ok(())
+    }
+}
+
+/// Hands this process's listener to AudioService's registry. A missing registry is counted and the process gets no group events; the app volume stays local the same way (dispatcher.rs).
+pub(crate) fn register_volume_listener() {
+    let registry: Strong<dyn IAudioVolumeRegistry> = match binder::check_interface(VOLUME_REGISTRY)
+    {
+        Ok(registry) => registry,
+        Err(e) => {
+            atl_diag::refused("IAudioVolumeRegistry", "lookup");
+            tracing::warn!(error = %e, "no AudioService volume registry: no group events");
+            return;
+        }
+    };
+    let listener = BnAudioVolumeListener::new_binder(VolumeCommits, BinderFeatures::default());
+    if let Err(e) = registry.register(listener) {
+        atl_diag::refused("IAudioVolumeRegistry", "register");
+        tracing::warn!(error = %e, "volume listener not registered: no group events");
+    }
+}
+
 struct AudioPolicy;
 
 impl Interface for AudioPolicy {}
@@ -315,18 +483,46 @@ impl IAudioPolicyService for AudioPolicy {
         Ok(output_handle())
     }
 
-    /// AOSP keeps the client for device and port callbacks; none is sent here, since no device or port ever changes.
+    /// AudioPolicyService::registerClient (AudioPolicyService.cpp:375-400): the caller's client, kept per (uid, pid) with its death link; a null client is ok. The client's port callbacks are never due (no device or port changes).
     fn r#registerClient(
         &self,
-        _client: Option<&Strong<dyn IAudioPolicyServiceClient>>,
+        client: Option<&Strong<dyn IAudioPolicyServiceClient>>,
     ) -> binder::Result<()> {
         atl_diag::answered(INTERFACE, "registerClient");
+        let Some(client) = client else {
+            return Ok(());
+        };
+        let key = caller();
+        let registration = clients().next_registration();
+        let mut binder = client.as_binder();
+        let death = if binder.is_remote() {
+            let mut death = DeathRecipient::new(move || clients().remove(key, registration));
+            binder.link_to_death(&mut death)?;
+            Some(death)
+        } else {
+            None
+        };
+        clients().insert(
+            key,
+            registration,
+            ClientBinder {
+                client: client.clone(),
+                _death: death,
+            },
+        );
         Ok(())
     }
 
     /// AudioPolicyService::setAudioPortCallbacksEnabled: marks the client for port-list callbacks; none are ever due.
     fn r#setAudioPortCallbacksEnabled(&self, _enabled: bool) -> binder::Result<()> {
         atl_diag::answered(INTERFACE, "setAudioPortCallbacksEnabled");
+        Ok(())
+    }
+
+    /// AudioPolicyService::setAudioVolumeGroupCallbacksEnabled (AudioPolicyService.cpp:417-430): the caller's own client; an unknown caller is ok and nothing changes.
+    fn r#setAudioVolumeGroupCallbacksEnabled(&self, enabled: bool) -> binder::Result<()> {
+        clients().enable(caller(), enabled);
+        atl_diag::answered(INTERFACE, "setAudioVolumeGroupCallbacksEnabled");
         Ok(())
     }
 
@@ -802,5 +998,103 @@ mod tests {
             .r#getStrategyForStream(AudioStreamType::SYS_RESERVED_REROUTING)
             .expect("a strategy");
         assert_eq!(strategy, STRATEGY_NONE);
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use atl_services_wire::audio_volume::{FLAG_ABSOLUTE_VOLUME, STREAM_MUSIC};
+
+    /// AudioSystem.STREAM_NOTIFICATION (AudioSystem.java:94).
+    const STREAM_NOTIFICATION: i32 = 5;
+    /// The engine's volume group ids for a default config, derived from the pinned source (A23 slice 5, state note): the handle counter starts at 1 (HandleGenerator.h:32) and takes one per volume group, in creation order: MUSIC first (EngineBase.cpp:134-137, :249-260); then per attributes entry in EngineDefaultConfig.h order, VOICE_CALL 2, BLUETOOTH_SCO 3, RING 4 (= the S4c probe's ringtone Some(4)), ALARM 5, ENFORCED_AUDIBLE 6, ACCESSIBILITY 7, NOTIFICATION 8 (EngineBase.cpp:261-283).
+    const MUSIC_GROUP: i32 = 1;
+    const NOTIFICATION_GROUP: i32 = 8;
+    /// A client's key: its uid and pid.
+    const KEY: (u32, i32) = (10_001, 42);
+
+    /// A client's sink: logs each (group, flags) it is given.
+    struct Log(Rc<RefCell<Vec<(i32, i32)>>>);
+
+    impl GroupSink for Log {
+        fn on_group(&self, group: i32, flags: i32) {
+            self.0.borrow_mut().push((group, flags));
+        }
+    }
+
+    /// A sink and its log, kept by the test.
+    fn log() -> (Log, Rc<RefCell<Vec<(i32, i32)>>>) {
+        let got = Rc::new(RefCell::new(Vec::new()));
+        (Log(Rc::clone(&got)), got)
+    }
+
+    /// A table with KEY registered and enabled, and the log of its events.
+    fn enabled() -> (Clients<Log>, Rc<RefCell<Vec<(i32, i32)>>>) {
+        let mut clients = Clients::new();
+        let (sink, got) = log();
+        assert!(clients.insert(KEY, 1, sink));
+        clients.enable(KEY, true);
+        (clients, got)
+    }
+
+    #[test]
+    fn a_music_write_gives_one_event_with_the_music_group() {
+        let (clients, got) = enabled();
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert_eq!(*got.borrow(), vec![(MUSIC_GROUP, 0)]);
+    }
+
+    #[test]
+    fn a_notification_write_gives_the_notification_group() {
+        let (clients, got) = enabled();
+        publish_written(&clients, STREAM_NOTIFICATION, 0);
+        assert_eq!(*got.borrow(), vec![(NOTIFICATION_GROUP, 0)]);
+    }
+
+    #[test]
+    fn the_flags_of_a_write_pass_through() {
+        let (clients, got) = enabled();
+        publish_written(&clients, STREAM_MUSIC, FLAG_ABSOLUTE_VOLUME);
+        assert_eq!(*got.borrow(), vec![(MUSIC_GROUP, FLAG_ABSOLUTE_VOLUME)]);
+    }
+
+    #[test]
+    fn a_disabled_client_gets_nothing() {
+        let mut clients = Clients::new();
+        let (sink, got) = log();
+        assert!(clients.insert(KEY, 1, sink));
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert!(got.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_dead_client_gets_nothing() {
+        let (mut clients, got) = enabled();
+        clients.remove(KEY, 2);
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert_eq!(*got.borrow(), vec![(MUSIC_GROUP, 0)]);
+        clients.remove(KEY, 1);
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert_eq!(*got.borrow(), vec![(MUSIC_GROUP, 0)]);
+    }
+
+    #[test]
+    fn an_unknown_caller_enables_nothing() {
+        let mut clients: Clients<Log> = Clients::new();
+        clients.enable(KEY, true);
+        let (sink, got) = log();
+        assert!(clients.insert(KEY, 1, sink));
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert!(got.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_first_registration_of_a_process_is_kept() {
+        let (mut clients, got) = enabled();
+        let (second, second_got) = log();
+        assert!(!clients.insert(KEY, 2, second));
+        publish_written(&clients, STREAM_MUSIC, 0);
+        assert_eq!(*got.borrow(), vec![(MUSIC_GROUP, 0)]);
+        assert!(second_got.borrow().is_empty());
     }
 }

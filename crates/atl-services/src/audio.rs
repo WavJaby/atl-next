@@ -39,6 +39,7 @@ use crate::packages::{PackageTable, Permissions};
 use crate::players::{Access, PIID_INVALID, Players};
 use crate::uid_state::UidViews;
 use crate::volume::{Absolute, AppVolumes, BadStream, Changes, Dispatch, STREAM_MUSIC};
+use crate::volume_listeners::{self, Shared};
 
 /// The interface name counters use.
 const INTERFACE: &str = "IAudioService";
@@ -184,6 +185,8 @@ struct AudioService {
     /// AppOps' policy: the hardening check reads TAKE_AUDIO_FOCUS through it (noteOperation's path)
     appops: AppOps,
     focus: Arc<Mutex<FocusStack>>,
+    /// The app processes' volume listeners, told of each write (volume_listeners).
+    listeners: Shared,
 }
 
 impl AudioService {
@@ -502,6 +505,7 @@ impl IAudioService for AudioService {
             .set(uid, stream, index, flags)
             .map_err(bad_stream)?;
         self.changed(uid, &changes, dispatch);
+        volume_listeners::commit(&self.listeners, uid, stream, flags, &changes);
         Ok(())
     }
 
@@ -527,6 +531,7 @@ impl IAudioService for AudioService {
             ));
         };
         self.changed(uid, &changes, dispatch);
+        volume_listeners::commit(&self.listeners, uid, stream, flags, &changes);
         Ok(())
     }
 
@@ -802,6 +807,7 @@ pub fn new_binder(
     broadcast: Broadcast,
     packages: Arc<PackageTable>,
     uids: UidViews,
+    listeners: Shared,
 ) -> SpIBinder {
     let appops = AppOps::new(Arc::clone(&permissions), packages, uids);
     let service = AudioService {
@@ -811,6 +817,7 @@ pub fn new_binder(
         broadcast,
         appops,
         focus: Arc::new(Mutex::new(FocusStack::default())),
+        listeners,
     };
     BnAudioService::new_binder(service, BinderFeatures::default()).as_binder()
 }
@@ -842,6 +849,7 @@ mod tests {
             volumes: Mutex::new(VolumeState::default()),
             broadcast: Arc::new(|_, _| {}),
             focus: Arc::new(Mutex::new(FocusStack::default())),
+            listeners: volume_listeners::shared(),
         }
     }
 

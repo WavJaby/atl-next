@@ -471,6 +471,8 @@ fn main() -> Result<()> {
     };
     // the volume broadcasts reach the changed app's receivers through the activity manager's delivery
     let volume_broadcasts = activity.clone();
+    // the app processes' volume listeners: AudioService tells each of a write (volume_listeners), the registry takes them in
+    let volume_listeners = atl_services::volume_listeners::shared();
     binder::add_service(
         AUDIO,
         atl_services::audio::new_binder(
@@ -480,9 +482,15 @@ fn main() -> Result<()> {
             }),
             Arc::clone(&table),
             Arc::clone(&uid_views),
+            Arc::clone(&volume_listeners),
         ),
     )
     .context("addService audio")?;
+    binder::add_service(
+        atl_services_wire::audio_listener::SERVICE,
+        atl_services::volume_listeners::new_binder(volume_listeners),
+    )
+    .context("addService audio volume registry")?;
     binder::add_service(USER, atl_services::user::new_binder()).context("addService user")?;
     binder::add_service(
         PROCESS_INFO,
