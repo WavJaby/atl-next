@@ -519,6 +519,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     let at = RowRun {
         exe: &exe,
         root,
+        ws: &ws,
         logs: &logs,
         task: &task,
         run: &run,
@@ -772,10 +773,39 @@ fn run_lanes<P: Send>(
     (stats, results.into_iter().flatten().collect())
 }
 
+/// What one attempt measured (the supervisor's record): the leaf's peak and CPU time, its wall time, and whether its leaf certified an OOM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Runtime {
+    mem_peak: u64,
+    oom: bool,
+    cpu_usec: u64,
+    wall_ms: u64,
+}
+
+/// The `gate-run` line of an attempt: a passed one, or a certified OOM (its peak a lower bound). None: a red or undecided attempt is no demand.
+fn gate_run(
+    row: &str,
+    run: &str,
+    outcome: Outcome,
+    measured: Runtime,
+) -> Option<resource_ledger::RunRecord> {
+    (outcome == Outcome::Pass || measured.oom).then(|| resource_ledger::RunRecord {
+        kind: resource_ledger::GATE_RUN,
+        name: row.to_owned(),
+        run: run.to_owned(),
+        mem_peak: measured.mem_peak,
+        oom: measured.oom,
+        cpu_usec: measured.cpu_usec,
+        wall_ms: measured.wall_ms,
+    })
+}
+
 /// What every row's run shares: the harness binary, the checkout, the log dir, the red-log task dir and run id, the host and build dir arguments.
 struct RowRun<'a> {
     exe: &'a Path,
     root: &'a Path,
+    /// the workspace: the pool's ledger (`resource_ledger`) lives under it
+    ws: &'a Path,
     logs: &'a Path,
     task: &'a Path,
     run: &'a str,
@@ -856,6 +886,23 @@ impl RowRun<'_> {
         } else {
             Outcome::Fail
         };
+        // the attempt's runtime for admission: a passed attempt or a certified OOM is a `gate-run` line (`gate_run`); the write is the row's, a failure is its red
+        let runtime = Runtime {
+            mem_peak: record.mem_peak,
+            oom: record.certified(),
+            cpu_usec: record.cpu_usec,
+            wall_ms: record.wall_ms,
+        };
+        let rerun = matches!(attempt, Attempt::Rerun { .. });
+        if let Some(line) = gate_run(
+            &row.name(),
+            &gate_need::attempt(self.run, rerun),
+            outcome,
+            runtime,
+        ) {
+            resource_ledger::append_runs(self.ws, &[line], gate_need::WINDOW)
+                .with_context(|| format!("gate runtime of {} not written", row.name()))?;
+        }
         // the undecided verdict's ruling, typed: the gate printed it as a `starvation-verdict:` line (harness `undecided_verdict`)
         let verdict = match outcome {
             Outcome::Undecided => undecided_verdict(&text)?,
@@ -1757,6 +1804,47 @@ mod tests {
         assert_eq!(
             starvation_of(&done).line("gates"),
             "gates: starvation starved=3 (cpu=3 gpu=0) rerun quiet=3 shared=0 -> ok=1 failed=1 undecided=1; judged late=0; unknown=0; ceiling=0"
+        );
+    }
+
+    /// Only a passed attempt or a certified OOM is a `gate-run` line: a red or undecided attempt is no demand, and an OOM keeps its peak as a lower bound.
+    #[test]
+    fn only_a_passed_or_oom_attempt_is_a_run_line() {
+        let measured = Runtime {
+            mem_peak: 3 << 30,
+            oom: false,
+            cpu_usec: 4_000_000,
+            wall_ms: 2_000,
+        };
+        let pass = gate_run("window-ime", "r1", Outcome::Pass, measured)
+            .expect("a passed attempt is demand");
+        assert_eq!(pass.kind, resource_ledger::GATE_RUN);
+        assert_eq!(
+            (
+                pass.name.as_str(),
+                pass.run.as_str(),
+                pass.mem_peak,
+                pass.oom,
+                pass.cpu_usec,
+                pass.wall_ms
+            ),
+            ("window-ime", "r1", 3 << 30, false, 4_000_000, 2_000)
+        );
+        assert!(
+            gate_run("window-ime", "r1", Outcome::Fail, measured).is_none(),
+            "a red attempt"
+        );
+        assert!(
+            gate_run("window-ime", "r1", Outcome::Undecided, measured).is_none(),
+            "an undecided attempt"
+        );
+        let oom = Runtime {
+            oom: true,
+            ..measured
+        };
+        assert!(
+            gate_run("window-ime", "r1", Outcome::Fail, oom).is_some_and(|r| r.oom),
+            "an OOM is a lower bound"
         );
     }
 
