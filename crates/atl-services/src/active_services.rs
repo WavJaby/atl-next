@@ -380,7 +380,7 @@ impl Inner {
         let packages = self.packages.snapshot();
         match packages.by_name(package) {
             Some(p) => self
-                .start_process_locked(st, p, process, false, None)
+                .start_process_locked(st, p, Some(process), false, None)
                 .map(|()| true)
                 .map_err(|e| e.to_string()),
             None => Err(format!("no package {package}")),

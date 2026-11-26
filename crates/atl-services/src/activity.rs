@@ -1033,16 +1033,14 @@ impl ActivityManager {
     /// Starts the process of `package`'s launcher activity, which launches once the process has attached: what ActivityTaskManager does for a MAIN / LAUNCHER start (startActivity is not
     /// implemented, so atl-system-services calls this for its `--launch` package, the stand-in for the home screen's tap).
     pub fn start_launcher(&self, package: &str) -> Result<(), String> {
+        // state lock first, record read after it: a publish that waited for the lock is seen; start_process_locked refuses a record with no launcher
+        let mut st = self.inner.state();
         let packages = self.inner.packages.snapshot();
         let p = packages
             .by_name(package)
             .ok_or_else(|| format!("no package {package}"))?;
-        if packages.launcher(p).is_none() {
-            return Err(format!("{package} has no launcher activity"));
-        }
-        let mut st = self.inner.state();
         self.inner
-            .start_process_locked(&mut st, p, p.process_name(), true, None)
+            .start_process_locked(&mut st, p, None, true, None)
             .map_err(|e| format!("starting {package}: {e}"))
     }
 
@@ -1072,12 +1070,13 @@ impl ActivityManager {
         flags: i32,
         component: Option<(&str, &str)>,
     ) -> Result<i32, Status> {
+        // state lock first, record read after it (see start_launcher): check_shell sees the launcher class of the record the lock-holder published
+        let mut st = self.inner.state();
         let packages = self.inner.packages.snapshot();
         let p = component.and_then(|(package, _)| packages.by_name(package));
         let launcher = p
             .and_then(|p| packages.launcher(p))
             .and_then(|a| a.component.item.name.as_deref());
-        let mut st = self.inner.state();
         let running = p.is_some_and(|p| st.processes.iter().any(|r| r.package == p.name()));
         match activity_start::check_shell(calling_uid, flags, component, launcher, running) {
             Ok(()) => {}
@@ -1088,7 +1087,7 @@ impl ActivityManager {
             return Ok(activity_start::START_CLASS_NOT_FOUND);
         };
         self.inner
-            .start_process_locked(&mut st, p, p.process_name(), true, None)
+            .start_process_locked(&mut st, p, None, true, None)
             .map_err(|e| {
                 Status::new_exception_str(
                     ExceptionCode::ILLEGAL_STATE,
@@ -1732,7 +1731,7 @@ impl Inner {
         &self,
         st: &mut State,
         p: &PackageRecord,
-        process_name: &str,
+        process_name: Option<&str>,
         launch_activity: bool,
         instr: Option<ActiveInstrumentation>,
     ) -> std::io::Result<()> {
@@ -1752,6 +1751,15 @@ impl Inner {
                 p.name()
             )));
         };
+        // None: the fresh record's process name (the caller's record may predate a publish that renamed the process)
+        let process_name = process_name.unwrap_or(p.process_name());
+        // a launch needs the launcher in the record it starts from: an update that removed it refuses the launch before the control start
+        if launch_activity && packages.launcher(p).is_none() {
+            return Err(std::io::Error::other(format!(
+                "{} has no launcher activity",
+                p.name()
+            )));
+        }
         st.proc_start_seq_counter += 1;
         let start_seq = st.proc_start_seq_counter;
         let pid = self.control.start(&StartRequest {
@@ -3028,7 +3036,7 @@ impl IActivityManager for ActivityManager {
         // :14613-14622 forceStopPackageLocked of the target, addAppLocked -> startProcessLocked
         let fx = inner.force_stop_package_locked(&mut st, target.name());
         let started =
-            inner.start_process_locked(&mut st, target, &default_process, false, Some(instr));
+            inner.start_process_locked(&mut st, target, Some(&default_process), false, Some(instr));
         drop(st);
         inner.deliver(fx);
         started.map_err(|e| illegal_state(&format!("starting {}: {e}", target.name())))?;
@@ -4494,7 +4502,7 @@ mod tests {
             .by_name(PROVIDER_PACKAGE)
             .expect("the provider package is installed");
         am.inner
-            .start_process_locked(&mut st, p, PROVIDER_PACKAGE, false, None)
+            .start_process_locked(&mut st, p, Some(PROVIDER_PACKAGE), false, None)
     }
 
     /// Starts process `process_name` of the provider package; its host pid when accepted (the record the start leaves is found by its name).
@@ -4505,7 +4513,7 @@ mod tests {
             .by_name(PROVIDER_PACKAGE)
             .expect("the provider package is installed");
         am.inner
-            .start_process_locked(&mut st, p, process_name, false, None)?;
+            .start_process_locked(&mut st, p, Some(process_name), false, None)?;
         Ok(st
             .processes
             .iter()
@@ -4555,7 +4563,7 @@ mod tests {
                 .by_name(PROVIDER_PACKAGE)
                 .expect("the provider package is installed");
             let mut st = inner.state();
-            inner.start_process_locked(&mut st, p, PROVIDER_PACKAGE, false, None)
+            inner.start_process_locked(&mut st, p, Some(PROVIDER_PACKAGE), false, None)
         });
         taken_rx.recv().expect("the start took its snapshot");
         // the update publishes the package with another target SDK while the start waits for the lock
@@ -4577,6 +4585,77 @@ mod tests {
         assert_eq!(
             *control.target_sdks.lock().expect("target_sdks"),
             [UPDATED_TARGET_SDK]
+        );
+    }
+
+    /// A start whose caller holds a record from before a publish takes the published process name: start_process_locked's default comes from the record it reads under the lock.
+    /// Red: the default came from the caller's record (the old name).
+    #[test]
+    fn a_start_with_a_stale_record_takes_the_published_process_name() {
+        const RENAMED: &str = "com.example.provider:renamed";
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let stale = am.inner.packages.snapshot();
+        let mut updated = fixture::record(PROVIDER_PACKAGE);
+        updated.uid = PROVIDER_UID;
+        updated
+            .info
+            .application_info
+            .as_mut()
+            .expect("the fixture's application info")
+            .process_name = Some(RENAMED.to_owned());
+        let next = am.inner.packages.snapshot().with_records(vec![updated]);
+        am.inner.packages.publish(next);
+        let stale_record = stale
+            .by_name(PROVIDER_PACKAGE)
+            .expect("the provider package is installed");
+        let mut st = am.inner.state();
+        am.inner
+            .start_process_locked(&mut st, stale_record, None, false, None)
+            .expect("the start is not refused");
+        assert_eq!(*control.starts.lock().expect("starts"), [RENAMED]);
+    }
+
+    /// A launch of a package whose publish removed its launcher is refused, though the caller's record still has one. Red: the start went through.
+    #[test]
+    fn a_launch_after_an_update_removed_the_launcher_is_refused() {
+        const MAIN: &str = "android.intent.action.MAIN";
+        const LAUNCHER: &str = "android.intent.category.LAUNCHER";
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        let mut with_launcher = fixture::record(PROVIDER_PACKAGE);
+        with_launcher.uid = PROVIDER_UID;
+        with_launcher.info.activities =
+            Some(vec![Some(fixture::activity(PROVIDER_PACKAGE, ".Main"))]);
+        with_launcher.intents.push(ComponentIntents {
+            kind: Kind::ActivityIntents,
+            name: ".Main".to_owned(),
+            intents: vec![fixture::filter(&[MAIN], &[LAUNCHER])],
+        });
+        let next = am
+            .inner
+            .packages
+            .snapshot()
+            .with_records(vec![with_launcher]);
+        am.inner.packages.publish(next);
+        let stale = am.inner.packages.snapshot();
+        let mut updated = fixture::record(PROVIDER_PACKAGE);
+        updated.uid = PROVIDER_UID;
+        let next = am.inner.packages.snapshot().with_records(vec![updated]);
+        am.inner.packages.publish(next);
+        let stale_record = stale
+            .by_name(PROVIDER_PACKAGE)
+            .expect("the provider package is installed");
+        let mut st = am.inner.state();
+        assert!(
+            am.inner
+                .start_process_locked(&mut st, stale_record, None, true, None)
+                .is_err(),
+            "a launch whose published package has no launcher is refused"
+        );
+        assert!(
+            control.starts.lock().expect("starts").is_empty(),
+            "nothing started"
         );
     }
 
