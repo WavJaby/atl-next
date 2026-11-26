@@ -673,6 +673,9 @@ pub const EXTRA_SYSTEM_UPDATE_UNINSTALL: &str = "android.intent.extra.SYSTEM_UPD
 pub const EXTRA_UID: &str = "android.intent.extra.UID";
 pub const EXTRA_REPLACING: &str = "android.intent.extra.REPLACING";
 pub const EXTRA_USER_HANDLE: &str = "android.intent.extra.user_handle";
+/// PackageInstaller.EXTRA_DATA_LOADER_TYPE (PackageInstaller.java:362), on ADDED and REPLACED (BroadcastHelper :618, :827); DataLoaderType.NONE (DataLoaderType.aidl:28) is an APK install's loader.
+pub const EXTRA_DATA_LOADER_TYPE: &str = "android.content.pm.extra.DATA_LOADER_TYPE";
+pub const DATA_LOADER_TYPE_NONE: i32 = 0;
 /// Intent.FLAG_RECEIVER_OFFLOAD = 0x80000000 (Intent.java:7609) as an int. Its offload queue is not modelled: the flag only reaches the receiver's Intent.
 pub const FLAG_RECEIVER_OFFLOAD: i32 = i32::MIN;
 

@@ -911,28 +911,35 @@ pub(super) fn package_sends(
         Some((Arc::clone(table), r.package.clone()))
     };
     let after = |r: &install::Reported| Some((Arc::clone(&audience.after), r.package.clone()));
+    let loader = || {
+        (
+            broadcast::EXTRA_DATA_LOADER_TYPE,
+            Value::Int(broadcast::DATA_LOADER_TYPE_NONE),
+        )
+    };
     let mut sends = Vec::new();
     for r in reports {
         match r.change {
             install::Change::New => sends.push(data_send(
                 broadcast::ACTION_PACKAGE_ADDED,
                 r,
-                Vec::new(),
+                vec![loader()],
                 after(r),
             )),
             install::Change::Updated { .. } => {
                 sends.push(removed_send(r, replaced(r)));
-                let replacing = || vec![(broadcast::EXTRA_REPLACING, Value::Bool(true))];
+                let update_extras =
+                    || vec![(broadcast::EXTRA_REPLACING, Value::Bool(true)), loader()];
                 sends.push(data_send(
                     broadcast::ACTION_PACKAGE_ADDED,
                     r,
-                    replacing(),
+                    update_extras(),
                     after(r),
                 ));
                 sends.push(data_send(
                     broadcast::ACTION_PACKAGE_REPLACED,
                     r,
-                    replacing(),
+                    update_extras(),
                     replaced(r),
                 ));
                 sends.push(my_package_replaced(r));
@@ -961,17 +968,24 @@ fn removed_send(r: &install::Reported, about: Option<(Arc<Packages>, String)>) -
     )
 }
 
-/// One data broadcast (sendPackageBroadcast): data `package:<pkg>` and EXTRA_UID, then `extras`, to the receivers `about` admits.
+/// One data broadcast (sendPackageBroadcast, BroadcastHelper :172-194): data `package:<pkg>`, EXTRA_UID and EXTRA_USER_HANDLE (the user, :191), then `extras`, to the receivers
+/// `about` admits.
 fn data_send(
     action: &str,
     r: &install::Reported,
     extras: Vec<(&str, Value)>,
     about: Option<(Arc<Packages>, String)>,
 ) -> PackageSend {
-    let mut entries = vec![(
-        broadcast::EXTRA_UID.to_owned(),
-        Value::Int(i32::try_from(r.uid).unwrap_or(i32::MAX)),
-    )];
+    let mut entries = vec![
+        (
+            broadcast::EXTRA_UID.to_owned(),
+            Value::Int(i32::try_from(r.uid).unwrap_or(i32::MAX)),
+        ),
+        (
+            broadcast::EXTRA_USER_HANDLE.to_owned(),
+            Value::Int(USER_SYSTEM),
+        ),
+    ];
     entries.extend(extras.into_iter().map(|(k, v)| (k.to_owned(), v)));
     PackageSend {
         package: r.package.clone(),
@@ -986,13 +1000,18 @@ fn data_send(
     }
 }
 
-/// MY_PACKAGE_REPLACED to the package's own receivers alone (setPackage, no data, no extras) with the REASON_PACKAGE_REPLACED temp allowlist; no audience (the allow list is null, BroadcastHelper :714-720).
+/// MY_PACKAGE_REPLACED to the package's own receivers alone (setPackage, no data, the user handle only: BroadcastHelper :191) with the REASON_PACKAGE_REPLACED temp allowlist; no
+/// audience (the allow list is null, BroadcastHelper :714-720).
 fn my_package_replaced(r: &install::Reported) -> PackageSend {
     PackageSend {
         package: r.package.clone(),
         intent: Intent {
             action: Some(broadcast::ACTION_MY_PACKAGE_REPLACED.to_owned()),
             package: Some(r.package.clone()),
+            extras: Some(Bundle::from_entries([(
+                broadcast::EXTRA_USER_HANDLE.to_owned(),
+                Value::Int(USER_SYSTEM),
+            )])),
             ..Intent::default()
         },
         about: None,

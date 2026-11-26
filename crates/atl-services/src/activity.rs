@@ -4094,22 +4094,27 @@ mod tests {
                 "android.intent.extra.SYSTEM_UPDATE_UNINSTALL=bool false",
                 "android.intent.extra.UID=int 10001",
                 "android.intent.extra.USER_INITIATED=bool true",
+                "android.intent.extra.user_handle=int 0",
             ]
         );
         assert_eq!(
             sends[0].intent.data.as_deref(),
             Some("package:com.example.app")
         );
-        assert_eq!(
-            extras_text(&sends[1].intent),
-            [
-                "android.intent.extra.REPLACING=bool true",
-                "android.intent.extra.UID=int 10001",
-            ]
-        );
-        assert_eq!(extras_text(&sends[2].intent), extras_text(&sends[1].intent));
+        // ADDED and REPLACED carry DATA_LOADER_TYPE NONE (BroadcastHelper.java :618, :827; DataLoaderType.aidl NONE = 0), as every package broadcast carries the user handle (:191)
+        let added = [
+            "android.content.pm.extra.DATA_LOADER_TYPE=int 0",
+            "android.intent.extra.REPLACING=bool true",
+            "android.intent.extra.UID=int 10001",
+            "android.intent.extra.user_handle=int 0",
+        ];
+        assert_eq!(extras_text(&sends[1].intent), added);
+        assert_eq!(extras_text(&sends[2].intent), added);
         assert_eq!(sends[3].intent.package.as_deref(), Some(PACKAGE));
-        assert!(extras_text(&sends[3].intent).is_empty());
+        assert_eq!(
+            extras_text(&sends[3].intent),
+            ["android.intent.extra.user_handle=int 0"]
+        );
         assert!(sends[3].intent.data.is_none());
         assert!(
             sends[3].grant.is_some(),
