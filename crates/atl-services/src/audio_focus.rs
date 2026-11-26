@@ -59,7 +59,6 @@ pub struct Request<B> {
 }
 
 /// One focus owner (FocusRequester): `binder` identifies the requesting binder (death removes by it), `link` is its death link (released with the owner, unlinking it), `loss` the strongest loss received so far.
-/// `serial` names the link: a death for a link whose owner already left is stale.
 pub struct Owner<B, L> {
     client: String,
     binder: B,
@@ -69,22 +68,17 @@ pub struct Owner<B, L> {
     sdk: i32,
     loss: i32,
     dispatch: Option<Dispatch>,
-    serial: u64,
     link: L,
 }
 
 /// The focus stack, bottom to top; the last owner holds focus. Removed links are returned so the caller releases them outside its lock.
 pub struct Stack<B, L> {
     owners: Vec<Owner<B, L>>,
-    next_serial: u64,
 }
 
 impl<B: PartialEq, L> Default for Stack<B, L> {
     fn default() -> Self {
-        Stack {
-            owners: Vec::new(),
-            next_serial: 0,
-        }
+        Stack { owners: Vec::new() }
     }
 }
 
@@ -112,13 +106,13 @@ impl<B: PartialEq, L> Stack<B, L> {
             .map(|o| o.loss)
     }
 
-    /// MediaFocusControl.requestAudioFocus after the binder checks. `alive` is pingBinder (dead client refused first); `link` runs only once the request is admissible, given the serial its owner will hold, so no owner exists without its live link.
+    /// MediaFocusControl.requestAudioFocus after the binder checks. `alive` is pingBinder (dead client refused first); `link` runs only once the request is admissible, so no owner exists without its live link.
     /// Returns the result and the links this request released (the same client's replaced owner, a silent removal, the losers that left, its own unused link): the caller drops them after releasing its lock.
     pub fn request(
         &mut self,
         r: Request<B>,
         alive: bool,
-        link: impl FnOnce(u64) -> Option<L>,
+        link: impl FnOnce() -> Option<L>,
     ) -> (i32, Vec<L>) {
         if !alive {
             atl_diag::refused(INTERFACE, "requestAudioFocus (client binder dead)");
@@ -132,10 +126,7 @@ impl<B: PartialEq, L> Stack<B, L> {
             atl_diag::refused(INTERFACE, "requestAudioFocus (stack full)");
             return (REQUEST_FAILED, Vec::new());
         }
-        // spent even when the link is released unused: a stale death of that link never matches a later owner
-        let serial = self.next_serial;
-        self.next_serial += 1;
-        let Some(link) = link(serial) else {
+        let Some(link) = link() else {
             atl_diag::refused(INTERFACE, "requestAudioFocus (linkToDeath failed)");
             return (REQUEST_FAILED, Vec::new());
         };
@@ -167,7 +158,6 @@ impl<B: PartialEq, L> Stack<B, L> {
             sdk: r.sdk,
             loss: NONE,
             dispatch: r.dispatch,
-            serial,
             link,
         });
         (REQUEST_GRANTED, gone)
@@ -184,12 +174,9 @@ impl<B: PartialEq, L> Stack<B, L> {
         links
     }
 
-    /// MediaFocusControl.removeFocusStackEntryOnDeath for the link `serial` on `binder`. A serial no owner holds is stale (its owner already left): nothing changes, so a re-requested owner survives.
-    /// Otherwise every owner of `binder` leaves at once, and the top is restored once if the top was among them: a dead client gets no callback. Returns the removed links.
-    pub fn die(&mut self, binder: &B, serial: u64) -> Vec<L> {
-        if !self.owners.iter().any(|o| o.serial == serial) {
-            return Vec::new();
-        }
+    /// MediaFocusControl.removeFocusStackEntryOnDeath: every owner of `binder` leaves at once, and the top is restored once if the top was among them: a dead client gets no callback. Returns the removed links.
+    /// Removal is by binder identity, the object each owner's death link was made on. No check for a link whose owner already left: its death comes only after the binder died (BpBinder::sendObituary), so every owner still found here is dead.
+    pub fn die(&mut self, binder: &B) -> Vec<L> {
         let top_died = self.owners.last().is_some_and(|o| o.binder == *binder);
         let links = self.take_where(|o| o.binder == *binder);
         if top_died {
@@ -435,7 +422,7 @@ mod tests {
     fn grant_is_granted_without_initial_callback() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         assert_eq!(code, REQUEST_GRANTED);
         assert!(gone.is_empty());
         assert_eq!(s.len(), 1);
@@ -452,8 +439,8 @@ mod tests {
         let log = log();
         // link ids: the owner keeps link 100, the repeat's own link 200 is the one released
         let mut s: Stack<u32, u32> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(100));
-        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(200));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(100));
+        let (code, gone) = s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(200));
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(s.len(), 1, "one owner after an identical repeat");
         assert_eq!(gone, vec![200], "the repeat's own new link is released");
@@ -464,7 +451,7 @@ mod tests {
     fn repeated_abandon_succeeds() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         assert_eq!(s.abandon("a").len(), 1);
         assert!(s.is_empty());
         assert!(
@@ -479,11 +466,11 @@ mod tests {
     fn delay_ok_unlocked_is_granted() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let (code, _) = s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT, FLAG_DELAY_OK, &log),
             true,
-            |_| Some(()),
+            || Some(()),
         );
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(s.top(), Some("b"));
@@ -494,9 +481,9 @@ mod tests {
     fn dead_binder_is_refused_without_state_change() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let mut linked = 0;
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), false, |_| {
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), false, || {
             linked += 1;
             Some(())
         });
@@ -512,8 +499,8 @@ mod tests {
     fn failed_death_link_allocates_no_owner() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| None);
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || None);
         assert_eq!(code, REQUEST_FAILED);
         assert_eq!(s.len(), 1);
         assert_eq!(s.top(), Some("a"));
@@ -526,8 +513,8 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || Some(()));
         assert_eq!(code, REQUEST_GRANTED);
         assert_eq!(calls(&log), vec![(LOSS, "a".to_owned())]);
         assert_eq!(s.len(), 1);
@@ -539,8 +526,8 @@ mod tests {
     fn transient_gain_keeps_owner_with_loss_transient() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        let (code, _) = s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        let (code, _) = s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         assert_eq!(code, REQUEST_GRANTED);
@@ -553,11 +540,11 @@ mod tests {
     fn exclusive_gain_sends_loss_transient() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_EXCLUSIVE, 0, &log),
             true,
-            |_| Some(()),
+            || Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT, "a".to_owned())]);
         assert_eq!(s.len(), 2);
@@ -569,13 +556,13 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
         let before = counted(key);
         s.request(
             req("b", 2, 10_001, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
-            |_| Some(()),
+            || Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
         assert_eq!(counted(key), before);
@@ -587,13 +574,13 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let key = "requestAudioFocus (CAN_DUCK: no player attenuation, sent as callback)";
         let before = counted(key);
         s.request(
             req("b", 2, 10_002, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
-            |_| Some(()),
+            || Some(()),
         );
         assert_eq!(calls(&log), vec![(LOSS_TRANSIENT_CAN_DUCK, "a".to_owned())]);
         assert_eq!(counted(key), before + 1);
@@ -605,10 +592,10 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
         let key = "requestAudioFocus (LOSS: no fade-out of active players, sent at once)";
         let before = counted(key);
-        s.request(req("b", 2, 10_002, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("b", 2, 10_002, GAIN, 0, &log), true, || Some(()));
         assert_eq!(calls(&log), vec![(LOSS, "a".to_owned())]);
         assert_eq!(counted(key), before + 1);
     }
@@ -618,23 +605,17 @@ mod tests {
     fn death_removes_every_entry_of_the_binder_silently() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        let mut serial_a = 0;
-        s.request(
-            req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log),
-            true,
-            |serial| {
-                serial_a = serial;
-                Some(())
-            },
-        );
-        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
-        s.request(req("c", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
+            Some(())
+        });
+        s.request(req("c", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         let before = calls(&log);
-        assert_eq!(s.die(&1, serial_a).len(), 2);
+        assert_eq!(s.die(&1).len(), 2);
         assert_eq!(s.len(), 1);
         assert_eq!(s.top(), Some("c"));
         assert_eq!(calls(&log), before, "a dead owner gets no callback");
@@ -647,24 +628,18 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        let mut serial_b = 0;
-        s.request(
-            req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log),
-            true,
-            |serial| {
-                serial_b = serial;
-                Some(())
-            },
-        );
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
+            Some(())
+        });
         s.request(
             req("c", 3, 10_003, GAIN_TRANSIENT_MAY_DUCK, 0, &log),
             true,
-            |_| Some(()),
+            || Some(()),
         );
         assert_eq!(s.abandon("c").len(), 1);
         assert_eq!(s.top(), Some("b"));
-        assert_eq!(s.die(&2, serial_b).len(), 1);
+        assert_eq!(s.die(&2).len(), 1);
         assert_eq!(s.top(), Some("a"));
         assert_eq!(
             calls(&log),
@@ -682,20 +657,16 @@ mod tests {
     fn buried_removal_emits_nothing() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        let mut serial_a = 0;
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |serial| {
-            serial_a = serial;
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
-        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
-            Some(())
-        });
-        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         let before = calls(&log);
         assert_eq!(s.abandon("b").len(), 1);
-        assert_eq!(s.die(&1, serial_a).len(), 1);
+        assert_eq!(s.die(&1).len(), 1);
         assert_eq!(s.top(), Some("c"));
         assert_eq!(calls(&log), before, "buried removals send nothing");
     }
@@ -706,11 +677,11 @@ mod tests {
         let _serial = serial();
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
-        s.request(req("c", 3, 10_003, GAIN, 0, &log), true, |_| Some(()));
+        s.request(req("c", 3, 10_003, GAIN, 0, &log), true, || Some(()));
         assert_eq!(s.len(), 1);
         assert_eq!(s.abandon("c").len(), 1);
         assert!(s.is_empty(), "no evicted owner comes back");
@@ -729,8 +700,8 @@ mod tests {
     fn same_uid_distinct_ids_restore_on_abandon() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        s.request(req("b", 2, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         assert_eq!(s.abandon("b").len(), 1);
@@ -746,12 +717,12 @@ mod tests {
     fn restored_owner_is_notified_of_its_next_loss() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, || Some(()));
+        s.request(req("b", 2, 10_002, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         s.abandon("b");
-        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("c", 3, 10_003, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
         assert_eq!(
@@ -764,46 +735,19 @@ mod tests {
         );
     }
 
-    /// Stale death: the owner of this link already left (abandoned), then the same binder requested again.
-    /// The stale death must not remove the re-requested owner.
-    #[test]
-    fn stale_death_leaves_a_re_requested_owner() {
-        let log = log();
-        let mut s: Stack<u32, ()> = Stack::default();
-        let mut stale = 0;
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |serial| {
-            stale = serial;
-            Some(())
-        });
-        assert_eq!(s.abandon("a").len(), 1);
-        s.request(req("a", 1, 10_001, GAIN, 0, &log), true, |_| Some(()));
-        s.die(&1, stale);
-        assert_eq!(
-            s.top(),
-            Some("a"),
-            "the re-requested owner survives a stale death"
-        );
-    }
-
     /// One binder's death removes all of its owners and restores the next owner once, not once per owner.
     #[test]
     fn death_restores_the_next_owner_once() {
         let log = log();
         let mut s: Stack<u32, ()> = Stack::default();
-        s.request(req("x", 2, 10_003, GAIN, 0, &log), true, |_| Some(()));
-        let mut serial_a = 0;
-        s.request(
-            req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log),
-            true,
-            |serial| {
-                serial_a = serial;
-                Some(())
-            },
-        );
-        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, |_| {
+        s.request(req("x", 2, 10_003, GAIN, 0, &log), true, || Some(()));
+        s.request(req("a", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
             Some(())
         });
-        assert_eq!(s.die(&1, serial_a).len(), 2);
+        s.request(req("b", 1, 10_001, GAIN_TRANSIENT, 0, &log), true, || {
+            Some(())
+        });
+        assert_eq!(s.die(&1).len(), 2);
         assert_eq!(s.top(), Some("x"));
         assert_eq!(
             calls(&log),
