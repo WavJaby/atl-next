@@ -143,12 +143,64 @@ fn run_display(
         let _ = ready.send(Err(UiError::Unavailable(e.to_string())));
         return;
     }
+    if let Some(display) = gtk4::gdk::Display::default() {
+        guard_xft_dpi(&display);
+    }
     // gtk4's init acquired the default main context and never releases it (gtk4 rt.rs `init`): this thread owns it for the process's life, so `is_owner` holds here only and every other thread's invoke is queued to this loop
     ping::report();
     let main_loop = glib::MainLoop::new(None, false);
     let _ = ready.send(Ok(thread::current().id()));
     main_loop.run();
     tracing::info!("atl-platform-ui: display: main loop ended");
+}
+
+/// GTK's default `gtk-xft-dpi`: 96 dpi, in 1024ths.
+const DEFAULT_XFT_DPI: i32 = 96 * 1024;
+
+/// `gtk-xft-dpi` unset (<= 0) and a monitor reports 0 mm wide or high: WebKit's screen dpi is +inf there (ScreenManagerGtk.cpp:148-152), fontDPI() reads it while xft-dpi is unset (PlatformScreenGtk.cpp:87-95), and refreshInternalScaling scales each page by it (WebKitWebViewBase.cpp:449-455): innerWidth 0, devicePixelRatio Infinity.
+fn xft_dpi_needs_default(xft: i32, monitors_mm: &[(i32, i32)]) -> bool {
+    xft <= 0 && monitors_mm.iter().any(|&(w, h)| w == 0 || h == 0)
+}
+
+/// Applies [`fix_xft_dpi`] now and on every monitor-list change; GtkSettings are read and written on the gtk4::init thread only.
+fn guard_xft_dpi(display: &gtk4::gdk::Display) {
+    use gtk4::prelude::*;
+    fix_xft_dpi(display);
+    let display = display.clone();
+    display
+        .monitors()
+        .connect_items_changed(move |_, _, _, _| fix_xft_dpi(&display));
+}
+
+/// Sets `gtk-xft-dpi` to [`DEFAULT_XFT_DPI`] when [`xft_dpi_needs_default`] says so; logs the monitor that triggered it. A set value (> 0) is never touched.
+fn fix_xft_dpi(display: &gtk4::gdk::Display) {
+    use gtk4::prelude::*;
+    let list = display.monitors();
+    let monitors: Vec<gtk4::gdk::Monitor> = (0..list.n_items())
+        .filter_map(|i| list.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+        .collect();
+    let mm: Vec<(i32, i32)> = monitors
+        .iter()
+        .map(|m| (m.width_mm(), m.height_mm()))
+        .collect();
+    let settings = gtk4::Settings::for_display(display);
+    let xft = settings.property::<i32>("gtk-xft-dpi");
+    if !xft_dpi_needs_default(xft, &mm) {
+        return;
+    }
+    let Some(m) = monitors
+        .iter()
+        .find(|m| m.width_mm() == 0 || m.height_mm() == 0)
+    else {
+        return;
+    };
+    settings.set_property("gtk-xft-dpi", DEFAULT_XFT_DPI);
+    tracing::info!(
+        "gtk-xft-dpi unset ({xft}): monitor {} reports {}x{} mm; set {DEFAULT_XFT_DPI} (96 dpi)",
+        m.connector().as_deref().unwrap_or("?"),
+        m.width_mm(),
+        m.height_mm()
+    );
 }
 
 #[cfg(test)]
@@ -159,6 +211,24 @@ mod tests {
     use gtk4::glib;
 
     use super::{CallDone, CallSignal, GtkInvoker};
+
+    /// Unset (`gtk-xft-dpi` <= 0) with a 0 mm side on any monitor needs GTK's default; a value the user set (> 0) stays whatever the monitors report; all-positive mm or no monitor needs nothing.
+    #[test]
+    fn unset_xft_dpi_with_a_zero_mm_side_needs_the_default() {
+        // 96 dpi in 1024ths: GTK's default DPI
+        assert_eq!(super::DEFAULT_XFT_DPI, 96 * 1024);
+        // GTK's unset value is -1; 0 counts as unset too
+        assert!(super::xft_dpi_needs_default(-1, &[(0, 0)]));
+        assert!(super::xft_dpi_needs_default(0, &[(0, 1200)]));
+        assert!(super::xft_dpi_needs_default(-1, &[(527, 296), (0, 296)]));
+        // a value the user set is never replaced
+        assert!(!super::xft_dpi_needs_default(96 * 1024, &[(0, 0)]));
+        assert!(!super::xft_dpi_needs_default(120 * 1024, &[(0, 0)]));
+        // every monitor reports mm: WebKit's screen dpi is finite
+        assert!(!super::xft_dpi_needs_default(-1, &[(527, 296)]));
+        // no monitor: nothing triggers it
+        assert!(!super::xft_dpi_needs_default(-1, &[]));
+    }
 
     /// The WebView claim's replay and a later focus are two invokes from an app thread; the second must not run first (sideband.rs). Also any `invoke` caller's ordering assumption.
     #[test]
