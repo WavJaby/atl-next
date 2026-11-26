@@ -1270,6 +1270,7 @@ impl Host {
     /// Request `Commit`: session `session` becomes `/data/app/<package>` as uid `uid` (PackageInstallerSession's rename), with its data dirs (installd createAppData) and external dirs.
     /// The swap ([`code_swap::replace`]) is the commit point. An error before it leaves the installed code, the table and the permissions as they were: the staging dir and the staged entry go.
     /// An update waits until every process of the package is reaped (`Processes::wait_gone`): a `Kill` only signals.
+    /// Order: wait_gone -> rename -> create_app_data -> swap. No unit test (Host has no seam for installd); the broadcast gate covers it.
     fn commit(&self, session: u32, package: &str, uid: u32, names: &[StagedName]) -> Result<()> {
         let i = &self.installd;
         let in_place = match i

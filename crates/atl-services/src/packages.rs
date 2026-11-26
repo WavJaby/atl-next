@@ -569,6 +569,7 @@ impl Permissions {
     /// them; a kept request keeps its state (grant and flags). (3) per batch app id: trimPermissionStates (:682), and a REVIEW_REQUIRED grant is not kept by a targetSdk >= M update (:1103).
     /// (4) each permission the batch defined or changed that a package outside the batch requests gets its initial state there, except a NORMAL one for a non-system package: AOSP marks it INSTALL_REVOKED.
     /// One batch of every package equals `new` over `next` (boot's start-with-all).
+    /// Not modelled: group-change revoke (addPermissions :517-551), storage / media revoke (:703); a non-runtime definition change keeps the states (AOSP re-evaluates each one).
     pub fn packages_added(&self, next: &Packages, names: &[String]) {
         let mut table = self.table();
         let Table { registry, states } = &mut *table;
