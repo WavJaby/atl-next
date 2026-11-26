@@ -12,9 +12,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use atl_aidl::aidl::android::media::IAudioDeviceVolumeDispatcher::IAudioDeviceVolumeDispatcher;
+use atl_aidl::aidl::android::media::IAudioFocusDispatcher::IAudioFocusDispatcher;
 use atl_aidl::aidl::android::media::IAudioService::{
     BnAudioService, EnforcePermission, IAudioService,
 };
+use atl_aidl::aidl::android::media::audiopolicy::IAudioPolicyCallback::IAudioPolicyCallback;
 use atl_parcelables::android::content::Intent;
 use atl_parcelables::android::media::{
     AudioAttributes, AudioDeviceAttributes, PlayerBase_PlayerIdCard, VolumeInfo,
@@ -22,13 +24,20 @@ use atl_parcelables::android::media::{
 use atl_parcelables::android::os::Bundle;
 use atl_parcelables::codecs::android::media::VolumeInfo::INDEX_NOT_SET;
 use atl_parcelables::codecs::android::os::Bundle::Value;
+use atl_services_types::{app_ops, permission};
 use atl_services_wire::audio_volume::{
     ALIAS, DEVICE_OUT_SPEAKER, DEVICE_VOLUME_BEHAVIOR_ABSOLUTE, ROLE_OUTPUT,
 };
-use binder::{BinderFeatures, ExceptionCode, Interface, SpIBinder, Status, Strong, ThreadState};
+use binder::{
+    BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, SpIBinder, Status, Strong,
+    ThreadState,
+};
 
-use crate::packages::Permissions;
+use crate::appops::AppOps;
+use crate::audio_focus::{self, Request, Stack};
+use crate::packages::{PackageTable, Permissions};
 use crate::players::{Access, PIID_INVALID, Players};
+use crate::uid_state::UidViews;
 use crate::volume::{Absolute, AppVolumes, BadStream, Changes, Dispatch, STREAM_MUSIC};
 
 /// The interface name counters use.
@@ -134,12 +143,47 @@ const RINGER_MODE_NORMAL: i32 = 2;
 const MODE_NORMAL: i32 = 0;
 /// AudioManager.USE_DEFAULT_STREAM_TYPE: adjustSuggestedStreamVolume's "pick the active stream".
 const USE_DEFAULT_STREAM_TYPE: i32 = i32::MIN;
+/// AppOpsManager.OP_TAKE_AUDIO_FOCUS (AppOpsManager.java): the MODE_FOREGROUND op a focus request needs.
+const OP_TAKE_AUDIO_FOCUS: i32 = 32;
+/// Build.VERSION_CODES.VANILLA_ICE_CREAM: HardeningEnforcer.blockFocusMethod blocks a denied focus request from this target on (below it only under all-hardening, off by default).
+const VANILLA_ICE_CREAM: i32 = 35;
+/// AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY (AudioAttributes.java:186): the usage a forced accessibility duck names.
+const USAGE_ASSISTANCE_ACCESSIBILITY: i32 = 11;
+/// The system usages (AudioAttributes.java:220-251: USAGE_CALL_ASSISTANT 17, SYSTEM_USAGE_OFFSET 1000 + 0..3). ATL supports none, so a request naming one is refused.
+const SYSTEM_USAGES: [i32; 5] = [17, 1000, 1001, 1002, 1003];
+/// AudioFocusRequest.KEY_ACCESSIBILITY_FORCE_FOCUS_DUCKING (AudioFocusRequest.java:226).
+const KEY_ACCESSIBILITY_FORCE_FOCUS_DUCKING: &str = "a11y_force_ducking";
+/// AudioSystem.IN_VOICE_COMM_FOCUS_ID (AudioSystem.java:2512): the telephony focus owner, which ATL has no telephony to hold.
+const IN_VOICE_COMM_FOCUS_ID: &str = "AudioFocus_For_Phone_Ring_And_Calls";
+/// The permissions that let a request skip HardeningEnforcer (AudioService.requestAudioFocus:11324-11327).
+const MODIFY_AUDIO_SETTINGS_PRIVILEGED: &str =
+    "android.permission.MODIFY_AUDIO_SETTINGS_PRIVILEGED";
+const MODIFY_AUDIO_ROUTING: &str = "android.permission.MODIFY_AUDIO_ROUTING";
+
+/// The focus stack of the service: owners keyed by their requesting binder; each owner's death link is a [`FocusLink`].
+type FocusStack = Stack<SpIBinder, FocusLink>;
+
+/// The death link of one focus owner. Dropping it unlinks: DeathRecipient's own drop does not (binder proxy.rs `Drop for DeathRecipient`).
+struct FocusLink {
+    binder: SpIBinder,
+    recipient: DeathRecipient,
+}
+
+impl Drop for FocusLink {
+    fn drop(&mut self) {
+        // a dead binder refuses the unlink: nothing is left to undo
+        let _ = self.binder.unlink_to_death(&mut self.recipient);
+    }
+}
 
 struct AudioService {
     permissions: Arc<Permissions>,
     players: Mutex<Players>,
     volumes: Mutex<VolumeState>,
     broadcast: Broadcast,
+    /// AppOps' policy: the hardening check reads TAKE_AUDIO_FOCUS through it (noteOperation's path)
+    appops: AppOps,
+    focus: Arc<Mutex<FocusStack>>,
 }
 
 impl AudioService {
@@ -151,6 +195,11 @@ impl AudioService {
     fn volumes(&self) -> MutexGuard<'_, VolumeState> {
         // a poisoned table still holds plain indices
         self.volumes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn focus(&self) -> MutexGuard<'_, FocusStack> {
+        // a poisoned stack still holds plain owners
+        self.focus.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The calling uid's volume of `stream`, read by `f`.
@@ -237,6 +286,140 @@ fn count_player_call(method: &str, access: Access) {
         Access::Denied => atl_diag::refused(INTERFACE, method),
         Access::Owned | Access::Unknown => atl_diag::answered(INTERFACE, method),
     };
+}
+
+/// The arguments AudioService.requestAudioFocus reads before MediaFocusControl sees the request.
+struct FocusArgs<'a> {
+    aa: Option<&'a AudioAttributes>,
+    focus_req_type: i32,
+    client_id: Option<&'a str>,
+    calling_package_name: Option<&'a str>,
+    flags: i32,
+    sdk: i32,
+}
+
+/// Counts a named refusal (atl-diag keys it `IAudioService.<why>`) and returns its name.
+fn refuse(why: &'static str) -> Option<&'static str> {
+    atl_diag::refused(INTERFACE, why);
+    Some(why)
+}
+
+fn is_system_usage(usage: i32) -> bool {
+    SYSTEM_USAGES.contains(&usage)
+}
+
+/// AudioService.forceFocusDuckingForAccessibility's flag: the bundle names KEY_ACCESSIBILITY_FORCE_FOCUS_DUCKING true.
+fn forces_duck(aa: &AudioAttributes) -> bool {
+    aa.bundle
+        .as_ref()
+        .and_then(|b| b.entries().ok())
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(k, v)| k == KEY_ACCESSIBILITY_FORCE_FOCUS_DUCKING && *v == Value::Bool(true))
+        })
+}
+
+/// AudioService.requestAudioFocus's checks in its order, for a caller `caller`: a test flag throws (IllegalArgumentException), a refusal returns its counted name, a request that may proceed returns None.
+/// The hardening check reads TAKE_AUDIO_FOCUS through `ops` (noteOperation's path), so a request is admitted by the same policy noteOperation applies.
+fn admit_request(
+    a: &FocusArgs<'_>,
+    caller: u32,
+    ops: &AppOps,
+    permissions: &Permissions,
+) -> binder::Result<Option<&'static str>> {
+    if a.flags & audio_focus::FLAG_TEST != 0 {
+        return Err(Status::new_exception_str(
+            ExceptionCode::ILLEGAL_ARGUMENT,
+            Some("Invalid test flag".to_owned()),
+        ));
+    }
+    if a.aa.is_some_and(|aa| is_system_usage(aa.usage)) {
+        return Ok(refuse("requestAudioFocus (unsupported usage)"));
+    }
+    if a.flags & audio_focus::FLAG_LOCK == audio_focus::FLAG_LOCK {
+        return Ok(refuse(
+            "requestAudioFocus (lock: no audio policy, no telephony)",
+        ));
+    }
+    let (Some(aa), Some(client), Some(package)) = (a.aa, a.client_id, a.calling_package_name)
+    else {
+        return Ok(refuse("requestAudioFocus (null parameter)"));
+    };
+    if client == IN_VOICE_COMM_FOCUS_ID {
+        return Ok(refuse(
+            "requestAudioFocus (telephony focus id: no telephony)",
+        ));
+    }
+    // AudioService.java:11324-11331: a privileged caller or a system uid skips HardeningEnforcer. Otherwise blockFocusMethod (:197-247) blocks a denied TAKE_AUDIO_FOCUS from target 35 on.
+    let privileged = caller < permission::FIRST_APPLICATION_UID
+        || permissions.holds(
+            caller,
+            &[MODIFY_AUDIO_SETTINGS_PRIVILEGED, MODIFY_AUDIO_ROUTING],
+            true,
+        );
+    if !privileged {
+        let uid = i32::try_from(caller).unwrap_or(-1);
+        let denied = ops.note_mode(caller, OP_TAKE_AUDIO_FOCUS, uid, package)? != app_ops::ALLOWED;
+        if denied && a.sdk >= VANILLA_ICE_CREAM {
+            return Ok(refuse(
+                "requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)",
+            ));
+        }
+    }
+    // forceFocusDuckingForAccessibility (:11198-11223) with no accessibility service: only uid 0 forces the duck
+    if caller == 0
+        && a.focus_req_type == audio_focus::GAIN_TRANSIENT_MAY_DUCK
+        && aa.usage == USAGE_ASSISTANCE_ACCESSIBILITY
+        && forces_duck(aa)
+    {
+        return Ok(refuse(
+            "requestAudioFocus (forced accessibility duck: no accessibility service)",
+        ));
+    }
+    Ok(None)
+}
+
+/// AudioService.abandonAudioFocus's only check (:11384): the usage. Abandon has no hardening gate in AOSP.
+fn abandon_refusal(aa: Option<&AudioAttributes>) -> Option<&'static str> {
+    if aa.is_some_and(|aa| is_system_usage(aa.usage)) {
+        return refuse("abandonAudioFocus (unsupported usage)");
+    }
+    None
+}
+
+/// The death link of a focus owner: when `binder` dies, its owners leave the stack silently. Holds the stack weakly (no cycle through the link).
+fn link_death(stack: &Arc<Mutex<FocusStack>>, binder: &SpIBinder) -> Option<FocusLink> {
+    let stack = Arc::downgrade(stack);
+    let owner = binder.clone();
+    let mut recipient = DeathRecipient::new(move || {
+        if let Some(stack) = stack.upgrade() {
+            let gone = stack.lock().unwrap_or_else(|e| e.into_inner()).die(&owner);
+            // the links unlink outside the lock (the obituary may be delivering)
+            drop(gone);
+        }
+    });
+    binder.clone().link_to_death(&mut recipient).ok()?;
+    Some(FocusLink {
+        binder: binder.clone(),
+        recipient,
+    })
+}
+
+/// The focus change of one owner, sent to its dispatcher as a oneway call (AudioService's `fd`).
+fn dispatch_to(fd: &Strong<dyn IAudioFocusDispatcher>) -> audio_focus::Dispatch {
+    let fd = fd.clone();
+    Box::new(move |change, client| {
+        match fd.r#dispatchAudioFocusChange(change, Some(client)) {
+            Ok(()) => atl_diag::sent("IAudioFocusDispatcher", "dispatchAudioFocusChange"),
+            Err(e) => {
+                crate::activity::log(format_args!(
+                    "audio focus change of {client} not dispatched: {e}"
+                ));
+                atl_diag::refused("IAudioFocusDispatcher", "dispatchAudioFocusChange")
+            }
+        };
+    })
 }
 
 impl Interface for AudioService {}
@@ -438,6 +621,74 @@ impl IAudioService for AudioService {
         self.r#adjustStreamVolume(stream, direction, flags, calling_package)
     }
 
+    /// AudioService.requestAudioFocus:11266-11358 over the ordinary stack: the checks (admit_request), then the caller's binder is pinged and its death link made, then MediaFocusControl's admission (audio_focus::Stack::request).
+    /// Lock, telephony, forced duck and the registered-policy path are counted refusals (FAILED), so no owner is made for them.
+    fn r#requestAudioFocus(
+        &self,
+        aa: Option<&AudioAttributes>,
+        focus_req_type: i32,
+        cb: Option<&SpIBinder>,
+        fd: Option<&Strong<dyn IAudioFocusDispatcher>>,
+        client_id: Option<&str>,
+        calling_package_name: Option<&str>,
+        _attribution_tag: Option<&str>,
+        flags: i32,
+        _pcb: Option<&Strong<dyn IAudioPolicyCallback>>,
+        sdk: i32,
+    ) -> binder::Result<i32> {
+        let caller = ThreadState::get_calling_uid();
+        let args = FocusArgs {
+            aa,
+            focus_req_type,
+            client_id,
+            calling_package_name,
+            flags,
+            sdk,
+        };
+        if admit_request(&args, caller, &self.appops, &self.permissions)?.is_some() {
+            return Ok(audio_focus::REQUEST_FAILED);
+        }
+        let Some(cb) = cb else {
+            return Err(Status::new_exception(ExceptionCode::NULL_POINTER, None));
+        };
+        // pingBinder first: a dead client is refused before any link (MediaFocusControl:1146)
+        let alive = cb.clone().ping_binder().is_ok();
+        let request = Request {
+            client: client_id.unwrap_or_default().to_owned(),
+            binder: cb.clone(),
+            uid: caller,
+            gain: focus_req_type,
+            flags,
+            sdk,
+            dispatch: fd.map(dispatch_to),
+        };
+        let (code, gone) = self
+            .focus()
+            .request(request, alive, || link_death(&self.focus, cb));
+        // the released links unlink outside the stack lock
+        drop(gone);
+        Ok(code)
+    }
+
+    /// AudioService.abandonAudioFocus:11377-11424: the usage check only (no hardening gate). The client's owners leave the stack silently; a repeat succeeds.
+    fn r#abandonAudioFocus(
+        &self,
+        _fd: Option<&Strong<dyn IAudioFocusDispatcher>>,
+        client_id: Option<&str>,
+        aa: Option<&AudioAttributes>,
+        _calling_package_name: Option<&str>,
+    ) -> binder::Result<i32> {
+        if abandon_refusal(aa).is_some() {
+            return Ok(audio_focus::REQUEST_FAILED);
+        }
+        let Some(client) = client_id else {
+            return Err(Status::new_exception(ExceptionCode::NULL_POINTER, None));
+        };
+        let gone = self.focus().abandon(client);
+        drop(gone);
+        Ok(audio_focus::REQUEST_GRANTED)
+    }
+
     /// AudioService.getRingerModeExternal:6161: NORMAL (see RINGER_MODE_NORMAL).
     fn r#getRingerModeExternal(&self) -> binder::Result<i32> {
         Ok(RINGER_MODE_NORMAL)
@@ -537,13 +788,21 @@ impl IAudioService for AudioService {
     }
 }
 
-/// The service's binder, for `addService`. `broadcast` delivers the volume broadcasts to one uid.
-pub fn new_binder(permissions: Arc<Permissions>, broadcast: Broadcast) -> SpIBinder {
+/// The service's binder, for `addService`. `broadcast` delivers the volume broadcasts to one uid. `packages` and `uids` are the AppOps policy's, the same ones the appops service reads.
+pub fn new_binder(
+    permissions: Arc<Permissions>,
+    broadcast: Broadcast,
+    packages: Arc<PackageTable>,
+    uids: UidViews,
+) -> SpIBinder {
+    let appops = AppOps::new(Arc::clone(&permissions), packages, uids);
     let service = AudioService {
         permissions,
         players: Mutex::new(Players::default()),
         volumes: Mutex::new(VolumeState::default()),
         broadcast,
+        appops,
+        focus: Arc::new(Mutex::new(FocusStack::default())),
     };
     BnAudioService::new_binder(service, BinderFeatures::default()).as_binder()
 }
@@ -557,6 +816,61 @@ mod tests {
             .into_iter()
             .find(|(o, a, _)| o == "refused" && a == key)
             .map_or(0, |(_, _, n)| n)
+    }
+
+    use crate::uid_state::{ProcessState, UidView};
+
+    /// A service over `packages` (installed, as records) and `uids` (the uid views the AppOps policy reads).
+    fn new_service(packages: Vec<crate::packages::PackageRecord>, uids: UidViews) -> AudioService {
+        let table = Arc::new(PackageTable::new(crate::packages::Packages::new(
+            packages,
+            BTreeMap::new(),
+        )));
+        let permissions = Arc::new(Permissions::new(&table.snapshot(), &[]));
+        AudioService {
+            appops: AppOps::new(Arc::clone(&permissions), table, uids),
+            permissions,
+            players: Mutex::new(Players::default()),
+            volumes: Mutex::new(VolumeState::default()),
+            broadcast: Arc::new(|_, _| {}),
+            focus: Arc::new(Mutex::new(FocusStack::default())),
+        }
+    }
+
+    /// The uid view of a process in `state` (no top or restriction time).
+    fn view_of(state: ProcessState) -> UidView {
+        UidView {
+            state: Some(state),
+            top_since: None,
+            restricted_since: None,
+            now: 0,
+        }
+    }
+
+    /// A service with one installed app, org.app (uid 10_001), in `state`.
+    fn app_service(state: ProcessState) -> AudioService {
+        let uids: UidViews = Arc::new(move |_| view_of(state));
+        new_service(vec![crate::packages::fixture::record("org.app")], uids)
+    }
+
+    /// Media audio: usage 1, no system usage.
+    fn media() -> AudioAttributes {
+        AudioAttributes {
+            usage: 1,
+            ..AudioAttributes::default()
+        }
+    }
+
+    /// org.app's request for a gain at target `sdk`, no flags.
+    fn request(aa: &AudioAttributes, sdk: i32) -> FocusArgs<'_> {
+        FocusArgs {
+            aa: Some(aa),
+            focus_req_type: audio_focus::GAIN,
+            client_id: Some("org.app#1"),
+            calling_package_name: Some("org.app"),
+            flags: 0,
+            sdk,
+        }
     }
 
     /// The device the app's controller registers (atl-audioflinger dispatcher.rs): output, speaker.
@@ -601,15 +915,7 @@ mod tests {
     fn a_uid_without_a_device_is_counted() {
         let key = format!("{INTERFACE}.dispatch (no absolute-volume device for the uid)");
         let before = counted(&key);
-        let service = AudioService {
-            permissions: Arc::new(Permissions::new(
-                &crate::packages::Packages::new(vec![], BTreeMap::new()),
-                &[],
-            )),
-            players: Mutex::new(Players::default()),
-            volumes: Mutex::new(VolumeState::default()),
-            broadcast: Arc::new(|_, _| {}),
-        };
+        let service = new_service(vec![], Arc::new(|_| view_of(ProcessState::Top)));
         let (changes, dispatch) = service
             .volumes()
             .volumes
@@ -649,5 +955,147 @@ mod tests {
             .expect("entries");
         assert!(extras.contains(&(EXTRA_STREAM_VOLUME_MUTED.to_owned(), Value::Bool(true))));
         assert!(extras.contains(&(EXTRA_VOLUME_STREAM_TYPE.to_owned(), Value::Int(9))));
+    }
+
+    /// Eligible: a foreground app's media gain passes every check (TAKE_AUDIO_FOCUS allowed, target 35).
+    #[test]
+    fn foreground_media_gain_is_admitted() {
+        let s = app_service(ProcessState::Top);
+        let aa = media();
+        let admitted = admit_request(&request(&aa, 35), 10_001, &s.appops, &s.permissions);
+        assert_eq!(admitted.expect("no exception"), None);
+    }
+
+    /// Target 35 with TAKE_AUDIO_FOCUS denied (a cached app): FAILED, counted as the hardening refusal.
+    #[test]
+    fn denied_take_audio_focus_blocks_target_35() {
+        let s = app_service(ProcessState::CachedEmpty);
+        let key = "IAudioService.requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)";
+        let before = counted(key);
+        let aa = media();
+        let refused = admit_request(&request(&aa, 35), 10_001, &s.appops, &s.permissions);
+        assert_eq!(
+            refused.expect("no exception"),
+            Some("requestAudioFocus (blocked by hardening: TAKE_AUDIO_FOCUS denied)")
+        );
+        assert_eq!(counted(key), before + 1);
+    }
+
+    /// The same denial from a target 34 is exempt under default hardening (blockFocusMethod: unblockedBySdk).
+    #[test]
+    fn denied_take_audio_focus_is_exempt_below_target_35() {
+        let s = app_service(ProcessState::CachedEmpty);
+        let aa = media();
+        let admitted = admit_request(&request(&aa, 34), 10_001, &s.appops, &s.permissions);
+        assert_eq!(admitted.expect("no exception"), None);
+    }
+
+    /// AudioService.java:11269: a test flag throws IllegalArgumentException before any other check.
+    #[test]
+    fn test_flag_throws_illegal_argument() {
+        let s = app_service(ProcessState::Top);
+        let aa = media();
+        let args = FocusArgs {
+            flags: audio_focus::FLAG_TEST,
+            ..request(&aa, 35)
+        };
+        let err = admit_request(&args, 10_001, &s.appops, &s.permissions)
+            .expect_err("a test flag throws");
+        assert_eq!(err.exception_code(), ExceptionCode::ILLEGAL_ARGUMENT);
+    }
+
+    /// The lock needs an audio policy or telephony, both absent here: refused and counted.
+    #[test]
+    fn lock_is_refused_and_counted() {
+        let s = app_service(ProcessState::Top);
+        let key = "IAudioService.requestAudioFocus (lock: no audio policy, no telephony)";
+        let before = counted(key);
+        let aa = media();
+        let args = FocusArgs {
+            flags: audio_focus::FLAG_LOCK,
+            ..request(&aa, 35)
+        };
+        let refused = admit_request(&args, 10_001, &s.appops, &s.permissions);
+        assert_eq!(
+            refused.expect("no exception"),
+            Some("requestAudioFocus (lock: no audio policy, no telephony)")
+        );
+        assert_eq!(counted(key), before + 1);
+    }
+
+    /// Named refusals that need no binder: a system usage, a null parameter, the telephony focus id.
+    #[test]
+    fn unsupported_requests_are_refused_by_name() {
+        let s = app_service(ProcessState::Top);
+        let aa = media();
+        let system = AudioAttributes {
+            usage: 1000,
+            ..AudioAttributes::default()
+        };
+        let check = |args: FocusArgs<'_>| {
+            admit_request(&args, 10_001, &s.appops, &s.permissions).expect("no exception")
+        };
+        assert_eq!(
+            check(request(&system, 35)),
+            Some("requestAudioFocus (unsupported usage)")
+        );
+        let no_client = FocusArgs {
+            client_id: None,
+            ..request(&aa, 35)
+        };
+        assert_eq!(check(no_client), Some("requestAudioFocus (null parameter)"));
+        let telephony = FocusArgs {
+            client_id: Some(IN_VOICE_COMM_FOCUS_ID),
+            ..request(&aa, 35)
+        };
+        assert_eq!(
+            check(telephony),
+            Some("requestAudioFocus (telephony focus id: no telephony)")
+        );
+    }
+
+    /// Forced accessibility duck: only uid 0 forces it (no accessibility service exists), and only with the bundle flag.
+    #[test]
+    fn forced_accessibility_duck_is_refused_for_uid_0() {
+        let s = app_service(ProcessState::Top);
+        let forced = AudioAttributes {
+            usage: USAGE_ASSISTANCE_ACCESSIBILITY,
+            bundle: Some(Bundle::from_entries([(
+                KEY_ACCESSIBILITY_FORCE_FOCUS_DUCKING.to_owned(),
+                Value::Bool(true),
+            )])),
+            ..AudioAttributes::default()
+        };
+        let plain = AudioAttributes {
+            usage: USAGE_ASSISTANCE_ACCESSIBILITY,
+            ..AudioAttributes::default()
+        };
+        let root = |aa: &AudioAttributes| {
+            let args = FocusArgs {
+                focus_req_type: audio_focus::GAIN_TRANSIENT_MAY_DUCK,
+                ..request(aa, 35)
+            };
+            admit_request(&args, 0, &s.appops, &s.permissions).expect("no exception")
+        };
+        assert_eq!(
+            root(&forced),
+            Some("requestAudioFocus (forced accessibility duck: no accessibility service)")
+        );
+        assert_eq!(root(&plain), None);
+    }
+
+    /// Abandon checks the usage only: a denied TAKE_AUDIO_FOCUS (cached app, target 35) does not stop it (AOSP abandon has no hardening gate).
+    #[test]
+    fn abandon_checks_only_the_usage() {
+        assert_eq!(abandon_refusal(Some(&media())), None);
+        let system = AudioAttributes {
+            usage: 1000,
+            ..AudioAttributes::default()
+        };
+        assert_eq!(
+            abandon_refusal(Some(&system)),
+            Some("abandonAudioFocus (unsupported usage)")
+        );
+        assert_eq!(abandon_refusal(None), None);
     }
 }

@@ -464,6 +464,11 @@ fn main() -> Result<()> {
         atl_services::content::new_binder(Arc::clone(&permissions)),
     )
     .context("addService content")?;
+    // the uid state shortcut, appops and audio read (AMInternal.getUidProcessState + uid observer history): the activity manager's, one source
+    let uid_views: atl_services::uid_state::UidViews = {
+        let activity = activity.clone();
+        Arc::new(move |uid| activity.uid_view(uid))
+    };
     // the volume broadcasts reach the changed app's receivers through the activity manager's delivery
     let volume_broadcasts = activity.clone();
     binder::add_service(
@@ -473,6 +478,8 @@ fn main() -> Result<()> {
             Arc::new(move |uid, intent| {
                 volume_broadcasts.broadcast_registered(intent, Some(uid));
             }),
+            Arc::clone(&table),
+            Arc::clone(&uid_views),
         ),
     )
     .context("addService audio")?;
@@ -577,11 +584,6 @@ fn main() -> Result<()> {
         binder::add_service(NETSTATS, atl_services::netstats::new_binder())
             .context("addService netstats")?;
     }
-    // the uid state shortcut and appops read (AMInternal.getUidProcessState + uid observer history): the activity manager's, one source
-    let uid_views: atl_services::uid_state::UidViews = {
-        let activity = activity.clone();
-        Arc::new(move |uid| activity.uid_view(uid))
-    };
     if !a.omit_service.iter().any(|s| s == SHORTCUT) {
         binder::add_service(
             SHORTCUT,

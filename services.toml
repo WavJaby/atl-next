@@ -313,7 +313,7 @@ mirrors = [
 ]
 
 [audio]
-src = ["crates/atl-services/src/audio.rs", "crates/atl-services/src/players.rs", "crates/atl-services/src/volume.rs"]
+src = ["crates/atl-services/src/audio.rs", "crates/atl-services/src/audio_focus.rs", "crates/atl-services/src/players.rs", "crates/atl-services/src/volume.rs"]
 mirrors = [
     "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#setStreamVolume",
     "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#adjustStreamVolume",
@@ -335,6 +335,20 @@ mirrors = [
     "frameworks/base/media/java/android/media/AudioAttributes.java#writeToParcel",
     "frameworks/base/media/java/android/media/AudioDeviceAttributes.java#writeToParcel",
     "frameworks/base/media/java/android/media/VolumeInfo.java#writeToParcel",
+    "frameworks/base/media/java/android/media/AudioManager.java",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#requestAudioFocus",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#abandonAudioFocus",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#isValidAudioAttributesUsage",
+    "frameworks/base/services/core/java/com/android/server/audio/AudioService.java#forceFocusDuckingForAccessibility",
+    "frameworks/base/services/core/java/com/android/server/audio/MediaFocusControl.java#requestAudioFocus",
+    "frameworks/base/services/core/java/com/android/server/audio/MediaFocusControl.java#abandonAudioFocus",
+    "frameworks/base/services/core/java/com/android/server/audio/MediaFocusControl.java#propagateFocusLossFromGain_syncAf",
+    "frameworks/base/services/core/java/com/android/server/audio/MediaFocusControl.java#removeFocusStackEntry",
+    "frameworks/base/services/core/java/com/android/server/audio/MediaFocusControl.java#removeFocusStackEntryOnDeath",
+    "frameworks/base/services/core/java/com/android/server/audio/FocusRequester.java#focusLossForGainRequest",
+    "frameworks/base/services/core/java/com/android/server/audio/FocusRequester.java#handleFocusLoss",
+    "frameworks/base/services/core/java/com/android/server/audio/FocusRequester.java#frameworkHandleFocusLoss",
+    "frameworks/base/services/core/java/com/android/server/audio/HardeningEnforcer.java#blockFocusMethod",
 ]
 
 [processinfo]

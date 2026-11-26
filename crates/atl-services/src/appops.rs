@@ -42,11 +42,22 @@ const UID_STATE_NONEXISTENT: i32 = i32::MAX;
 /// threshold commits this long after it happens (AppOpsUidStateTrackerImpl.updateUidProcState :262-277). BG_STATE_SETTLE_TIME (1 s) only delays BACKGROUND -> CACHED, which evaluates alike.
 const FOREGROUND_SETTLE_TIME_MS: u64 = 5_000;
 
-struct AppOps {
+pub struct AppOps {
     permissions: Arc<Permissions>,
     packages: Arc<PackageTable>,
     /// the op uid's state (the activity manager's)
     uids: UidViews,
+}
+
+impl AppOps {
+    /// The policy over these packages and uid views. AudioService holds one on the same Arcs: a second handle, not a second policy.
+    pub fn new(permissions: Arc<Permissions>, packages: Arc<PackageTable>, uids: UidViews) -> Self {
+        AppOps {
+            permissions,
+            packages,
+            uids,
+        }
+    }
 }
 
 /// AppOpsUidStateTracker.processStateToUidState (:45-84) over the derived states; no process = NONEXISTENT (finishRunningOpsForKilledPackages; CACHED otherwise, which evaluates alike).
@@ -100,8 +111,8 @@ enum Verified {
 }
 
 impl AppOps {
-    fn verify(&self, uid: i32, package: &str) -> Verified {
-        let caller = ThreadState::get_calling_uid();
+    /// `package` as `caller` sees it, and whether it is `uid`'s.
+    fn verify(&self, caller: u32, uid: i32, package: &str) -> Verified {
         let packages = self.packages.snapshot();
         if packages.visible(caller, package).is_none() {
             return Verified::Invalid;
@@ -134,7 +145,7 @@ impl AppOps {
         let mode = match package {
             _ if device != DEVICE_ID_DEFAULT => app_ops::IGNORED,
             None => app_ops::IGNORED,
-            Some(package) => match self.verify(uid, package) {
+            Some(package) => match self.verify(ThreadState::get_calling_uid(), uid, package) {
                 Verified::Invalid | Verified::WrongUid => default,
                 Verified::Ok if raw => self.mode(code, uid)?,
                 Verified::Ok => self.evaluated(code, uid)?,
@@ -142,6 +153,21 @@ impl AppOps {
         };
         atl_diag::answered(INTERFACE, method);
         Ok(mode)
+    }
+
+    /// noteOperationUnchecked's mode of `code` for `package` of `uid`, read as `caller`: an invalid or foreign package is MODE_ERRORED, else the uid's mode with MODE_FOREGROUND evaluated (:3480-3510).
+    /// AudioService's HardeningEnforcer.noteOp reads this same path.
+    pub fn note_mode(
+        &self,
+        caller: u32,
+        code: i32,
+        uid: i32,
+        package: &str,
+    ) -> binder::Result<i32> {
+        Ok(match self.verify(caller, uid, package) {
+            Verified::Invalid | Verified::WrongUid => app_ops::ERRORED,
+            Verified::Ok => self.evaluated(code, uid)?,
+        })
     }
 
     /// The uid's mode with MODE_FOREGROUND evaluated against its state now (evaluateForegroundMode).
@@ -280,11 +306,7 @@ impl IAppOpsService for AppOps {
             return Err(bad_op(code));
         }
         let package = non_null(package)?;
-        let op_mode = match self.verify(uid, package) {
-            Verified::Invalid | Verified::WrongUid => app_ops::ERRORED,
-            // noteOperationUnchecked :3480-3510: the package mode through uidState.evalMode
-            Verified::Ok => self.evaluated(code, uid)?,
-        };
+        let op_mode = self.note_mode(caller, code, uid, package)?;
         atl_diag::answered(INTERFACE, "noteOperation (not recorded)");
         Ok(Some(SyncNotedAppOp {
             op_mode,
@@ -327,10 +349,12 @@ impl IAppOpsService for AppOps {
     /// checkPackage: MODE_ALLOWED when `package` is installed under `uid` and visible to the caller, else MODE_ERRORED.
     fn r#checkPackage(&self, uid: i32, package: Option<&str>) -> binder::Result<i32> {
         let package = non_null(package)?;
-        Ok(match self.verify(uid, package) {
-            Verified::Ok => app_ops::ALLOWED,
-            Verified::Invalid | Verified::WrongUid => app_ops::ERRORED,
-        })
+        Ok(
+            match self.verify(ThreadState::get_calling_uid(), uid, package) {
+                Verified::Ok => app_ops::ALLOWED,
+                Verified::Invalid | Verified::WrongUid => app_ops::ERRORED,
+            },
+        )
     }
 }
 
@@ -414,5 +438,26 @@ mod tests {
             app_ops::IGNORED
         );
         assert_eq!(eval(None, 2_000), app_ops::IGNORED);
+    }
+
+    /// The AudioService path (HardeningEnforcer.noteOp): an installed package of the caller (uid 10_001) reads its uid's state, MODE_FOREGROUND evaluated; a package the caller cannot see is MODE_ERRORED.
+    #[test]
+    fn note_mode_reads_the_uid_state_of_an_installed_package() {
+        let table = Arc::new(PackageTable::new(crate::packages::Packages::new(
+            vec![crate::packages::fixture::record("org.app")],
+            std::collections::BTreeMap::new(),
+        )));
+        let permissions = Arc::new(Permissions::new(&table.snapshot(), &[]));
+        let top: UidViews = Arc::new(|_| view(Some(ProcessState::Top), None, 0));
+        let cached: UidViews = Arc::new(|_| view(Some(ProcessState::CachedEmpty), None, 0));
+        let foreground = AppOps::new(Arc::clone(&permissions), Arc::clone(&table), top);
+        let background = AppOps::new(permissions, table, cached);
+        let mode = |ops: &AppOps, package: &str| {
+            ops.note_mode(10_001, OP_TAKE_AUDIO_FOCUS, 10_001, package)
+                .expect("a known op")
+        };
+        assert_eq!(mode(&foreground, "org.app"), app_ops::ALLOWED);
+        assert_eq!(mode(&background, "org.app"), app_ops::IGNORED);
+        assert_eq!(mode(&foreground, "org.missing"), app_ops::ERRORED);
     }
 }
