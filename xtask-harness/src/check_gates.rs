@@ -224,6 +224,10 @@ struct Done {
     first: Option<Box<Done>>,
     /// this run's wait samples (gate_need.rs); kept in the need ledger when the row passes
     waits: Vec<gate_need::WaitLine>,
+    /// the attempt was a certified OOM kill (its leaf's own counters): the drained replay runs the row once more
+    oom: bool,
+    /// the row's deciding attempt is its drained replay (`replay_ooms`): settle gives it no rerun
+    replayed: bool,
 }
 
 impl Done {
@@ -243,6 +247,8 @@ impl Done {
             host_unknown: false,
             first: None,
             waits: Vec::new(),
+            oom: false,
+            replayed: false,
         }
     }
 
@@ -261,7 +267,11 @@ impl Done {
 #[derive(Clone, Copy)]
 enum Attempt {
     First,
-    Rerun { starved: Option<Supply> },
+    Rerun {
+        starved: Option<Supply>,
+    },
+    /// the drained replay of a certified OOM (`replay_ooms`): alone, with the whole budget
+    Replay,
 }
 
 impl Attempt {
@@ -270,36 +280,56 @@ impl Attempt {
         match self {
             Attempt::First => format!("{}.log", row.name()),
             Attempt::Rerun { .. } => format!("{}.rerun.log", row.name()),
+            Attempt::Replay => format!("{}.replay.log", row.name()),
         }
     }
 
-    /// The lead of the row line's field group: empty for a first run; a rerun's says what the first attempt was and what the rerun ended as (`starved, rerun ok; `, `undecided, rerun ok; ` when the first verdict named no supply).
+    /// The lead of the row line's field group: empty for a first run; a rerun's says what the first attempt was and what the rerun ended as (`starved, rerun ok; `, `undecided, rerun ok; ` when the first verdict named no supply); a replay's says it replayed an OOM (`oom, replay red; `).
     fn lead(self, outcome: Outcome) -> String {
-        let Attempt::Rerun { starved } = self else {
-            return String::new();
-        };
-        let first = starved.map_or(UNDECIDED, |_| "starved");
         let ended = match outcome {
             Outcome::Pass => "ok",
             Outcome::Fail => "red",
             Outcome::Undecided => UNDECIDED,
         };
-        format!("{first}, rerun {ended}; ")
+        match self {
+            Attempt::First => String::new(),
+            Attempt::Rerun { starved } => {
+                let first = starved.map_or(UNDECIDED, |_| "starved");
+                format!("{first}, rerun {ended}; ")
+            }
+            Attempt::Replay => format!("oom, replay {ended}; "),
+        }
     }
 }
 
 /// An undecided outcome's word in a row line.
 const UNDECIDED: &str = "undecided";
 
-/// Reruns each undecided row once: `rerun(i, first)` runs row `i` alone and its outcome is the row's; the first attempt moves into `first`. A red or passing row is never rerun.
+/// Reruns each undecided row once: `rerun(i, first)` runs row `i` alone and its outcome is the row's; the first attempt moves into `first`. A red or passing row is never rerun, and a row that had its drained replay (`replay_ooms`) is not either: no third attempt.
 fn settle(done: &mut [Done], rerun: &mut dyn FnMut(usize, &Done) -> Done) {
     for (i, d) in done.iter_mut().enumerate() {
-        if d.outcome != Outcome::Undecided {
+        if d.outcome != Outcome::Undecided || d.replayed {
             continue;
         }
         let again = rerun(i, d);
         let first = std::mem::replace(d, again);
         d.first = Some(Box::new(first));
+    }
+}
+
+/// The drained replay: each row whose attempt was a certified OOM runs once more (`replay(i, first)`, alone, the whole budget); its attempt replaces the first, which moves into `first`. Only the lanes' OOMs are replayed: a replay's own OOM is final (red), so no row gets a third attempt.
+fn replay_ooms(done: &mut [Done], replay: &mut dyn FnMut(usize, &Done) -> Done) {
+    let oom: Vec<usize> = done
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.oom)
+        .map(|(i, _)| i)
+        .collect();
+    for i in oom {
+        let again = replay(i, &done[i]);
+        let first = std::mem::replace(&mut done[i], again);
+        done[i].first = Some(Box::new(first));
+        done[i].replayed = true;
     }
 }
 
@@ -310,7 +340,8 @@ fn starvation_of(done: &[Done]) -> Starvation {
         for a in d.attempts() {
             counts.record_attempt(a.judged, a.host_unknown);
         }
-        if let Some(first) = d.first.as_deref() {
+        // a replay is an OOM's second attempt, not a starved rerun: its attempts are counted above, not as a rerun
+        if let Some(first) = d.first.as_deref().filter(|_| !d.replayed) {
             counts.record_starved(first.supply());
             counts.record_rerun(d.grant, d.outcome);
         }
@@ -589,6 +620,28 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     let (stats, mut done) = run_lanes(ROWS, &wall, &take, &run_one, &mut |first| {
         eprintln!("{}", first.line)
     });
+    // the drained replay: after every row ended, each certified OOM once more, alone, with the whole budget (the pool's exclusive path, waiting its turn)
+    let replay = |i: usize| -> Done {
+        let row = &ROWS[i];
+        let whole = Demand {
+            mem_gib: budget,
+            cores: f64::from(cpu),
+        };
+        let gated = build_pool::acquire_demand(&ws, root, whole).and_then(|grant| {
+            let mut done = at.row(row, Attempt::Replay, grant.mem_gib)?;
+            done.running = 1;
+            done.grant = grant.class;
+            Ok((done, grant))
+        });
+        note_moved(row);
+        let mut done = gated
+            .map(|(done, _grant)| done)
+            .unwrap_or_else(|e| errored(row, &e));
+        done.line = with_lane(&done.line, Lane::Serial, done.running);
+        eprintln!("{}", done.line);
+        done
+    };
+    replay_ooms(&mut done, &mut |i, _| replay(i));
     settle(&mut done, &mut |i, first| rerun(i, first));
     let names: Vec<String> = ROWS.iter().map(Row::name).collect();
     let Judged {
@@ -913,10 +966,11 @@ impl RowRun<'_> {
             cpu_usec: record.cpu_usec,
             wall_ms: record.wall_ms,
         };
-        let rerun = matches!(attempt, Attempt::Rerun { .. });
+        // a rerun and a replay are retries: their attempt id carries `.rerun` (gate_need.rs), a row has at most one of them
+        let retry = !matches!(attempt, Attempt::First);
         if let Some(line) = gate_run(
             &row.name(),
-            &gate_need::attempt(self.run, rerun),
+            &gate_need::attempt(self.run, retry),
             outcome,
             runtime,
         ) {
@@ -938,6 +992,11 @@ impl RowRun<'_> {
             shown.to_owned()
         } else {
             format!("ran cargo: {}", refused.join("; "))
+        };
+        let shown = if runtime.oom {
+            "OOM in its leaf".to_owned()
+        } else {
+            shown
         };
         let kept = keep_unless_pass(self.task, self.run, row, &log, outcome);
         let at = kept.as_ref().unwrap_or(&log);
@@ -975,6 +1034,8 @@ impl RowRun<'_> {
             host_unknown: seen.stall_pct.is_none(),
             first: None,
             waits: gate_need::wait_samples(&text),
+            oom: runtime.oom,
+            replayed: false,
         })
     }
 }
@@ -1950,6 +2011,117 @@ mod tests {
                 },
                 u64::MAX
             )
+        );
+    }
+
+    /// A certified OOM is replayed once, drained after the lanes, alone; a second OOM is red. A replayed row gets no settle rerun (no third attempt). An undecided first attempt reruns through settle; its rerun's OOM is red, with no replay.
+    #[test]
+    fn an_oom_row_is_replayed_once_after_the_lanes() {
+        const FAKE: &[Row] = &[
+            Row::new(&["steady"], false, false),
+            Row::new(&["oom-pass"], false, false),
+            Row::new(&["oom-twice"], false, false),
+            Row::new(&["oom-then-undecided"], false, false),
+            Row::new(&["undecided-then-oom"], false, false),
+        ];
+        let run_one = |row: &Row, _: (), admitted: &Admitted| -> Done {
+            let entered = admitted.enter();
+            let (outcome, oom) = match row.name().as_str() {
+                "oom-pass" | "oom-twice" | "oom-then-undecided" => (Outcome::Fail, true),
+                "undecided-then-oom" => (Outcome::Undecided, false),
+                _ => (Outcome::Pass, false),
+            };
+            Done {
+                running: entered.count,
+                oom,
+                verdict: (outcome == Outcome::Undecided).then(|| {
+                    Ruling::starved(
+                        Supply::Cpu,
+                        "event bound 1000 ms need 100 ms stalled 960 ms",
+                    )
+                }),
+                ..Done::bare(outcome, format!("gates: {} first", row.name()), row.name())
+            }
+        };
+        let (_, mut done) = run_lanes(
+            FAKE,
+            &vec![0u64; FAKE.len()],
+            &|_: usize| (),
+            &run_one,
+            &mut |_| {},
+        );
+        let replayed = Mutex::new(Vec::new());
+        replay_ooms(&mut done, &mut |i, _| {
+            let name = FAKE[i].name();
+            replayed.lock().expect("replayed").push(name.clone());
+            let (outcome, oom) = match name.as_str() {
+                "oom-pass" => (Outcome::Pass, false),
+                "oom-twice" => (Outcome::Fail, true),
+                _ => (Outcome::Undecided, false),
+            };
+            Done {
+                grant: "quiet",
+                oom,
+                ..Done::bare(outcome, format!("gates: {name} replay"), name.clone())
+            }
+        });
+        let mut reran = Vec::new();
+        settle(&mut done, &mut |i, _| {
+            let name = FAKE[i].name();
+            reran.push(name.clone());
+            Done {
+                grant: "quiet",
+                running: 1,
+                oom: true,
+                ..Done::bare(Outcome::Fail, format!("gates: {name} rerun"), name.clone())
+            }
+        });
+        assert_eq!(
+            replayed.into_inner().expect("replayed"),
+            ["oom-pass", "oom-twice", "oom-then-undecided"]
+        );
+        assert_eq!(reran, ["undecided-then-oom"]);
+        let outcomes: Vec<Outcome> = done.iter().map(|d| d.outcome).collect();
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Pass,
+                Outcome::Pass,
+                Outcome::Fail,
+                Outcome::Undecided,
+                Outcome::Fail
+            ]
+        );
+        assert!(
+            done[1].replayed
+                && done[1]
+                    .first
+                    .as_deref()
+                    .is_some_and(|f| f.oom && f.outcome == Outcome::Fail),
+            "the OOM attempt is kept as the first"
+        );
+        assert!(
+            !done[4].replayed
+                && done[4]
+                    .first
+                    .as_deref()
+                    .is_some_and(|f| f.outcome == Outcome::Undecided),
+            "a rerun, not a replay"
+        );
+        assert_eq!(
+            starvation_of(&done).line("gates"),
+            "gates: starvation starved=1 (cpu=1 gpu=0) rerun quiet=1 shared=0 -> ok=0 failed=1 undecided=0; judged late=0; unknown=0; ceiling=0"
+        );
+    }
+
+    /// The row line names the OOM it replays: `oom, replay ok; `, likewise `red` and `undecided`.
+    #[test]
+    fn the_replay_line_names_its_oom() {
+        assert_eq!(Attempt::Replay.lead(Outcome::Pass), "oom, replay ok; ");
+        assert_eq!(Attempt::Replay.lead(Outcome::Fail), "oom, replay red; ");
+        assert_eq!(
+            Attempt::Replay.lead(Outcome::Undecided),
+            "oom, replay undecided; "
         );
     }
 
