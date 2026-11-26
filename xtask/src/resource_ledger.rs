@@ -115,6 +115,20 @@ pub fn append(ws: &Path, records: &[Record], keep_runs: usize) -> Result<()> {
     })
 }
 
+/// Adds `records` that are older than every record in the ledger (a migration): they go first, in their own order. A key both sides have keeps one record with the larger took. Then each key keeps its newest `keep_runs` runs.
+pub fn append_older(ws: &Path, records: &[Record], keep_runs: usize) -> Result<()> {
+    let path = ledger_path(ws);
+    rewrite(&path, &lock_path(ws), |text| {
+        let existing = parse_text(&path, text)?;
+        Ok(render(&older_first(records, existing, keep_runs)))
+    })
+}
+
+/// What [`append_older`] writes over `existing` (age order): `older` deduped and first, then `existing` merged in, then retained. Pure, so a dry run reports the same result.
+pub fn older_first(older: &[Record], existing: Vec<Record>, keep_runs: usize) -> Vec<Record> {
+    retain(merge(merge(Vec::new(), older), &existing), keep_runs)
+}
+
 /// `batch` merged into `snapshot` by key: a new key is appended (age order), a known key keeps its place and the larger took.
 pub fn merge(snapshot: Vec<Record>, batch: &[Record]) -> Vec<Record> {
     let mut out = snapshot;

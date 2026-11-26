@@ -199,7 +199,7 @@ pub fn derived(ws: &Path, row: &str) -> Result<BTreeMap<String, u64>> {
     Ok(needs(&resource_ledger::read(ws)?, row))
 }
 
-/// `--migrate`: the old `out/pool/gate-need.tsv` (`run commit row wait took_ms bound_ms stall`) into the ledger, once. Quiet lines become records; commit and bound are projected away (the archive keeps them). Retired seed lines (`seed:*` run, row `-`) and not-quiet lines are dropped; a malformed line refuses the whole file. Dry run unless `execute`: reports, writes nothing. Execute: merges (a repeat changes nothing), then renames the old file to `<task>/`[`MIGRATED`].
+/// `--migrate`: the old `out/pool/gate-need.tsv` (`run commit row wait took_ms bound_ms stall`) into the ledger, once. Quiet lines become records; commit and bound are projected away (the archive keeps them). Retired seed lines (`seed:*` run, row `-`) and not-quiet lines are dropped; a malformed line refuses the whole file. Dry run unless `execute`: reports, writes nothing. Execute: merges in front of the ledger's records (the migrated runs are older; a repeat changes nothing), then renames the old file to `<task>/`[`MIGRATED`].
 pub fn migrate(ws: &Path, task: &Path, execute: bool) -> Result<String> {
     let old = ws.join(out::POOL).join(OLD_LEDGER);
     let text = match fs::read_to_string(&old) {
@@ -232,7 +232,7 @@ pub fn migrate(ws: &Path, task: &Path, execute: bool) -> Result<String> {
         );
     }
     let before = resource_ledger::read(ws)?;
-    let after = resource_ledger::retain(resource_ledger::merge(before.clone(), &kept), WINDOW);
+    let after = resource_ledger::older_first(&kept, before.clone(), WINDOW);
     let report = format!(
         "migrate: {} quiet records kept ({retired} retired and {busy} not quiet dropped); ledger {} -> {} records",
         kept.len(),
@@ -244,7 +244,7 @@ pub fn migrate(ws: &Path, task: &Path, execute: bool) -> Result<String> {
             "{report}; dry run, nothing written (--execute writes)"
         ));
     }
-    resource_ledger::append(ws, &kept, WINDOW)?;
+    resource_ledger::append_older(ws, &kept, WINDOW)?;
     fs::create_dir_all(task).with_context(|| format!("creating {}", task.display()))?;
     let archive = task.join(MIGRATED);
     fs::rename(&old, &archive)
@@ -607,6 +607,66 @@ mod tests {
             got,
             "nothing written on refusal"
         );
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// The new binary's verify check ran first, so the ledger holds r20..r25. The migrated runs are older: they go first, in age order; a shared key keeps one record, the larger took.
+    #[test]
+    fn migration_into_a_nonempty_ledger_puts_the_older_runs_first_and_dedupes() {
+        let ws = scratch("migrate-nonempty");
+        let task = ws.join("task");
+        let old = ws.join(out::POOL).join(OLD_LEDGER);
+        fs::create_dir_all(old.parent().expect("pool dir")).expect("pool dir");
+        let fresh: Vec<Record> = (20..=25)
+            .map(|i| rec(&format!("r{i}"), "app", "marker", 100 + i, Some(0.1)))
+            .collect();
+        resource_ledger::append(&ws, &fresh, WINDOW).expect("fresh records");
+        let mut text: String = (1..=5)
+            .map(|i| format!("r{i}\tc0ffee\tapp\tmarker\t{}\t60000\t0.10\n", 10 + i))
+            .collect();
+        text.push_str("r20\tc0ffee\tapp\tmarker\t999\t60000\t0.10\n");
+        fs::write(&old, &text).expect("old ledger");
+        migrate(&ws, &task, true).expect("migrate");
+        let got = resource_ledger::read(&ws).expect("ledger");
+        let runs: Vec<&str> = got.iter().map(|r| r.run.as_str()).collect();
+        assert_eq!(
+            runs,
+            [
+                "r1", "r2", "r3", "r4", "r5", "r20", "r21", "r22", "r23", "r24", "r25"
+            ],
+            "the older runs come first, in age order"
+        );
+        let r20: Vec<u64> = got
+            .iter()
+            .filter(|r| r.run == "r20")
+            .map(|r| r.took_ms)
+            .collect();
+        assert_eq!(r20, [999], "a shared key is one record, the larger took");
+        fs::remove_dir_all(&ws).expect("cleanup");
+    }
+
+    /// A full window: the migrated runs are older than the ledger's twenty, so the window cuts them, not the fresh ones.
+    #[test]
+    fn migration_into_a_full_window_cuts_the_migrated_runs_first() {
+        let ws = scratch("migrate-full");
+        let task = ws.join("task");
+        let old = ws.join(out::POOL).join(OLD_LEDGER);
+        fs::create_dir_all(old.parent().expect("pool dir")).expect("pool dir");
+        let fresh: Vec<Record> = (6..=25)
+            .map(|i| rec(&format!("r{i}"), "app", "marker", i, Some(0.1)))
+            .collect();
+        resource_ledger::append(&ws, &fresh, WINDOW).expect("fresh records");
+        let text: String = (1..=5)
+            .map(|i| format!("r{i}\tc0ffee\tapp\tmarker\t{i}\t60000\t0.10\n"))
+            .collect();
+        fs::write(&old, &text).expect("old ledger");
+        migrate(&ws, &task, true).expect("migrate");
+        let runs: Vec<String> = resource_ledger::read(&ws)
+            .expect("ledger")
+            .into_iter()
+            .map(|r| r.run)
+            .collect();
+        assert_eq!(runs, (6..=25).map(|i| format!("r{i}")).collect::<Vec<_>>());
         fs::remove_dir_all(&ws).expect("cleanup");
     }
 }
