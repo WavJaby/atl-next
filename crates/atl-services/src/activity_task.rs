@@ -457,7 +457,10 @@ impl ActivityTasks {
         process_configuration(&*self.tasks, pid)
     }
 
-    /// finishAttachApplication's launcher: the process's Task (made at its start, `task`), its record pushed, its launch sent. Returns the record's token.
+    /// finishAttachApplication's launcher: the process's Task (made at its start, `task`), its record pushed, its launch sent. None when the process was killed: `killed` is set
+    /// by process_out_locked before process_died. The check and the push share the machine lock process_died takes: launch first, the record is pushed and process_died drops
+    /// it; death first, `killed` is already set and nothing is pushed or bound.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_launcher(
         &self,
         thread: Strong<dyn IApplicationThread>,
@@ -466,8 +469,14 @@ impl ActivityTasks {
         package: &str,
         decl: &ActivityInfo,
         task: TaskId,
-    ) -> SpIBinder {
+        killed: &AtomicBool,
+    ) -> Option<SpIBinder> {
         let packages = self.packages.snapshot();
+        // machine -> tasks: the order send takes too; the token is bound only once the launch is known to register
+        let mut m = self.machine();
+        if killed.load(Ordering::Acquire) {
+            return None;
+        }
         let token = token::new();
         self.tasks.bind_token(token.clone(), task);
         let owner = Owner {
@@ -505,7 +514,6 @@ impl ActivityTasks {
                 ..Default::default()
             },
         };
-        let mut m = self.machine();
         let push = Push {
             no_history: crate::packages::declared(decl).no_history,
             ..Push::default()
@@ -513,7 +521,7 @@ impl ActivityTasks {
         let commands = m.push_with(task, token.clone(), owner, launch, push);
         self.note_settle(&m);
         self.send(&m, commands);
-        token
+        Some(token)
     }
 
     /// startActivity: validate, then the new record goes on top of the caller's activity's Task and is sent its launch. Ok: the START code (0 started, else refused).
@@ -1339,7 +1347,16 @@ mod tests {
                 height: 800,
             },
         );
-        atm.launch_launcher(thread.clone(), PID, UID, PACKAGE, &decl(LAUNCHER), task)
+        atm.launch_launcher(
+            thread.clone(),
+            PID,
+            UID,
+            PACKAGE,
+            &decl(LAUNCHER),
+            task,
+            &AtomicBool::new(false),
+        )
+        .expect("a live process's launch registers")
     }
 
     /// The intent of the LaunchActivityItem scheduled for `class`, as the app thread received it.
@@ -1389,7 +1406,15 @@ mod tests {
                 height: 900,
             },
         );
-        atm.launch_launcher(thread, PID, UID, PACKAGE, &decl(LAUNCHER), task);
+        atm.launch_launcher(
+            thread,
+            PID,
+            UID,
+            PACKAGE,
+            &decl(LAUNCHER),
+            task,
+            &AtomicBool::new(false),
+        );
         let over = scheduled
             .lock()
             .expect("transactions lock")
@@ -1449,7 +1474,15 @@ mod tests {
         let bound = atm.bind_configuration(PID, Some(task));
         assert_eq!(dp(&bound), (281, 450, 1));
         let (thread, scheduled) = app_thread();
-        atm.launch_launcher(thread, PID, UID, PACKAGE, &decl(LAUNCHER), task);
+        atm.launch_launcher(
+            thread,
+            PID,
+            UID,
+            PACKAGE,
+            &decl(LAUNCHER),
+            task,
+            &AtomicBool::new(false),
+        );
         let cur = scheduled
             .lock()
             .expect("transactions lock")

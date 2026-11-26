@@ -11,6 +11,7 @@
 //! (the reporter thread: AOSP posts them for the same reason, "can't call out of the system process with a lock held"), happens after the lock is released.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -497,6 +498,8 @@ struct ProcessRecord {
     touched: u64,
     /// why the activity service ended this process; None while it lives. Read by its death (services_died: restart or not)
     kill_reason: Option<KillReason>,
+    /// AOSP ProcessRecord.killed: set by process_out_locked before process_died; shared with the launch copies taken before the death (launch_attached -> launch_launcher checks it)
+    killed: Arc<AtomicBool>,
 }
 
 /// Why the activity service ended a process it started: a window's close (removeTask, M29), or the empty-headless end rule (uid_state::ends).
@@ -1561,7 +1564,7 @@ impl Inner {
     }
 
     /// The launch ActivityTaskManager makes for an attached process started with one (realStartActivityLocked): its Task's launcher record pushed and sent (activity_task.rs). No lock held; a
-    /// process that died or launched meanwhile is a no-op.
+    /// process killed meanwhile is refused by launch_launcher: its `killed` flag is copied here, under the lock, with the thread and task.
     fn launch_attached(&self, start_seq: i64) {
         let packages = self.packages.snapshot();
         let st = self.state();
@@ -1578,13 +1581,14 @@ impl Inner {
             return;
         };
         let (pid, uid, package) = (rec.pid, rec.uid, rec.package.clone());
+        let killed = Arc::clone(&rec.killed);
         drop(st);
         if let Some(p) = packages.by_name(&package)
             && let Some(activity) = packages.launcher(p)
         {
             // the launch is the lifecycle's: the process's Task (made at its start), the record pushed, its Launch + Resume sent (activity_task.rs). The app was bound with its Task's configuration (bind_configuration).
             self.atm
-                .launch_launcher(thread, pid, uid, &package, activity, task);
+                .launch_launcher(thread, pid, uid, &package, activity, task, &killed);
         }
     }
 
@@ -1796,6 +1800,7 @@ impl Inner {
             attach_finished: false,
             touched: now,
             kill_reason: None,
+            killed: Arc::new(AtomicBool::new(false)),
         });
         self.arm_settle(p.uid, settle);
         self.touch_all_locked(st);
@@ -2033,6 +2038,8 @@ impl Inner {
     ) -> (Vec<LostWaiter>, Option<bool>) {
         // WindowProcessController.destroy: its configuration listener goes
         self.tasks.set_process_task(rec.pid, None);
+        // before process_died: a launch copy taken earlier is refused under the machine lock; a registered one is dropped by process_died (activity_task.rs launch_launcher)
+        rec.killed.store(true, Ordering::Release);
         // Some(finished): this death left no activity anywhere and the process had a Task (a launched app; SettingsProvider, WebView and other no-Task processes never count)
         let last_app = rec
             .attached
@@ -3928,6 +3935,7 @@ mod tests {
             attach_finished: false,
             touched: 0,
             kill_reason: None,
+            killed: Arc::new(AtomicBool::new(false)),
         };
         am.inner
             .state()
@@ -3963,6 +3971,7 @@ mod tests {
             attach_finished: false,
             touched: 0,
             kill_reason: None,
+            killed: Arc::new(AtomicBool::new(false)),
         };
         am.inner
             .state()
@@ -4389,6 +4398,7 @@ mod tests {
             PROVIDER_PACKAGE,
             &decl,
             task,
+            &Arc::new(AtomicBool::new(false)),
         );
         assert!(
             am.activity_tasks().hosts_activity(&app.as_binder()),
@@ -4491,6 +4501,57 @@ mod tests {
             *control.starts.lock().expect("starts"),
             ["com.example.p1", "com.example.p2"],
             "p1's death before finishAttach releases the cold slot so p2 starts immediately"
+        );
+    }
+
+    /// A launch copied before its process was force stopped (launch_attached copies the thread, task and `killed` under the state lock, then launches off it) registers no
+    /// activity. The force stop sets `killed` before process_died; launch_launcher checks it under the machine lock process_died takes. Red: the activity is in the stack.
+    #[test]
+    fn a_launch_copied_before_a_force_stop_registers_no_activity() {
+        let control = Arc::new(RecordingProcesses::default());
+        let am = provider_manager(Arc::clone(&control));
+        start_provider_process(&am).expect("the provider process starts");
+        let (app, _) = waiting_caller();
+        let task = am.inner.tasks.new_task(
+            PROVIDER_UID,
+            PROVIDER_PACKAGE,
+            TaskSize {
+                width: 1080,
+                height: 1920,
+            },
+        );
+        let now = am.inner.now_ms();
+        // the copy: pid, task and the flag, taken under the state lock; the launch below runs after the lock is released
+        let (pid, killed) = {
+            let mut st = am.inner.state();
+            st.uids.on_task_added(PROVIDER_UID, now);
+            st.open_tasks.insert(task, PROVIDER_UID);
+            st.processes[0].attached = Some(Attached {
+                thread: app.clone(),
+                program_pid: None,
+                _death: DeathRecipient::new(|| {}),
+            });
+            st.processes[0].task = Some(task);
+            (st.processes[0].pid, Arc::clone(&st.processes[0].killed))
+        };
+        am.force_stop_package(PROVIDER_PACKAGE);
+        let decl = fixture::activity(PROVIDER_PACKAGE, PROVIDER_CLASS);
+        let launched = am.activity_tasks().launch_launcher(
+            app.clone(),
+            pid,
+            PROVIDER_UID,
+            PROVIDER_PACKAGE,
+            &decl,
+            task,
+            &killed,
+        );
+        assert!(
+            launched.is_none(),
+            "a launch of a killed process is refused"
+        );
+        assert!(
+            !am.activity_tasks().hosts_activity(&app.as_binder()),
+            "no activity is registered after the death"
         );
     }
 
@@ -4720,6 +4781,7 @@ mod tests {
             attach_finished: false,
             touched: 0,
             kill_reason: None,
+            killed: Arc::new(AtomicBool::new(false)),
         });
         let (caller, told) = waiting_caller();
         assert!(ask_for_provider(&am, &caller).is_none());
@@ -4879,6 +4941,7 @@ mod tests {
             attach_finished: true,
             touched: 0,
             kill_reason: None,
+            killed: Arc::new(AtomicBool::new(false)),
         }
     }
 
