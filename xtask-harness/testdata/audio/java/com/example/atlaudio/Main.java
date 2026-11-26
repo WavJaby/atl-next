@@ -13,11 +13,15 @@ import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The audio gate (`xtask test audio-app`, xtask-harness/src/audio_app.rs). Tag AtlAudio, one line each, checked by the gate:
@@ -37,6 +41,8 @@ public class Main extends Activity {
     private static final String VOLUME_ASSET = "volume";
     /** How long the app's own mute lasts: long enough for the gate to read it on the node (app_volume.rs polls every 50 ms, within STEP_LIMIT). */
     private static final long APP_MUTE_MS = 1500;
+    /** How long the focus probe waits for the first listener's LOSS_TRANSIENT before it abandons: a bound, so a dispatcher that sends none reads as lost=0. */
+    private static final long FOCUS_WAIT_MS = 5000;
     /** AudioManager's hidden broadcast actions and extras (AudioManager.java:204, :246, :288, :298, :306, :312, :338); the fixture compiles against the public SDK. */
     private static final String VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION";
     private static final String STREAM_MUTE_CHANGED_ACTION = "android.media.STREAM_MUTE_CHANGED_ACTION";
@@ -176,14 +182,25 @@ public class Main extends Activity {
 
     /**
      * The focus probe, public AudioManager API only: a foreground media gain is GRANTED, its identical repeat is GRANTED, a DELAY_OK
-     * request with no lock is GRANTED (never DELAYED), and each abandon succeeds. The listeners log what they receive.
+     * request with no lock is GRANTED (never DELAYED), and each abandon succeeds. The first listener must receive LOSS_TRANSIENT when the
+     * delayed transient gain takes focus. Its callback runs on a handler thread; the probe waits for it (bounded) before the abandons,
+     * since an abandon unregisters the listener. The listeners log what they receive; the summary's lost is that change, or 0 when none came.
      */
     private void focusProbe(AudioManager audio) {
         AudioAttributes media = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA).build();
+        HandlerThread thread = new HandlerThread("atl-focus");
+        thread.start();
+        Handler callbacks = new Handler(thread.getLooper());
+        CountDownLatch lossSeen = new CountDownLatch(1);
+        AtomicInteger lost = new AtomicInteger(AudioManager.AUDIOFOCUS_NONE);
         AudioManager.OnAudioFocusChangeListener first = new AudioManager.OnAudioFocusChangeListener() {
             public void onAudioFocusChange(int change) {
                 Log.i(TAG, "focus: first change=" + change);
+                if (change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                    lost.set(change);
+                    lossSeen.countDown();
+                }
             }
         };
         AudioManager.OnAudioFocusChangeListener second = new AudioManager.OnAudioFocusChangeListener() {
@@ -193,7 +210,7 @@ public class Main extends Activity {
         };
         AudioFocusRequest request = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(media)
-                .setOnAudioFocusChangeListener(first)
+                .setOnAudioFocusChangeListener(first, callbacks)
                 .build();
         int granted = audio.requestAudioFocus(request);
         int repeat = audio.requestAudioFocus(request);
@@ -203,10 +220,16 @@ public class Main extends Activity {
                 .setOnAudioFocusChangeListener(second)
                 .build();
         int delay = audio.requestAudioFocus(delayed);
+        try {
+            lossSeen.await(FOCUS_WAIT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         int abandon = audio.abandonAudioFocusRequest(request);
         int again = audio.abandonAudioFocusRequest(request);
         Log.i(TAG, "focus: first=" + granted + " repeat=" + repeat + " delayed=" + delay
-                + " abandon=" + abandon + " again=" + again);
+                + " abandon=" + abandon + " again=" + again + " lost=" + lost.get());
+        thread.quitSafely();
     }
 
     @Override

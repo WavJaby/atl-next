@@ -143,7 +143,7 @@ fn native_verdicts(app: &str, services: &str) -> bool {
             aaudio.unwrap_or("no line")
         ),
     );
-    // AudioManager's public focus API through AudioService's ordinary stack: the foreground gain and its identical repeat are GRANTED (1), a DELAY_OK request is GRANTED not DELAYED (2), each abandon succeeds
+    // AudioManager's public focus API through AudioService's ordinary stack: the foreground gain and its identical repeat are GRANTED (1), a DELAY_OK request is GRANTED not DELAYED (2), each abandon succeeds; the first listener sees LOSS_TRANSIENT when the transient gain takes focus, before its abandon (lost)
     let focus = line_value(app, "focus: ");
     let want = [
         ("first", 1),
@@ -151,12 +151,13 @@ fn native_verdicts(app: &str, services: &str) -> bool {
         ("delayed", 1),
         ("abandon", 1),
         ("again", 1),
+        ("lost", FOCUS_LOSS_TRANSIENT),
     ];
     ok &= verdict(
         "audio focus",
         want.iter().all(|&(k, v)| field(focus, k) == Some(v)),
         &format!(
-            "want first, repeat, delayed, abandon, again = 1 (GRANTED), line: {}",
+            "want first, repeat, delayed, abandon, again = 1 (GRANTED), lost = {FOCUS_LOSS_TRANSIENT} (LOSS_TRANSIENT), line: {}",
             focus.unwrap_or("no line")
         ),
     );
@@ -286,6 +287,8 @@ const MIX_TRACK_UNDERRUNS: &str = "track_underruns";
 const FAST_DENIED_NOTIFY_MS: i64 = 20;
 /// Main.java ADAPTIVE_STABLE_MS: the adaptive tuner ends after this many ms without an xrun rise.
 const ADAPTIVE_STABLE_MS: i64 = 1_000;
+/// AudioManager.AUDIOFOCUS_LOSS_TRANSIENT (-1 * AUDIOFOCUS_GAIN_TRANSIENT, AudioManager.java:4333): the first listener's loss when the transient gain takes focus (FocusRequester.focusLossForGainRequest).
+const FOCUS_LOSS_TRANSIENT: i64 = -2;
 const TONE_DBFS: f64 = -12.0;
 /// Silence that separates two tone runs in the recording (the gap is about 0.5 s).
 const GAP_SECONDS: f64 = 0.2;
