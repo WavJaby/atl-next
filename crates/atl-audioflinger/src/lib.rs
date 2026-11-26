@@ -11,6 +11,7 @@ extern crate atl_audioflinger_stubs;
 extern crate atl_diag;
 extern crate atl_parcelables;
 extern crate audioclient_types_aidl;
+extern crate av_types_aidl;
 extern crate binder;
 extern crate framework_permission_aidl;
 extern crate shared_file_region_aidl;

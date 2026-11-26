@@ -302,6 +302,21 @@ impl Mix {
         true
     }
 
+    /// Applies IAudioTrack.applyVolumeShaper to track `name`: the configuration and operation as AIDL parcel bytes, read as AOSP reads them. AOSP's status: a shaper id, or a negative status_t. None for an unknown name.
+    pub fn apply_volume_shaper(
+        &mut self,
+        name: i32,
+        configuration: &[u8],
+        operation: &[u8],
+    ) -> Option<i32> {
+        let track = self.tracks.get_mut(&name)?;
+        Some(bridge::ffi::track_apply_volume_shaper(
+            track.proxy.pin_mut(),
+            configuration,
+            operation,
+        ))
+    }
+
     /// Fills `out` (interleaved stereo) with the next frames of the mix: one AudioMixerBase quantum at a time, any request size.
     pub fn render(&mut self, out: &mut [f32]) {
         bridge::ffi::mix_render(self.inner.pin_mut(), out);

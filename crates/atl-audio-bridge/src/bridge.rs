@@ -48,6 +48,12 @@ pub(crate) mod ffi {
         fn take_underruns() -> u64;
         fn take_underrun_frames() -> u64;
         fn track_underruns(track: &Track) -> u32;
+        /// IAudioTrack.applyVolumeShaper on `track`: the configuration and operation as AIDL parcel bytes; AOSP's status.
+        fn track_apply_volume_shaper(
+            track: Pin<&mut Track>,
+            configuration: &[u8],
+            operation: &[u8],
+        ) -> i32;
 
         /// AOSP's policy engine with its default config (`PolicyEngine` in wrap/engine.h).
         type PolicyEngine;

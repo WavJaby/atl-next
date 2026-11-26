@@ -7,19 +7,21 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use atl_bridgegen::converter::{self, Converter};
 
-/// The C++ AIDL parcelables wrap/engine.cpp calls (AudioProductStrategy, AudioVolumeGroup, AudioAttributes); see the loop after link_package.
-const AIDL_SHARED: [&str; 3] = [
+/// The C++ AIDL parcelables the wrappers call: AudioProductStrategy, AudioVolumeGroup, AudioAttributes (wrap/engine.cpp); VolumeShaperConfiguration, VolumeShaperOperation (wrap/mix.cpp, av-types). See the loop after link_package.
+const AIDL_SHARED: [&str; 4] = [
     "device/audiopolicy-types-aidl-cpp",
     "device/audioclient-types-aidl-cpp",
     "device/android.media.audio.common.types-V4-cpp",
+    "device/av-types-aidl-cpp",
 ];
 
 /// The converter modules whose C++ argv the adapters compile with and whose shared libraries they link. The engine's argv gives wrap/engine.cpp its EngineInterface headers.
-const MODULES: [&str; 4] = [
+const MODULES: [&str; 5] = [
     "device/libaudioclient",
     "device/libaudioprocessing_base",
     "device/libaudioutils",
     "device/libaudiopolicyenginedefault",
+    "device/av-types-aidl-cpp",
 ];
 
 fn main() -> Result<()> {

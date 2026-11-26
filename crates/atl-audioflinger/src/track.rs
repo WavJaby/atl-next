@@ -8,6 +8,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use atl_audio_bridge::{Control, Mapping, Track as Server};
 use atl_audioflinger_stubs::aidl::android::media::IAudioTrack::{BnAudioTrack, IAudioTrack};
+use av_types_aidl::mangled::{
+    _7_android_5_media_21_VolumeShaperOperation as VolumeShaperOperation,
+    _7_android_5_media_25_VolumeShaperConfiguration as VolumeShaperConfiguration,
+};
+use binder::binder_impl::{Parcel, Serialize};
 use binder::{BinderFeatures, Interface, StatusCode, Strong};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use shared_file_region_aidl::mangled::_7_android_5_media_16_SharedFileRegion as SharedFileRegion;
@@ -202,6 +207,13 @@ pub(crate) fn server_shared(
     })
 }
 
+/// A parcelable's bytes as the bridge reads them: the marker and sized body that Parcel::write gives (policy.rs attributes_bytes).
+fn parcel_bytes<T: Serialize>(value: &T) -> binder::Result<Vec<u8>> {
+    let mut parcel = Parcel::new();
+    parcel.write(value)?;
+    Ok(parcel.marshal()?)
+}
+
 /// AudioTrack's playback states as AOSP's Track keeps them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -308,6 +320,29 @@ impl IAudioTrack for Track {
             Ok(BAD_VALUE)
         }
     }
+
+    /// IAudioTrack.applyVolumeShaper (TrackHandle::applyVolumeShaper, Tracks.cpp:603-621): the configuration and operation become the track's VolumeShapers in the mix, applied from the next quantum. A null argument is BAD_VALUE (AIDL: not nullable). A negative status counts as a refusal: a shaper the mix does not apply would fail silently.
+    fn r#applyVolumeShaper(
+        &self,
+        configuration: Option<&VolumeShaperConfiguration>,
+        operation: Option<&VolumeShaperOperation>,
+    ) -> binder::Result<i32> {
+        let status = match (configuration, operation) {
+            (Some(configuration), Some(operation)) => output::apply_volume_shaper(
+                &self.mixer,
+                self.name,
+                &parcel_bytes(configuration)?,
+                &parcel_bytes(operation)?,
+            ),
+            _ => BAD_VALUE,
+        };
+        if status < 0 {
+            atl_diag::refused(INTERFACE, "applyVolumeShaper");
+        } else {
+            atl_diag::answered(INTERFACE, "applyVolumeShaper");
+        }
+        Ok(status)
+    }
 }
 
 /// The IAudioTrack for a new track over `region`, idle, named `name` in `mixer`.
@@ -375,5 +410,118 @@ mod tests {
     #[test]
     fn triple_buffered_period() {
         assert_eq!(notification_frames(0, 3072, &out(48_000), false), 1024);
+    }
+
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use atl_audio_bridge::{Mix, MixCell};
+    use av_types_aidl::mangled::_7_android_5_media_29_VolumeShaperConfigurationType as VolumeShaperConfigurationType;
+
+    /// The output's quantum and rate (output.rs REQUEST_RATE_HZ, PipeWire's 1024 frames).
+    const QUANTUM: usize = 1024;
+    const RATE: u32 = 48_000;
+    /// AUDIO_CHANNEL_OUT_STEREO (system/media/audio/include/system/audio.h).
+    const STEREO: u32 = 0x3;
+
+    /// A static track of `frames` stereo float frames of `value`, added to `mixer` (installed at QUANTUM). Its client volume is the control block's default, unity (AudioTrackShared.cpp:66-68).
+    fn static_track(mixer: &Shared, frames: usize, value: f32) -> Track {
+        let cblk = allocate(0, false).expect("control block region");
+        let fd = memfd_create("atl-audio-test-clip", MemfdFlags::CLOEXEC).expect("clip memfd");
+        let clip: Vec<u8> = (0..frames * 2).flat_map(|_| value.to_le_bytes()).collect();
+        ftruncate(&fd, clip.len() as u64).expect("clip size");
+        std::fs::File::from(fd.try_clone().expect("clip dup"))
+            .write_all(&clip)
+            .expect("clip write");
+        let buffer = SharedFileRegion {
+            r#fd: Some(binder::ParcelFileDescriptor::new(fd)),
+            r#offset: 0,
+            r#size: clip.len() as i64,
+            r#writeable: false,
+        };
+        let server = server_shared(&cblk, &buffer, PcmFormat::Float, 2, frames, 8, RATE)
+            .expect("static track");
+        let name = output::add_track(mixer, server, 0, STEREO).expect("track in the mix");
+        Track {
+            region: cblk,
+            mixer: Arc::clone(mixer),
+            name,
+            state: Mutex::new(State::Idle),
+        }
+    }
+
+    /// One quantum of the output, interleaved stereo, pulled as the realtime fill does.
+    fn quantum(mixer: &Shared) -> Vec<f32> {
+        let mut out = vec![0f32; QUANTUM * 2];
+        assert!(mixer.fill(&mut out), "mixer in the cell");
+        out
+    }
+
+    /// A TYPE_SCALE shaper holding `volume` over its whole curve: both points are `volume` (VolumeShaper.java:508-511 writes xy as time, volume pairs).
+    fn flat_shaper(volume: f32) -> (VolumeShaperConfiguration, VolumeShaperOperation) {
+        let mut configuration = VolumeShaperConfiguration {
+            r#type: VolumeShaperConfigurationType::SCALE,
+            r#id: 1,
+            r#durationMs: 1000.0,
+            ..Default::default()
+        };
+        configuration
+            .r#interpolatorConfig
+            .insert(Default::default())
+            .r#xy = vec![0.0, volume, 1.0, volume];
+        let operation = VolumeShaperOperation {
+            r#replaceId: -1,
+            ..Default::default()
+        };
+        (configuration, operation)
+    }
+
+    /// Refusals AOSP's status counts for `api` (atl_diag, process-wide).
+    fn refusals(api: &str) -> u64 {
+        atl_diag::counts()
+            .iter()
+            .filter(|(outcome, name, _)| outcome == "refused" && name == api)
+            .map(|(_, _, n)| *n)
+            .sum()
+    }
+
+    // IAudioTrack.applyVolumeShaper must change the PCM the mixer produces. Expected by construction: the clip is 0.5; the client volume is unity (AudioTrackShared.cpp:66-68), so 0.5; the flat shaper holds 0.5 (Threads.cpp:5860-5862 multiplies the track volume by it), so 0.5 x 0.5 = 0.25.
+    // Quantum 0 starts the track and quantum 1 is steady at unity; the change ramps in over quantum 2 and quantum 3 is steady at the shaper's gain.
+    #[test]
+    fn volume_shaper_changes_the_pcm() {
+        let mixer: Shared = Arc::new(MixCell::default());
+        assert!(mixer.install(Mix::new(QUANTUM, RATE)), "mixer installed");
+        let track = static_track(&mixer, 4 * QUANTUM, 0.5);
+        track.r#start().expect("start");
+        let _ = quantum(&mixer);
+        let unity = quantum(&mixer);
+        assert!(unity.iter().all(|&s| s == 0.5), "unity: {:?}", &unity[..4]);
+        let (configuration, operation) = flat_shaper(0.5);
+        let status = track
+            .r#applyVolumeShaper(Some(&configuration), Some(&operation))
+            .expect("applyVolumeShaper answers");
+        assert!(status >= 0, "a shaper id, got {status}");
+        let _ = quantum(&mixer);
+        let shaped = quantum(&mixer);
+        assert!(
+            shaped.iter().all(|&s| (s - 0.25).abs() < 1e-6),
+            "shaped: {:?}",
+            &shaped[..4]
+        );
+    }
+
+    // A null argument is BAD_VALUE (AIDL: not nullable, Tracks.cpp:603-621 reads both parcelables first) and counts as a refusal.
+    #[test]
+    fn null_shaper_argument_is_refused() {
+        let mixer: Shared = Arc::new(MixCell::default());
+        assert!(mixer.install(Mix::new(QUANTUM, RATE)), "mixer installed");
+        let track = static_track(&mixer, QUANTUM, 0.5);
+        let (_, operation) = flat_shaper(0.5);
+        let before = refusals("IAudioTrack.applyVolumeShaper");
+        assert_eq!(
+            track.r#applyVolumeShaper(None, Some(&operation)),
+            Ok(BAD_VALUE)
+        );
+        assert_eq!(refusals("IAudioTrack.applyVolumeShaper"), before + 1);
     }
 }

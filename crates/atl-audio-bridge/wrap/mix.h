@@ -13,6 +13,7 @@
 
 #include "media/AudioBufferProvider.h"
 #include "media/AudioMixerBase.h"
+#include "media/VolumeShaper.h"
 #include "private/media/AudioTrackShared.h"
 #include "rust/cxx.h"
 
@@ -21,7 +22,7 @@ namespace atl::audio {
 /// One track's server side: the proxy over its control block and buffer, read in the track's format and handed to the mixer as float (Track::getNextBuffer).
 struct Track final : public android::AudioBufferProvider {
     Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame,
-          bool shared_buffer);
+          bool shared_buffer, uint32_t rate);
     android::status_t getNextBuffer(Buffer* buffer) override;
     void releaseBuffer(Buffer* buffer) override;
 
@@ -38,6 +39,8 @@ struct Track final : public android::AudioBufferProvider {
     void* server_raw = nullptr;
     /// A stopped streaming track still enabled until its written frames are mixed (AOSP STOPPED, still active); the fill ends the drain. No underrun is tallied while it drains.
     bool draining = false;
+    /// The track's VolumeShapers (AOSP Track::mVolumeHandler, made at the track's rate: Tracks.cpp:909). applyVolumeShaper sets them; apply_volume reads their gain each quantum.
+    android::sp<android::media::VolumeHandler> volume;
 };
 
 /// The mixer: AudioMixerBase at `quantum_frames` and `rate`. `out` holds one quantum of mixed stereo float; `next` is the first frame of it not yet handed out.
@@ -72,6 +75,8 @@ void mix_pause(Mix& mix, int32_t name);
 void mix_stop(Mix& mix, Track& track, int32_t name);
 /// IAudioTrack.flush: discards the unread frames of a track the mixer is not reading now; a draining one ends at its next quantum.
 void mix_flush(Mix& mix, Track& track, int32_t name);
+/// IAudioTrack.applyVolumeShaper on `track` (TrackHandle::applyVolumeShaper, Tracks.cpp:603-621): the configuration and operation as AIDL parcel bytes. Returns AOSP's status: a shaper id, or a negative status_t.
+int32_t track_apply_volume_shaper(Track& track, rust::Slice<const uint8_t> configuration, rust::Slice<const uint8_t> operation);
 /// Fills `out` (interleaved stereo) with the next frames of the mix, one quantum at a time.
 void mix_render(Mix& mix, rust::Slice<float> out);
 /// Frames the mixer took from tracks (getNextBuffer) since the last call; resets the count.

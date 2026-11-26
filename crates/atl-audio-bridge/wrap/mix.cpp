@@ -5,6 +5,8 @@
 #include <atomic>
 #include <new>
 
+#include <binder/Parcel.h>
+
 #include "audio_utils/format.h"
 #include "audio_utils/minifloat.h"
 #include "system/audio.h"
@@ -23,6 +25,17 @@ constexpr size_t kOutChannels = 2;
 
 void* as_value(uint32_t v) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(v));
+}
+
+/// A parcelable from its bytes as AOSP reads one (engine.cpp attributes_from): setData, then readParcelable.
+template <typename T>
+android::status_t read_parcelable(rust::Slice<const uint8_t> bytes, T& out) {
+    android::Parcel parcel;
+    if (android::status_t status = parcel.setData(bytes.data(), bytes.size()); status != android::NO_ERROR) {
+        return status;
+    }
+    parcel.setDataPosition(0);
+    return parcel.readParcelable(&out);
 }
 
 /// Counters for the output's line (atl-audioflinger output.rs): written by the realtime fill, read by the output's thread.
@@ -44,21 +57,27 @@ void disable(Mix& mix, int32_t name) {
     g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
 }
 
-/// The client's volume (cblk mVolumeLR, gain_minifloat) applied to track `name`, as AudioFlinger's prepareTracks does every cycle. True when both sides are zero.
+/// The client's volume (cblk mVolumeLR, gain_minifloat) times the track's shaper gain on both sides, applied to track `name` as AudioFlinger's prepareTracks does every cycle (Threads.cpp:5860-5862: `volume *= vh`, then the client's LR).
+/// True when the client's volume is zero on both sides (the shaper is not counted: muted_tracks reads the client's volume).
 bool apply_volume(Mix& mix, Track& track, int32_t name) {
     const gain_minifloat_packed_t volume = track.proxy->getVolumeLR();
     float left = float_from_gain(gain_minifloat_unpack_left(volume));
     float right = float_from_gain(gain_minifloat_unpack_right(volume));
+    const bool muted = left == 0.0f && right == 0.0f;
+    const float shaper = track.volume->getVolume(track.proxy->framesReleased()).first;
+    left *= shaper;
+    right *= shaper;
     mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME0, &left);
     mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME1, &right);
-    return left == 0.0f && right == 0.0f;
+    return muted;
 }
 
 }  // namespace
 
 Track::Track(android::sp<android::AudioTrackServerProxy> server, audio_format_t track_format, size_t channels_per_frame,
-             bool shared_buffer)
-    : proxy(std::move(server)), format(track_format), channels(channels_per_frame), is_static(shared_buffer) {}
+             bool shared_buffer, uint32_t rate)
+    : proxy(std::move(server)), format(track_format), channels(channels_per_frame), is_static(shared_buffer),
+      volume(new android::media::VolumeHandler(rate)) {}
 
 // Track::getNextBuffer (Tracks.cpp:1252): the proxy hands out what the client has written, in the track's format. The mixer reads float (AudioMixerBase::create sets mMixerInFormat to PCM_FLOAT; nothing changes it), so the frames go through AOSP's conversion: the copy ReformatBufferProvider::copyFrames makes (BufferProviders.cpp:412), which AudioMixer inserts for any track format other than the mixer's. That class is not linked: its object needs libaudiohal (EffectsFactoryHalInterface) and libsonic.
 // A float track is copied as is (memcpy_by_audio_format of equal formats is a memcpy), still into `floats`: one buffer shape for every format.
@@ -134,7 +153,7 @@ std::unique_ptr<Track> new_track(uint8_t* cblk_mem, uint8_t* buffer, uint32_t fo
     }
     // one sample per channel: frame_bytes is channels x audio_bytes_per_sample(format) (createTrack_l's frameSize)
     return std::make_unique<Track>(std::move(server), track_format, frame_bytes / audio_bytes_per_sample(track_format),
-                                   is_static);
+                                   is_static, rate);
 }
 
 std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate) {
@@ -205,6 +224,27 @@ void mix_flush(Mix& mix, Track& track, int32_t name) {
     if (mix.enabled.count(name) == 0) {
         track.proxy->flushBufferIfNeeded();
     }
+}
+
+// TrackHandle::applyVolumeShaper (Tracks.cpp:603-621): both parcelables are read before the handler sees them; a read that fails is the status and leaves the handler untouched.
+int32_t track_apply_volume_shaper(Track& track, rust::Slice<const uint8_t> configuration, rust::Slice<const uint8_t> operation) {
+    android::media::VolumeShaperConfiguration conf_parcel;
+    if (android::status_t status = read_parcelable(configuration, conf_parcel); status != android::NO_ERROR) {
+        return status;
+    }
+    android::media::VolumeShaperOperation op_parcel;
+    if (android::status_t status = read_parcelable(operation, op_parcel); status != android::NO_ERROR) {
+        return status;
+    }
+    android::sp<android::media::VolumeShaper::Configuration> conf = new android::media::VolumeShaper::Configuration();
+    if (android::status_t status = conf->readFromParcelable(conf_parcel); status != android::NO_ERROR) {
+        return status;
+    }
+    android::sp<android::media::VolumeShaper::Operation> op = new android::media::VolumeShaper::Operation();
+    if (android::status_t status = op->readFromParcelable(op_parcel); status != android::NO_ERROR) {
+        return status;
+    }
+    return track.volume->applyVolumeShaper(conf, op);
 }
 
 // AudioMixerBase::process() makes one quantum; the output takes it frame by frame, so a request of any size is served from it.

@@ -334,6 +334,24 @@ pub(crate) fn control(mixer: &Shared, name: i32, call: Control) {
     }
 }
 
+/// status_t INVALID_OPERATION (ENOSYS): the mixer has no such track, or no mixer yet.
+const INVALID_OPERATION: i32 = -38;
+
+/// IAudioTrack.applyVolumeShaper on track `name`: the shapers go to the mix, which reads them each quantum (AOSP Track::applyVolumeShaper). AOSP's status.
+pub(crate) fn apply_volume_shaper(
+    mixer: &Shared,
+    name: i32,
+    configuration: &[u8],
+    operation: &[u8],
+) -> i32 {
+    let status =
+        lock(mixer).and_then(|mut mix| mix.apply_volume_shaper(name, configuration, operation));
+    status.unwrap_or_else(|| {
+        tracing::error!(name, "shaper for a track unknown to the mixer");
+        INVALID_OPERATION
+    })
+}
+
 /// Removes track `name` from the mix; its server side is dropped with it. Its streaming frames never played count as dropped; the underruns its client saw over its life are logged per track.
 pub(crate) fn remove_track(mixer: &Shared, name: i32) {
     if let Some(mut mix) = lock(mixer) {
