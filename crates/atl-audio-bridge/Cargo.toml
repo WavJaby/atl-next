@@ -11,7 +11,7 @@ publish.workspace = true
 # Everything needs libaudioclient and libaudioprocessing_base, so without feature `converter` the crate is empty.
 # C++ is cxx glue (src/bridge.rs) plus wrap/mix.{h,cpp}: adapters that convert types and forward to AOSP's public API, no logic (AGENTS.md, C++ exception).
 [package.metadata.atl]
-converter = ["device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils", "device/libaudiopolicyenginedefault"]
+converter = ["device/libaudioclient", "device/libaudioprocessing_base", "device/libaudioutils", "device/libaudiopolicyenginedefault", "device/libaudioclient_aidl_conversion", "device/libaudiopolicy", "device/libbinder", "device/libutils"]
 
 [features]
 converter = []

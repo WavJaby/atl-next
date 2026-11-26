@@ -5,6 +5,9 @@
 #![cfg(feature = "converter")]
 
 mod bridge;
+mod engine;
+
+pub use engine::PolicyEngine;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;

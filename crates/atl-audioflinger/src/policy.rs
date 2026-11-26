@@ -4,6 +4,7 @@
 //! No input device is modelled. Other methods keep the stub's default (UNKNOWN_TRANSACTION, counted). getOutputForAttr is not served: its only server-side caller is AudioFlinger::createTrack
 //! (AudioFlinger.cpp:1120), which this server replaces, and no client path calls it (AudioTrack gets its output from createTrack's response). Routing is one output for every stream.
 //! The primary output mix (a SOURCE MIX port; its active config carries getOutput's I/O handle) and its patch to the speaker are listed from startup, as the route is fixed (no hotplug, no reroute). AOSP lists a mix only while its output is open.
+//! The product strategy and volume group transactions are AOSP's engine's answers (atl-audio-bridge engine.rs): this file unparcels the attributes and the answer, and maps the engine's status to the binder's error.
 
 use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_3_Int as Int,
@@ -11,6 +12,7 @@ use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_11_AudioDevice as AudioDevice,
     _7_android_5_media_5_audio_6_common_12_AudioIoFlags as AudioIoFlags,
     _7_android_5_media_5_audio_6_common_12_AudioPortExt as AudioPortExt,
+    _7_android_5_media_5_audio_6_common_15_AudioAttributes as AudioAttributes,
     _7_android_5_media_5_audio_6_common_15_AudioDeviceType as AudioDeviceType,
     _7_android_5_media_5_audio_6_common_15_AudioMMapPolicy as AudioMMapPolicy,
     _7_android_5_media_5_audio_6_common_15_AudioPortConfig as AudioPortConfig,
@@ -24,12 +26,15 @@ use android_media_audio_common_types::mangled::{
     _7_android_5_media_5_audio_6_common_22_AudioDeviceDescription as AudioDeviceDescription,
     _7_android_5_media_5_audio_6_common_22_AudioPortMixExtUseCase as AudioPortMixExtUseCase,
 };
+use atl_audio_bridge::PolicyEngine;
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyService::{
     BnAudioPolicyService, IAudioPolicyService,
 };
 use atl_audioflinger_stubs::aidl::android::media::IAudioPolicyServiceClient::IAudioPolicyServiceClient;
 use atl_audioflinger_stubs::mangled::{
     _7_android_5_media_16_AudioOffloadMode as AudioOffloadMode,
+    _7_android_5_media_16_AudioVolumeGroup as AudioVolumeGroup,
+    _7_android_5_media_20_AudioProductStrategy as AudioProductStrategy,
     _7_android_5_media_22_AudioPolicyDeviceState as AudioPolicyDeviceState,
 };
 use audioclient_types_aidl::mangled::{
@@ -44,10 +49,12 @@ use audioclient_types_aidl::mangled::{
     _7_android_5_media_18_AudioPortMixExtSys as AudioPortMixExtSys,
     _7_android_5_media_21_AudioPortDeviceExtSys as AudioPortDeviceExtSys,
 };
-use binder::{BinderFeatures, Interface, SpIBinder, StatusCode, Strong};
+use binder::binder_impl::{Deserialize, Parcel};
+use binder::{BinderFeatures, Interface, SpIBinder, Status, StatusCode, Strong};
 
 use crate::flinger::{output_format, output_handle, output_layout};
 use crate::ids;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const INTERFACE: &str = "IAudioPolicyService";
 
@@ -249,6 +256,40 @@ fn mmap_type(policy_type: AudioMMapPolicyType) -> binder::Result<()> {
     }
 }
 
+/// The engine this process answers from: AOSP's default-config engine, loaded at first use. A failed load is every answer's error (AOSP has no policy manager then, NO_INIT-like).
+fn engine() -> binder::Result<MutexGuard<'static, PolicyEngine>> {
+    static ENGINE: std::sync::OnceLock<Result<Mutex<PolicyEngine>, i32>> =
+        std::sync::OnceLock::new();
+    match ENGINE.get_or_init(|| PolicyEngine::load().map(Mutex::new)) {
+        Ok(engine) => Ok(engine.lock().unwrap_or_else(PoisonError::into_inner)),
+        Err(status) => Err(status_error(*status)),
+    }
+}
+
+/// AOSP's status as the binder's error: binderStatusFromStatusT.
+fn status_error(status: i32) -> Status {
+    Status::from(status)
+}
+
+/// The list an engine parcel holds: an int32 count, then each parcelable (engine.cpp).
+fn unparcel_list<T: Deserialize>(bytes: &[u8]) -> binder::Result<Vec<T>> {
+    let parcel = Parcel::unmarshal(bytes)?;
+    let count: i32 = parcel.read()?;
+    let mut list = Vec::new();
+    for _ in 0..count {
+        list.push(parcel.read()?);
+    }
+    Ok(list)
+}
+
+/// The AudioAttributes parcelable as the engine reads it: the marker and sized body that Parcel::write gives. A null argument is BAD_VALUE (AIDL: not nullable).
+fn attributes_bytes(aa: Option<&AudioAttributes>) -> binder::Result<Vec<u8>> {
+    let aa = aa.ok_or(StatusCode::BAD_VALUE)?;
+    let mut parcel = Parcel::new();
+    parcel.write(aa)?;
+    Ok(parcel.marshal()?)
+}
+
 struct AudioPolicy;
 
 impl Interface for AudioPolicy {}
@@ -359,6 +400,61 @@ impl IAudioPolicyService for AudioPolicy {
         info.r#mmapPolicy = AudioMMapPolicy::NEVER;
         atl_diag::answered(INTERFACE, "getMmapPolicyForDevice");
         Ok(())
+    }
+
+    /// AudioPolicyService::getStrategyForStream (AudioPolicyInterfaceImpl.cpp:1379): the engine's strategy for the stream.
+    fn r#getStrategyForStream(&self, stream: AudioStreamType) -> binder::Result<i32> {
+        let strategy = engine()?
+            .product_strategy_for_stream(stream.0)
+            .map_err(status_error)?;
+        atl_diag::answered(INTERFACE, "getStrategyForStream");
+        Ok(strategy)
+    }
+
+    /// AudioPolicyService::listAudioProductStrategies (AudioPolicyInterfaceImpl.cpp:2438): the engine's strategies as AudioProductStrategy parcelables.
+    fn r#listAudioProductStrategies(
+        &self,
+    ) -> binder::Result<Option<Vec<Option<AudioProductStrategy>>>> {
+        let parcel = engine()?.product_strategies().map_err(status_error)?;
+        let strategies = unparcel_list::<AudioProductStrategy>(&parcel)?;
+        atl_diag::answered(INTERFACE, "listAudioProductStrategies");
+        Ok(Some(strategies.into_iter().map(Some).collect()))
+    }
+
+    /// AudioPolicyService::getProductStrategyFromAudioAttributes (AudioPolicyInterfaceImpl.cpp:2455): the engine's strategy for `aa`.
+    fn r#getProductStrategyFromAudioAttributes(
+        &self,
+        aa: Option<&AudioAttributes>,
+        fallback_on_default: bool,
+    ) -> binder::Result<i32> {
+        let attributes = attributes_bytes(aa)?;
+        let strategy = engine()?
+            .product_strategy_for_attributes(&attributes, fallback_on_default)
+            .map_err(status_error)?;
+        atl_diag::answered(INTERFACE, "getProductStrategyFromAudioAttributes");
+        Ok(strategy)
+    }
+
+    /// AudioPolicyService::listAudioVolumeGroups (AudioPolicyInterfaceImpl.cpp:2474): the engine's volume groups as AudioVolumeGroup parcelables.
+    fn r#listAudioVolumeGroups(&self) -> binder::Result<Option<Vec<Option<AudioVolumeGroup>>>> {
+        let parcel = engine()?.volume_groups().map_err(status_error)?;
+        let groups = unparcel_list::<AudioVolumeGroup>(&parcel)?;
+        atl_diag::answered(INTERFACE, "listAudioVolumeGroups");
+        Ok(Some(groups.into_iter().map(Some).collect()))
+    }
+
+    /// AudioPolicyService::getVolumeGroupFromAudioAttributes (AudioPolicyInterfaceImpl.cpp:2489): the engine's volume group for `aa`.
+    fn r#getVolumeGroupFromAudioAttributes(
+        &self,
+        aa: Option<&AudioAttributes>,
+        fallback_on_default: bool,
+    ) -> binder::Result<i32> {
+        let attributes = attributes_bytes(aa)?;
+        let group = engine()?
+            .volume_group_for_attributes(&attributes, fallback_on_default)
+            .map_err(status_error)?;
+        atl_diag::answered(INTERFACE, "getVolumeGroupFromAudioAttributes");
+        Ok(group)
     }
 }
 
@@ -534,5 +630,153 @@ mod tests {
             again.first().and_then(Option::as_ref).map(|p| p.id),
             Some(patch.id)
         );
+    }
+
+    use android_media_audio_common_types::mangled::{
+        _7_android_5_media_5_audio_6_common_10_AudioUsage as AudioUsage,
+        _7_android_5_media_5_audio_6_common_11_AudioSource as AudioSource,
+        _7_android_5_media_5_audio_6_common_16_AudioContentType as AudioContentType,
+    };
+
+    /// policy.h:46 (V(STRATEGY_NONE, -1)): no strategy; getProductStrategyFromAudioAttributes answers it when fallback is off.
+    const STRATEGY_NONE: i32 = -1;
+    /// policy.h:52 (V(STRATEGY_MEDIA, 5)): the strategy of the media streams and of the default attributes.
+    const STRATEGY_MEDIA: i32 = 5;
+    /// policy.h:56 (V(STRATEGY_REROUTING, 9)): a system strategy the engine appends (EngineBase.cpp:244-247).
+    const STRATEGY_REROUTING: i32 = 9;
+    /// policy.h:57 (V(STRATEGY_PATCH, 10)): the second system strategy (EngineBase.cpp:244-247).
+    const STRATEGY_PATCH: i32 = 10;
+
+    /// AudioAttributes of `usage`, every other field at its default: content UNKNOWN, source DEFAULT, no flags, no tags.
+    fn attributes(usage: AudioUsage) -> AudioAttributes {
+        AudioAttributes {
+            r#contentType: AudioContentType::UNKNOWN,
+            r#usage: usage,
+            r#source: AudioSource::DEFAULT,
+            r#flags: 0,
+            r#tags: Vec::new(),
+        }
+    }
+
+    /// getProductStrategyFromAudioAttributes for `aa` (AudioPolicyInterfaceImpl.cpp:2455).
+    fn strategy_for(aa: &AudioAttributes, fallback: bool) -> binder::Result<i32> {
+        AudioPolicy.r#getProductStrategyFromAudioAttributes(Some(aa), fallback)
+    }
+
+    /// getVolumeGroupFromAudioAttributes for `aa`, with fallback on (AudioPolicyInterfaceImpl.cpp:2489).
+    fn group_for(aa: &AudioAttributes) -> binder::Result<i32> {
+        AudioPolicy.r#getVolumeGroupFromAudioAttributes(Some(aa), true)
+    }
+
+    /// listAudioProductStrategies, its entries flattened (AudioPolicyInterfaceImpl.cpp:2438).
+    fn list_strategies() -> Vec<AudioProductStrategy> {
+        AudioPolicy
+            .r#listAudioProductStrategies()
+            .expect("listAudioProductStrategies")
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// listAudioVolumeGroups, its entries flattened (AudioPolicyInterfaceImpl.cpp:2474).
+    fn list_groups() -> Vec<AudioVolumeGroup> {
+        AudioPolicy
+            .r#listAudioVolumeGroups()
+            .expect("listAudioVolumeGroups")
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// AUDIO_USAGE_MEDIA is listed under STRATEGY_MEDIA (EngineDefaultConfig.h:91); the exact match is EQUALS, which wins outright (ProductStrategy.cpp:164-165).
+    #[test]
+    fn media_attributes_follow_the_media_strategy() {
+        let media = attributes(AudioUsage::MEDIA);
+        assert_eq!(
+            strategy_for(&media, true).expect("a strategy"),
+            STRATEGY_MEDIA
+        );
+    }
+
+    /// No entry lists AUDIO_USAGE_ANNOUNCEMENT (EngineDefaultConfig.h has none). Its only match is STRATEGY_MEDIA's default entry, score 0 (EngineDefaultConfig.h:99, AudioProductStrategy.cpp:73-78): fallback on takes it, fallback off gives NONE (ProductStrategy.cpp:172-173).
+    #[test]
+    fn unlisted_usage_has_no_strategy_without_fallback() {
+        let announcement = attributes(AudioUsage::ANNOUNCEMENT);
+        assert_eq!(
+            strategy_for(&announcement, true).expect("a strategy"),
+            STRATEGY_MEDIA
+        );
+        assert_eq!(
+            strategy_for(&announcement, false).expect("a strategy"),
+            STRATEGY_NONE
+        );
+    }
+
+    /// Each strategy's volume-group name gets its own group (EngineBase.cpp:264-283: no configured group, so one is made from the MUSIC config under that name): the ring (EngineDefaultConfig.h:46) and notification (:75) usages land in two distinct groups, both in the list.
+    #[test]
+    fn ring_and_notification_volume_groups_are_distinct() {
+        let groups: Vec<i32> = list_groups().iter().map(|g| g.r#groupId).collect();
+        let ring = group_for(&attributes(AudioUsage::NOTIFICATION_TELEPHONY_RINGTONE))
+            .expect("the ring's group");
+        let notification =
+            group_for(&attributes(AudioUsage::NOTIFICATION)).expect("the notification's group");
+        assert!(groups.contains(&ring));
+        assert!(groups.contains(&notification));
+        assert_ne!(ring, notification);
+    }
+
+    /// gOrderedSystemStrategies (EngineDefaultConfig.h:147-163) is appended to the list (EngineBase.cpp:244-247): ids policy.h:56-57, names EngineDefaultConfig.h:148,156.
+    #[test]
+    fn list_includes_the_rerouting_and_patch_strategies() {
+        let strategies = list_strategies();
+        for (id, name) in [
+            (STRATEGY_REROUTING, "STRATEGY_REROUTING"),
+            (STRATEGY_PATCH, "STRATEGY_PATCH"),
+        ] {
+            let strategy = strategies
+                .iter()
+                .find(|s| s.r#id == id)
+                .expect("a listed strategy");
+            assert_eq!(strategy.r#name.as_deref(), Some(name));
+        }
+    }
+
+    /// Every attribute a listed strategy carries names a volume group the group list holds (AudioAttributesEx.groupId, AudioVolumeGroup.groupId).
+    #[test]
+    fn every_listed_attribute_group_is_in_the_group_list() {
+        let groups: Vec<i32> = list_groups().iter().map(|g| g.r#groupId).collect();
+        assert!(!groups.is_empty());
+        let mut checked = 0;
+        for strategy in list_strategies() {
+            for entry in strategy.r#audioAttributes.iter().flatten().flatten() {
+                assert!(
+                    groups.contains(&entry.r#groupId),
+                    "group {} of a listed attribute is not in the group list",
+                    entry.r#groupId
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    /// streamToStrategy (AudioPolicyManager.h:204-208): the stream's attributes, then their strategy. MUSIC's first attributes are AUDIO_USAGE_MEDIA (EngineDefaultConfig.h:89-91).
+    #[test]
+    fn music_stream_follows_the_media_strategy() {
+        let strategy = AudioPolicy
+            .r#getStrategyForStream(AudioStreamType::MUSIC)
+            .expect("a strategy");
+        assert_eq!(strategy, STRATEGY_MEDIA);
+    }
+
+    /// AudioPolicyService::getStrategyForStream (AudioPolicyInterfaceImpl.cpp:1384): a stream past AUDIO_STREAM_PUBLIC_CNT (audio-base-utils.h:32, ASSISTANT + 1 = 12) has no strategy. SYS_RESERVED_REROUTING is 12 (AudioStreamType.aidl).
+    #[test]
+    fn stream_past_the_public_range_has_no_strategy() {
+        let strategy = AudioPolicy
+            .r#getStrategyForStream(AudioStreamType::SYS_RESERVED_REROUTING)
+            .expect("a strategy");
+        assert_eq!(strategy, STRATEGY_NONE);
     }
 }

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! The cxx bridge to wrap/mix.h. Handles and scalars cross; raw pointers cross only for memory the caller maps (lib.rs `Mapping`), and each `unsafe` call says so.
+//! The cxx bridge to wrap/mix.h and wrap/engine.h. Handles and scalars cross; raw pointers cross only for memory the caller maps (lib.rs `Mapping`), and each `unsafe` call says so.
+//! Engine answers: a status (AOSP's status_t, 0 = NO_ERROR) and an out value; list answers are AIDL parcel bytes (engine.rs).
 
 #[cxx::bridge(namespace = "atl::audio")]
 pub(crate) mod ffi {
     unsafe extern "C++" {
         include!("wrap/mix.h");
+        include!("wrap/engine.h");
 
         /// AOSP's server side of one track (`Track` in wrap/mix.h).
         type Track;
@@ -46,5 +48,25 @@ pub(crate) mod ffi {
         fn take_underruns() -> u64;
         fn take_underrun_frames() -> u64;
         fn track_underruns(track: &Track) -> u32;
+
+        /// AOSP's policy engine with its default config (`PolicyEngine` in wrap/engine.h).
+        type PolicyEngine;
+        fn new_policy_engine() -> UniquePtr<PolicyEngine>;
+        fn policy_engine_status(policy: &PolicyEngine) -> i32;
+        fn list_product_strategies(policy: &PolicyEngine, out: &mut Vec<u8>) -> i32;
+        fn product_strategy_for_attributes(
+            policy: &PolicyEngine,
+            attributes: &[u8],
+            fallback_on_default: bool,
+            out: &mut i32,
+        ) -> i32;
+        fn product_strategy_for_stream(policy: &PolicyEngine, stream: i32, out: &mut i32) -> i32;
+        fn list_volume_groups(policy: &PolicyEngine, out: &mut Vec<u8>) -> i32;
+        fn volume_group_for_attributes(
+            policy: &PolicyEngine,
+            attributes: &[u8],
+            fallback_on_default: bool,
+            out: &mut i32,
+        ) -> i32;
     }
 }
