@@ -506,18 +506,22 @@ impl Drop for Entered<'_> {
 }
 
 /// Each row's admission: its demand and predicted wall (ms; `u64::MAX` cold), from `resource_ledger::demand_of` over its own gate-run history, in table order.
+/// The CPU claim is at least `cpu_floor` (the harness class's share): a latency-bound gate averages well under a core, so its measured cores alone admit 15 rows at once (warm run: `window-surface-view` red; the kept trial ran 8 rows at 2 CPU).
 fn plan_of(
     rows: &[Row],
     history: &[resource_ledger::RunRecord],
     budget: u32,
     cpu: u32,
+    cpu_floor: u32,
 ) -> Vec<(Demand, u64)> {
     rows.iter()
         .map(|row| {
             let name = row.name();
             let runs: Vec<resource_ledger::RunRecord> =
                 history.iter().filter(|r| r.name == name).cloned().collect();
-            resource_ledger::demand_of(&runs, budget, cpu)
+            let (demand, wall_ms) = resource_ledger::demand_of(&runs, budget, cpu);
+            let cores = demand.cores.max(f64::from(cpu_floor)).min(f64::from(cpu));
+            (Demand { cores, ..demand }, wall_ms)
         })
         .collect()
 }
@@ -580,7 +584,8 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     // a row's place is taken on the lanes' thread, in start order; its grant is waited for on the row's own thread
     let history = resource_ledger::read_runs(&ws, resource_ledger::GATE_RUN)?;
     let (budget, cpu) = build_pool::demand_budget(&ws)?;
-    let plan = plan_of(ROWS, &history, budget, cpu);
+    let floor = build_pool::class_cpu_min(&ws, Class::Harness)?;
+    let plan = plan_of(ROWS, &history, budget, cpu, floor);
     let wall: Vec<u64> = plan.iter().map(|p| p.1).collect();
     let take = |i: usize| build_pool::enqueue_demand(&ws, root, plan[i].0);
     let run_one = |row: &Row, place: Result<build_pool::Queued>, admitted: &Admitted| -> Done {
@@ -1991,7 +1996,7 @@ mod tests {
             Row::new(&["app"], false, false),
             Row::new(&["task-bind"], false, false),
         ];
-        let plan = plan_of(FAKE, &[passed], 20, 16);
+        let plan = plan_of(FAKE, &[passed], 20, 16, 2);
         assert_eq!(
             plan[0],
             (
@@ -2122,6 +2127,45 @@ mod tests {
         assert_eq!(
             Attempt::Replay.lead(Outcome::Undecided),
             "oom, replay undecided; "
+        );
+    }
+
+    /// A gate row's CPU claim is at least the harness class's share (`cpu_floor`): a row averaging a quarter core still claims 2 cores, a cold row keeps the whole pool.
+    #[test]
+    fn a_gate_row_claims_at_least_the_harness_cpu_share() {
+        let quarter_core = resource_ledger::RunRecord {
+            kind: resource_ledger::GATE_RUN,
+            name: "light".to_owned(),
+            run: "r1".to_owned(),
+            mem_peak: 100 << 20,
+            oom: false,
+            cpu_usec: 250_000,
+            wall_ms: 1_000,
+        };
+        const FAKE: &[Row] = &[
+            Row::new(&["light"], false, false),
+            Row::new(&["cold"], false, false),
+        ];
+        let plan = plan_of(FAKE, &[quarter_core], 20, 16, 2);
+        assert_eq!(
+            plan[0],
+            (
+                Demand {
+                    mem_gib: 1,
+                    cores: 2.0
+                },
+                1_000
+            )
+        );
+        assert_eq!(
+            plan[1],
+            (
+                Demand {
+                    mem_gib: 20,
+                    cores: 16.0
+                },
+                u64::MAX
+            )
         );
     }
 

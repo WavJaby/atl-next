@@ -511,6 +511,11 @@ pub fn demand_budget(ws: &Path) -> Result<(u32, u32)> {
     Ok((shared_mem(&pool), pool.cpu_slots.value))
 }
 
+/// The CPU slots a class's grant claims at least (`[pool.<class>]` cpu_min): a runtime gate row's CPU claim never goes below the harness share (check_gates.rs `plan_of`).
+pub fn class_cpu_min(ws: &Path, class: Class) -> Result<u32> {
+    Ok(ws_config::load(ws)?.pool.classes[&class].cpu_min)
+}
+
 /// The pool directory of workspace `ws`.
 pub fn dir(ws: &Path) -> PathBuf {
     ws.join("cache").join("build-pool")
