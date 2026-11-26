@@ -352,6 +352,16 @@ pub(crate) fn apply_volume_shaper(
     })
 }
 
+/// IAudioTrack.getVolumeShaperState on track `name`: shaper `id`'s state, None for AOSP's null or when the mixer is not open.
+pub(crate) fn volume_shaper_state(
+    mixer: &Shared,
+    name: i32,
+    id: i32,
+) -> Option<atl_audio_bridge::ShaperState> {
+    let mut mix = lock(mixer)?;
+    mix.volume_shaper_state(name, id)
+}
+
 /// Removes track `name` from the mix; its server side is dropped with it. Its streaming frames never played count as dropped; the underruns its client saw over its life are logged per track.
 pub(crate) fn remove_track(mixer: &Shared, name: i32) {
     if let Some(mut mix) = lock(mixer) {

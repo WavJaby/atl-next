@@ -20,9 +20,6 @@ constexpr size_t kCblkBytes = 232;
 static_assert(sizeof(android::audio_track_cblk_t) == kCblkBytes,
               "audio_track_cblk_t differs from the mirror in atl-audio-bridge (AudioTrackShared.h)");
 
-/// Interleaved channels of the output: AUDIO_CHANNEL_OUT_STEREO.
-constexpr size_t kOutChannels = 2;
-
 void* as_value(uint32_t v) {
     return reinterpret_cast<void*>(static_cast<uintptr_t>(v));
 }
@@ -38,39 +35,11 @@ android::status_t read_parcelable(rust::Slice<const uint8_t> bytes, T& out) {
     return parcel.readParcelable(&out);
 }
 
-/// Counters for the output's line (atl-audioflinger output.rs): written by the realtime fill, read by the output's thread.
+/// Counters for the output's line (atl-audioflinger output.rs): written by the provider's pulls, read by the output's thread.
 std::atomic<uint64_t> g_track_frames{0};
-std::atomic<uint32_t> g_muted{0};
-/// Enabled tracks: a drain ends in the fill, so the level is kept here, not by the control calls.
-std::atomic<uint32_t> g_active{0};
 /// Underruns the tracks' proxies counted (steps of the cblk's mUnderrunCount) and the frames they tallied as underrun.
 std::atomic<uint64_t> g_underruns{0};
 std::atomic<uint64_t> g_underrun_frames{0};
-
-/// Disables track `name` and forgets it as enabled (a pause, a static stop, a finished drain).
-void disable(Mix& mix, int32_t name) {
-    mix.disable(name);
-    if (const auto it = mix.enabled.find(name); it != mix.enabled.end()) {
-        it->second->draining = false;
-        mix.enabled.erase(it);
-    }
-    g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
-}
-
-/// The client's volume (cblk mVolumeLR, gain_minifloat) times the track's shaper gain on both sides, applied to track `name` as AudioFlinger's prepareTracks does every cycle (Threads.cpp:5860-5862: `volume *= vh`, then the client's LR).
-/// True when the client's volume is zero on both sides (the shaper is not counted: muted_tracks reads the client's volume).
-bool apply_volume(Mix& mix, Track& track, int32_t name) {
-    const gain_minifloat_packed_t volume = track.proxy->getVolumeLR();
-    float left = float_from_gain(gain_minifloat_unpack_left(volume));
-    float right = float_from_gain(gain_minifloat_unpack_right(volume));
-    const bool muted = left == 0.0f && right == 0.0f;
-    const float shaper = track.volume->getVolume(track.proxy->framesReleased()).first;
-    left *= shaper;
-    right *= shaper;
-    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME0, &left);
-    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME1, &right);
-    return muted;
-}
 
 }  // namespace
 
@@ -127,8 +96,7 @@ void Track::releaseBuffer(Buffer* buffer) {
     proxy->releaseBuffer(&buf);
 }
 
-Mix::Mix(size_t quantum_frames, uint32_t rate)
-    : android::AudioMixerBase(quantum_frames, rate), quantum(quantum_frames), out(quantum_frames * kOutChannels) {}
+Mix::Mix(size_t quantum_frames, uint32_t rate) : android::AudioMixerBase(quantum_frames, rate), quantum(quantum_frames) {}
 
 void Mix::set_provider(int32_t name, android::AudioBufferProvider* provider) {
     mTracks.find(name)->second->bufferProvider = provider;
@@ -160,8 +128,8 @@ std::unique_ptr<Mix> new_mix(size_t quantum_frames, uint32_t rate) {
     return std::make_unique<Mix>(quantum_frames, rate);
 }
 
-// AudioMixerBase::create and the parameters AudioFlinger's prepareTracks sets (Threads.cpp, the mixer block).
-bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t channel_mask, uint32_t rate) {
+// AudioMixerBase::create and the parameters AudioFlinger's prepareTracks sets (Threads.cpp, the mixer block). `main` is the output's quantum, which Rust keeps: the mixer adds into it.
+bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t channel_mask, uint32_t rate, float* main) {
     if (mix.exists(name)) {
         return false;
     }
@@ -172,58 +140,74 @@ bool mix_add(Mix& mix, Track& track, int32_t name, int32_t session, uint32_t cha
     track.floats.resize(mix.quantum * track.channels);
     mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MIXER_FORMAT,
                      as_value(AUDIO_FORMAT_PCM_FLOAT));
-    mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MAIN_BUFFER,
-                     mix.out.data());
+    mix.setParameter(name, android::AudioMixerBase::TRACK, android::AudioMixerBase::MAIN_BUFFER, main);
     mix.setParameter(name, android::AudioMixerBase::RESAMPLE, android::AudioMixerBase::SAMPLE_RATE,
                      as_value(rate));
     mix.set_provider(name, &track);
     return true;
 }
 
-// A removed track is not mixed again, draining or not: AOSP's destroyTrack_l terminates it (Threads.cpp:3021-3026) and prepareTracks_l mixes no terminated track.
-// A static track's buffer stays the client's to replay, so it never counts as dropped (Tracks.cpp:1321-1325 gives it no frames once stopped).
-uint64_t mix_remove(Mix& mix, Track& track, int32_t name) {
-    uint64_t dropped = 0;
-    if (!track.is_static) {
-        const uint64_t unread = track.proxy->framesReady();
-        dropped = unread + static_cast<uint64_t>(std::max<int64_t>(track.proxy->framesFlushed(), 0));
-    }
-    if (mix.exists(name)) {
-        disable(mix, name);
-        mix.destroy(name);
-    }
-    return dropped;
+bool mix_exists(Mix& mix, int32_t name) {
+    return mix.exists(name);
 }
 
-void mix_start(Mix& mix, Track& track, int32_t name) {
-    // a draining track resumes: start lifts the client's stop limit (AudioTrackServerProxy::start)
-    track.proxy->start();
-    track.draining = false;
-    apply_volume(mix, track, name);
-    mix.enabled[name] = &track;
+void mix_destroy(Mix& mix, int32_t name) {
+    mix.destroy(name);
+}
+
+void mix_enable(Mix& mix, int32_t name) {
     mix.enable(name);
-    g_active.store(static_cast<uint32_t>(mix.enabled.size()), std::memory_order_relaxed);
 }
 
-void mix_pause(Mix& mix, int32_t name) {
-    disable(mix, name);
+void mix_disable(Mix& mix, int32_t name) {
+    mix.disable(name);
 }
 
-// Track::stop (Tracks.cpp:1550-1553): a normal mixed track goes to STOPPED and stays active; prepareTracks_l keeps mixing it with minFrames 1 (Threads.cpp:5976-5980) until framesReady, bounded by the client's stop position (AudioTrackServerProxy::getRear), is 0, then removes it (:6297-6309).
-// A static track has no frames once stopped (Tracks.cpp:1321-1325): it leaves the mix now.
-void mix_stop(Mix& mix, Track& track, int32_t name) {
-    if (track.is_static || mix.enabled.count(name) == 0) {
-        disable(mix, name);
-        return;
-    }
-    track.draining = true;
+void mix_set_volume(Mix& mix, int32_t name, float left, float right) {
+    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME0, &left);
+    mix.setParameter(name, android::AudioMixerBase::VOLUME, android::AudioMixerBase::VOLUME1, &right);
 }
 
-// Track::flush (Tracks.cpp:1646-1648): a track the mixer is not reading is flushed now, so the client can refill it while stopped or paused. A draining track's flush is applied by its next framesReady in the fill, which then ends the drain.
-void mix_flush(Mix& mix, Track& track, int32_t name) {
-    if (mix.enabled.count(name) == 0) {
-        track.proxy->flushBufferIfNeeded();
-    }
+void mix_process(Mix& mix) {
+    mix.process();
+}
+
+void track_start(Track& track) {
+    track.proxy->start();
+}
+
+void track_flush_if_needed(Track& track) {
+    track.proxy->flushBufferIfNeeded();
+}
+
+uint64_t track_frames_ready(Track& track) {
+    return track.proxy->framesReady();
+}
+
+int64_t track_frames_flushed(Track& track) {
+    return track.proxy->framesFlushed();
+}
+
+int64_t track_frames_released(Track& track) {
+    return track.proxy->framesReleased();
+}
+
+void track_client_gain(Track& track, float& left, float& right) {
+    const gain_minifloat_packed_t volume = track.proxy->getVolumeLR();
+    left = float_from_gain(gain_minifloat_unpack_left(volume));
+    right = float_from_gain(gain_minifloat_unpack_right(volume));
+}
+
+float track_shaper_gain(Track& track, int64_t frame) {
+    return track.volume->getVolume(frame).first;
+}
+
+bool track_draining(Track& track) {
+    return track.draining;
+}
+
+void track_set_draining(Track& track, bool draining) {
+    track.draining = draining;
 }
 
 // TrackHandle::applyVolumeShaper (Tracks.cpp:603-621): both parcelables are read before the handler sees them; a read that fails is the status and leaves the handler untouched.
@@ -247,45 +231,19 @@ int32_t track_apply_volume_shaper(Track& track, rust::Slice<const uint8_t> confi
     return track.volume->applyVolumeShaper(conf, op);
 }
 
-// AudioMixerBase::process() makes one quantum; the output takes it frame by frame, so a request of any size is served from it.
-void mix_render(Mix& mix, rust::Slice<float> out) {
-    const size_t frames = out.size() / kOutChannels;
-    for (size_t done = 0; done < frames;) {
-        if (mix.next == mix.quantum) {
-            // a stopped track whose frames up to its stop position are all mixed leaves the mix (prepareTracks_l, Threads.cpp:6297-6309)
-            for (auto it = mix.enabled.begin(); it != mix.enabled.end();) {
-                const auto [name, track] = *it++;  // advanced first: disable erases this entry
-                if (track->draining && track->proxy->framesReady() == 0) {
-                    disable(mix, name);
-                }
-            }
-            uint32_t muted = 0;
-            for (auto& [name, track] : mix.enabled) {
-                muted += apply_volume(mix, *track, name) ? 1 : 0;
-            }
-            g_muted.store(muted, std::memory_order_relaxed);
-            std::fill(mix.out.begin(), mix.out.end(), 0.0f);
-            mix.process();
-            mix.next = 0;
-        }
-        const size_t n = std::min(frames - done, mix.quantum - mix.next);
-        std::copy_n(mix.out.data() + mix.next * kOutChannels, n * kOutChannels,
-                    out.data() + done * kOutChannels);
-        mix.next += n;
-        done += n;
+// VolumeHandler::getVolumeShaperState (VolumeShaper.h:1064-1072) and VolumeShaper::State's getters (VolumeShaper.h:628-636).
+bool track_volume_shaper_state(Track& track, int32_t id, float& volume, float& x_offset) {
+    const android::sp<android::media::VolumeShaper::State> state = track.volume->getVolumeShaperState(id);
+    if (state == nullptr) {
+        return false;
     }
+    volume = state->getVolume();
+    x_offset = state->getXOffset();
+    return true;
 }
 
 uint64_t take_track_frames() {
     return g_track_frames.exchange(0, std::memory_order_relaxed);
-}
-
-uint32_t muted_tracks() {
-    return g_muted.load(std::memory_order_relaxed);
-}
-
-uint32_t active_tracks() {
-    return g_active.load(std::memory_order_relaxed);
 }
 
 uint64_t take_underruns() {

@@ -9,6 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use atl_audio_bridge::{Control, Mapping, Track as Server};
 use atl_audioflinger_stubs::aidl::android::media::IAudioTrack::{BnAudioTrack, IAudioTrack};
 use av_types_aidl::mangled::{
+    _7_android_5_media_17_VolumeShaperState as VolumeShaperState,
     _7_android_5_media_21_VolumeShaperOperation as VolumeShaperOperation,
     _7_android_5_media_25_VolumeShaperConfiguration as VolumeShaperConfiguration,
 };
@@ -321,6 +322,19 @@ impl IAudioTrack for Track {
         }
     }
 
+    /// IAudioTrack.getVolumeShaperState (TrackHandle::getVolumeShaperState, Tracks.cpp:623-633): shaper `id`'s state, or null when the track has no such shaper (Tracks.cpp:627-630).
+    fn r#getVolumeShaperState(&self, id: i32) -> binder::Result<Option<VolumeShaperState>> {
+        atl_diag::answered(INTERFACE, "getVolumeShaperState");
+        Ok(
+            output::volume_shaper_state(&self.mixer, self.name, id).map(|state| {
+                VolumeShaperState {
+                    r#volume: state.volume,
+                    r#xOffset: state.x_offset,
+                }
+            }),
+        )
+    }
+
     /// IAudioTrack.applyVolumeShaper (TrackHandle::applyVolumeShaper, Tracks.cpp:603-621): the configuration and operation become the track's VolumeShapers in the mix, applied from the next quantum. A null argument is BAD_VALUE (AIDL: not nullable). A negative status counts as a refusal: a shaper the mix does not apply would fail silently.
     fn r#applyVolumeShaper(
         &self,
@@ -523,5 +537,40 @@ mod tests {
             Ok(BAD_VALUE)
         );
         assert_eq!(refusals("IAudioTrack.applyVolumeShaper"), before + 1);
+    }
+
+    /// Shaper 1's state on `track` is the flat `volume` at offset 0.
+    fn assert_flat_state(track: &Track, volume: f32) {
+        let state = track
+            .r#getVolumeShaperState(1)
+            .expect("getVolumeShaperState answers")
+            .expect("shaper 1 has a state");
+        assert!(
+            (state.r#volume - volume).abs() < 1e-6,
+            "volume: {}",
+            state.r#volume
+        );
+        assert_eq!(state.r#xOffset, 0.0, "xOffset");
+    }
+
+    // IAudioTrack.getVolumeShaperState (TrackHandle::getVolumeShaperState, Tracks.cpp:623-633). An id the track does not have is null (Tracks.cpp:627-630; VolumeHandler::getVolumeShaperState returns nullptr, VolumeShaper.h:1064-1069).
+    // A shaper that has not started reports its delay: the curve at its delay offset, and the offset (VolumeShaper.h:771-776). The offset starts at MIN_CURVE_TIME = 0 (VolumeShaper.h:64, :754), and the operation's xOffset 0 sets it (VolumeShaper.h:1042-1056, :786-788). The flat curve is 0.5 everywhere (VolumeShaper.java:508-511).
+    // Started at frame 0, the state is the same point: x = 0 at the start (VolumeShaper.h:816-823).
+    #[test]
+    fn volume_shaper_state_is_served() {
+        let mixer: Shared = Arc::new(MixCell::default());
+        assert!(mixer.install(Mix::new(QUANTUM, RATE)), "mixer installed");
+        let track = static_track(&mixer, 4 * QUANTUM, 0.5);
+        let (configuration, operation) = flat_shaper(0.5);
+        assert!(
+            matches!(track.r#getVolumeShaperState(1), Ok(None)),
+            "no shaper 1 before applyVolumeShaper"
+        );
+        track
+            .r#applyVolumeShaper(Some(&configuration), Some(&operation))
+            .expect("applyVolumeShaper answers");
+        assert_flat_state(&track, 0.5);
+        track.r#start().expect("start");
+        assert_flat_state(&track, 0.5);
     }
 }

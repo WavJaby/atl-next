@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The server side of AOSP's track shared memory and mixer, for atl-audioflinger (game audio A2). A track's control block and buffer are mapped here; AOSP's server proxy reads them (ServerProxy, AudioTrackServerProxy, StaticAudioTrackServerProxy); AudioMixerBase mixes every enabled track into one quantum of float output (wrap/mix.cpp).
+//! The server side of AOSP's track shared memory and mixer, for atl-audioflinger (game audio A2). A track's control block and buffer are mapped here; AOSP's server proxy reads them (ServerProxy, AudioTrackServerProxy, StaticAudioTrackServerProxy); AudioMixerBase mixes every enabled track into one quantum of float output.
+//! The quantum loop, the enabled set, the drains and the gains are Rust's ([`Mix`]); the AOSP calls go through wrap/mix.cpp, which only forwards (the AudioBufferProvider callbacks stay there: AOSP's process() calls them).
 //! [`Mapping`] is the only place pointers into shared memory are made. [`Track`] and [`Mix`] own the C++ objects and the mappings they read. [`Mix`] is `Send`: its C++ state has no thread affinity. [`MixCell`] gives the mixer to one holder at a time (the output's realtime fill or one control call), so no lock is shared with the fill.
 //! With feature `converter` (`xtask native` turns it on) it is compiled; without, it is empty.
 #![cfg(feature = "converter")]
@@ -14,7 +15,7 @@ use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::AsFd;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use cxx::UniquePtr;
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
@@ -31,12 +32,12 @@ pub fn take_track_frames() -> u64 {
 
 /// Enabled tracks whose client volume was zero in the last mixed quantum.
 pub fn muted_tracks() -> u32 {
-    bridge::ffi::muted_tracks()
+    MUTED.load(Ordering::Relaxed)
 }
 
 /// Tracks enabled in the mix, draining ones included.
 pub fn active_tracks() -> u32 {
-    bridge::ffi::active_tracks()
+    ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Underruns the tracks counted since the last call (resets): one per start of an underrun, the steps of the count each client reads (AudioTrack::getUnderrunCount, AAudioStream_getXRunCount).
@@ -56,6 +57,15 @@ pub struct Removed {
     pub dropped: u64,
     /// The underruns its client read over its life (0 for a static track).
     pub underruns: u32,
+}
+
+/// A VolumeShaper's state as AOSP's VolumeShaper::State holds it: the interpolated volume (y-axis) and the normalized time (x-axis).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShaperState {
+    /// The volume the shaper gives at its position.
+    pub volume: f32,
+    /// The shaper's position on its curve (MIN_CURVE_TIME..MAX_CURVE_TIME).
+    pub x_offset: f32,
 }
 
 /// A shared mapping of a file range, unmapped on drop. Pointers into it are valid while it lives.
@@ -135,6 +145,8 @@ impl Drop for Mapping {
 pub struct Track {
     proxy: UniquePtr<bridge::ffi::Track>,
     rate: u32,
+    /// A static (shared-buffer) track: a stop leaves the mix at once (Tracks.cpp:1321-1325).
+    is_static: bool,
     _cblk: Mapping,
     _buffer: Option<Mapping>,
 }
@@ -174,6 +186,7 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
+            is_static: false,
             _cblk: cblk,
             _buffer: None,
         })
@@ -219,6 +232,7 @@ impl Track {
         Ok(Self {
             proxy,
             rate,
+            is_static: true,
             _cblk: cblk,
             _buffer: Some(buffer),
         })
@@ -238,15 +252,29 @@ pub enum Control {
     Flush,
 }
 
-/// The output's mixer: AudioMixerBase at one quantum and the output's rate, with the tracks added to it by name.
+/// The output's mixer: AudioMixerBase at one quantum and the output's rate, with the tracks added to it by name. The mixer's state is here: the enabled tracks, the quantum and its position, the counters. The C++ side (wrap/mix.cpp) forwards each AOSP call.
 pub struct Mix {
     inner: UniquePtr<bridge::ffi::Mix>,
     tracks: BTreeMap<i32, Track>,
     next_name: i32,
+    /// Enabled tracks, draining ones included, unordered: a removal swaps the last one in, so the fill never allocates.
+    enabled: Vec<i32>,
+    /// One quantum of interleaved stereo: the mixer's main buffer (every track's MAIN_BUFFER), zeroed before each process.
+    out: Vec<f32>,
+    quantum: usize,
+    /// The first frame of `out` not yet handed out.
+    next: usize,
 }
 
-// SAFETY: the C++ mixer and its tracks have no thread affinity. Calls never overlap: [`MixCell`] hands the mixer to one holder at a time.
+// SAFETY: the C++ mixer and its tracks have no thread affinity; the rest is plain data. Calls never overlap: [`MixCell`] hands the mixer to one holder at a time.
 unsafe impl Send for Mix {}
+
+/// Enabled tracks, draining ones included (the `active_tracks` counter).
+static ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// Enabled tracks whose client volume was zero in the last quantum (the `muted_tracks` counter).
+static MUTED: AtomicU32 = AtomicU32::new(0);
+/// Interleaved channels of the output: stereo (AUDIO_CHANNEL_OUT_STEREO).
+const CHANNELS: usize = 2;
 
 impl Mix {
     /// A mixer of `quantum_frames` per [`Mix::render`] quantum at `rate`.
@@ -255,20 +283,28 @@ impl Mix {
             inner: bridge::ffi::new_mix(quantum_frames, rate),
             tracks: BTreeMap::new(),
             next_name: 0,
+            enabled: Vec::new(),
+            out: vec![0.0; quantum_frames * CHANNELS],
+            quantum: quantum_frames,
+            next: 0,
         }
     }
 
     /// Adds `track`, disabled, in its format and `channel_mask` (mono or stereo) of `session`. Returns its name, or None when AOSP refuses the format (then `track` is dropped).
     pub fn add(&mut self, mut track: Track, session: i32, channel_mask: u32) -> Option<i32> {
         let name = self.next_name;
-        let added = bridge::ffi::mix_add(
-            self.inner.pin_mut(),
-            track.proxy.pin_mut(),
-            name,
-            session,
-            channel_mask,
-            track.rate,
-        );
+        // SAFETY: `out` is one quantum of stereo floats and is never resized; the mixer writes through this pointer only while this Mix is held (the fill or one control call). `inner` drops before `out` (field order), so no track outlives the buffer it adds into.
+        let added = unsafe {
+            bridge::ffi::mix_add(
+                self.inner.pin_mut(),
+                track.proxy.pin_mut(),
+                name,
+                session,
+                channel_mask,
+                track.rate,
+                self.out.as_mut_ptr(),
+            )
+        };
         if !added {
             return None;
         }
@@ -282,22 +318,55 @@ impl Mix {
         let Some(mut track) = self.tracks.remove(&name) else {
             return Removed::default();
         };
-        let dropped = bridge::ffi::mix_remove(self.inner.pin_mut(), track.proxy.pin_mut(), name);
+        // Frames it never played: unread (framesReady applies a pending flush first) and flushed away (mix_remove's count).
+        let dropped = if track.is_static {
+            0
+        } else {
+            let unread = bridge::ffi::track_frames_ready(track.proxy.pin_mut());
+            let flushed = bridge::ffi::track_frames_flushed(track.proxy.pin_mut()).max(0);
+            unread + u64::try_from(flushed).unwrap_or(0)
+        };
+        if bridge::ffi::mix_exists(self.inner.pin_mut(), name) {
+            self.disable(name);
+            bridge::ffi::mix_destroy(self.inner.pin_mut(), name);
+        }
         let underruns = track.proxy.as_ref().map_or(0, bridge::ffi::track_underruns);
         Removed { dropped, underruns }
     }
 
     /// Applies an IAudioTrack playback call to track `name` (see [`Control`]). False for an unknown name.
     pub fn control(&mut self, name: i32, call: Control) -> bool {
-        let Some(track) = self.tracks.get_mut(&name) else {
+        let Some(is_static) = self.tracks.get(&name).map(|track| track.is_static) else {
             return false;
         };
-        let (mix, proxy) = (self.inner.pin_mut(), track.proxy.pin_mut());
         match call {
-            Control::Start => bridge::ffi::mix_start(mix, proxy, name),
-            Control::Pause => bridge::ffi::mix_pause(mix, name),
-            Control::Stop => bridge::ffi::mix_stop(mix, proxy, name),
-            Control::Flush => bridge::ffi::mix_flush(mix, proxy, name),
+            Control::Start => {
+                if let Some(track) = self.tracks.get_mut(&name) {
+                    bridge::ffi::track_start(track.proxy.pin_mut());
+                    bridge::ffi::track_set_draining(track.proxy.pin_mut(), false);
+                }
+                self.apply_gain(name);
+                if !self.enabled.contains(&name) {
+                    self.enabled.push(name);
+                }
+                bridge::ffi::mix_enable(self.inner.pin_mut(), name);
+                self.publish_active();
+            }
+            Control::Pause => self.disable(name),
+            Control::Stop => {
+                if is_static || !self.enabled.contains(&name) {
+                    self.disable(name);
+                } else {
+                    self.set_draining(name, true);
+                }
+            }
+            Control::Flush => {
+                if !self.enabled.contains(&name)
+                    && let Some(track) = self.tracks.get_mut(&name)
+                {
+                    bridge::ffi::track_flush_if_needed(track.proxy.pin_mut());
+                }
+            }
         }
         true
     }
@@ -317,9 +386,97 @@ impl Mix {
         ))
     }
 
-    /// Fills `out` (interleaved stereo) with the next frames of the mix: one AudioMixerBase quantum at a time, any request size.
+    /// IAudioTrack.getVolumeShaperState on track `name`: shaper `id`'s state, or None when the track has no such shaper (AOSP's null). None too for an unknown track.
+    pub fn volume_shaper_state(&mut self, name: i32, id: i32) -> Option<ShaperState> {
+        let track = self.tracks.get_mut(&name)?;
+        let (mut volume, mut x_offset) = (0.0f32, 0.0f32);
+        bridge::ffi::track_volume_shaper_state(
+            track.proxy.pin_mut(),
+            id,
+            &mut volume,
+            &mut x_offset,
+        )
+        .then_some(ShaperState { volume, x_offset })
+    }
+
+    /// Fills `out` (interleaved stereo) with the next frames of the mix: one quantum at a time, any request size.
     pub fn render(&mut self, out: &mut [f32]) {
-        bridge::ffi::mix_render(self.inner.pin_mut(), out);
+        let frames = out.len() / CHANNELS;
+        let mut done = 0;
+        while done < frames {
+            if self.next == self.quantum {
+                self.begin_quantum();
+            }
+            let n = (frames - done).min(self.quantum - self.next);
+            let from = self.next * CHANNELS;
+            out[done * CHANNELS..(done + n) * CHANNELS]
+                .copy_from_slice(&self.out[from..from + n * CHANNELS]);
+            self.next += n;
+            done += n;
+        }
+    }
+
+    /// The quantum step, the loop mix_render kept in C++ until now: a draining track whose written frames are all mixed leaves the mix (prepareTracks_l, Threads.cpp:6297-6309); each enabled track takes its gains; the mixer makes one quantum into `out`.
+    fn begin_quantum(&mut self) {
+        let mut at = 0;
+        while at < self.enabled.len() {
+            let name = self.enabled[at];
+            let finished = match self.tracks.get_mut(&name) {
+                Some(track) => {
+                    bridge::ffi::track_draining(track.proxy.pin_mut())
+                        && bridge::ffi::track_frames_ready(track.proxy.pin_mut()) == 0
+                }
+                None => false,
+            };
+            if finished {
+                // disable moves the last enabled track into `at`: it is checked next
+                self.disable(name);
+            } else {
+                at += 1;
+            }
+        }
+        let mut muted = 0;
+        for at in 0..self.enabled.len() {
+            let name = self.enabled[at];
+            muted += u32::from(self.apply_gain(name));
+        }
+        MUTED.store(muted, Ordering::Relaxed);
+        self.out.fill(0.0);
+        bridge::ffi::mix_process(self.inner.pin_mut());
+        self.next = 0;
+    }
+
+    /// Track `name`'s gains for the next quantum: its client volume times its shaper gain, on both sides, at the track's released frame (Threads.cpp:5860-5862: `volume *= vh`, then the client's LR). True when the client's volume is zero on both sides; the shaper does not count.
+    fn apply_gain(&mut self, name: i32) -> bool {
+        let Some(track) = self.tracks.get_mut(&name) else {
+            return false;
+        };
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        bridge::ffi::track_client_gain(track.proxy.pin_mut(), &mut left, &mut right);
+        let frame = bridge::ffi::track_frames_released(track.proxy.pin_mut());
+        let shaper = bridge::ffi::track_shaper_gain(track.proxy.pin_mut(), frame);
+        bridge::ffi::mix_set_volume(self.inner.pin_mut(), name, left * shaper, right * shaper);
+        left == 0.0 && right == 0.0
+    }
+
+    /// Disables track `name` in the mixer, forgets it as enabled and ends its drain.
+    fn disable(&mut self, name: i32) {
+        bridge::ffi::mix_disable(self.inner.pin_mut(), name);
+        if let Some(at) = self.enabled.iter().position(|&n| n == name) {
+            self.enabled.swap_remove(at);
+            self.set_draining(name, false);
+        }
+        self.publish_active();
+    }
+
+    fn set_draining(&mut self, name: i32, draining: bool) {
+        if let Some(track) = self.tracks.get_mut(&name) {
+            bridge::ffi::track_set_draining(track.proxy.pin_mut(), draining);
+        }
+    }
+
+    fn publish_active(&self) {
+        ACTIVE.store(self.enabled.len() as u32, Ordering::Relaxed);
     }
 }
 
