@@ -5,10 +5,12 @@
 //! The table is generic over the handle `C` (the services use SpIBinder): handles are cloned and compared by equality, so the table and its tests build without the converter feature, which the test step needs.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::desktop_bounds::{ActivityInput, Rect, initial_bounds};
-use atl_services_types::display_model::{DENSITY_DEFAULT, Declaration, DisplayModel};
+use crate::display_rotation;
+use atl_services_types::display_model::{DENSITY_DEFAULT, Declaration, DisplayModel, ROTATION_0};
 
 /// A Task's identity, assigned by the services (positive). The wire carries it as an i32: compositor_registry SET_BOUNDS and the IUiAgent TASK transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,8 +91,10 @@ struct WindowEntry<C> {
 struct State<C> {
     /// the declared display (atld `--declare-display`); None: the display is the monitor
     declared: Option<Declaration>,
-    /// `DisplayModel::of(monitor, declared)` of the last monitor (atld's at start, then each window's report: set_monitor); the monitor itself is not kept, nothing reads it
+    /// `DisplayModel::of(monitor, declared)` turned by `rotation`, of the last monitor (atld's at start, then each window's report: set_monitor); the monitor itself is not kept, nothing reads it
     display: DisplayModel,
+    /// the display's rotation under fixed-orientation requests (request_orientation): 0 at start, and only a declared display that obeys requests leaves it
+    rotation: i32,
     tasks: BTreeMap<TaskId, TaskRecord>,
     /// the last TaskId handed out
     last_id: i32,
@@ -113,6 +117,7 @@ impl<C> State<C> {
         State {
             declared,
             display,
+            rotation: ROTATION_0,
             tasks: BTreeMap::new(),
             last_id: 0,
             tokens: Vec::new(),
@@ -199,7 +204,8 @@ impl<C: Clone + PartialEq> Tasks<C> {
         })
     }
 
-    /// The display now: [`DisplayModel::of`] of the monitor and the declaration, unchanged by any window's size ([`Tasks::set_monitor`]). The one owner: every service reads it here, none keeps a copy.
+    /// The display now: [`DisplayModel::of`] of the monitor and the declaration, turned by the fixed-orientation rotation ([`Tasks::request_orientation`]), unchanged by any window's size ([`Tasks::set_monitor`]).
+    /// The one owner: every service reads it here, none keeps a copy.
     pub fn display(&self) -> DisplayModel {
         self.lock().display
     }
@@ -280,7 +286,7 @@ impl<C: Clone + PartialEq> Tasks<C> {
         self.lock().tasks.values().any(|t| t.owner == owner)
     }
 
-    /// Sets `task`'s top orientation (the requested orientation of its top activity at the last check, activity_task.rs top_orientation_changed) and returns the one it replaces: None before
+    /// Sets `task`'s top orientation (the requested orientation of its top activity at the last check, activity_task.rs top_orientation_checked) and returns the one it replaces: None before
     /// the first, and for no Task.
     pub fn replace_top_orientation(&self, task: TaskId, orientation: i32) -> Option<i32> {
         self.lock()
@@ -322,7 +328,11 @@ impl<C: Clone + PartialEq> Tasks<C> {
         monitor: DisplayModel,
     ) -> Result<(DisplayChange, DisplayModel), String> {
         let mut st = self.lock();
-        let display = DisplayModel::of(monitor, st.declared)?;
+        let mut display = DisplayModel::of(monitor, st.declared)?;
+        // a declared display keeps the turn its requests set; an undeclared one is the monitor as it reports itself, its own rotation included
+        if st.declared.is_some() {
+            display = display.turned(st.rotation);
+        }
         let old = std::mem::replace(&mut st.display, display);
         if display == old {
             return Ok((DisplayChange::Unchanged, display));
@@ -341,6 +351,43 @@ impl<C: Clone + PartialEq> Tasks<C> {
             })
             .collect();
         Ok((DisplayChange::Config(tasks), display))
+    }
+
+    /// A fixed-orientation request (`screen_orientation`; `why` names it in the log: launch, top activity, setRequestedOrientation) turns a declared display that obeys requests
+    /// ([`display_rotation::obeys_requests`]) to AOSP's rotation for it ([`display_rotation::rotation_for_orientation`] of the natural size and the last rotation). A turn sets every Task
+    /// to the turned display (a Task on a declared display is the display) and renumbers their configurations. Any other request is `Unchanged`. Logged once per turn.
+    pub fn request_orientation(&self, screen_orientation: i32, why: &str) -> DisplayChange {
+        let mut st = self.lock();
+        if !display_rotation::obeys_requests(st.declared) {
+            return DisplayChange::Unchanged;
+        }
+        let next = display_rotation::rotation_for_orientation(
+            st.display.natural_size(),
+            screen_orientation,
+            st.rotation,
+        );
+        if next == st.rotation {
+            return DisplayChange::Unchanged;
+        }
+        let old = std::mem::replace(&mut st.rotation, next);
+        // the turned model of the natural size: st.display holds the old turn, and natural_size undoes it
+        st.display = st.display.turned(next);
+        let (width, height) = (st.display.width, st.display.height);
+        let tasks = st
+            .tasks
+            .iter_mut()
+            .map(|(id, record)| {
+                record.size = TaskSize { width, height };
+                record.config_seq = next_config_seq(record.config_seq);
+                *id
+            })
+            .collect();
+        let _ = writeln!(
+            std::io::stderr(),
+            "services: rotation {old} -> {next} ({why}): display {}",
+            st.display.to_arg()
+        );
+        DisplayChange::Config(tasks)
     }
 
     /// The Configuration.seq of `task`'s override (ActivityRecord.java:7697): numbered per size, 0 until the first change. Every copy of one override carries it: the item, IWindow.resized, relayout. They race on the app's main thread (AOSP orders them), and a seq-0 copy reads as older than a pending numbered one, so ActivityThread drops it and a layout runs on the old configuration; an item at seq 0 fares no better: handleActivityConfigurationChangedInner:7112 takes its own pending copy for newer and drops it.
@@ -661,6 +708,116 @@ mod tests {
         assert_eq!(t.size(full), Some(size(411, 914)));
         assert_eq!(tasks().full_display(), None);
         assert_eq!(tasks().opening_size(&landscape), three_quarters());
+    }
+
+    /// A landscape request on the phone of the gates (411x914 dp at mdpi, portrait natural) turns the display to 914x411 with rotation 1 (AOSP's portrait -> landscape 1): the Task takes
+    /// the turned display, its configuration is renumbered once, and a monitor report of the same display keeps the turn. A repeat of the request changes nothing.
+    #[test]
+    fn a_landscape_request_turns_a_declared_phone_display() {
+        use atl_services_types::packages::SCREEN_ORIENTATION_LANDSCAPE;
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
+        let task = t.new_task(7, "com.example.app", size(411, 914));
+        assert_eq!(
+            t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch"),
+            DisplayChange::Config(vec![task])
+        );
+        assert_eq!(
+            (t.display().width, t.display().height, t.display().rotation),
+            (914, 411, 1)
+        );
+        assert_eq!(t.size(task), Some(size(914, 411)));
+        assert_eq!(t.config_seq(task), 1);
+        assert_eq!(
+            t.set_monitor(at(1.0)),
+            Ok((DisplayChange::Unchanged, t.display()))
+        );
+        assert_eq!(t.display().rotation, 1);
+        assert_eq!(
+            t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch"),
+            DisplayChange::Unchanged
+        );
+        assert_eq!(t.config_seq(task), 1);
+    }
+
+    /// At 256 dpi (a 1.6 monitor) the declared 411x914 dp is 658x1462 px (411 x 1.6 = 657.6 -> 658, 914 x 1.6 = 1462.4 -> 1462); turned, 1462x658 with rotation 1, and the Task follows.
+    #[test]
+    fn the_turn_follows_the_monitor_density() {
+        use atl_services_types::packages::SCREEN_ORIENTATION_LANDSCAPE;
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        let at = |scale| DisplayModel::from_monitor(2560, 1600, Some(120.0), scale, 0);
+        let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
+        let task = t.new_task(7, "com.example.app", size(411, 914));
+        t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch");
+        let monitor = at(1.6);
+        let (change, display) = t.set_monitor(monitor).expect("in range");
+        assert_eq!(change, DisplayChange::Config(vec![task]));
+        assert_eq!(
+            (display.width, display.height, display.dpi, display.rotation),
+            (1462, 658, 256, 1)
+        );
+        assert_eq!(t.size(task), Some(size(1462, 658)));
+    }
+
+    /// A window's monitor report of the same display keeps the turn (set_monitor applies the rotation the requests set): `Unchanged`, rotation 1 kept. A density change
+    /// turns the new density's size too.
+    #[test]
+    fn a_monitor_report_keeps_the_rotation() {
+        use atl_services_types::packages::SCREEN_ORIENTATION_LANDSCAPE;
+        let declared = Declaration {
+            width_dp: 411,
+            height_dp: 914,
+        };
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
+        t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch");
+        assert_eq!(
+            t.set_monitor(at(1.0)),
+            Ok((DisplayChange::Unchanged, t.display()))
+        );
+        assert_eq!(
+            (t.display().width, t.display().height, t.display().rotation),
+            (914, 411, 1)
+        );
+        let (change, display) = t.set_monitor(at(1.6)).expect("in range");
+        assert!(matches!(change, DisplayChange::Config(_)));
+        assert_eq!(
+            (display.width, display.height, display.rotation),
+            (1462, 658, 1)
+        );
+    }
+
+    /// Undeclared displays are the monitor's: a fixed request turns nothing, and a 600 dp smallest side (AOSP's large-screen rule) ignores requests too.
+    #[test]
+    fn requests_turn_only_a_declared_display_under_600_dp() {
+        use atl_services_types::packages::SCREEN_ORIENTATION_LANDSCAPE;
+        let t = tasks();
+        assert_eq!(
+            t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch"),
+            DisplayChange::Unchanged
+        );
+        assert_eq!(t.display().rotation, 0);
+        let wide = Declaration {
+            width_dp: 600,
+            height_dp: 914,
+        };
+        let t: Tasks<Handle> =
+            Tasks::new(DisplayModel::default(), Some(wide), None).expect("in range");
+        assert_eq!(
+            t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch"),
+            DisplayChange::Unchanged
+        );
+        assert_eq!(
+            (t.display().width, t.display().height, t.display().rotation),
+            (600, 914, 0)
+        );
     }
 
     /// A Task that does not exist has no owner, no size, and takes no size.

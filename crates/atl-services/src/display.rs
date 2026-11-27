@@ -90,7 +90,7 @@ impl DisplayCallbacks {
         Ok(())
     }
 
-    /// Display 0 changed (Tasks::set_monitor): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each live callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). Returns the callbacks told.
+    /// Display 0 changed (a monitor report or a fixed-orientation turn: activity.rs Inner::display_changed): onDisplayEvent(0, EVENT_DISPLAY_BASIC_CHANGED) to each live callback whose mask takes it (DisplayManagerService.deliverDisplayEvent). Returns the callbacks told.
     pub fn display_changed(&self) -> usize {
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         records.retain(|r| !r.dead.load(Ordering::Acquire));

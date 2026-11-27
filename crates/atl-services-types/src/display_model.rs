@@ -97,6 +97,23 @@ impl DisplayModel {
         }
     }
 
+    /// The display shown at quarter turns `rotation` from the panel's natural size: the odd turns swap the sides (DisplayContent.updateDisplayAndOrientation:2276-2290), `rotation` is set.
+    /// Built from the natural size, so a turned display turns to any rotation (the owner turns the monitor's `of` by its own rotation, tasks.rs).
+    pub fn turned(self, rotation: i32) -> Self {
+        let (width, height) = self.natural_size();
+        let (width, height) = if rotation % 2 == 1 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        DisplayModel {
+            width,
+            height,
+            rotation,
+            ..self
+        }
+    }
+
     /// `WxH@hz,dpi,rotation`, e.g. `1920x1080@59.94,240,1`. Sizes, rate and dpi must be positive, the rotation a Surface.ROTATION_* value (0..=3).
     pub fn parse_arg(s: &str) -> Result<Self, String> {
         let bad = || format!("{s}: not WxH@hz,dpi,rotation");
@@ -254,6 +271,38 @@ mod tests {
         assert_eq!(p.natural_size(), (2560, 1600));
         let f = DisplayModel::from_monitor(2560, 1600, None, 1.6, 2);
         assert_eq!((f.rotation, f.natural_size()), (2, (2560, 1600)));
+    }
+
+    /// Hand values: 658x1462 at 120 Hz, 256 dpi turned a quarter is 1462x658 with rotation 1, whose natural size is 658x1462 again. Turned to 0 or to its own rotation it is the same model;
+    /// a half turn keeps the sides.
+    #[test]
+    fn turned_swaps_the_sides_of_the_natural_size() {
+        let unturned = DisplayModel {
+            width: 658,
+            height: 1462,
+            refresh_hz: 120.0,
+            dpi: 256,
+            rotation: 0,
+        };
+        let turned = unturned.turned(1);
+        assert_eq!(
+            turned,
+            DisplayModel {
+                width: 1462,
+                height: 658,
+                refresh_hz: 120.0,
+                dpi: 256,
+                rotation: 1,
+            }
+        );
+        assert_eq!(turned.natural_size(), (658, 1462));
+        assert_eq!(turned.turned(0), unturned);
+        assert_eq!(unturned.turned(0), unturned);
+        assert_eq!(turned.turned(1), turned);
+        assert_eq!(
+            (unturned.turned(2).width, unturned.turned(2).height),
+            (658, 1462)
+        );
     }
 
     /// Fractional rates and other sizes parse; the form round-trips.

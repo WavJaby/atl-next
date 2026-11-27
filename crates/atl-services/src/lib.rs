@@ -30,6 +30,7 @@ pub mod broadcast;
 pub mod broadcast_dispatch;
 pub mod config_diff;
 pub mod desktop_bounds;
+pub mod display_rotation;
 pub mod ducking;
 pub mod focus;
 pub mod ime_bind;

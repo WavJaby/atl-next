@@ -10,12 +10,19 @@ use serde::{Deserialize, Serialize};
 pub const SCREEN_ORIENTATION_UNSPECIFIED: i32 = -1;
 pub const SCREEN_ORIENTATION_LANDSCAPE: i32 = 0;
 pub const SCREEN_ORIENTATION_PORTRAIT: i32 = 1;
+pub const SCREEN_ORIENTATION_USER: i32 = 2;
+pub const SCREEN_ORIENTATION_BEHIND: i32 = 3;
+pub const SCREEN_ORIENTATION_SENSOR: i32 = 4;
+pub const SCREEN_ORIENTATION_NOSENSOR: i32 = 5;
 pub const SCREEN_ORIENTATION_SENSOR_LANDSCAPE: i32 = 6;
 pub const SCREEN_ORIENTATION_SENSOR_PORTRAIT: i32 = 7;
 pub const SCREEN_ORIENTATION_REVERSE_LANDSCAPE: i32 = 8;
 pub const SCREEN_ORIENTATION_REVERSE_PORTRAIT: i32 = 9;
+pub const SCREEN_ORIENTATION_FULL_SENSOR: i32 = 10;
 pub const SCREEN_ORIENTATION_USER_LANDSCAPE: i32 = 11;
 pub const SCREEN_ORIENTATION_USER_PORTRAIT: i32 = 12;
+pub const SCREEN_ORIENTATION_FULL_USER: i32 = 13;
+pub const SCREEN_ORIENTATION_LOCKED: i32 = 14;
 
 /// `<permission android:name android:protectionLevel>` (ParsedPermissionUtils): the level as written, base type in the low 4 bits (PermissionInfo.PROTECTION_MASK_BASE). framework-res's list is the
 /// install-time grant rule's platform half (permission::install_grants).

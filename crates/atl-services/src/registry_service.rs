@@ -12,7 +12,6 @@ use binder::{
 };
 
 use crate::activity::ActivityManager;
-use crate::display::DisplayCallbacks;
 use crate::input::KeyMaps;
 use crate::tasks::{DisplayChange, TaskId, TaskSize, Tasks};
 use crate::ui_agents::{AppProcess, UiAgents};
@@ -268,8 +267,6 @@ struct Registry {
     tasks: Arc<Tasks<SpIBinder>>,
     /// the activities of the Tasks: a size change reaches their app threads (activity.rs task_resized)
     activities: ActivityManager,
-    /// the display service's callbacks: a display change reaches them (display.rs)
-    display_callbacks: Arc<DisplayCallbacks>,
     /// the input service's key maps (input.rs), served by KEY_MAP
     key_maps: Arc<KeyMaps>,
 }
@@ -285,25 +282,6 @@ impl Registry {
                 atl_diag::set_cause(&format!("uid {caller_uid} does not own task {task}"));
                 StatusCode::PERMISSION_DENIED
             })
-    }
-
-    /// `task`'s configuration changed (its size or the display): its activities get the change (activity.rs task_resized), then its windows `resized`, unless a relaunch holds them.
-    fn task_changed(&self, task: TaskId) {
-        self.activities.task_resized(task);
-        if self.activities.task_relaunching(task) {
-            let _ = writeln!(
-                std::io::stderr(),
-                "services: resize of task {} held for the relaunch",
-                task.raw()
-            );
-            return;
-        }
-        let windows = crate::window::notify_resized(&self.tasks, task);
-        let _ = writeln!(
-            std::io::stderr(),
-            "services: resized {windows} windows of task {}",
-            task.raw()
-        );
     }
 }
 
@@ -360,7 +338,7 @@ impl ICompositorRegistry for Registry {
                 "services: task {} of uid {caller_uid} bounds {width}x{height}",
                 task.raw()
             );
-            self.task_changed(task);
+            self.activities.task_changed(task);
         }
         Ok(())
     }
@@ -390,29 +368,7 @@ impl ICompositorRegistry for Registry {
                 DisplayChange::Config(_) => "",
             }
         );
-        // AOSP's order: DisplayManagerService delivers the display event, then WindowManager's display change updates the global configuration (ActivityTaskManagerService.updateGlobalConfigurationLocked:4813: ConfigurationChangeItem to each process), then each activity's
-        match change {
-            DisplayChange::Unchanged => {}
-            DisplayChange::Refresh => {
-                // a display event only: the apps' display listeners hear it, no Configuration changes
-                let callbacks = self.display_callbacks.display_changed();
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "services: display change told {callbacks} display callbacks, 0 processes"
-                );
-            }
-            DisplayChange::Config(tasks) => {
-                let callbacks = self.display_callbacks.display_changed();
-                let processes = self.activities.global_configuration_changed();
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "services: display change told {callbacks} display callbacks, {processes} processes"
-                );
-                for task in tasks {
-                    self.task_changed(task);
-                }
-            }
-        }
+        self.activities.display_changed(change);
         Ok(display)
     }
 
@@ -459,7 +415,6 @@ pub fn new_binder(
     agents: Arc<UiAgents>,
     tasks: Arc<Tasks<SpIBinder>>,
     activities: ActivityManager,
-    display_callbacks: Arc<DisplayCallbacks>,
     key_maps: Arc<KeyMaps>,
 ) -> SpIBinder {
     BnCompositorRegistry::new_binder(
@@ -467,7 +422,6 @@ pub fn new_binder(
             agents,
             tasks,
             activities,
-            display_callbacks,
             key_maps,
         },
         BinderFeatures::default(),

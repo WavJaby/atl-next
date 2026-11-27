@@ -196,6 +196,9 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
     let threads: &dyn VmHost = &*host;
     // asked at this process's start, not atld's: a monitor report since then changed the services' display
     let display = display()?;
+    // the gates read the start display here: task_reports logs only a later change (set_display)
+    let start_arg = display.to_arg();
+    tracing::info!("atl-composer: ui: display {}", start_arg);
     let script = match optional_property(POINTER_PROPERTY)? {
         Some(script) => input::parse_script(&script)?,
         None => Vec::new(),

@@ -68,6 +68,7 @@ use crate::broadcast_queue;
 use crate::config_diff::{self, Config, Delivery};
 pub use crate::desktop_bounds::OrientationReshape;
 use crate::desktop_bounds::{self, ActivityInput, reshaped_size};
+use crate::display::DisplayCallbacks;
 use crate::memory_levels;
 use crate::package;
 use crate::packages::{PackageRecord, PackageTable, Packages, Permissions};
@@ -77,7 +78,7 @@ use crate::pending_intent_table::Key;
 use crate::process_control::ProcessControl;
 use crate::running_processes;
 use crate::shared_memory::ApplicationSharedMemory;
-use crate::tasks::{TaskId, TaskSize, Tasks};
+use crate::tasks::{DisplayChange, TaskId, TaskSize, Tasks};
 use crate::ui_agents::{AppProcess, UiAgents};
 use crate::uid_state::{self, ProcessState, Settle, UidView};
 use atl_services_types::display_model::DisplayModel;
@@ -539,6 +540,8 @@ enum Timer {
     FgsAnr(i32),
     /// a launch held behind its package's first-start boot broadcasts, released (due now) by BOOT_COMPLETED's final result: the launch runs here, off the state lock; by start_seq
     HeldLaunch(i64),
+    /// a launch's fixed-orientation turn that changed other Tasks' display (start_process_locked): its fan-out runs here, once the state lock is released (display_turned, "launch")
+    LaunchTurn(DisplayChange),
 }
 
 /// The thread of an attached process and the death link on its binder (AppDeathRecipient, ActivityManagerService.java:4600); the recipient is only held so the link outlives the attach call.
@@ -809,6 +812,10 @@ struct Inner {
     atm: Arc<ActivityTasks>,
     /// the Tasks: a launch that starts a Task creates it here and binds its activity's token to it (tasks.rs)
     tasks: Arc<Tasks<SpIBinder>>,
+    /// the display service's callbacks: a display change (a monitor report or a turn) reaches them (display_changed)
+    display_callbacks: Arc<DisplayCallbacks>,
+    /// the apps' UI agents: a turned Task's window is resized through the agent of its process (turn_window)
+    agents: Arc<UiAgents>,
     /// what each activity reported (ReportedBuckets), shared with the activity client controller
     buckets: Arc<ReportedBuckets>,
     /// the broadcast sender thread (broadcast_queue.rs)
@@ -957,7 +964,8 @@ fn under_policy(back: Back, root: RootBack) -> Back {
 }
 
 impl ActivityManager {
-    /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them.
+    /// `tasks` is the table the window service and the registry read: the launch binds each activity it starts to its Task there. `agents` are the apps' UI agents: a root Back minimizes through them,
+    /// and a turned Task's window is resized through them. `display_callbacks` are the display service's: a display change reaches them.
     /// `back_finish` false is the test-only break (`--no-back-finish`): see [`ActivityClientController::back_finish`]. `root_back`: see [`RootBack`]. `orientation_reshape`: see [`OrientationReshape`]. `bind_services` false is the test-only
     /// break `--no-bind-service`: every bindService answers 0. `hw`: the multiplier of the process-start and broadcast timers ([`HwTimeouts`]).
     #[allow(clippy::too_many_arguments)]
@@ -967,6 +975,7 @@ impl ActivityManager {
         control: Arc<dyn ProcessControl>,
         tasks: Arc<Tasks<SpIBinder>>,
         agents: Arc<UiAgents>,
+        display_callbacks: Arc<DisplayCallbacks>,
         back_finish: bool,
         root_back: RootBack,
         orientation_reshape: OrientationReshape,
@@ -983,7 +992,6 @@ impl ActivityManager {
                     ActivityClientController {
                         buckets: Arc::clone(&buckets),
                         inner: inner.clone(),
-                        agents,
                         back_finish,
                         root_back,
                         orientation_reshape,
@@ -1008,6 +1016,8 @@ impl ActivityManager {
                     }),
                     reporter: Reporter::new(),
                     tasks,
+                    display_callbacks,
+                    agents,
                     buckets,
                     broadcast_queue: broadcast_queue::Queue::new(),
                     pending: PendingIntents::new(Arc::new(IntentRoute(inner.clone()))),
@@ -1160,19 +1170,10 @@ impl ActivityManager {
         }
     }
 
-    /// The display changed (registry REPORT_MONITOR): every attached process gets its configuration again, as ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813 does
-    /// (each WindowProcessController's onConfigurationChanged -> dispatchConfiguration): the new global one, or its Task's on the new display ([`process_configuration`]). Needed: a Task's
-    /// override leaves density to the global configuration (task_override), so without it an activity's merged configuration and the Application's resources keep the old density. Returns the processes told.
-    pub(crate) fn global_configuration_changed(&self) -> usize {
-        let pids: Vec<i32> = self
-            .inner
-            .state()
-            .processes
-            .iter()
-            .filter(|p| p.attached.is_some())
-            .map(|p| p.pid)
-            .collect();
-        self.inner.dispatch_process_configuration(&pids)
+    /// A display change (registry REPORT_MONITOR, or a launch's turn): see [`Inner::display_changed`]. Every attached process gets its configuration again (ActivityTaskManagerService.updateGlobalConfigurationLocked),
+    /// its Task's on the new display ([`process_configuration`]): a Task's override leaves density to the global configuration (task_override).
+    pub(crate) fn display_changed(&self, change: DisplayChange) {
+        self.inner.display_changed(change);
     }
 
     /// forceStopPackageLocked for a reason outside a binder call of this service (PMS's PACKAGE_CHANGED without DONT_KILL_APP): the package's processes leave the table and are killed.
@@ -1184,14 +1185,9 @@ impl ActivityManager {
         self.inner.deliver(fx);
     }
 
-    /// Registry set_bounds changed `task`'s size.
-    pub(crate) fn task_resized(&self, task: TaskId) {
-        self.inner.task_resized(task);
-    }
-
-    /// An activity of `task` is relaunching (WindowState.inRelaunchingActivity): its windows wait, a layout now would run in the old instance on the old configuration.
-    pub(crate) fn task_relaunching(&self, task: TaskId) -> bool {
-        self.inner.task_relaunching(task)
+    /// `task`'s configuration changed (registry SET_BOUNDS, or a display change): see [`Inner::task_changed`].
+    pub(crate) fn task_changed(&self, task: TaskId) {
+        self.inner.task_changed(task);
     }
 
     /// The Task of the process `pid` (its launch's, made at the process start); None for a process with no launch.
@@ -1464,6 +1460,103 @@ impl Inner {
         self.atm.task_relaunching(task)
     }
 
+    /// The display changed (a monitor report, or a launch's turn after the lock): the display event to the registered callbacks, then for a configuration change every attached
+    /// process's configuration and each listed Task's ([`Inner::task_changed`]). AOSP's order: DisplayManagerService delivers the event, then the global configuration, then each activity.
+    /// Takes the state lock: never called with it held.
+    fn display_changed(&self, change: DisplayChange) {
+        match change {
+            DisplayChange::Unchanged => {}
+            DisplayChange::Refresh => {
+                // a display event only: the apps' display listeners hear it, no Configuration changes
+                let callbacks = self.display_callbacks.display_changed();
+                log(format_args!(
+                    "display change told {callbacks} display callbacks, 0 processes"
+                ));
+            }
+            DisplayChange::Config(tasks) => {
+                let callbacks = self.display_callbacks.display_changed();
+                let processes = self.global_configuration_changed();
+                log(format_args!(
+                    "display change told {callbacks} display callbacks, {processes} processes"
+                ));
+                for task in tasks {
+                    self.task_changed(task);
+                }
+            }
+        }
+    }
+
+    /// A display change that turns the display (a fixed-orientation request): [`Inner::display_changed`], then each turned Task's window takes the turned size ([`Inner::turn_window`]).
+    fn display_turned(&self, change: DisplayChange, why: &str) {
+        let tasks = match &change {
+            DisplayChange::Config(tasks) => tasks.clone(),
+            DisplayChange::Unchanged | DisplayChange::Refresh => Vec::new(),
+        };
+        self.display_changed(change);
+        for task in tasks {
+            self.turn_window(task, why);
+        }
+    }
+
+    /// The processes' global configuration after the display changed (ActivityTaskManagerService.updateGlobalConfigurationLocked:4807-4813): each attached process gets it again. Returns the processes told.
+    fn global_configuration_changed(&self) -> usize {
+        let pids: Vec<i32> = self
+            .state()
+            .processes
+            .iter()
+            .filter(|p| p.attached.is_some())
+            .map(|p| p.pid)
+            .collect();
+        self.dispatch_process_configuration(&pids)
+    }
+
+    /// `task`'s configuration changed (its size or the display): its activities get the change (task_resized), then its windows `resized`, unless a relaunch holds them.
+    fn task_changed(&self, task: TaskId) {
+        self.task_resized(task);
+        if self.task_relaunching(task) {
+            log(format_args!(
+                "resize of task {} held for the relaunch",
+                task.raw()
+            ));
+            return;
+        }
+        let windows = crate::window::notify_resized(&self.tasks, task);
+        log(format_args!(
+            "resized {windows} windows of task {}",
+            task.raw()
+        ));
+    }
+
+    /// The Task's window takes the Task's size after a turn: a RESIZE to its UI agent (the desktop toplevel takes the turned shape). Logged as `turned task=<id> <w>x<h> (<why>)`;
+    /// no size or no agent (headless): counted, nothing else.
+    fn turn_window(&self, task: TaskId, why: &str) {
+        let Some(size) = self.tasks.size(task) else {
+            return;
+        };
+        log(format_args!(
+            "turned task={} {}x{} ({why})",
+            task.raw(),
+            size.width,
+            size.height
+        ));
+        let Some(agent) = self.task_agent(task) else {
+            atl_diag::answered(AM, "turn window: no UI agent");
+            return;
+        };
+        atl_diag::answered(AM, "turn window (window resize asked)");
+        if let Err(e) = agent.resize(size.width, size.height) {
+            log(format_args!("turn window: resize: {e:?}"));
+        }
+    }
+
+    /// The UI agent of the process `task`'s window is in ([`Inner::process_of_task`]); None when no process has the Task or no agent is registered.
+    fn task_agent(&self, task: TaskId) -> Option<Strong<dyn IUiAgent>> {
+        let process = self.process_of_task(task)?;
+        self.agents
+            .agent(process)
+            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
+    }
+
     /// The process `task` was launched in (the oldest live record whose launch made it): the process whose window shows the Task. None when none lives.
     fn process_of_task(&self, task: TaskId) -> Option<AppProcess> {
         self.state()
@@ -1560,6 +1653,7 @@ impl Inner {
             Timer::FgsStart(component) => self.foreground_timeout(component),
             Timer::FgsAnr(pid) => self.foreground_anr(pid),
             Timer::HeldLaunch(seq) => self.launch_attached(seq),
+            Timer::LaunchTurn(change) => self.display_turned(change, "launch"),
         }
     }
 
@@ -1766,7 +1860,15 @@ impl Inner {
         }
         st.proc_start_seq_counter += 1;
         let start_seq = st.proc_start_seq_counter;
-        let pid = self.control.start(&StartRequest {
+        let launcher = packages.launcher(p).filter(|_| launch_activity);
+        let now = self.now_ms();
+        // the launcher's fixed orientation turns the display before the process starts (AOSP fixed-rotation launch), so the process binds in the turned configuration. The other Tasks
+        // follow after the state lock (Timer::LaunchTurn): the fan-out takes that lock. A failed start keeps the turn: the display did change.
+        let turn = launcher.map(|a| {
+            self.tasks
+                .request_orientation(a.screen_orientation, "launch")
+        });
+        let started = self.control.start(&StartRequest {
             uid: p.uid,
             process_name: process_name.to_owned(),
             package: p.name().to_owned(),
@@ -1775,13 +1877,16 @@ impl Inner {
             args: vec![format!("{PROC_START_SEQ_IDENT}{start_seq}")],
             instruction_set: p.instruction_set.clone(),
             rights: atl_broker::rights_of(self.permissions.granted_names(p.uid).as_slice()),
-        })?;
-        // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO)
-        let task = packages.launcher(p).filter(|_| launch_activity).map(|a| {
+        });
+        if let Some(change @ DisplayChange::Config(_)) = turn {
+            self.arm(Timer::LaunchTurn(change), now);
+        }
+        let pid = started?;
+        // the launch's Task exists before the process attaches: the composer asks for its bounds and package at its window's install (registry TASK_INFO); it is made at the turned size
+        let task = launcher.map(|a| {
             let size = self.tasks.opening_size(&crate::packages::bounds_input(a));
             self.tasks.new_task(p.uid, p.name(), size)
         });
-        let now = self.now_ms();
         if let Some(task) = task {
             st.open_tasks.insert(task, p.uid);
             st.uids.on_task_added(p.uid, now);
@@ -3507,8 +3612,6 @@ impl ReportedBuckets {
 struct ActivityClientController {
     buckets: Arc<ReportedBuckets>,
     inner: Weak<Inner>,
-    /// the app processes' UI agents: a move to the back minimizes, and a TaskDescription titles, the Task's window through the agent of the process the Task was launched in
-    agents: Arc<UiAgents>,
     /// false: onBackPressed sends no requestFinish (`--no-back-finish`, the dialog gate's back sub-gate's deliberate break); a Back then never finishes an activity.
     back_finish: bool,
     /// what an unhandled Back on a launcher root does
@@ -3518,12 +3621,9 @@ struct ActivityClientController {
 }
 
 impl ActivityClientController {
-    /// The UI agent of the process `task`'s window is in (Inner::process_of_task). Not the binder caller's: onBackPressed is oneway, and a oneway call carries no calling pid.
+    /// The UI agent of the process `task`'s window is in ([`Inner::task_agent`]). Not the binder caller's: onBackPressed is oneway, and a oneway call carries no calling pid.
     fn task_agent(&self, task: TaskId) -> Option<Strong<dyn IUiAgent>> {
-        let process = self.inner.upgrade()?.process_of_task(task)?;
-        self.agents
-            .agent(process)
-            .and_then(|b| b.into_interface::<dyn IUiAgent>().ok())
+        self.inner.upgrade()?.task_agent(task)
     }
 
     /// The reshape check (desktop_bounds::reshaped_size) of `task` for `input`, an orientation request (`why`: what made it): a due reshape goes to the Task's window as RESIZE. Logged as
@@ -3545,11 +3645,6 @@ impl ActivityClientController {
         else {
             return;
         };
-        // a declared display: the Task is the display, whatever the request (tasks.rs full_display)
-        let (width, height) = inner
-            .tasks
-            .full_display()
-            .map_or((width, height), |s| (s.width, s.height));
         if (width, height) == current {
             return;
         }
@@ -3585,6 +3680,25 @@ impl ActivityClientController {
 }
 
 impl ActivityClientController {
+    /// An orientation request of a record; `top` is its orientation when the record is its Task's top (the orientation the display turns to), else None. An undeclared display runs the
+    /// reshape check as before (`--orientation-reshape`, maintainer option A). A declared display never reshapes (its Task is the display): it turns (Tasks::request_orientation) or keeps.
+    fn orientation_request(
+        &self,
+        inner: &Inner,
+        task: TaskId,
+        input: &ActivityInput,
+        top: Option<i32>,
+        why: &str,
+    ) {
+        if inner.tasks.full_display().is_none() {
+            self.reshape(inner, task, input, why);
+            return;
+        }
+        if let Some(orientation) = top {
+            inner.display_turned(inner.tasks.request_orientation(orientation, why), why);
+        }
+    }
+
     /// getCallingRecord's (package, class) for `token`; None for no token, no services, or no owed result.
     fn calling(&self, token: Option<&SpIBinder>) -> Option<(String, String)> {
         self.inner.upgrade()?.atm.calling(token?)
@@ -3606,8 +3720,19 @@ impl IActivityClientController for ActivityClientController {
                 atl_diag::answered(ACC, "activityResumed: no such activity");
                 return Ok(());
             }
-            if let Some((task, input)) = inner.atm.top_orientation_changed(token) {
-                self.reshape(&inner, task, &input, "top activity");
+            if let Some((task, input, orientation, changed)) =
+                inner.atm.top_orientation_checked(token)
+            {
+                // an undeclared display reshapes when the top's request changed, as before; a declared one follows the top's request at each resume (AOSP updateOrientation)
+                if changed || inner.tasks.full_display().is_some() {
+                    self.orientation_request(
+                        &inner,
+                        task,
+                        &input,
+                        Some(orientation),
+                        "top activity",
+                    );
+                }
             }
         }
         Ok(())
@@ -3712,7 +3837,8 @@ impl IActivityClientController for ActivityClientController {
             atl_diag::answered(ACC, "setRequestedOrientation: no token");
             return Ok(());
         };
-        let Some((task, input)) = inner.atm.set_requested_orientation(token, orientation) else {
+        let Some((task, input, top)) = inner.atm.set_requested_orientation(token, orientation)
+        else {
             atl_diag::answered(ACC, "setRequestedOrientation: no such activity");
             return Ok(());
         };
@@ -3720,7 +3846,7 @@ impl IActivityClientController for ActivityClientController {
             "setRequestedOrientation task={} orientation={orientation}",
             task.raw()
         ));
-        self.reshape(&inner, task, &input, "setRequestedOrientation");
+        self.orientation_request(&inner, task, &input, top, "setRequestedOrientation");
         Ok(())
     }
 
@@ -3863,6 +3989,7 @@ mod tests {
             control,
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             Arc::new(UiAgents::default()),
+            Arc::new(DisplayCallbacks::default()),
             true,
             RootBack::default(),
             OrientationReshape::default(),
@@ -4348,6 +4475,7 @@ mod tests {
             control,
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             Arc::new(UiAgents::default()),
+            Arc::new(DisplayCallbacks::default()),
             true,
             RootBack::default(),
             OrientationReshape::default(),
@@ -4498,6 +4626,7 @@ mod tests {
             control.clone(),
             Arc::new(Tasks::new(DisplayModel::default(), None, None).expect("the default display")),
             Arc::new(UiAgents::default()),
+            Arc::new(DisplayCallbacks::default()),
             true,
             RootBack::default(),
             OrientationReshape::default(),

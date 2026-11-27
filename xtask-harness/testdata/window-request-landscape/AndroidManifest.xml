@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage orientation with declare-display 411x914: the window fixture (java/ links to it), resizeable, no manifest orientation, so it opens portrait on the
+     declared phone display; at its first create it calls setRequestedOrientation(SCREEN_ORIENTATION_LANDSCAPE = 0) (meta-data atl.requestOrientation). The display turns (rotation_checks,
+     xtask-harness/src/window/rotation.rs) and the activity is told the change in onConfigurationChanged (the size and orientation bits declared, no relaunch). targetSdk 35 as window-orientation. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="35" />
+
+    <application android:label="ATL window test">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <meta-data android:name="atl.requestOrientation" android:value="0" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

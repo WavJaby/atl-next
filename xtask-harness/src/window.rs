@@ -44,6 +44,7 @@ mod gles2;
 mod ime;
 mod move_output;
 mod opening;
+mod rotation;
 mod slow_display;
 mod splash;
 mod surface_view;
@@ -176,12 +177,13 @@ pub struct Args {
     #[arg(long)]
     break_suspended: bool,
     /// Stages move and opening: the display declared in dp (atld `--declare-display`, display_model.rs `Declaration`), the apps see this size on each output's density; adds the `declared` sub-gate.
+    /// Stages landscape and orientation: the same declaration, and a width under 600 dp turns the display for a fixed-orientation activity (xtask-harness/src/window/rotation.rs).
     #[arg(long, value_name = "WxH", value_parser = Declaration::parse_arg)]
     declare_display: Option<Declaration>,
     /// Stage move, undeclared only: the window is resized (a configure) before the move and must keep that dp size on the second output.
     #[arg(long, conflicts_with = "declare_display")]
     user_resize: bool,
-    /// Stage move, with `--declare-display` only: the run is not given the declaration, so the declared sub-gate must fail (the gate's deliberate break, harness-side).
+    /// Stages move, landscape and orientation, with `--declare-display` only: the run is not given the declaration, so the declared sub-gates must fail (the gate's deliberate break, harness-side).
     #[arg(long, requires = "declare_display")]
     break_declare_display: bool,
     /// Stage move, with `--declare-display` only: the composer adopts the monitor it reported instead of the services' answer (atl-composer feature `break-declared-adopt`), so its SurfaceFlinger display is not DisplayInfo and the declared sub-gate must fail.
@@ -300,8 +302,11 @@ enum Stage {
     /// UI mode, the window tiled: the proxy gives every compositor configure the size [`TILE`], the first included, as a tiling compositor sizes a window without asking it; the Task's bounds, every layout, the display metrics and the picture are the tile's content ([`tiled_checks`]).
     Tiled,
     /// UI mode with the orientation fixture (xtask-harness/testdata/window-orientation): opened landscape, the activity's setRequestedOrientation(PORTRAIT) reshapes the window to AOSP's portrait size
-    /// and the activity is told the portrait configuration ([`orientation_checks`]).
+    /// and the activity is told the portrait configuration ([`orientation_checks`]). With `--declare-display` the window-request-landscape fixture requests landscape instead and the display turns ([`rotation::orientation_checks`]).
     Orientation,
+    /// UI mode with `--declare-display` (sw < 600 dp): the window-landscape fixture is a fixed landscape activity; the launch turns the display before the process binds, and the activity is
+    /// created once on the turned display ([`rotation::landscape_checks`]; xtask-harness/src/window/rotation.rs).
+    Landscape,
     /// UI mode, two processes of one uid (window-aux): a `:aux` process registered before the window's first layout, killed, restarted, then a dialog; the main window's and the dialog's layers stay in the main process's compositor (xtask-harness/src/window/aux_process.rs).
     AuxProcess,
     /// UI mode: the last `xdg_toplevel.set_app_id` the window sends before its first commit is `atl.<package>` ([`app_id_check`]).
@@ -344,6 +349,7 @@ impl Stage {
             Stage::Portrait => "portrait",
             Stage::Tiled => "tiled",
             Stage::Orientation => "orientation",
+            Stage::Landscape => "landscape",
             Stage::AppId => "app-id",
             Stage::Title => "title",
             Stage::Capture => "capture",
@@ -365,6 +371,7 @@ impl Stage {
             | Stage::Portrait
             | Stage::Tiled
             | Stage::Orientation
+            | Stage::Landscape
             | Stage::AppId
             | Stage::Title
             | Stage::Opening
@@ -509,6 +516,10 @@ const HWUI_FIXTURE: &str = "xtask-harness/testdata/window-hwui";
 const PORTRAIT_FIXTURE: &str = "xtask-harness/testdata/window-portrait";
 /// FIXTURE with no manifest orientation, requesting portrait at its first create (stage orientation): its java/ links to FIXTURE's.
 const ORIENTATION_FIXTURE: &str = "xtask-harness/testdata/window-orientation";
+/// FIXTURE fixed landscape in the manifest, no configChanges (stage landscape with `--declare-display`; rotation.rs).
+const LANDSCAPE_FIXTURE: &str = "xtask-harness/testdata/window-landscape";
+/// FIXTURE with no manifest orientation, requesting landscape at its first create (stage orientation with `--declare-display`; rotation.rs).
+const REQUEST_LANDSCAPE_FIXTURE: &str = "xtask-harness/testdata/window-request-landscape";
 /// The fixture's first onDraw on hwui's RecordingCanvas (Canvas.isHardwareAccelerated).
 const HARDWARE_DRAW_LINE: &str = "onDraw reached hardware=true";
 /// Scenes the compositor must present into the window before its readback (the fixture's first frame and a repaint).
@@ -613,6 +624,7 @@ fn marker(stage: Stage) -> &'static str {
         | Stage::Portrait
         | Stage::Tiled
         | Stage::Orientation
+        | Stage::Landscape
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -2540,6 +2552,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         | Stage::Portrait
         | Stage::Tiled
         | Stage::Orientation
+        | Stage::Landscape
         | Stage::AppId
         | Stage::Title
         | Stage::Splash
@@ -2684,8 +2697,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let rt = rt.with_monitor(start.to_arg());
     // the declared display is the move stage's: the break runs without it, so the run is judged against the declaration it did not get
     ensure!(
-        args.declare_display.is_none() || matches!(args.stage, Stage::Move | Stage::Opening),
-        "--declare-display is for stages move and opening only"
+        args.declare_display.is_none()
+            || matches!(
+                args.stage,
+                Stage::Move | Stage::Opening | Stage::Landscape | Stage::Orientation
+            ),
+        "--declare-display is for stages move, opening, landscape and orientation only"
     );
     ensure!(
         !args.user_resize || matches!(args.stage, Stage::Move),
@@ -2756,7 +2773,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         .as_ref()
         .filter(|_| matches!(args.stage, Stage::Move))
         .map(|n| n.output_display(1));
-    let fixture = fixture(args.stage);
+    let fixture = fixture(args.stage, args.declare_display.is_some());
     // the GLES2 fixture's library is built for the host arch (the identity guest), as its static gate builds it
     let native = match args.stage {
         Stage::Gles2 => Some(gles2_fixture::apk_libs(
@@ -3425,7 +3442,27 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         }
         (Stage::Orientation, Some(_)) => {
             let mut sub = vec![("mapped", gtk_window_check(&app))];
-            sub.extend(orientation_checks(&app, display));
+            if args.declare_display.is_some() {
+                sub.extend(rotation::orientation_checks(
+                    &app,
+                    &services,
+                    display,
+                    args.declare_display,
+                ));
+            } else {
+                sub.extend(orientation_checks(&app, display));
+            }
+            sub.push(("pong", pong_check(&liveness)));
+            sub
+        }
+        (Stage::Landscape, Some(_)) => {
+            let mut sub = vec![("mapped", gtk_window_check(&app))];
+            sub.extend(rotation::landscape_checks(
+                &app,
+                &services,
+                display,
+                args.declare_display,
+            ));
             sub.push(("pong", pong_check(&liveness)));
             sub
         }
@@ -3672,7 +3709,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
 }
 
 /// The stage's fixture dir.
-fn fixture(stage: Stage) -> &'static str {
+fn fixture(stage: Stage, declared: bool) -> &'static str {
     match stage {
         Stage::Widgets | Stage::Ime | Stage::MouseTouch => widgets::FIXTURE,
         Stage::Relaunch => SIZED_FIXTURE,
@@ -3688,7 +3725,9 @@ fn fixture(stage: Stage) -> &'static str {
         Stage::Gles2 => gles2_fixture::FIXTURE,
         Stage::Gles1 => gles1::FIXTURE,
         Stage::Portrait => PORTRAIT_FIXTURE,
+        Stage::Orientation if declared => REQUEST_LANDSCAPE_FIXTURE,
         Stage::Orientation => ORIENTATION_FIXTURE,
+        Stage::Landscape => LANDSCAPE_FIXTURE,
         Stage::AuxProcess => aux_process::FIXTURE,
         _ => FIXTURE,
     }
@@ -3899,7 +3938,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
     let rt = rt.with_app_env(&[format!("GDK_DEBUG={}", crate::gdk_dmabuf::GDK_DEBUG)]);
     let work = rt.out.join(&key);
     let apk = rt.apk.build(
-        &root.join(fixture(args.stage)),
+        &root.join(fixture(args.stage, args.declare_display.is_some())),
         &work.join("apk"),
         &[],
         None,

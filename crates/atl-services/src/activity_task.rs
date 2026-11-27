@@ -1006,22 +1006,28 @@ impl ActivityTasks {
     }
 
     /// setRequestedOrientation of `token`'s record (ActivityRecord.setRequestedOrientation -> setOrientation): the request becomes its mOrientation; when the record is its Task's top it is also the
-    /// Task's top orientation ([`Tasks::replace_top_orientation`]). Returns the record's Task and bounds input for the reshape check AOSP runs on every request
-    /// (notifyActivityRequestedOrientationChanged -> DesktopActivityOrientationChangeHandler); None when no record has the token.
+    /// Task's top orientation ([`Tasks::replace_top_orientation`]). Returns the record's Task, its bounds input for the reshape check AOSP runs on every request
+    /// (notifyActivityRequestedOrientationChanged -> DesktopActivityOrientationChangeHandler), and the orientation when the record is its Task's top (`Some`: the request the display turns
+    /// to); None when no record has the token.
     pub(crate) fn set_requested_orientation(
         &self,
         token: &SpIBinder,
         orientation: i32,
-    ) -> Option<(TaskId, ActivityInput)> {
+    ) -> Option<(TaskId, ActivityInput, Option<i32>)> {
         let mut m = self.machine();
         let owner = m.owner_mut(token)?;
         owner.orientation = orientation;
         let input = owner.bounds_input();
         let task = m.task_of(token)?;
-        if m.records(task).last().is_some_and(|(top, _)| top == token) {
+        let top = m
+            .records(task)
+            .last()
+            .is_some_and(|(top, _)| top == token)
+            .then_some(orientation);
+        if top.is_some() {
             self.tasks.replace_top_orientation(task, orientation);
         }
-        Some((task, input))
+        Some((task, input, top))
     }
 
     /// ActivityClientController.getRequestedOrientation:843-850: the record's mOrientation (no app-compat override is modelled), SCREEN_ORIENTATION_UNSPECIFIED for no record.
@@ -1032,12 +1038,12 @@ impl ActivityTasks {
     }
 
     /// DesktopActivityOrientationChangeHandler's task-info branch (`:72-81`): a new top activity whose orientation differs from the previous top's is checked as a request. When `token`'s record
-    /// is its Task's top and its orientation differs from the Task's top orientation at the last check, returns the Task and the record's bounds input; the check's value becomes the record's.
-    /// Called at each resume (the top changes by a push or by a finish, and the new top resumes either way).
-    pub(crate) fn top_orientation_changed(
+    /// is its Task's top: returns the Task, the record's bounds input, its orientation (the request the display turns to) and whether it differs from the Task's top orientation at the last
+    /// check (`changed`: the reshape's trigger). The check's value becomes the record's. Called at each resume (the top changes by a push or by a finish, and the new top resumes either way).
+    pub(crate) fn top_orientation_checked(
         &self,
         token: &SpIBinder,
-    ) -> Option<(TaskId, ActivityInput)> {
+    ) -> Option<(TaskId, ActivityInput, i32, bool)> {
         let m = self.machine();
         let task = m.task_of(token)?;
         let (top, owner) = m.records(task).last()?;
@@ -1045,7 +1051,8 @@ impl ActivityTasks {
             return None;
         }
         let before = self.tasks.replace_top_orientation(task, owner.orientation);
-        (before.is_some_and(|b| b != owner.orientation)).then(|| (task, owner.bounds_input()))
+        let changed = before.is_some_and(|b| b != owner.orientation);
+        Some((task, owner.bounds_input(), owner.orientation, changed))
     }
 
     /// Whether a record of `task` waits for its relaunch.

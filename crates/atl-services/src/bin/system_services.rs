@@ -106,6 +106,7 @@ struct Args {
     root_back: RootBack,
     /// Which windows an activity's fixed-orientation request (manifest screenOrientation of a new top activity, or setRequestedOrientation) reshapes: `every` (a portrait request turns a landscape
     /// window portrait, resizeable apps included: the desktop default) or `unresizeable` (AOSP desktop windowing: only non-resizeable activities; a resizeable one keeps its window).
+    /// Undeclared displays only: a declared display turns for the request (`--declare-display`, display_rotation.rs) and never reshapes.
     #[arg(long, value_parser = parse_orientation_reshape, default_value = "every")]
     orientation_reshape: OrientationReshape,
     /// The headless empty grace, ms (atld `--empty-process-grace-ms`): a process nothing holds ends this long after its last holding change, once its uid is idle (uid_state settle period).
@@ -325,6 +326,7 @@ fn main() -> Result<()> {
         Arc::clone(&process_control),
         Arc::clone(&tasks),
         Arc::clone(&agents),
+        Arc::clone(&display_callbacks),
         !a.no_back_finish,
         a.root_back,
         a.orientation_reshape,
@@ -733,7 +735,6 @@ fn main() -> Result<()> {
             Arc::clone(&agents),
             Arc::clone(&tasks),
             activity.clone(),
-            display_callbacks,
             key_maps,
         ),
     )
