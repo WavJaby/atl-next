@@ -81,7 +81,8 @@ pub trait WebView {
         script: &str,
         done: Box<dyn FnOnce(Result<String, String>) + Send>,
     );
-    /// Replaces the scripts injected at document start into every frame of every later load (an already loaded document keeps what it got).
+    /// Replaces this view's scripts injected at document start into every frame of every later load (an already loaded document keeps what it got). A source must be view-agnostic: the
+    /// backend may run one controller for several views (a popup shares its opener's), where a source any view holds runs in all of them.
     fn set_user_scripts(&self, sources: &[String]);
     /// Applies one engine-backed setting to the view; `value` has the kind of `which` ([`WebSetting::kind`]). The core stores every WebSettings value and calls this only for the ones WebKit has.
     fn set_setting(&self, which: WebSetting, value: &SettingValue);

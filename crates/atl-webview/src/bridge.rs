@@ -13,18 +13,29 @@ pub const MARKER: &str = "atl-javabridge:";
 /// The text a JavaScript exception thrown for a failed Java call carries (Chromium's wording).
 pub const JAVA_EXCEPTION: &str = "Java exception was raised during method invocation";
 
-/// The document-start script exposing `window[name]` with `methods`.
-pub fn script(name: &str, methods: &[String]) -> String {
-    let name_js = Value::String(name.to_owned()).to_string();
-    let methods_js = Value::from(methods.to_vec()).to_string();
+/// The message of the bootstrap's query prompt: the asking document's view answers [`interface_list`] of its own interfaces (WebView.java:1879: injected into all frames, each frame asks).
+pub const QUERY: &str = "atl-javabridge?";
+
+/// The one document-start script, identical for every view (all frames): asks its own view for its interfaces through `prompt` (the prompt reaches the asking document's view, not the
+/// controller's other views) and exposes `window[name]` for each. View-agnostic, so a script controller shared by several views (a popup's related view) gives each view exactly its own set.
+pub fn bootstrap() -> String {
     format!(
-        "(function(){{var P=window.prompt.bind(window),n={name_js},ms={methods_js},o={{}};\
-         ms.forEach(function(m){{o[m]=function(){{\
-         var r=P({marker}+JSON.stringify({{o:n,m:m,a:Array.prototype.slice.call(arguments)}}),'');\
-         if(r===null)return undefined;var v=JSON.parse(r);if('e' in v)throw new Error(v.e);return v.r;}};}});\
-         Object.defineProperty(window,n,{{value:o,configurable:true,writable:true}});}})();",
+        "(function(){{var P=window.prompt.bind(window),l=P({query},'');if(l===null)return;try{{l=JSON.parse(l)}}catch(e){{return}}         l.forEach(function(x){{var n=x[0],o={{}};x[1].forEach(function(m){{o[m]=function(){{         var r=P({marker}+JSON.stringify({{o:n,m:m,a:Array.prototype.slice.call(arguments)}}),'');         if(r===null)return undefined;var v=JSON.parse(r);if('e' in v)throw new Error(v.e);return v.r;}};}});         Object.defineProperty(window,n,{{value:o,configurable:true,writable:true}});}});}})();",
+        query = Value::String(QUERY.to_owned()),
         marker = Value::String(MARKER.to_owned())
     )
+}
+
+/// The query's answer: `[[name, [method, ...]], ...]` in `list` order.
+pub fn interface_list<'a>(list: impl IntoIterator<Item = (&'a str, &'a [String])>) -> String {
+    Value::from(
+        list.into_iter()
+            .map(|(name, methods)| {
+                Value::from(vec![Value::from(name), Value::from(methods.to_vec())])
+            })
+            .collect::<Vec<_>>(),
+    )
+    .to_string()
 }
 
 /// A parsed bridge call.
@@ -228,6 +239,19 @@ mod tests {
             })
         );
         assert_eq!(parse("hello"), None);
+    }
+
+    #[test]
+    fn interface_list_is_the_json_the_bootstrap_reads() {
+        let ms = ["f".to_owned(), "g".to_owned()];
+        assert_eq!(
+            interface_list([("A", &ms[..]), ("B", &[][..])]),
+            r#"[["A",["f","g"]],["B",[]]]"#
+        );
+        assert_eq!(interface_list([]), "[]");
+        // the query is not a call: a page prompt with it must not parse as one
+        assert_eq!(parse(QUERY), None);
+        assert!(bootstrap().contains(&Value::String(QUERY.to_owned()).to_string()));
     }
 
     #[test]

@@ -764,6 +764,16 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
                 atl_diag::count(atl_diag::DIVERGENCE, INTERCEPT_NO_CANCEL, None);
                 return;
             }
+            // the bootstrap's query: answered here on the display thread from the shared list (WTC R5: no wait on the WebView's thread); the set as of this document's start, as
+            // Android's "not until the page is next (re)loaded" (WebView.java:1888)
+            WebEvent::Prompt { message, reply, .. } if message == bridge::QUERY => {
+                let list = interfaces.lock().unwrap_or_else(|p| p.into_inner());
+                let answer = bridge::interface_list(
+                    list.iter().map(|(n, _, ms)| (n.as_str(), ms.as_slice())),
+                );
+                drop(list);
+                return reply.finish(Some(answer));
+            }
             WebEvent::Prompt {
                 message,
                 default,
@@ -1471,11 +1481,14 @@ fn box_arg(env: Env, a: bridge::Arg) -> Obj {
 }
 
 /// Rebuilds the document-start scripts from the interfaces (takes effect on the next load, as Android documents for addJavascriptInterface).
+/// The view's document-start scripts: the bootstrap while it has an interface, none otherwise (a page of a view without interfaces pays no query). The bootstrap reads the list itself.
 fn refresh_scripts(n: &Native) {
-    let scripts: Vec<String> = interfaces(&n.shared.interfaces)
-        .iter()
-        .map(|(name, _, ms)| bridge::script(name, ms))
-        .collect();
+    let any = !interfaces(&n.shared.interfaces).is_empty();
+    let scripts = if any {
+        vec![bridge::bootstrap()]
+    } else {
+        Vec::new()
+    };
     n.view.set_user_scripts(&scripts);
 }
 

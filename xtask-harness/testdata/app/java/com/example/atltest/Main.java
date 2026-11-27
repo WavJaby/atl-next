@@ -500,6 +500,115 @@ public class Main extends Activity {
         return "data:text/html;base64," + android.util.Base64.encodeToString(html.getBytes(java.nio.charset.StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
     }
 
+    /** An interface whose method records what the calling document saw; called on the JavaBridge thread. */
+    public static final class Seen {
+        final StringBuilder hits = new StringBuilder();
+        final Runnable onHit;
+        String step = "load";
+        int count;
+        Seen(Runnable onHit) { this.onHit = onHit; }
+        @android.webkit.JavascriptInterface
+        public void hit(String what) {
+            synchronized (this) {
+                hits.append(hits.length() == 0 ? "" : ",").append(step).append('-').append(what);
+                count++;
+            }
+            onHit.run();
+        }
+        synchronized int count() { return count; }
+    }
+
+    /** One page reporting, for its top document and an iframe, which of atlA / atlB it has; each frame calls its own view's object. */
+    static String bridgeViewsPage(String title) {
+        String probe = "var s=(window.atlA?'A':'')+(window.atlB?'B':'');var o=window.atlA||window.atlB;if(o)o.hit(T+':'+(s||'-'));";
+        return "<html><head><title>" + title + "</title></head><body><script>var T='top';" + probe + "</script>"
+                + "<iframe srcdoc=\"<script>var T='frame';" + probe + "</script>\"></iframe></body></html>";
+    }
+
+    /**
+     * The bridge isolation line (app.rs WEBVIEW_BRIDGE_VIEWS): two WebViews on the same URL, one with atlA, one with atlB. AOSP: an object is injected into its own WebView, into all frames
+     * including iframes (WebView.java:1879), and appears after the next (re)load (:1888); so each view's top document and iframe see exactly its own object on the first load, a reload and
+     * a navigation to another page.
+     */
+    private void webViewBridgeViews() {
+        try {
+            final String p1 = dataUrl(bridgeViewsPage("v1"));
+            final String p2 = dataUrl(bridgeViewsPage("v2"));
+            final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+            final android.webkit.WebView[] views = new android.webkit.WebView[2];
+            final Seen[] seen = new Seen[2];
+            final boolean[] logged = new boolean[1];
+            for (int i = 0; i < 2; i++) {
+                final int k = i;
+                seen[k] = new Seen(new Runnable() {
+                    @Override public void run() {
+                        ui.post(new Runnable() {
+                            @Override public void run() {
+                                Seen me = seen[k];
+                                int c = me.count();
+                                // two hits (top + frame) per step: load -> reload -> nav -> done
+                                if (c == 2 && me.step.equals("load")) {
+                                    synchronized (me) { me.step = "reload"; }
+                                    views[k].reload();
+                                } else if (c == 4 && me.step.equals("reload")) {
+                                    synchronized (me) { me.step = "nav"; }
+                                    views[k].loadUrl(p2);
+                                } else if (seen[0].count() >= 6 && seen[1].count() >= 6 && !logged[0]) {
+                                    logged[0] = true;
+                                    String a, b;
+                                    synchronized (seen[0]) { a = seen[0].hits.toString(); }
+                                    synchronized (seen[1]) { b = seen[1].hits.toString(); }
+                                    Log.i("AtlTest", "webview-bridge-views: a=" + a + " b=" + b);
+                                }
+                            }
+                        });
+                    }
+                });
+                views[k] = new android.webkit.WebView(this);
+                views[k].getSettings().setJavaScriptEnabled(true);
+                views[k].addJavascriptInterface(seen[k], k == 0 ? "atlA" : "atlB");
+                mThreadViews.add(views[k]);
+            }
+            views[0].loadUrl(p1);
+            views[1].loadUrl(p1);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-bridge-views: threw=" + e);
+        }
+    }
+
+    /**
+     * The bridge latency line (app.rs WEBVIEW_BRIDGE_LATENCY, measured, not judged): one WebView with an interface loads the same page 12 times; per load onPageStarted -> onPageFinished on
+     * its Looper, the first load dropped (engine warm-up); prints the median and every sample in microseconds.
+     */
+    private void webViewBridgeLatency() {
+        try {
+            final String page = dataUrl("<html><head><title>lat</title></head><body><script>var x=typeof atl;</script><p>lat</p></body></html>");
+            final android.webkit.WebView w = new android.webkit.WebView(this);
+            final long[] start = new long[1];
+            final java.util.List<Long> us = new java.util.ArrayList<>();
+            w.getSettings().setJavaScriptEnabled(true);
+            w.addJavascriptInterface(new Bridge(), "atl");
+            w.setWebViewClient(new android.webkit.WebViewClient() {
+                @Override public void onPageStarted(android.webkit.WebView view, String url, android.graphics.Bitmap favicon) { start[0] = System.nanoTime(); }
+                @Override public void onPageFinished(android.webkit.WebView view, String url) {
+                    us.add((System.nanoTime() - start[0]) / 1000);
+                    if (us.size() < 12) {
+                        view.loadUrl(page);
+                        return;
+                    }
+                    java.util.List<Long> s = new java.util.ArrayList<>(us.subList(1, us.size()));
+                    java.util.Collections.sort(s);
+                    long median = s.get(s.size() / 2);
+                    Log.i("AtlTest", "webview-bridge-latency: loads=" + s.size() + " median-us=" + median + " samples-us=" + us.subList(1, us.size()));
+                }
+            });
+            mThreadViews.add(w);
+            w.loadUrl(page);
+        } catch (Throwable e) {
+            Log.i("AtlTest", "webview-bridge-latency: threw=" + e);
+        }
+    }
+
     /** webViewReenter's record (main Looper only). */
     static final class Reenter {
         String p1, p2, afterLoad, override;
@@ -763,6 +872,8 @@ public class Main extends Activity {
                         webViewReenter();
                         webViewSlowCallback();
                         webViewLooperThread();
+                        webViewBridgeViews();
+                        webViewBridgeLatency();
                         Log.i("AtlTest", "webview-classloader: " + webViewClassLoader());
                     }
                 });

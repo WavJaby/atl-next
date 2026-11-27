@@ -136,7 +136,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-threads, webview-reenter, webview-slow-callback, webview-looper-thread, webview-classloader",
+        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-threads, webview-reenter, webview-bridge-views, webview-bridge-latency, webview-slow-callback, webview-looper-thread, webview-classloader",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -683,6 +683,25 @@ const WEBVIEW_LOOPER_THREAD: Line = Line {
     want: Want::Exact("looper=ht override=wv started=wv finished=wv title=wv progress=wv eval=wv"),
     timing: Timing::Async,
 };
+/// Main.webViewBridgeViews' line: two WebViews on one URL, one with atlA, one with atlB; each view's top document and iframe see only its own object (WebView.java:1879 "injected into all
+/// frames of the web page, including all the iframes"; :1888 "will not appear in JavaScript until the page is next (re)loaded"), on the first load, a reload and a navigation. Each frame
+/// reports through its own view's object, so a frame without it leaves no hit and the line never comes. The backend builds every view on one script controller, so a source installed per
+/// interface would show `AB` in both views.
+const WEBVIEW_BRIDGE_VIEWS: Line = Line {
+    row: "webview-bridge-views",
+    prefix: "AtlTest: webview-bridge-views: ",
+    want: Want::Exact(
+        "a=load-top:A,load-frame:A,reload-top:A,reload-frame:A,nav-top:A,nav-frame:A b=load-top:B,load-frame:B,reload-top:B,reload-frame:B,nav-top:B,nav-frame:B",
+    ),
+    timing: Timing::Async,
+};
+/// Main.webViewBridgeLatency's line: 11 timed loads of one page in a WebView with an interface (median and samples, microseconds). Measured, not judged: only the load count is.
+const WEBVIEW_BRIDGE_LATENCY: Line = Line {
+    row: "webview-bridge-latency",
+    prefix: "AtlTest: webview-bridge-latency: ",
+    want: Want::Prefix("loads=11 "),
+    timing: Timing::Async,
+};
 /// Main.webViewScale's line: setInitialScale(200) -> 200 % = 2 device pixels per CSS pixel whatever the screen density (WebView.java:1184-1188), the page's devicePixelRatio.
 const WEBVIEW_SCALE: Line = Line {
     row: "webview-scale",
@@ -821,7 +840,7 @@ struct Line {
 /// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. The STICKY restart and the NOT_STICKY process are judged by [`StickyCase`], from their own processes' logs.
 /// fgsnotype: Main.foregroundStarts' AtlFgsNoType (targetSdk 36, no foregroundServiceType, main process): startForeground without a type throws `Starting FGS without a type` (AS :2883-2886); the line carries the message's start.
 /// The `fgs` and `fgstimeout` rows are [`ForegroundCase`]'s, from their own processes' logs.
-const LOG_LINES: [Line; 33] = [
+const LOG_LINES: [Line; 35] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -920,6 +939,8 @@ const LOG_LINES: [Line; 33] = [
     WEBVIEW_HTTP,
     WEBVIEW_THREADS,
     WEBVIEW_REENTER,
+    WEBVIEW_BRIDGE_VIEWS,
+    WEBVIEW_BRIDGE_LATENCY,
     WEBVIEW_SLOW_CALLBACK,
     WEBVIEW_LOOPER_THREAD,
     WEBVIEW_CLASSLOADER,

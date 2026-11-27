@@ -116,11 +116,63 @@ struct View {
     events: Rc<Events>,
     /// `view_create`'s `shown`: the widget now, null at `view_drop`.
     shown: SendCallback<*mut c_void>,
+    /// This view's references in [`SCRIPTS`] (`view_set_user_scripts`' last sources), released at retirement.
+    scripts: Vec<String>,
+}
+
+/// The one script controller every view is built on, shared as a popup's related view must share its opener's. A source is in it while any view holds it (count), so no view's
+/// update removes another view's script; the core's sources are view-agnostic (atl-webview bridge bootstrap), each document asking its own view.
+struct Scripts {
+    ucm: webkit6::UserContentManager,
+    held: HashMap<String, (webkit6::UserScript, u32)>,
+}
+
+impl Scripts {
+    fn hold(&mut self, src: &str) {
+        let ucm = &self.ucm;
+        self.held
+            .entry(src.to_owned())
+            .or_insert_with(|| {
+                let script = webkit6::UserScript::new(
+                    src,
+                    webkit6::UserContentInjectedFrames::AllFrames,
+                    webkit6::UserScriptInjectionTime::Start,
+                    &[],
+                    &[],
+                );
+                ucm.add_script(&script);
+                (script, 0)
+            })
+            .1 += 1;
+    }
+
+    fn release(&mut self, src: &str) {
+        let Some((script, n)) = self.held.get_mut(src) else {
+            return tracing::warn!("webview: release of a script no view holds; ignored");
+        };
+        *n -= 1;
+        if *n == 0 {
+            self.ucm.remove_script(script);
+            self.held.remove(src);
+        }
+    }
 }
 
 thread_local! {
     /// The live views by key; filled and read on the display thread only.
     static VIEWS: RefCell<HashMap<i32, View>> = RefCell::default();
+    /// Made with the first view (after GTK init), on the display thread only.
+    static SCRIPTS: RefCell<Option<Scripts>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` on [`SCRIPTS`], made on first use.
+fn with_scripts<R>(f: impl FnOnce(&mut Scripts) -> R) -> R {
+    SCRIPTS.with_borrow_mut(|s| {
+        f(s.get_or_insert_with(|| Scripts {
+            ucm: webkit6::UserContentManager::new(),
+            held: HashMap::new(),
+        }))
+    })
 }
 
 /// Runs `f` with `key`'s view on the display thread ([`on_display`]); a key with no view there (creation failed, already dropped) is logged and `f` dropped. The view is cloned out of
@@ -472,7 +524,17 @@ fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<
     let widget: *mut webkit6::gtk::ffi::GtkWidget =
         web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
     shown.call(&widget.cast());
-    VIEWS.with_borrow_mut(|m| m.insert(key, View { web, events, shown }));
+    VIEWS.with_borrow_mut(|m| {
+        m.insert(
+            key,
+            View {
+                web,
+                events,
+                shown,
+                scripts: Vec::new(),
+            },
+        )
+    });
 }
 
 /// The engine defaults and the event sink; no signal connected yet ([`connect_view`]).
@@ -480,6 +542,7 @@ fn build_view(events: SendCallback<WebEventView>) -> (webkit6::WebView, Rc<Event
     // autoplay is the app's setting alone (WebSettings.setMediaPlaybackRequiresUserGesture -> media-playback-requires-user-gesture): WebKit's own policy, ALLOW_WITHOUT_SOUND by default,
     // would refuse an audible play() the app allowed (NotAllowedError), which Android's WebView plays. Construct-only on the view, so set here once.
     let web = webkit6::WebView::builder()
+        .user_content_manager(&with_scripts(|s| s.ucm.clone()))
         .website_policies(
             &webkit6::WebsitePolicies::builder()
                 .autoplay(webkit6::AutoplayPolicy::Allow)
@@ -610,10 +673,12 @@ fn connect_view(web: &webkit6::WebView, events: &Rc<Events>) {
             .prompt_get_default_text()
             .map(|m| m.to_string())
             .unwrap_or_default();
-        // answered asynchronously (WebKit keeps the dialog pending while a ref is held and close is not called); the answer may come from any thread, so it hops back to the main context
+        // answered asynchronously (WebKit keeps the dialog pending while a ref is held and close is not called); the answer may come from any thread, so it hops back to the main context.
+        // Always a later dispatch, never `invoke`: an answer given inside this handler (the bridge query is answered on D at once) closed the dialog before the handler returned, and
+        // WebKit's unref after it crashed (webkit_script_dialog_unref).
         let held = glib::thread_guard::ThreadGuard::new(dialog.clone());
         let reply = ReplyAbi::new(move |text: Option<String>| {
-            glib::MainContext::default().invoke(move || {
+            glib::idle_add_once(move || {
                 let d = held.into_inner();
                 if let Some(t) = text {
                     d.prompt_set_text(&t);
@@ -639,6 +704,7 @@ unsafe extern "C" fn view_drop(key: i32) {
 /// Retires `v` on D: its sources go silent first, then the widget is detached (`shown(null)`) and the page closed, so nothing from `v` reaches the sink after the detach.
 fn retire_view(mut v: View) {
     v.events.retire();
+    with_scripts(|s| v.scripts.iter().for_each(|src| s.release(src)));
     v.shown.call(&std::ptr::null_mut());
     v.web.try_close();
 }
@@ -738,20 +804,18 @@ unsafe extern "C" fn view_set_user_scripts(key: i32, sources: *const Str, len: u
         // SAFETY: as above.
         .map(|s| unsafe { s.get() }.into_owned())
         .collect();
-    on_view(key, "set_user_scripts", move |web, _| {
-        let Some(ucm) = web.user_content_manager() else {
-            return;
+    on_display(move || {
+        let Some(old) = VIEWS.with_borrow_mut(|m| {
+            m.get_mut(&key)
+                .map(|v| std::mem::replace(&mut v.scripts, sources.clone()))
+        }) else {
+            return tracing::warn!("webview[{key}]: set_user_scripts for no view; ignored");
         };
-        ucm.remove_all_scripts();
-        for src in &sources {
-            ucm.add_script(&webkit6::UserScript::new(
-                src,
-                webkit6::UserContentInjectedFrames::AllFrames,
-                webkit6::UserScriptInjectionTime::Start,
-                &[],
-                &[],
-            ));
-        }
+        // hold the new before releasing the old: a source in both stays installed
+        with_scripts(|s| {
+            sources.iter().for_each(|src| s.hold(src));
+            old.iter().for_each(|src| s.release(src));
+        });
     });
 }
 
