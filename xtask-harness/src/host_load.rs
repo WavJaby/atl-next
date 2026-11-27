@@ -9,6 +9,8 @@
 //! Cases and their expected outcomes ([`Case::expect`]): starved -> undecided (exit 4); no event, no load -> FAIL; worker asleep under load -> FAIL (a sleeper adds no stall);
 //! crash under load -> FAIL (a death); wrong value under load -> FAIL; self-inflicted (64 spinners in the case's own scope, no burners) -> FAIL (own CPU, not foreign); late on a quiet host
 //! (sleeps past the bound, then works) -> FAIL; pass under equal-weight load -> pass. Without `--case` the gate runs every case and passes when each ends as expected.
+//! A case the rule excused on measured foreign stall (the host's own work on the CPU broke the case's premise, e.g. self-inflicted beside a parallel build) judged nothing: the gate is then
+//! undecided with that ruling (check_gates reruns it alone), never red and never a pass; any case that ended otherwise unexpected still fails it.
 //! A FAIL case must end red with its expected cause on its own stdout line ([`CAUSE_PREFIX`]: `late`, `exited`, `wrong`). Any other exit 1 (a burner or the worker that did not start) fails the row.
 //! `--break burner-start` refuses the burners' CPUWeight: every burning case must then fail the gate.
 //! `--break leak` leaves a process running in each case: each case must then end in the leftover verdict (main.rs; tests/gate_leftovers.rs runs one case both ways).
@@ -365,6 +367,7 @@ fn every(brk: Option<Break>) -> Result<ExitCode> {
         .context("an empty CPU set")?;
     let exe = std::env::current_exe().context("the harness's own path")?;
     let mut fails = Vec::new();
+    let mut undecided = Vec::new();
     for case in Case::ALL {
         let mut child = Command::new("taskset");
         child.args(["-c", &cpu.to_string()]);
@@ -394,6 +397,16 @@ fn every(brk: Option<Break>) -> Result<ExitCode> {
         let want = case.expect();
         if got == Some(want) {
             println!("host-load: case {} {want:?} as expected", case.name());
+        } else if got == Some(Outcome::Undecided)
+            && let Ok(Some(ruling)) =
+                xtask::harness::undecided_verdict(&String::from_utf8_lossy(&out.stdout))
+        {
+            // the rule excused the case's wait on its measured foreign stall: the host broke the case's premise, so it judged nothing (neither its red nor a pass)
+            println!(
+                "host-load: case {} undecided, want {want:?}: {ruling}",
+                case.name()
+            );
+            undecided.push((case, ruling));
         } else {
             fails.push(format!(
                 "case {}: want {want:?}, got {:?} ({})",
@@ -402,6 +415,16 @@ fn every(brk: Option<Break>) -> Result<ExitCode> {
                 out.status
             ));
         }
+    }
+    if fails.is_empty()
+        && let Some((case, ruling)) = undecided.first()
+    {
+        // every other case ended as expected; check_gates reruns an undecided row alone
+        return Ok(starvation::undecided(
+            "host-load",
+            &format!("case {}", case.name()),
+            ruling,
+        ));
     }
     if fails.is_empty() {
         println!(
