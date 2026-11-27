@@ -48,6 +48,7 @@ static VTABLE: UiVtable = UiVtable {
     window_capture,
     window_on_resize,
     window_on_close_requested,
+    window_on_placed,
     window_on_monitor,
     window_request_frame,
     window_frame_requester,
@@ -330,6 +331,11 @@ unsafe extern "C" fn window_on_monitor(w: *mut WindowHandle, mut f: Callback<Mon
 unsafe extern "C" fn window_on_close_requested(w: *mut WindowHandle, mut f: Callback<()>) {
     // SAFETY: a live window.
     unsafe { win(w) }.on_close_requested(move || f.call(&()))
+}
+
+unsafe extern "C" fn window_on_placed(w: *mut WindowHandle, mut f: Callback<()>) {
+    // SAFETY: a live window.
+    unsafe { win(w) }.on_placed(move || f.call(&()))
 }
 
 unsafe extern "C" fn window_request_frame(w: *mut WindowHandle) {

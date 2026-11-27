@@ -102,7 +102,7 @@ struct TaskInfo {
 }
 
 /// Physical pixels per desktop logical pixel at `dpi`: 1 dp is 1 logical pixel. The one conversion (a per-app density multiplier would divide here).
-fn window_scale(dpi: i32) -> Option<Scale> {
+pub(crate) fn window_scale(dpi: i32) -> Option<Scale> {
     Scale::new(f64::from(dpi) / f64::from(DENSITY_DEFAULT))
 }
 
@@ -257,6 +257,14 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
             Arc::clone(&reports),
             outbox,
         )?;
+        // the window's display before REGISTER, so before bindApplication: its first commit answered and the monitor it entered adopted (task_reports.rs wait_settled)
+        let waited = Instant::now();
+        reports.wait_settled();
+        tracing::info!(
+            "atl-composer: ui: display settled after {} us: {}",
+            waited.elapsed().as_micros(),
+            composer.display().to_arg()
+        );
         Some(reports)
     } else {
         let first_frame = input_tx.clone();

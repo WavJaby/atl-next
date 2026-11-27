@@ -52,6 +52,14 @@ impl<T: ?Sized> Slot<T> {
     }
 }
 
+/// The window's first commit and the desktop's answer to it ([`Window::on_placed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    Unpainted,
+    Syncing,
+    Placed,
+}
+
 /// State shared between the window handle and the toolkit's signal closures.
 struct Shared {
     on_tick: Slot<dyn FnMut(FrameTick)>,
@@ -63,6 +71,9 @@ struct Shared {
     size: Cell<Option<PhysSize>>,
     on_monitor: Slot<dyn FnMut(Monitor)>,
     on_close_requested: Slot<dyn FnMut()>,
+    on_placed: Slot<dyn FnMut()>,
+    /// Where the first commit's answer stands ([`Shared::place`]).
+    placed: Cell<Placement>,
     /// The monitor entered last, with the handlers of its change notifications (disconnected when another is entered).
     monitor: RefCell<Option<(gdk::Monitor, Vec<glib::SignalHandlerId>)>>,
     /// The window surface's scale (GdkSurface `scale`: wp_fractional_scale_v1's preferred scale once it arrived), None before realise: the monitor report's density scale ([`reported_monitor`]).
@@ -110,6 +121,34 @@ impl Shared {
             );
         }
         samples.into_iter().map(|s| clock.map(s, now)).collect()
+    }
+
+    /// After the first paint of the mapped surface (its first buffer committed): a roundtrip on the surface's queue from the next idle, outside the frame cycle. A compositor handles the commit before the
+    /// later sync, and wlroots' scene sends the surface's enter inside that commit's handling (wlr_compositor.c surface_commit_state: role commit -> map -> labwc enables the node, then the commit signal ->
+    /// buffer set -> wlr_scene.c update_node_update_outputs -> output_enter), so the roundtrip dispatches any enter (-> `on_monitor`) before its `done` (surface_sync.rs). Then `on_placed`.
+    /// A failed roundtrip is logged and places at once: the window is then treated as on no monitor until an enter comes.
+    fn place(self: &Rc<Self>, surface: gdk::Surface) {
+        if self.placed.get() != Placement::Unpainted {
+            return;
+        }
+        self.placed.set(Placement::Syncing);
+        let shared = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            // the default queue first, as GDK's own source dispatches: `preferred_scale` (sent with the enter) is on it, so the enter reports the monitor at the fractional scale, not GDK's integer guess (F3)
+            surface.display().sync();
+            if let Err(e) = crate::surface_sync::roundtrip(&surface) {
+                tracing::warn!("atl-platform-ui: placement roundtrip: {e}");
+            }
+            shared.placed.set(Placement::Placed);
+            tracing::info!(
+                "atl-platform-ui: placed on_monitor={}",
+                shared.monitor.borrow().is_some()
+            );
+            shared.on_placed.call(|f| f());
+        });
     }
 
     /// `t` (toolkit ms) of a single `kind` event on CLOCK_MONOTONIC ns.
@@ -255,7 +294,17 @@ impl GtkWindow {
             let on_after_paint = Rc::clone(&shared);
             let granted_view = view.clone();
             clock.connect_after_paint(move |_| {
-                on_after_paint.painted(granted_view.upgrade().as_ref());
+                // the first paint of a mapped surface: its commit carried the first buffer (a paint before the first configure commits none)
+                let view = granted_view.upgrade();
+                let mapped = view
+                    .as_ref()
+                    .and_then(|v| v.native())
+                    .and_then(|n| n.surface())
+                    .filter(|s| s.is_mapped());
+                if let Some(surface) = mapped {
+                    on_after_paint.place(surface);
+                }
+                on_after_paint.painted(view.as_ref());
                 on_after_paint.report_presented();
                 let now = monotonic_ns();
                 let after = on_after_paint.paint_end.take().map(|end| now - end);
@@ -660,6 +709,8 @@ impl Window for GtkWindow {
             touch_ids: RefCell::default(),
             on_monitor: Slot::new(),
             on_close_requested: Slot::new(),
+            on_placed: Slot::new(),
+            placed: Cell::new(Placement::Unpainted),
             monitor: RefCell::new(None),
             surface_scale: Cell::new(None),
             on_painted: Slot::new(),
@@ -930,6 +981,13 @@ impl Window for GtkWindow {
         self.shared
             .on_close_requested
             .set(Box::new(on_close_requested));
+    }
+
+    fn on_placed<F: FnMut() + 'static>(&self, on_placed: F) {
+        self.shared.on_placed.set(Box::new(on_placed));
+        if self.shared.placed.get() == Placement::Placed {
+            self.shared.on_placed.call(|f| f());
+        }
     }
 
     fn on_monitor<F: FnMut(Monitor) + 'static>(&self, on_monitor: F) {

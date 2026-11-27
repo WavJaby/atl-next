@@ -246,6 +246,10 @@ pub trait Window: FrameClock + InputSource + Sized {
     /// Calls `on_close_requested` each time the desktop asks to close the window (its close button, a shortcut; Wayland `xdg_toplevel.close`), replacing the previous callback.
     /// The toolkit never closes the window itself: the caller removes it (Android ends the Task and its process).
     fn on_close_requested<F: FnMut() + 'static>(&self, on_close_requested: F);
+
+    /// Calls `on_placed` once the desktop has answered the window's first commit (Wayland: a `wl_display.sync` after it returned): every monitor entry that commit brought was reported to
+    /// [`Window::on_monitor`] before it. No entry by then: the window is on no monitor now (a hidden workspace) and reports one when it enters. Called at once if that already happened.
+    fn on_placed<F: FnMut() + 'static>(&self, on_placed: F);
 }
 
 /// Window content pixels, as [`Window::capture`] returns them.

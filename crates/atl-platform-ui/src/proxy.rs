@@ -263,6 +263,10 @@ impl Window for PlatformWindow {
             on_close_requested()
         })
     }
+
+    fn on_placed<F: FnMut() + 'static>(&self, mut on_placed: F) {
+        self.set(self.vt.window_on_placed, move |_: &()| on_placed())
+    }
 }
 
 /// [`FrameClock::request_frame`] from any thread.

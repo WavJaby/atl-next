@@ -250,6 +250,9 @@ pub struct AtMap {
     /// Configures of the compositor rewritten, the injected one included.
     pinned: AtomicU64,
     held_scales: AtomicU64,
+    /// The window surface's `wl_surface.enter` is held until [`Proxy::release_enter`] ([`Proxy::hold_enter`]).
+    holding_enter: AtomicBool,
+    held_enters: AtomicU64,
 }
 
 impl AtMap {
@@ -261,6 +264,11 @@ impl AtMap {
     /// The last window geometry set.
     pub fn last(&self) -> Option<(i32, i32)> {
         self.last.lock().ok().and_then(|g| *g)
+    }
+
+    /// `wl_surface.enter` events of the window surface held so far ([`Proxy::hold_enter`]).
+    pub fn held_enters(&self) -> u64 {
+        self.held_enters.load(Ordering::Relaxed)
     }
 
     /// (configures pinned, `preferred_scale` events held) so far: 0 pinned means the policy never reached the client.
@@ -305,6 +313,8 @@ const XDG_TOPLEVEL_SET_MINIMIZED: u16 = 13;
 /// `wl_surface.attach(buffer, x, y)` request 1 (a null buffer unmaps), `commit` request 6 (wayland.xml).
 const WL_SURFACE_ATTACH: u16 = 1;
 const WL_SURFACE_COMMIT: u16 = 6;
+/// wayland.xml `wl_surface` event 0 `enter(output)`.
+const WL_SURFACE_ENTER: u16 = 0;
 /// fractional-scale-v1.xml: `wp_fractional_scale_manager_v1.get_fractional_scale(new_id, surface)` request 1; `wp_fractional_scale_v1.preferred_scale(scale)` event 0.
 const FRACTIONAL_SCALE_MANAGER: &str = "wp_fractional_scale_manager_v1";
 const GET_FRACTIONAL_SCALE: u16 = 1;
@@ -812,6 +822,17 @@ impl Proxy {
         }
     }
 
+    /// The window surface's `wl_surface.enter` events are held until [`Proxy::release_enter`]: a window on no output at its first commit (a hidden workspace). Call before the client connects.
+    pub fn hold_enter(&self) {
+        self.at_map.holding_enter.store(true, Ordering::Relaxed);
+    }
+
+    /// The held enters go out, in order.
+    pub fn release_enter(&self) -> Result<()> {
+        self.at_map.holding_enter.store(false, Ordering::Relaxed);
+        wake_all(&self.wakes)
+    }
+
     /// The map's record, valid after the proxy moves.
     pub fn at_map(&self) -> Arc<AtMap> {
         Arc::clone(&self.at_map)
@@ -1226,6 +1247,8 @@ fn server_to_client(
     let mut held = Held::default();
     // the window's last `preferred_scale` before its map (FloatAtMap::Hold): goes out once the window has mapped
     let mut held_scale: Option<Vec<u8>> = None;
+    // the window surface's enters while [`Proxy::hold_enter`] holds them, in order
+    let mut held_enter: Vec<u8> = Vec::new();
     // each wl_output's geometry and mode until its scale or done ([`scale_first`])
     let mut output_info: HashMap<u32, Vec<u8>> = HashMap::new();
     loop {
@@ -1351,6 +1374,10 @@ fn server_to_client(
                         held_scale = Some(self::event(object, opcode, body));
                         return;
                     }
+                    MapEdit::HoldEnter => {
+                        held_enter.extend(self::event(object, opcode, body));
+                        return;
+                    }
                     MapEdit::Replace(bytes) => {
                         out.extend(bytes);
                         return;
@@ -1407,6 +1434,20 @@ fn server_to_client(
             && let Some(scale) = held_scale.take()
         {
             forward(client.as_fd(), &scale, &mut Vec::new())?;
+        }
+        if !held_enter.is_empty()
+            && !ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ids poisoned"))?
+                .at_map
+                .holding_enter
+                .load(Ordering::Relaxed)
+        {
+            forward(
+                client.as_fd(),
+                &std::mem::take(&mut held_enter),
+                &mut Vec::new(),
+            )?;
         }
         // only the window's connection takes injections: the first one to create an xdg_toplevel claims them until it ends ([`WindowRelease`]).
         // Every connection is woken per injection, so "has bound xdg_wm_base" raced: a windowless one (another process, or one that binds wm_base and never maps) took the queue and dropped the configure / tap -- drive gate's "no configure ack" and "no frame" (tap lost -> app idle).
@@ -1590,6 +1631,8 @@ enum MapEdit {
     Drop,
     /// Goes out after the map, the last one only.
     Hold,
+    /// The window surface's enter: goes out at [`Proxy::release_enter`], every one in order.
+    HoldEnter,
     Replace(Vec<u8>),
 }
 
@@ -1604,6 +1647,8 @@ struct MapView {
     mapped: bool,
     /// The window surface's `wp_fractional_scale_v1`s.
     scales: Vec<u32>,
+    /// The window's `wl_surface`, once its xdg role names it.
+    surface: Option<u32>,
     at_map: Arc<AtMap>,
 }
 
@@ -1628,11 +1673,19 @@ impl MapView {
                 .filter(|(_, s)| ids.surface.is_none_or(|w| w == *s))
                 .map(|(scale, _)| *scale)
                 .collect(),
+            surface: ids.surface,
             at_map: Arc::clone(&ids.at_map),
         }
     }
 
     fn edit(&self, object: u32, opcode: u16, body: &[u8]) -> MapEdit {
+        if opcode == WL_SURFACE_ENTER
+            && self.surface == Some(object)
+            && self.at_map.holding_enter.load(Ordering::Relaxed)
+        {
+            self.at_map.held_enters.fetch_add(1, Ordering::Relaxed);
+            return MapEdit::HoldEnter;
+        }
         if self.policy == FloatAtMap::Off {
             return MapEdit::Pass;
         }

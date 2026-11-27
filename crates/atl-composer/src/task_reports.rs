@@ -6,11 +6,11 @@
 //! One window per process, so one Task: a different number named later is refused, and nothing is ever sent under the first Task's number for it.
 //! The desktop closing the window is `REMOVE_TASK`, the Shell's removeTask: sent after any pending size, once per close request.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::host::Composer;
 use crate::start::IRegistry;
-use atl_platform_ui::{LooperPoster, PhysSize};
+use atl_platform_ui::{LooperPoster, PhysSize, Scale};
 use atl_services_types::compositor_registry::{REMOVE_TASK, REPORT_MONITOR, SERVICE, SET_BOUNDS};
 use atl_services_types::display_model::DisplayModel;
 use binder::binder_impl::IBinderInternal;
@@ -20,25 +20,57 @@ use binder::{SpIBinder, Strong};
 #[derive(Default)]
 struct Pending {
     task: Option<i32>,
-    size: Option<PhysSize>,
+    /// The content size and the window scale it was measured at; converted to the display's pixels only when sent ([`Measured::at`]).
+    size: Option<Measured>,
     monitor: Option<DisplayModel>,
     /// The desktop asked to close the window; requests before the send coalesce into one.
     remove: bool,
     /// A flush is posted to the outbox and has not yet found nothing left to send.
     flushing: bool,
+    /// The desktop answered the window's first commit (`Window::on_placed`): any monitor it entered then is in `monitor` or sent.
+    placed: bool,
+    /// A monitor is taken and its answer not yet adopted.
+    monitor_sending: bool,
+}
+
+/// A size as the window measured it: physical px at the window's scale then. Before the window's opening is granted that scale is the opening's (TASK_INFO, the display at process start),
+/// which on another monitor's density is not the display the services answer for the window's monitor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Measured {
+    px: PhysSize,
+    scale: Scale,
+}
+
+impl Measured {
+    /// The size in `display`'s pixels: the logical size (dp) the window has, at the display's scale. The display is the composer's, adopted from the services' monitor answer, so a size sent
+    /// after that answer is in the window's monitor's pixels whatever scale it was measured at. break `size-at-measured-scale`: the measured px as they are.
+    fn at(self, display: &DisplayModel) -> PhysSize {
+        let Some(to) = crate::start::window_scale(display.dpi) else {
+            return self.px;
+        };
+        if cfg!(feature = "break-size-at-measured-scale") || to == self.scale {
+            return self.px;
+        }
+        let side = |v: u32| to.to_physical(self.scale.to_logical(f64::from(v))).round() as u32;
+        PhysSize {
+            width: side(self.px.width),
+            height: side(self.px.height),
+        }
+    }
 }
 
 /// One report, taken from [`Pending`].
 enum Report {
     Monitor(DisplayModel),
-    Size(i32, PhysSize),
+    Size(i32, Measured),
     RemoveTask(i32),
 }
 
 impl Pending {
     /// The next report to send: the monitor first (it needs no Task number), then the size and the removal once the Task is named.
     fn take(&mut self) -> Option<Report> {
-        if let Some(monitor) = self.monitor.take() {
+        if let Some(monitor) = self.take_monitor() {
+            self.monitor_sending = true;
             return Some(Report::Monitor(monitor));
         }
         let task = self.task?;
@@ -48,10 +80,30 @@ impl Pending {
         std::mem::take(&mut self.remove).then_some(Report::RemoveTask(task))
     }
 
+    /// Whether the pending monitor may go now. break `bind-before-placed` (with start.rs not waiting): it waits for the Task (named at the first window add), so the app binds on the start
+    /// monitor by construction and the report relaunches it.
+    fn monitor_sendable(&self) -> bool {
+        self.monitor.is_some()
+            && !(cfg!(feature = "break-bind-before-placed") && self.task.is_none())
+    }
+
+    /// The window's display is settled for binding: the first commit answered, and the monitor it entered (if any) sent and its answer adopted.
+    fn settled(&self) -> bool {
+        self.placed && self.monitor.is_none() && !self.monitor_sending
+    }
+
+    fn take_monitor(&mut self) -> Option<DisplayModel> {
+        if self.monitor_sendable() {
+            self.monitor.take()
+        } else {
+            None
+        }
+    }
+
     /// Whether a change needs a flush posted: something is sendable and no flush is pending. Marks the flush pending.
     fn needs_flush(&mut self) -> bool {
-        let sendable =
-            self.monitor.is_some() || (self.task.is_some() && (self.size.is_some() || self.remove));
+        let sendable = self.monitor_sendable()
+            || (self.task.is_some() && (self.size.is_some() || self.remove));
         let post = sendable && !self.flushing;
         self.flushing |= post;
         post
@@ -68,6 +120,8 @@ impl Pending {
 /// The window's Task reports: stored by the window's thread, sent on the outbox. A monitor's reply becomes `composer`'s display.
 pub struct TaskReports {
     pending: Mutex<Pending>,
+    /// Notified at each change of `pending` that may settle it ([`TaskReports::wait_settled`]).
+    settled: Condvar,
     outbox: Arc<dyn LooperPoster>,
     composer: Arc<Composer>,
 }
@@ -77,6 +131,7 @@ impl TaskReports {
     pub fn new(outbox: Arc<dyn LooperPoster>, composer: Arc<Composer>) -> Arc<Self> {
         Arc::new(TaskReports {
             pending: Mutex::new(Pending::default()),
+            settled: Condvar::new(),
             outbox,
             composer,
         })
@@ -94,9 +149,9 @@ impl TaskReports {
         });
     }
 
-    /// A size change on the window's thread: replaces the pending size, so a size overtaken before it was sent is never sent.
-    pub fn submit_size(self: &Arc<Self>, size: PhysSize) {
-        self.change(|p| p.size = Some(size));
+    /// A size change on the window's thread, `size` in physical px at the window's `scale`: replaces the pending size, so a size overtaken before it was sent is never sent.
+    pub fn submit_size(self: &Arc<Self>, size: PhysSize, scale: Scale) {
+        self.change(|p| p.size = Some(Measured { px: size, scale }));
     }
 
     /// The window's monitor changed: replaces the pending monitor. The services answer with their display, which the composer adopts after the send.
@@ -109,10 +164,32 @@ impl TaskReports {
         self.change(|p| p.remove = true);
     }
 
+    /// The window's first commit was answered (`Window::on_placed`, after any monitor it entered was submitted).
+    pub fn placed(self: &Arc<Self>) {
+        self.change(|p| p.placed = true);
+    }
+
+    /// On the launcher thread before REGISTER (start.rs; an app thread, display-thread rule B1): returns once the window's display is settled, so the app binds on it. A window on no monitor
+    /// at its first commit (a hidden workspace) settles at once on the services' current display; its later enter is an ordinary monitor report (a configuration change). No timer: the
+    /// desktop answers a commit in one roundtrip. break `bind-before-placed`: returns at once.
+    pub fn wait_settled(&self) {
+        if cfg!(feature = "break-bind-before-placed") {
+            return;
+        }
+        let mut pending = self.lock();
+        while !pending.settled() {
+            pending = self
+                .settled
+                .wait(pending)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     fn change(self: &Arc<Self>, edit: impl FnOnce(&mut Pending)) {
         let post = {
             let mut pending = self.lock();
             edit(&mut pending);
+            self.settled.notify_all();
             pending.needs_flush()
         };
         if post {
@@ -126,21 +203,30 @@ impl TaskReports {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// On the outbox: sends until nothing is left, the lock released during each transaction.
+    /// On the outbox: sends until nothing is left, the pending lock released during each transaction. A monitor's answer is adopted before the wait it settles is woken.
     fn flush(&self) {
         loop {
             let Some(report) = self.lock().next() else {
                 return;
             };
-            match send(&report) {
-                Ok(Some(answer)) => {
-                    if self.composer.set_display(answer) {
-                        tracing::info!("atl-composer: ui: display {}", answer.to_arg());
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("atl-composer: task reports: {e}"),
+            self.deliver(&report);
+            if matches!(report, Report::Monitor(_)) {
+                self.lock().monitor_sending = false;
+                self.settled.notify_all();
             }
+        }
+    }
+
+    /// One report sent, a size in the composer's display's pixels at the send; a monitor's answer becomes the composer's display.
+    fn deliver(&self, report: &Report) {
+        match send(report, &self.composer.display()) {
+            Ok(Some(answer)) => {
+                if self.composer.set_display(answer) {
+                    tracing::info!("atl-composer: ui: display {}", answer.to_arg());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("atl-composer: task reports: {e}"),
         }
     }
 }
@@ -154,8 +240,8 @@ fn registry() -> Result<SpIBinder, String> {
     Ok(registry.as_binder())
 }
 
-/// One transaction: REPORT_MONITOR with the monitor, whose reply is the display the services answer with (`Some`); SET_BOUNDS with the Task's number, then the size; or REMOVE_TASK.
-fn send(report: &Report) -> Result<Option<DisplayModel>, String> {
+/// One transaction: REPORT_MONITOR with the monitor, whose reply is the display the services answer with (`Some`); SET_BOUNDS with the Task's number, then the size in `display`'s pixels; or REMOVE_TASK.
+fn send(report: &Report, display: &DisplayModel) -> Result<Option<DisplayModel>, String> {
     let binder = registry()?;
     let mut data = binder.prepare_transact().map_err(|e| e.to_string())?;
     let code = match report {
@@ -163,7 +249,8 @@ fn send(report: &Report) -> Result<Option<DisplayModel>, String> {
             data.write(&monitor.to_arg()).map_err(|e| e.to_string())?;
             REPORT_MONITOR
         }
-        Report::Size(task, size) => {
+        Report::Size(task, measured) => {
+            let size = measured.at(display);
             let width = i32::try_from(size.width).map_err(|e| e.to_string())?;
             let height = i32::try_from(size.height).map_err(|e| e.to_string())?;
             data.write(task).map_err(|e| e.to_string())?;
@@ -206,8 +293,51 @@ fn send(report: &Report) -> Result<Option<DisplayModel>, String> {
 mod tests {
     use super::*;
 
-    fn size(width: u32, height: u32) -> PhysSize {
-        PhysSize { width, height }
+    fn size(width: u32, height: u32) -> Measured {
+        Measured {
+            px: PhysSize { width, height },
+            scale: Scale::ONE,
+        }
+    }
+
+    /// A size measured at the opening scale (1, the start display) is sent in the display's px: 2160x1350 dp at 256 dpi (1.6) = 3456x2160, by hand; at 160 dpi it stays 2160x1350.
+    /// 1800x1125 px at 1.6 = 1125x703.125 dp -> 1125x703 at 160 dpi; unchanged at 256 (same scale, no dp round trip).
+    #[test]
+    fn a_size_goes_in_the_display_pixels() {
+        let at_dpi = |dpi| DisplayModel {
+            dpi,
+            ..DisplayModel::default()
+        };
+        let opening = size(2160, 1350);
+        assert_eq!(
+            opening.at(&at_dpi(256)),
+            PhysSize {
+                width: 3456,
+                height: 2160
+            }
+        );
+        assert_eq!(
+            opening.at(&at_dpi(160)),
+            PhysSize {
+                width: 2160,
+                height: 1350
+            }
+        );
+        let fractional = Measured {
+            px: PhysSize {
+                width: 1800,
+                height: 1125,
+            },
+            scale: Scale::new(1.6).unwrap(),
+        };
+        assert_eq!(fractional.at(&at_dpi(256)), fractional.px);
+        assert_eq!(
+            fractional.at(&at_dpi(160)),
+            PhysSize {
+                width: 1125,
+                height: 703
+            }
+        );
     }
 
     /// The monitor goes without the Task (the registry checks the uid's Task only); the size waits for the Task. Each goes once, the latest: the monitor before the size.

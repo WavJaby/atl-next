@@ -504,7 +504,7 @@ fn declared_check(
 }
 
 /// (config, metrics) of each density line, in order.
-fn densities(app: &str) -> Vec<(i32, i32)> {
+pub(super) fn densities(app: &str) -> Vec<(i32, i32)> {
     app.lines()
         .filter(|l| l.contains(DENSITY_LINE))
         .filter_map(|l| {

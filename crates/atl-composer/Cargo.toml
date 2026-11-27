@@ -32,6 +32,10 @@ break-handle-hold = []
 break-declared-adopt = []
 # the composer starts on a fixed display (DisplayModel::default, the gate output's density), not the services' current one (start.rs display): the move stage's second-process row must fail
 break-stale-display = []
+# REGISTER does not wait for the window's display, and the monitor waits for the Task, named at the first window add (task_reports.rs wait_settled, monitor_sendable): an app opened off atld's start monitor binds there and relaunches
+break-bind-before-placed = []
+# a size is sent in the px it was measured in, not the services' display's (task_reports.rs Measured::at): a window opened off atld's start monitor reports the start monitor's px first
+break-size-at-measured-scale = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }

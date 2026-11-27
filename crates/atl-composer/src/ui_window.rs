@@ -445,7 +445,13 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
         let presented = Arc::clone(&session.composer);
         window.on_presented(move |sample| presented.on_presented(sample));
         let sizes = Arc::clone(&session.reports);
-        window.on_resize(move |size| sizes.submit_size(size));
+        // with the scale the size was measured at: task_reports converts it to the services' display at the send
+        let measured = Rc::downgrade(&window);
+        window.on_resize(move |size| {
+            if let Some(w) = measured.upgrade() {
+                sizes.submit_size(size, w.scale());
+            }
+        });
         // the desktop closing the window is the Shell removing its Task (REMOVE_TASK, task_reports.rs)
         let closes = Arc::clone(&session.reports);
         window.on_close_requested(move || closes.submit_remove_task());
@@ -461,6 +467,9 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
             );
             monitors.submit_monitor(model);
         });
+        // after on_monitor: a placement already answered replays at once, behind the monitor the window is on
+        let placed = Arc::clone(&session.reports);
+        window.on_placed(move || placed.placed());
         window.request_frame();
         // the in-app input method's desktop side: the window's TextInput (its calls on the editor's connection go to the outbox, atl-ime field.rs)
         atl_ime::attach(Rc::clone(&window));

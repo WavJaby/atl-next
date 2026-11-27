@@ -190,6 +190,21 @@ pub struct Args {
     /// Stage move only: every app process's composer starts on a fixed display instead of asking the services (atl-composer feature `break-stale-display`), so the second process, started after the move, answers the start density and the second-process sub-gate must fail.
     #[arg(long)]
     break_stale_display: bool,
+    /// Stage opening only: atld's `--monitor` is the output at scale 1 (density 160), not the only output's 1.6, so the window opens off atld's start monitor; adds the `instances` and `densities` sub-gates (one instance, no relaunch, no intermediate density).
+    #[arg(long)]
+    start_monitor_other: bool,
+    /// Stage opening, with `--start-monitor-other` only: REGISTER does not wait for the window's display and the monitor waits for the first window add (atl-composer feature
+    /// `break-bind-before-placed`), so the app binds on the start monitor, relaunches, and the instances sub-gate must fail.
+    #[arg(long, requires = "start_monitor_other")]
+    break_bind_before_placed: bool,
+    /// Stage opening, with `--start-monitor-other` only: the proxy holds the window's `wl_surface.enter` until the app's `onCreate` (a window on no monitor at its first commit: a hidden workspace).
+    /// REGISTER must not wait for it: the app binds on atld's start display, then the enter changes the density once (one relaunch). Expected rows change to that (opening.rs `checks`).
+    #[arg(long, requires = "start_monitor_other")]
+    hold_enter: bool,
+    /// Stage opening, with `--start-monitor-other` only: the composer sends a size in the px it was measured in (atl-composer feature `break-size-at-measured-scale`), so the opening size goes at the
+    /// start monitor's scale and the bounds sub-gate must fail.
+    #[arg(long, requires = "start_monitor_other")]
+    break_size_at_measured_scale: bool,
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
@@ -2578,7 +2593,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     p.withhold_in_contexts(&move_output::WITHHELD);
                 }
                 if matches!(args.stage, Stage::Opening) {
-                    opening::setup(&p);
+                    opening::setup(&p, args.hold_enter);
                 }
                 if matches!(args.stage, Stage::Tiled) {
                     // before atld starts: the window's first configure is the tile's
@@ -2606,6 +2621,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                     ),
                     (args.break_stale_display, "atl-composer/break-stale-display"),
                     (args.break_outbox, "atl-composer/break-outbox"),
+                    (
+                        args.break_bind_before_placed,
+                        "atl-composer/break-bind-before-placed",
+                    ),
+                    (
+                        args.break_size_at_measured_scale,
+                        "atl-composer/break-size-at-measured-scale",
+                    ),
                     (args.break_handle_hold, "atl-composer/break-handle-hold"),
                     (args.break_ime_copy, "atl-ime/break-copy"),
                 ]
@@ -2648,7 +2671,17 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         None => GATE_OUTPUT.display(),
     };
     // atld gets the display this gate judges against and never asks the desktop itself: under the window gate's proxy that query reaches the proxy's client
-    let rt = rt.with_monitor(display.to_arg());
+    ensure!(
+        !args.start_monitor_other || matches!(args.stage, Stage::Opening),
+        "--start-monitor-other is for stage opening only"
+    );
+    // `--start-monitor-other`: atld starts on the output at scale 1, so the first monitor report changes the display (opening.rs)
+    let start = if args.start_monitor_other {
+        opening::start_monitor(display)
+    } else {
+        display
+    };
+    let rt = rt.with_monitor(start.to_arg());
     // the declared display is the move stage's: the break runs without it, so the run is judged against the declaration it did not get
     ensure!(
         args.declare_display.is_none() || matches!(args.stage, Stage::Move | Stage::Opening),
@@ -2822,6 +2855,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             run: &run,
             package: &m.name,
             display,
+            start,
             rate: Rate::Fixed,
             moved,
             app_uid,
@@ -2975,6 +3009,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
     let esc_back = args.esc_back;
     let tap_origin = args.tap_origin;
     let break_suspended = args.break_suspended;
+    let hold_enter = args.hold_enter;
     // the app-id stage's probe leaves the window's app ids here; the sub-gates read them once the probe is joined
     let app_ids: Arc<Mutex<AppIdsSeen>> = Arc::default();
     // the title stage's probe leaves the window's titles here, in order
@@ -3067,7 +3102,7 @@ fn live(l: LiveIn, atld: &mut Atld) -> Result<LiveOut> {
             (Stage::Title, _, _) => drive_title(p, &log, &titles_seen),
             (Stage::AuxProcess, _, _) => aux_process::drive(p, &log),
             (Stage::Splash, _, _) => splash::drive(p, &log),
-            (Stage::Opening, _, _) => opening::drive(p, &log),
+            (Stage::Opening, _, _) => opening::drive(p, &log, hold_enter),
             (Stage::Suspended, _, _) => suspended::drive(p, &log, break_suspended),
             (Stage::Move, Some(outputs), _) => move_output::drive(p, &log, outputs, user_resize),
             _ => drive(p, &log),
@@ -3182,6 +3217,8 @@ struct Judged<'a> {
     package: &'a str,
     /// The display atld answered with and the cadence is judged against.
     display: DisplayModel,
+    /// atld's `--monitor`: `display`, or the output at scale 1 with `--start-monitor-other`.
+    start: DisplayModel,
     rate: Rate,
     /// The move stage's second output.
     moved: Option<DisplayModel>,
@@ -3198,6 +3235,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         run,
         package,
         display,
+        start,
         rate,
         moved,
         app_uid,
@@ -3329,7 +3367,15 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             None => vec![("outputs", Err("no nested compositor".to_owned()))],
         },
         (Stage::Opening, Some(_)) => match &opened {
-            Some(record) => opening::checks(&app, &services, display, args.declare_display, record),
+            Some(record) => opening::checks(
+                &app,
+                &services,
+                display,
+                start,
+                args.declare_display,
+                record,
+                args.hold_enter,
+            ),
             None => vec![("policy", Err("no proxy".to_owned()))],
         },
         (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
@@ -4000,6 +4046,7 @@ pub fn remote(root: &Path, a: &crate::remote::TestArgs) -> Result<ExitCode> {
             run: &run,
             package: &m.name,
             display,
+            start: display,
             rate: if ui { Rate::Session } else { Rate::Fixed },
             moved: None,
             app_uid,
