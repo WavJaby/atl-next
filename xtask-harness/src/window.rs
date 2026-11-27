@@ -187,6 +187,9 @@ pub struct Args {
     /// Stage move, with `--declare-display` only: the composer adopts the monitor it reported instead of the services' answer (atl-composer feature `break-declared-adopt`), so its SurfaceFlinger display is not DisplayInfo and the declared sub-gate must fail.
     #[arg(long, requires = "declare_display")]
     break_declared_adopt: bool,
+    /// Stage move only: every app process's composer starts on a fixed display instead of asking the services (atl-composer feature `break-stale-display`), so the second process, started after the move, answers the start density and the second-process sub-gate must fail.
+    #[arg(long)]
+    break_stale_display: bool,
     /// Stage capture only: the refusal sub-gate expects the fixture served, so it must fail on the registry's SECURITY (the gate's deliberate break, harness-side).
     #[arg(long)]
     break_capture_caller: bool,
@@ -2601,6 +2604,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                         args.break_declared_adopt,
                         "atl-composer/break-declared-adopt",
                     ),
+                    (args.break_stale_display, "atl-composer/break-stale-display"),
                     (args.break_outbox, "atl-composer/break-outbox"),
                     (args.break_handle_hold, "atl-composer/break-handle-hold"),
                     (args.break_ime_copy, "atl-ime/break-copy"),
@@ -3314,6 +3318,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
         (Stage::Move, Some(_)) => match moved {
             Some(moved) => move_output::checks(
                 &app,
+                &read(&move_output::moved_log(&app_log)),
                 &services,
                 &liveness,
                 display,

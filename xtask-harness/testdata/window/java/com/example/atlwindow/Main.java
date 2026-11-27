@@ -51,6 +51,8 @@ public class Main extends Activity {
     private int frameCallbacks;
     /** Set by armDestroyDelay (F11): the next onDestroy of this instance waits DESTROY_DELAY_MS. Only the timeout sub-gate presses F11, on the window it relaunched. */
     private boolean destroyDelayed;
+    /** The saved-state key holding the density this instance had: a relaunch at another density starts Moved. */
+    static final String SAVED_DPI = "atl.dpi";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -65,6 +67,17 @@ public class Main extends Activity {
         getWindow().setAttributes(attrs);
         setContentView(new Quadrants(this));
         requestOrientation();
+        // a relaunch for a density change (the move stage): a new process starts now, after the monitor moved, and logs the display it got (Moved)
+        int dpi = getResources().getConfiguration().densityDpi;
+        if (savedInstanceState != null && savedInstanceState.getInt(SAVED_DPI, dpi) != dpi) {
+            startService(new android.content.Intent(this, Moved.class));
+        }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putInt(SAVED_DPI, getResources().getConfiguration().densityDpi);
     }
 
     /** Manifest meta-data REQUEST_ORIENTATION on this activity (window-orientation): setRequestedOrientation with its value at the first create, then the request read back (orientation stage). */
@@ -264,7 +277,7 @@ public class Main extends Activity {
      * The display as the app's two sources answer it (move_output.rs declared): info = IDisplayManager.getDisplayInfo(0) (DisplayManagerGlobal, the services) as `WxH@hz,dpi,rotation`;
      * sf = SurfaceFlinger's active mode (SurfaceControl.getDynamicDisplayInfo, the in-app compositor) as `WxH@hz,dpi`, the panel's natural size. Both @hide: reflection, as apps reach them.
      */
-    private void logDisplay(String when) {
+    static void logDisplay(String when) {
         String info;
         try {
             Object dmg = Class.forName("android.hardware.display.DisplayManagerGlobal").getMethod("getInstance").invoke(null);

@@ -18,5 +18,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- the move stage's second process (Moved.java) -->
+        <service android:name=".Moved" android:process=":moved" android:exported="false" />
     </application>
 </manifest>

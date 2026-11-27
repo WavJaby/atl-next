@@ -121,9 +121,12 @@ impl Tilt {
     }
 }
 
-/// The injector thread: connects as [`atl_services_wire::sensor::TILT_INJECTOR_PACKAGE`], then every period steps the tilt and injects. Ends (logged) when the service is not in injection mode or the connection fails.
+/// The injector thread: connects as [`atl_services_wire::sensor::TILT_INJECTOR_PACKAGE`], then every period steps the tilt at `rotation()` (the display's now) and injects. Ends (logged) when the service is not in injection mode or the connection fails.
 #[cfg(feature = "converter")]
-pub fn spawn(tilt: std::sync::Arc<std::sync::Mutex<Tilt>>, rotation: i32) -> Result<(), String> {
+pub fn spawn(
+    tilt: std::sync::Arc<std::sync::Mutex<Tilt>>,
+    rotation: impl Fn() -> i32 + Send + 'static,
+) -> Result<(), String> {
     use atl_services_wire::sensor_wire::Injector;
     let run = move || {
         let injector = match Injector::connect(atl_services_wire::sensor::TILT_INJECTOR_PACKAGE) {
@@ -143,6 +146,7 @@ pub fn spawn(tilt: std::sync::Arc<std::sync::Mutex<Tilt>>, rotation: i32) -> Res
             let period = tilt.lock().unwrap_or_else(|e| e.into_inner()).period();
             std::thread::sleep(period);
             let now = std::time::Instant::now();
+            let rotation = rotation();
             let values = tilt
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

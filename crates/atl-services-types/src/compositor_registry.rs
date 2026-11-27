@@ -26,9 +26,10 @@ pub const REMOVE_TASK: u32 = 6;
 /// The transaction an app process's compositor sends for an input device's key map, for the dispatcher's fallback keys (InputDispatcher / InputManagerService.dispatchUnhandledKey): the device id (i32). Reply: the map in Parcel form (byte[], atl-libinput `KeyCharacterMap::parcel_bytes`), the same bytes the input service puts in that device's InputDevice, so one owner serves one map; empty for an unknown device. Any caller: the maps are what every app reads through getInputDevice.
 /// Not getInputDevice itself: libinput's Parcel form of a map carries no length, so the Rust InputDevice codec cannot read a reply holding a map other than the one it was set up with.
 pub const KEY_MAP: u32 = 7;
-/// The system property holding the display the in-app compositor answers with (`DisplayModel::to_arg`): atld's start value of the services' display (`DisplayModel::of` of the monitor and the declaration), delivered to the app the way its other environment is. Its presence marks an ATL app process (atl-composer start).
-pub const DISPLAY_PROPERTY: &str = "ro.atl.display";
-/// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered like [`DISPLAY_PROPERTY`]. Unset: no input thread; the window handoff still works.
+/// The transaction every app process's compositor sends at its start, before the compositor is made (any process mode): no arguments. Reply: the display the services answer with now, a String16 in the
+/// `WxH@hz,dpi,rotation` form (display_model.rs `DisplayModel::to_arg`), as [`REPORT_MONITOR`]'s reply: one owner, so a process started after a monitor change starts on the changed display. Any caller.
+pub const GET_DISPLAY: u32 = 8;
+/// The system property holding the headless pointer script (atld `--headless-pointer`, parsed by atl-composer `input::parse_script`), delivered to the app with its other environment. Unset: no input thread; the window handoff still works.
 pub const POINTER_PROPERTY: &str = "ro.atl.headless.pointer";
 /// The system property selecting an app process's UI mode (atld `--ui`): `gtk` presents the compositor's scenes into a GTK window of the process, on its main thread (atl-app-launcher lib.rs `start_ui`, atl-composer). Unset: headless.
 pub const UI_PROPERTY: &str = "ro.atl.ui";

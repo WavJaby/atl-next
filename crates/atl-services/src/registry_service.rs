@@ -17,7 +17,8 @@ use crate::input::KeyMaps;
 use crate::tasks::{DisplayChange, TaskId, TaskSize, Tasks};
 use crate::ui_agents::{AppProcess, UiAgents};
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, GET_COMPOSER, KEY_MAP, REGISTER, REMOVE_TASK, REPORT_MONITOR, SET_BOUNDS, TASK_INFO,
+    DESCRIPTOR, GET_COMPOSER, GET_DISPLAY, KEY_MAP, REGISTER, REMOVE_TASK, REPORT_MONITOR,
+    SET_BOUNDS, TASK_INFO,
 };
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::permission::{SHELL_UID, SYSTEM_UID};
@@ -66,6 +67,9 @@ pub trait ICompositorRegistry: Interface {
 
     /// KEY_MAP once the device id is read: that device's key map in Parcel form, empty for an unknown device (compositor_registry.rs KEY_MAP).
     fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode>;
+
+    /// GET_DISPLAY: the display the services answer with now (compositor_registry.rs GET_DISPLAY).
+    fn display(&self) -> Result<DisplayModel, StatusCode>;
 }
 
 declare_binder_interface! {
@@ -85,6 +89,7 @@ fn method_name(code: TransactionCode) -> Option<&'static str> {
         (TASK_INFO, "TASK_INFO"),
         (REMOVE_TASK, "REMOVE_TASK"),
         (KEY_MAP, "KEY_MAP"),
+        (GET_DISPLAY, "GET_DISPLAY"),
     ]
     .into_iter()
     .find_map(|(c, n)| (c == code).then_some(n))
@@ -164,6 +169,9 @@ fn dispatch(
         reply.write(&dpi)?;
         return reply.write(&package);
     }
+    if code == GET_DISPLAY {
+        return reply.write(&service.display()?.to_arg());
+    }
     if code == KEY_MAP {
         let device_id: i32 = data.read()?;
         return reply.write(&service.key_map(device_id)?);
@@ -198,6 +206,10 @@ impl ICompositorRegistry for BpCompositorRegistry {
     }
 
     fn key_map(&self, _: i32) -> Result<Vec<u8>, StatusCode> {
+        Err(StatusCode::INVALID_OPERATION)
+    }
+
+    fn display(&self) -> Result<DisplayModel, StatusCode> {
         Err(StatusCode::INVALID_OPERATION)
     }
 
@@ -244,6 +256,10 @@ impl ICompositorRegistry for Binder<BnCompositorRegistry> {
 
     fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode> {
         self.0.key_map(device_id)
+    }
+
+    fn display(&self) -> Result<DisplayModel, StatusCode> {
+        self.0.display()
     }
 }
 
@@ -294,6 +310,10 @@ impl Registry {
 impl ICompositorRegistry for Registry {
     fn key_map(&self, device_id: i32) -> Result<Vec<u8>, StatusCode> {
         Ok(self.key_maps.of(device_id).unwrap_or_default().to_vec())
+    }
+
+    fn display(&self) -> Result<DisplayModel, StatusCode> {
+        Ok(self.tasks.display())
     }
 
     fn remove_task(&self, caller_uid: u32, task: i32) -> Result<(), StatusCode> {

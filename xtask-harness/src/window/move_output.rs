@@ -55,6 +55,12 @@ const LAYOUT_LINE: &str = "AtlWindow: size=";
 const APP_DISPLAY_LINE: &str = "AtlWindow: display ";
 /// The tag of the display line logged after an instance's frames.
 const SETTLED: &str = "settled";
+/// The tag of the display line the second process (Moved.java, `:moved`) logs at its first vsync.
+const MOVED_PROCESS: &str = "moved-process";
+/// The second process's name suffix (window AndroidManifest.xml): its log is the app's with this suffix.
+const MOVED_SUFFIX: &str = ":moved";
+/// From the relaunched instance's frames to the second process's display line: a cold process start (8-20 s under load, window.rs probe_ends_run), with slack.
+const SECOND_PROCESS_WAIT: Duration = Duration::from_secs(60);
 /// Main.java's last frame callback line prefix (FRAME_CALLBACKS = 31): each instance's resume runs the whole series.
 const LAST_FRAME: &str = "AtlWindow: frame 31 ";
 
@@ -113,6 +119,14 @@ pub fn drive(
         app_log,
         &|t: &str| t.matches(LAST_FRAME).count() >= 2,
     ))?;
+    // the relaunched instance started `:moved`; its display line before the turn, so it reads the moved display unrotated
+    until(&Wait::log(
+        "second-process",
+        "the second process never logged its display",
+        SECOND_PROCESS_WAIT,
+        &moved_log(app_log),
+        &|t: &str| t.contains(&format!("{APP_DISPLAY_LINE}{MOVED_PROCESS} ")),
+    ))?;
     outputs
         .set_transform(1, ROTATED_TRANSFORM)
         .map_err(|e| format!("{e:#}"))?;
@@ -134,8 +148,11 @@ pub fn drive(
 
 /// The sub-gates: display (the services took a display at `moved`'s density), density (the last instance's Configuration and DisplayMetrics say it; the first said `opened`'s), relaunch (AOSP's: one relaunch, ended, two instances), frames (the relaunched instance drew and ran its frame callbacks).
 /// `declared` (`--declare-display`) adds the declared sub-gate and changes display: a declared display keeps rotation 0, so the turned output changes nothing.
+/// `second`: the log of the second process (`:moved`, [`moved_log`]), started after the move: its first-vsync display line must be the moved display (second-process), not the run's start display.
+#[allow(clippy::too_many_arguments)]
 pub fn checks(
     app: &str,
+    second: &str,
     services: &str,
     liveness: &Result<Liveness, String>,
     opened: DisplayModel,
@@ -172,10 +189,39 @@ pub fn checks(
             bounds_check(app, opened, moved, declared, user_resize),
         ),
     ];
+    subs.push(("second-process", second_check(second, moved, declared)));
     if let Some(declared) = declared {
         subs.push(("declared", declared_check(app, declared, opened, moved)));
     }
     subs
+}
+
+/// The log of the app's second process (`:moved`), beside `app_log` (atld names a process's log after the process).
+pub fn moved_log(app_log: &Path) -> std::path::PathBuf {
+    let name = app_log
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    app_log.with_file_name(format!("{name}{MOVED_SUFFIX}.log"))
+}
+
+/// The second process's display line: DisplayInfo and SurfaceFlinger at its first vsync answer the moved display (on a declared display, the declared size at the moved dpi).
+/// A process that starts on the run's start display (the display pushed at atld's start, not asked of the services) answers the opened dpi -> red.
+fn second_check(
+    second: &str,
+    moved: DisplayModel,
+    declared: Option<Declaration>,
+) -> Result<String, String> {
+    let want = match declared {
+        Some(d) => DisplayModel::of(moved, Some(d))?,
+        None => moved,
+    };
+    let lines = app_displays(second);
+    let line = lines.iter().find(|l| l.when == MOVED_PROCESS);
+    match app_display_problem(line, "in the second process", want) {
+        None => Ok(format!("{} at its first vsync", want.to_arg())),
+        Some(problem) => Err(problem),
+    }
 }
 
 /// The displays the services took, in order: the reports that changed the display.

@@ -1516,9 +1516,8 @@ struct Host {
     boot: Vec<String>,
     /// the desktop's font dirs, dir k bound at /system/fonts/<k> (font_layout)
     fonts: Vec<PathBuf>,
-    /// the default property set and the display model: what [`Host::process_properties`] builds an app process's area from
+    /// the default property set: what [`Host::process_properties`] builds an app process's area from
     defaults: Vec<Property>,
-    display: DisplayModel,
     /// the headless pointer script; pushed to each app process as `ro.atl.headless.pointer`
     headless_pointer: Option<String>,
     /// the UI mode; pushed to each app process as `ro.atl.ui`
@@ -1672,14 +1671,10 @@ impl Host {
         art_env(&self.art_root, &self.lib, &self.log_tags)
     }
 
-    /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.display` is the display the process's compositor answers with
-    /// (compositor_registry.rs), the model the services answer with too; `ro.atl.headless.pointer` is the input script, present only with `--headless-pointer`.
+    /// The property area of the app process `name` of `uid`: the defaults plus what only this process has. `ro.atl.headless.pointer` is the input script, present only
+    /// with `--headless-pointer`. The display is not here: the compositor asks the services (registry GET_DISPLAY), which own it.
     fn process_properties(&self, uid: u32, name: &str) -> Result<PathBuf> {
         let mut props = self.defaults.clone();
-        props.push((
-            compositor_registry::DISPLAY_PROPERTY.to_owned(),
-            self.display.to_arg(),
-        ));
         if let Some(script) = &self.headless_pointer {
             props.push((
                 compositor_registry::POINTER_PROPERTY.to_owned(),
@@ -2794,13 +2789,10 @@ fn run(a: &Args) -> Result<ExitCode> {
                 }
             })?;
     }
-    // the monitor the services start on, and the display every app process starts with: the declaration applied to the monitor (DisplayModel::of, the function the services apply to each
-    // report). The services get the monitor and the declaration themselves (below), so this is the one copy atld keeps; it leaves with the composer's start value
+    // the monitor the services start on; they apply the declaration themselves (DisplayModel::of) and own the display from then on, so app processes ask them for it (registry GET_DISPLAY)
     let monitor = a.monitor.unwrap_or_else(host_monitor);
-    let display = DisplayModel::of(monitor, a.declare_display)
-        .map_err(|e| anyhow::anyhow!("--declare-display: {e}"))?;
-    // its density, as a device's vendor build.prop states its panel's (DisplayMetrics DENSITY_DEVICE); into the services' and the apps' areas below
-    defaults.push(atl_property_service::lcd_density(display.dpi));
+    // its density, as a device's vendor build.prop states its panel's (DisplayMetrics DENSITY_DEVICE); into the services' and the apps' areas below. A declaration keeps the monitor's dpi (DisplayModel::of)
+    defaults.push(atl_property_service::lcd_density(monitor.dpi));
     // the desktop's UI language (LC_MESSAGES, atl_platform_host::ui_locale): the apps' persist.sys.locale and the services' --locale; none: AOSP's en-US
     let locale = atl_platform_host::ui_locale();
     log(format_args!(
@@ -3070,7 +3062,6 @@ fn run(a: &Args) -> Result<ExitCode> {
         boot,
         fonts,
         defaults,
-        display,
         headless_pointer: a.headless_pointer.clone(),
         ui: a.ui.clone(),
         desktop_input: compositor_registry::DesktopInput {

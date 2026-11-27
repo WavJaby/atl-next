@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 //! Starting the compositor of an app process: its two service objects are served under AOSP's names by the process's service view (atl-service-view; libgui looks them up there), and its UI agent (ui_agent.rs)
-//! goes to the registry in the system process (atl_services_types::compositor_registry has the protocol). Reads from the process's own property area what atld wrote there (`ro.atl.display`); a process without it
-//! is not an ATL app process and gets no compositor.
+//! goes to the registry in the system process (atl_services_types::compositor_registry has the protocol). The display comes from the registry (GET_DISPLAY) before the compositor is made; the rest of
+//! the process's environment from its own property area, as atld wrote it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atl_services_types::compositor_registry::{
-    DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DISPLAY_PROPERTY, DesktopInput, KEY_MAP, POINTER_PROPERTY,
+    DESCRIPTOR, DESKTOP_INPUT_PROPERTY, DesktopInput, GET_DISPLAY, KEY_MAP, POINTER_PROPERTY,
     REGISTER, SERVICE, SPLASH_PROPERTY, SURFACE_FLINGER, SURFACE_FLINGER_AIDL, Splash, TASK_INFO,
 };
 use atl_services_types::display_model::{DENSITY_DEFAULT, DisplayModel};
@@ -62,11 +62,6 @@ fn optional_property(name: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("reading {name}: {e}"))
 }
 
-fn property(name: &str) -> Result<String, String> {
-    optional_property(name)?
-        .ok_or_else(|| format!("{name} is not set: not an app process atld started"))
-}
-
 fn registry() -> Result<Strong<dyn IRegistry>, String> {
     let deadline = std::time::Instant::now() + REGISTRY_WAIT;
     loop {
@@ -80,6 +75,22 @@ fn registry() -> Result<Strong<dyn IRegistry>, String> {
         }
         std::thread::sleep(REGISTRY_POLL);
     }
+}
+
+/// The GET_DISPLAY transaction: the display the services answer with now (compositor_registry.rs), the one owner; a process started after a monitor change starts on the changed display.
+fn display() -> Result<DisplayModel, String> {
+    let proxy = registry()?;
+    let binder = proxy.as_binder();
+    let data = binder.prepare_transact().map_err(|e| e.to_string())?;
+    let reply = binder
+        .submit_transact(GET_DISPLAY, data, 0)
+        .map_err(|e| format!("get display: {e}"))?;
+    let arg: String = reply.read().map_err(|e| format!("get display: {e}"))?;
+    // break `stale-display`: the answer is dropped for a fixed start value, as a display pushed at atld's start was
+    if cfg!(feature = "break-stale-display") {
+        return Ok(DisplayModel::default());
+    }
+    DisplayModel::parse_arg(&arg)
 }
 
 /// What TASK_INFO answers for a process with a Task.
@@ -183,7 +194,8 @@ pub fn open_window(ui: PlatformUi, started: Instant) -> Result<Option<OpenWindow
 /// [`open_window`] opened): scenes go through a mailbox to it ([`ui_window`]), which takes the latest on its frame clock; the window's session is installed on the display thread (`call`) before the composer registers.
 pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Composer>, String> {
     let threads: &dyn VmHost = &*host;
-    let display = DisplayModel::parse_arg(&property(DISPLAY_PROPERTY)?)?;
+    // asked at this process's start, not atld's: a monitor report since then changed the services' display
+    let display = display()?;
     let script = match optional_property(POINTER_PROPERTY)? {
         Some(script) => input::parse_script(&script)?,
         None => Vec::new(),
@@ -194,15 +206,15 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
         Some(arg) => DesktopInput::parse_arg(&arg)?,
         None => DesktopInput::default(),
     };
-    let tilt = match desktop_input.tilt {
-        Some(config) => {
-            let t = Arc::new(std::sync::Mutex::new(crate::tilt::Tilt::new(config)));
-            crate::tilt::spawn(Arc::clone(&t), display.rotation)?;
-            Some(t)
-        }
-        None => None,
-    };
-    let input_tx = input::spawn(script, wake_enabled, tilt, desktop_input.mouse_touch)?;
+    let tilt = desktop_input
+        .tilt
+        .map(|config| Arc::new(std::sync::Mutex::new(crate::tilt::Tilt::new(config))));
+    let input_tx = input::spawn(
+        script,
+        wake_enabled,
+        tilt.clone(),
+        desktop_input.mouse_touch,
+    )?;
     let composer = Composer::new(ComposerConfig {
         display,
         compositor: CompositorConfig {
@@ -218,6 +230,11 @@ pub fn start(host: Arc<dyn VmHost>, window: Option<OpenWindow>) -> Result<Arc<Co
         hold_shown: !cfg!(feature = "break-ignore-hold"),
         backpressure: !cfg!(feature = "break-no-backpressure"),
     });
+    if let Some(tilt) = tilt {
+        // the rotation read at each step: a monitor report turns the display under a held tilt
+        let composer = Arc::clone(&composer);
+        crate::tilt::spawn(tilt, move || composer.display().rotation)?;
+    }
     // the in-app input method exists only with a window: its desktop side is the window's TextInput (headless: none, IMMS-lite answers NO_IME)
     let mut input_method = None;
     let reports = if let Some(window) = window {

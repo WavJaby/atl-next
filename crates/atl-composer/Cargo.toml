@@ -30,6 +30,8 @@ break-outbox = []
 break-handle-hold = []
 # the composer keeps the monitor it reported, not the services' answer (task_reports.rs send): the declared display's SurfaceFlinger row must fail
 break-declared-adopt = []
+# the composer starts on a fixed display (DisplayModel::default, the gate output's density), not the services' current one (start.rs display): the move stage's second-process row must fail
+break-stale-display = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }
