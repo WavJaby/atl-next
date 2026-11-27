@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! atl-sandbox-stub: the in-child launcher stage of a sandbox (plan Q5: "Landlock + seccomp are applied by our in-child launcher stub in every backend"). bwrap runs it in place of the program; it restricts itself with Landlock, then execs the program, which inherits the domain.
-//! Usage: `atl-sandbox-stub [--nice LINE] [--net] [--ro PATH | --rw PATH | --device PATH]... -- PROGRAM [ARGS]...`. Every filesystem right is handled; each path gets only its grant, and a path under no grant is refused. `--ro`: read, list, execute. `--rw`: also write, create, remove, rename. `--device`: rw plus the device ioctls (ABI >= 5).
-//! TCP bind/connect: `--net` leaves them unhandled (unrestricted: the app holds INTERNET); otherwise they are handled with no rule, so every port is refused (ABI >= 4). Abstract unix sockets and signals are scoped to the domain (ABI >= 6).
+//! Usage: `atl-sandbox-stub [--nice LINE] [--ro PATH | --rw PATH | --device PATH]... -- PROGRAM [ARGS]...`. Every filesystem right is handled; each path gets only its grant, and a path under no grant is refused. `--ro`: read, list, execute. `--rw`: also write, create, remove, rename. `--device`: rw plus the device ioctls (ABI >= 5).
+//! No network rule here: socket creation is refused by the seccomp INTERNET rule (atl-broker seccomp.rs) on every kernel; Landlock's TCP rights are not used.
+//! Abstract unix sockets and signals are scoped to the domain (ABI >= 6).
 //! `--nice LINE` (app profile): raises the soft RLIMIT_NICE to the hard limit the host grants (what Android's init does with 40/40) and prints `sandbox-stub: nice LINE`, the broker's tier description (atl-broker seccomp.rs NiceTiers).
 //! Best effort over the kernel's ABI: the achieved ABI and enforcement are printed to stderr as `sandbox-stub: landlock abi=<n> ruleset=<status>`; a kernel that enforces nothing fails the start (exit 2) rather than run the program unconfined.
 #![forbid(unsafe_code)]
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, LandlockStatus, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    ABI, Access, AccessFs, LandlockStatus, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
@@ -32,7 +33,6 @@ enum Grant {
 
 struct Args {
     grants: Vec<(Grant, PathBuf)>,
-    net: bool,
     nice: Option<OsString>,
     program: OsString,
     args: Vec<OsString>,
@@ -40,7 +40,6 @@ struct Args {
 
 fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
     let mut grants = Vec::new();
-    let mut net = false;
     let mut nice = None;
     loop {
         let flag = match it.next() {
@@ -49,10 +48,6 @@ fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
             None => return Err("missing `-- PROGRAM`".into()),
         };
         let grant = match flag.to_str() {
-            Some("--net") => {
-                net = true;
-                continue;
-            }
             Some("--nice") => {
                 nice = Some(it.next().ok_or("--nice needs a line")?);
                 continue;
@@ -68,7 +63,6 @@ fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
     let program = it.next().ok_or("missing PROGRAM after --")?;
     Ok(Args {
         grants,
-        net,
         nice,
         program,
         args: it.collect(),
@@ -76,7 +70,7 @@ fn parse(mut it: impl Iterator<Item = OsString>) -> Result<Args, String> {
 }
 
 /// Restricts this process: every filesystem right handled, each grant's rights on its path only.
-fn restrict(grants: &[(Grant, PathBuf)], net: bool) -> Result<(ABI, RulesetStatus), String> {
+fn restrict(grants: &[(Grant, PathBuf)]) -> Result<(ABI, RulesetStatus), String> {
     let err = |e: landlock::RulesetError| e.to_string();
     let read = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
     let write = read
@@ -89,15 +83,10 @@ fn restrict(grants: &[(Grant, PathBuf)], net: bool) -> Result<(ABI, RulesetStatu
         | AccessFs::RemoveFile
         | AccessFs::RemoveDir
         | AccessFs::Refer;
-    // Landlock restricts exactly the rights a ruleset handles; an unhandled right is unrestricted. INTERNET leaves TCP unhandled; otherwise TCP is handled with no rule.
+    // Only filesystem rights are handled: an unhandled right is unrestricted, so network stays with the seccomp rule.
     let attr = Ruleset::default()
         .handle_access(AccessFs::from_all(WANT))
         .map_err(err)?;
-    let attr = if net {
-        attr
-    } else {
-        attr.handle_access(AccessNet::from_all(WANT)).map_err(err)?
-    };
     let mut created = attr
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
         .map_err(err)?
@@ -158,7 +147,7 @@ fn main() -> ExitCode {
             line.to_string_lossy()
         );
     }
-    match restrict(&a.grants, a.net) {
+    match restrict(&a.grants) {
         Ok((abi, ruleset)) => {
             let _ = writeln!(
                 std::io::stderr(),

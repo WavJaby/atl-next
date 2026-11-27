@@ -92,8 +92,8 @@ pub struct Spawn {
     pub devices: Vec<PathBuf>,
     /// The property area file, mounted read-only at [`PROPERTY_AREA`].
     pub property_area: Option<PathBuf>,
-    /// What the app's manifest permissions give ([`rights_of`]). Some: an app process; [`Right::Net`] leaves TCP unrestricted (Landlock ABI >= 4) and lets it create AF_INET / AF_INET6 sockets (seccomp).
-    /// None: not an app (a system service, the shell uid, adbd, a probe run by hand). No manifest means no Landlock grants, as before; AOSP's netd gives such a uid INTERNET by default, so its sockets are not refused.
+    /// What the app's manifest permissions give ([`rights_of`]). Some: an app process; [`Right::Net`] lets it create AF_INET / AF_INET6 sockets (seccomp) and mounts the host's resolver configuration.
+    /// None: not an app (a system service, the shell uid, adbd, a probe run by hand). No manifest means no Landlock grants; AOSP's netd gives such a uid INTERNET by default, so its sockets are not refused.
     pub rights: Option<Vec<Right>>,
     /// The app's desktop identity (`atl.<package>`, atl_launch::app_id) the host gives the web processes it spawns for this process ([`webspawn::AppView::app_id`]); None: a process of no package.
     pub app_id: Option<String>,
@@ -187,7 +187,7 @@ pub enum Profile {
     /// AOSP's adbd ([`Broker::spawn_adbd`], plan adbd S2): a user namespace mapped by the setuid helpers ([`adb`]) so its drop_privileges runs unpatched, the host's network (its listener is loopback by property), the app seccomp program, not registered with binderd (S3 gives its shell a binder door).
     Adb,
     /// A WebKit web process an app asked for ([`webspawn`]): built inside the app's mount namespace (bind sources are app paths) as a child of its pid namespace, the app's uid,
-    /// no further user namespaces, its own network (loopback only), ipc, uts and session, no `/dev/socket`, `/.flatpak-info` (WebKit's route switch), Landlock over exactly its binds, TCP refused, the app seccomp program.
+    /// no further user namespaces, its own network (loopback only), ipc, uts and session, no `/dev/socket`, `/.flatpak-info` (WebKit's route switch), Landlock over exactly its binds, the app seccomp program with INET refused whatever the app holds (`seccomp::profile_inet`).
     WebProcess,
 }
 
@@ -421,12 +421,9 @@ pub fn binderd_args(files: &[PathBuf], info_fd: i32, seccomp_fd: i32) -> Vec<OsS
     a.end()
 }
 
-/// The sandbox stub's argv after its path: `--net` when `net` (TCP unrestricted), each grant as `--ro` / `--rw` / `--device` PATH, then `-- program`. The stub restricts itself with Landlock to exactly those grants and execs `program`, which inherits the domain.
-pub fn stub_args(grants: &[(Access, PathBuf)], net: bool, program: &Path) -> Vec<OsString> {
-    let mut v = Vec::with_capacity(grants.len() * 2 + 3);
-    if net {
-        v.push("--net".into());
-    }
+/// The sandbox stub's argv after its path: each grant as `--ro` / `--rw` / `--device` PATH, then `-- program`. The stub restricts itself with Landlock to exactly those grants and execs `program`, which inherits the domain.
+pub fn stub_args(grants: &[(Access, PathBuf)], program: &Path) -> Vec<OsString> {
+    let mut v = Vec::with_capacity(grants.len() * 2 + 2);
     for (access, path) in grants {
         v.push(
             match access {
@@ -443,7 +440,7 @@ pub fn stub_args(grants: &[(Access, PathBuf)], net: bool, program: &Path) -> Vec
     v
 }
 
-/// One row per manifest permission: what it gives the app process. Landlock restricts exactly the rights a ruleset handles, so `Net` is the only network row: TCP left unhandled (ABI >= 4), not a port list.
+/// One row per manifest permission: what it gives the app process. `Net` is the only network row (AF_INET / AF_INET6 socket creation, seccomp.rs; the resolver configuration).
 /// `RecordAudio` / `Camera` are not the broker's: atld's PipeWire permission manager grants the process's PipeWire client the audio / video sources (atl-platform-host-linux pipewire_context).
 pub const PERMISSION_RIGHTS: &[(&str, Right)] = &[
     ("android.permission.INTERNET", Right::Net),
@@ -464,7 +461,7 @@ pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Right {
-    /// TCP bind and connect on any port (the Landlock network rights are left unhandled), and AF_INET / AF_INET6 sockets (the seccomp INTERNET rule, seccomp.rs).
+    /// AF_INET / AF_INET6 socket creation (the seccomp INTERNET rule, seccomp.rs), and the host's resolver configuration (`resolver_view`).
     Net,
     /// The desktop's audio sources through the process's PipeWire security context (atld grants them).
     RecordAudio,
@@ -951,7 +948,7 @@ impl Broker {
         let bwrap_args = binderd_args(&files, info_w.as_raw_fd(), seccomp.as_raw_fd());
         let grants: Vec<(Access, PathBuf)> =
             allow.iter().map(|f| (Access::Ro, f.clone())).collect();
-        let args = stub_args(&grants, false, program);
+        let args = stub_args(&grants, program);
         let process = launch(
             Launch {
                 bwrap_args,
@@ -1052,7 +1049,7 @@ impl Broker {
             None => None,
         };
         // the stub applies the grants, then execs the program with the spawn's arguments
-        let mut args = stub_args(&grants, spawn.has_right(Right::Net), &spawn.program);
+        let mut args = stub_args(&grants, &spawn.program);
         // the app's thread-priority tiers (seccomp.rs NiceTiers): the stub raises the soft RLIMIT_NICE to the hard one and logs the tier line once per process
         if self.app_seccomp {
             let tiers = seccomp::NiceTiers::for_limit(seccomp::granted_nice());
@@ -1208,7 +1205,7 @@ impl WebSpawner {
                 vec![]
             },
             property_area: None,
-            // the web process's grants stay as they were (no resolver view, Landlock TCP refused); its INTERNET rule is the app's (`app.inet`)
+            // the web process's grants stay as they were (no resolver view); its seccomp program refuses INET whatever the app holds (`seccomp::profile_inet`)
             rights: Some(vec![]),
             app_id: None,
             program: plan.program.clone(),
@@ -1237,8 +1234,8 @@ impl WebSpawner {
             seccomp.as_ref().map(AsRawFd::as_raw_fd),
         );
         let info = flatpak_info(&mut bwrap_args, &mut grants)?;
-        // no rights: TCP stays handled (refused) by the stub, and the namespace has loopback only
-        let mut args = stub_args(&grants, false, &spawn.program);
+        // the namespace has loopback only; the seccomp program refuses INET (`seccomp::profile_inet`)
+        let mut args = stub_args(&grants, &spawn.program);
         args.extend([
             OsString::from(&plan.identifier),
             socket.as_raw_fd().to_string().into(),
@@ -1309,8 +1306,8 @@ impl Broker {
             Some(seccomp.as_raw_fd()),
         );
         let context = context_file(&mut bwrap_args, &mut grants, &spawn.context)?;
-        // no rights: TCP is left handled (refused) by the stub, and the namespace has no network anyway
-        let mut args = stub_args(&grants, false, &spawn.program);
+        // the seccomp allow-list passes only AF_UNIX sockets (any other kills), and the namespace has no network anyway
+        let mut args = stub_args(&grants, &spawn.program);
         args.extend(spawn.args.iter().cloned());
         let Process {
             child,
@@ -1338,7 +1335,7 @@ impl Broker {
 }
 
 impl Broker {
-    /// Starts adbd in [`Profile::Adb`]: bwrap blocks its first process until `maps` are written into the new user namespace ([`adb::write_maps`] on the reported pid), then runs the stub (TCP left open: adbd listens) and adbd as namespace [`adb::AID_SHELL`] with [`adb::ADBD_CAPS`].
+    /// Starts adbd in [`Profile::Adb`]: bwrap blocks its first process until `maps` are written into the new user namespace ([`adb::write_maps`] on the reported pid), then runs the stub and adbd (its seccomp program allows INET: it listens on TCP) as namespace [`adb::AID_SHELL`] with [`adb::ADBD_CAPS`].
     /// `spawn.uid` must be AID_SHELL (the id the maps give the caller); its environment is `spawn.env` alone (init's, as adbd's on a device); no binderd registration. Maps that fail to write end the sandbox.
     pub fn spawn_adbd(&self, mut spawn: Spawn, maps: &adb::IdMaps) -> io::Result<Process> {
         if spawn.uid != adb::AID_SHELL || spawn.context_manager || !spawn.devices.is_empty() {
@@ -1363,7 +1360,7 @@ impl Broker {
         let mut block = bwrap::Args::new();
         block.userns_block_fd(block_r.as_raw_fd());
         bwrap_args.splice(0..0, block.options());
-        let mut args = stub_args(&grants, true, &spawn.program);
+        let mut args = stub_args(&grants, &spawn.program);
         args.extend(spawn.args.iter().cloned());
         let process = launch(
             Launch {
@@ -1542,17 +1539,17 @@ fn context_file(
     Ok(file.into())
 }
 
-/// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`. `net`: the process holds INTERNET ([`seccomp::filter`]).
-fn seccomp_memfd(profile: Profile, net: bool) -> io::Result<OwnedFd> {
-    memfd_of(&seccomp::filter(profile, net)?)
+/// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`. `app_inet`: the app holds INTERNET ([`seccomp::filter`] gives the process's right).
+fn seccomp_memfd(profile: Profile, app_inet: bool) -> io::Result<OwnedFd> {
+    memfd_of(&seccomp::filter(profile, app_inet)?)
 }
 
-/// An app profile's program: the full app program, or with `priority` off (`--no-app-seccomp`) the INTERNET rules alone ([`seccomp::inet_filter`]).
-fn app_seccomp_memfd(profile: Profile, net: bool, priority: bool) -> io::Result<OwnedFd> {
+/// An app profile's program: the full app program, or with `priority` off (`--no-app-seccomp`) the INTERNET rules alone ([`seccomp::inet_filter`]). `app_inet`: the app holds INTERNET.
+fn app_seccomp_memfd(profile: Profile, app_inet: bool, priority: bool) -> io::Result<OwnedFd> {
     if priority {
-        seccomp_memfd(profile, net)
+        seccomp_memfd(profile, app_inet)
     } else {
-        memfd_of(&seccomp::inet_filter(net)?)
+        memfd_of(&seccomp::inet_filter(profile, app_inet)?)
     }
 }
 
@@ -1914,12 +1911,8 @@ mod tests {
             (Access::Dev, "/dev/dri".into()),
         ];
         assert_eq!(
-            s(&stub_args(&grants, false, Path::new("/b/atl-binderd"))).join(" "),
+            s(&stub_args(&grants, Path::new("/b/atl-binderd"))).join(" "),
             "--ro /b/atl-binderd --rw /rw/x --device /dev/dri -- /b/atl-binderd"
-        );
-        assert_eq!(
-            s(&stub_args(&grants, true, Path::new("/b/atl-binderd"))).join(" "),
-            "--net --ro /b/atl-binderd --rw /rw/x --device /dev/dri -- /b/atl-binderd"
         );
         // INTERNET is one table row; no permission gives no right
         assert_eq!(

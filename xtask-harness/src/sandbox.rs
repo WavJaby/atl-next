@@ -4,7 +4,7 @@
 //! Pass, both runs: the $HOME file and the new $HOME name refused (ENOENT or EACCES), a write to /usr refused, the own data dir written and read back. The TCP connect is refused without INTERNET and succeeds with it.
 //! The UI baseline grants (each a grant class every UI app gets, not a manifest right), each with one shown and one refused path: the compositor socket (atl_platform_host::app_access::socket_of; a second socket beside it refused), the fontconfig file (config_file_of; a file beside it refused),
 //! the DRM node's sysfs (atl_broker::drm_sysfs over /dev/dri: the device dir's `uevent` read, `/sys/kernel/uevent_seqnum` refused; the CPU topology dir every sandbox shows is judged by `test app`'s cpuProbe row). Font dirs are not probed: the face dirs fontconfig lists are bound the same way as the file.
-//! The TCP judgement needs Landlock ABI >= 4 (the network rights): below it the gate prints the net check as not judged and counts nothing for it. WSL is ABI 3, so the net branch is asserted on the Arch laptop only.
+//! The socket rows (`net-connect`, AF_INET, AF_INET6) are judged on every Landlock ABI: socket creation is the seccomp INTERNET rule's, not Landlock's.
 //! The resolver (judge_resolv): with INTERNET the probe reads the host's /etc/resolv.conf through whatever link chain the host has (WSL `/mnt/wsl/resolv.conf`, systemd-resolved `/run/...`); a dangling link reads ENOENT and fails it.
 //! The environment (judge_env): only atl-broker app_env::APP_ENV names, the spawn's own and the sandbox's fixed ones; the broker's HOME must not arrive.
 //! Wayland (wayland_rows): on the gates' labwc, the probe connects through a per-app security context as atld gives it; no privileged interface offered, a privileged bind fails, ATL's interfaces stay. Deliberate break: mount `nested.socket` instead of the context socket; the row must then fail.
@@ -375,8 +375,7 @@ fn judge_resolv(line: &str, want: &str) -> Option<String> {
     })
 }
 
-/// The verdict on one probe line: the file checks in every run; the socket rows by the run's rights, on every Landlock ABI (socket creation is the seccomp INTERNET rule's:
-/// AF_INET / AF_INET6 are refused with EPERM without INTERNET, AF_UNIX never; plan internet-permission G).
+/// The verdict on one probe line: the file checks in every run; the socket rows by the run's rights (socket creation is the seccomp INTERNET rule's: AF_INET / AF_INET6 are refused with EPERM without INTERNET, AF_UNIX never).
 fn judge(line: &str, internet: bool) -> Vec<String> {
     let checks: BTreeMap<&str, &str> = line
         .strip_prefix("probe: ")

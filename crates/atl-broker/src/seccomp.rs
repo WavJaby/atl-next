@@ -98,15 +98,23 @@ impl NiceTiers {
     }
 }
 
-/// `profile`'s program. `net`: the process holds INTERNET (App, WebProcess; Adb is always net; the allow-lists ignore it).
-pub fn program(profile: Profile, net: bool) -> io::Result<BpfProgram> {
+/// The INTERNET right of a process of `profile`, given that its app holds INTERNET (`app_inet`). An app process has its app's. The web process never: WebKit's renderer opens no sockets (AOSP's isolated renderer has none; the network process, which the app spawns with its own rights, does the network). adbd always: its shell uid holds INTERNET (platform.xml:177). Binderd and the installer: their allow-lists decide, the flag is unused.
+pub fn profile_inet(profile: Profile, app_inet: bool) -> bool {
     match profile {
-        // a WebKit web process: the app's program, the app being what it runs for (narrowing to WebKit's own seccomp list is a step still to measure); `net` = the app's INTERNET
-        Profile::App | Profile::WebProcess => {
+        Profile::App => app_inet,
+        Profile::WebProcess | Profile::BinderDaemon | Profile::Installer => false,
+        Profile::Adb => true,
+    }
+}
+
+/// `profile`'s program for an app holding INTERNET `app_inet`; the process's right is [`profile_inet`]'s.
+pub fn program(profile: Profile, app_inet: bool) -> io::Result<BpfProgram> {
+    let net = profile_inet(profile, app_inet);
+    match profile {
+        // the app's program; a web process runs it without INET (profile_inet). Narrowing to WebKit's own seccomp list is a step still to measure.
+        Profile::App | Profile::WebProcess | Profile::Adb => {
             app_program(NiceTiers::for_limit(granted_nice()), net)
         }
-        // adbd listens on loopback TCP, and its shell uid holds INTERNET (platform.xml:177): never refused a socket
-        Profile::Adb => app_program(NiceTiers::for_limit(granted_nice()), true),
         Profile::BinderDaemon => binderd_program(),
         Profile::Installer => installer_program(),
     }
@@ -256,8 +264,8 @@ fn app_program(tiers: NiceTiers, net: bool) -> io::Result<BpfProgram> {
 }
 
 /// The app filter without the thread-priority rule (atld `--no-app-seccomp`): [`inet_rules`] and every other call allowed. The INTERNET right is kept: it is not part of the check the switch drops.
-pub fn inet_filter(net: bool) -> io::Result<Vec<u8>> {
-    let mut p = inet_rules(net)?;
+pub fn inet_filter(profile: Profile, app_inet: bool) -> io::Result<Vec<u8>> {
+    let mut p = inet_rules(profile_inet(profile, app_inet))?;
     p.push(seccompiler::sock_filter {
         code: BPF_RET_K,
         jt: 0,
@@ -321,9 +329,9 @@ fn row(call: i64, body: &[seccompiler::sock_filter]) -> io::Result<Vec<seccompil
     Ok(rows)
 }
 
-/// `profile`'s filter as the bytes bwrap reads from `--seccomp`'s fd: a `struct sock_filter` array in host byte order (code u16, jt u8, jf u8, k u32).
-pub fn filter(profile: Profile, net: bool) -> io::Result<Vec<u8>> {
-    Ok(bytes(&program(profile, net)?))
+/// `profile`'s filter as the bytes bwrap reads from `--seccomp`'s fd: a `struct sock_filter` array in host byte order (code u16, jt u8, jf u8, k u32). `app_inet`: see [`program`].
+pub fn filter(profile: Profile, app_inet: bool) -> io::Result<Vec<u8>> {
+    Ok(bytes(&program(profile, app_inet)?))
 }
 
 fn bytes(program: &[seccompiler::sock_filter]) -> Vec<u8> {

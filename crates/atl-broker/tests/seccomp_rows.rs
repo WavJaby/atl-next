@@ -61,6 +61,8 @@ fn probe() {
         Some("rows-no-inet") => rows_probe(false),
         Some("rows-no-priority-inet") => inet_only_probe(true),
         Some("rows-no-priority-no-inet") => inet_only_probe(false),
+        Some("rows-web-internet") => web_rows_probe(),
+        Some("rows-web-no-priority-internet") => web_inet_only_probe(),
         Some("denied") => denied_probe(),
         Some("table-installer") => table_probe(Profile::Installer, |r| r.installer),
         Some("table-binderd") => table_probe(Profile::BinderDaemon, |r| r.binderd),
@@ -111,7 +113,19 @@ fn rows_probe(net: bool) -> ! {
 
 /// `--no-app-seccomp`'s program ([`seccomp_inet_filter`]): the INTERNET rules and io_uring_setup, without the thread-priority rule. Same rows as [`rows_probe`].
 fn inet_only_probe(net: bool) -> ! {
-    apply_bytes(&seccomp_inet_filter(net).expect("inet filter bytes"));
+    apply_bytes(&seccomp_inet_filter(Profile::App, net).expect("inet filter bytes"));
+    print_rows()
+}
+
+/// The web process's filter for an app holding INTERNET: [`apply_net`] with `Profile::WebProcess` (the table refuses INET whatever the app holds).
+fn web_rows_probe() -> ! {
+    apply_net(Profile::WebProcess, true);
+    print_rows()
+}
+
+/// `--no-app-seccomp`'s web process program for an app holding INTERNET ([`seccomp_inet_filter`]).
+fn web_inet_only_probe() -> ! {
+    apply_bytes(&seccomp_inet_filter(Profile::WebProcess, true).expect("inet filter bytes"));
     print_rows()
 }
 
@@ -180,6 +194,22 @@ fn no_priority_filter_keeps_the_inet_rules_and_io_uring() {
     if cfg!(target_arch = "x86_64") {
         assert_eq!(no_net["inet_x32"], "err:1");
         assert_eq!(no_net["io_uring_x32"], "err:13");
+    }
+}
+
+/// The web process (WebKit's renderer, spawned through the broker) gets no AF_INET / AF_INET6 sockets even when its app holds INTERNET: AOSP's isolated renderer has none, and the network process (WebKit spawns it with the app's rights) does the network. Both the full web program and `--no-app-seccomp`'s; AF_UNIX and io_uring as for any app. Break: `profile_inet`'s WebProcess arm = `app_inet` turns both modes red.
+#[test]
+fn web_process_refuses_inet_even_when_the_app_holds_internet() {
+    for mode in ["rows-web-internet", "rows-web-no-priority-internet"] {
+        let line = probe_line(mode, &[]);
+        assert_eq!(line["inet"], "err:1", "{mode}");
+        assert_eq!(line["inet6"], "err:1", "{mode}");
+        assert_eq!(line["unix"], "ok", "{mode}");
+        assert_eq!(line["io_uring"], "err:13", "{mode}");
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(line["inet_x32"], "err:1", "{mode}");
+            assert_eq!(line["io_uring_x32"], "err:13", "{mode}");
+        }
     }
 }
 
