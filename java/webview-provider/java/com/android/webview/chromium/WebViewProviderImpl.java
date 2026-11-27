@@ -96,6 +96,20 @@ final class WebViewProviderImpl implements WebViewProvider, WebViewProvider.View
     @Override public void setDownloadListener(DownloadListener listener) { mDownloadListener = listener; }
     @Override public native void setInitialScale(int scaleInPercent);
 
+    // ---- popups (a34): onCreateWindow's resultMsg, called by the native popup request on this WebView's Looper ----
+    // a Message on a Handler of the opener's current Looper with a real WebViewTransport in obj (WebView.java:130-150); its send forwards the captured token and that transport
+    private Message newPopupMessage(final long token) {
+        final WebView.WebViewTransport transport = mWebView.new WebViewTransport();
+        Handler h = new Handler(android.os.Looper.myLooper(), new Handler.Callback() {
+            @Override public boolean handleMessage(Message m) {
+                completePopup(token, transport);
+                return true;
+            }
+        });
+        return h.obtainMessage(0, transport);
+    }
+    private native void completePopup(long token, WebView.WebViewTransport transport);
+
     // ---- View-system callbacks on every WebView: counted, not thrown (Unimplemented.accept) ----
     // View state: WebView.setOverScrollMode's super call (WebView.java:2703) keeps it, so getOverScrollMode answers; the page has no overscroll mode of its own
     @Override public void setOverScrollMode(int mode) {}

@@ -41,6 +41,8 @@ static VTABLE: WebViewVtable = WebViewVtable {
     view_set_str,
     view_set_background,
     view_set_initial_scale,
+    view_cancel_popup,
+    view_adopt_popup,
     cookies_watch,
     cookies_add,
     cookies_replace,
@@ -212,6 +214,7 @@ struct Pending {
     flags: u32,
     back: u32,
     forward: u32,
+    popup_token: u64,
 }
 
 /// What a LOCATION event reports: URL, original URL, entries back, entries forward.
@@ -251,8 +254,26 @@ struct Events {
     load_uri: RefCell<String>,
     /// The location last reported ([`Self::location_changed`]).
     location: RefCell<Option<Location>>,
-    /// False once the view is retired ([`Self::retire`]): no event reaches the sink from then on ([`Self::push`]).
+    /// False once the view is retired ([`Self::retire`]) and while it is a parked popup: no event reaches the sink then ([`Self::push`]).
     active: std::cell::Cell<bool>,
+    /// The key the view is named by; 0 while a parked popup (no key yet).
+    key: std::cell::Cell<i32>,
+    /// WebSettings.setSupportMultipleWindows: `create` parks a popup only while on.
+    multiple_windows: std::cell::Cell<bool>,
+    /// A parked popup's hold ([`Park`]); None for every other view.
+    park: RefCell<Option<Park>>,
+    /// An adopted popup: its page's `window.close()` is reported (once, [`Self::closed`]).
+    popup: std::cell::Cell<bool>,
+    /// POPUP_CLOSED was reported.
+    closed: std::cell::Cell<bool>,
+}
+
+/// A parked popup's first navigation: the one whose URI equals what `create` received is held until adoption (`held`); adopted before it came -> `released`, it proceeds when it comes.
+/// No frame evidence in WebKitGTK's API (`frame_name` None for main and injected subframe alike, a34 gate f2), so the URI match is the identity.
+struct Park {
+    uri: String,
+    held: Option<webkit6::PolicyDecision>,
+    released: bool,
 }
 
 impl Events {
@@ -267,6 +288,11 @@ impl Events {
             load_uri: RefCell::default(),
             location: RefCell::default(),
             active: std::cell::Cell::new(true),
+            key: std::cell::Cell::new(0),
+            multiple_windows: std::cell::Cell::new(false),
+            park: RefCell::default(),
+            popup: std::cell::Cell::new(false),
+            closed: std::cell::Cell::new(false),
         })
     }
 
@@ -357,6 +383,7 @@ impl Events {
             flags: p.flags,
             back: p.back,
             forward: p.forward,
+            popup_token: p.popup_token,
             // the receiver takes `reply` only for PROMPT and NAVIGATION; any other event carries a placeholder this side drops
             reply: ManuallyDrop::new(p.reply.unwrap_or_else(|| ReplyAbi::new(|_| {}))),
         };
@@ -411,6 +438,9 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
         return false;
     };
     let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+    if let Some(taken) = parked_policy(ev, decision, &uri) {
+        return taken;
+    }
     let method = request
         .http_method()
         .map(|m| m.to_string())
@@ -448,7 +478,7 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
     let held = glib::thread_guard::ThreadGuard::new((decision.clone(), Rc::downgrade(ev)));
     let nav_uri = uri.clone();
     let reply = ReplyAbi::new(move |taken: Option<String>| {
-        glib::MainContext::default().invoke(move || {
+        defer(move || {
             let (d, ev) = held.into_inner();
             if taken.is_some() {
                 d.ignore();
@@ -491,6 +521,259 @@ fn navigation_policy(ev: &Rc<Events>, decision: &webkit6::PolicyDecision) -> boo
     true
 }
 
+/// Runs a reply's engine step on the display thread, always as a later dispatch, never inline (`MainContext::invoke` runs inline on the owner): a reply finished inside the signal that made it
+/// (the bridge query answered on D at once; a retired view's [`Events::push`]; a parked popup's ignored navigation) would close a dialog / decide a policy before the handler returned, and WebKit's
+/// unref after it crashed (webkit_script_dialog_unref, measured in 3a). Any thread.
+fn defer(f: impl FnOnce() + Send + 'static) {
+    glib::idle_add_once(f);
+}
+
+/// A parked popup's navigation decision (None: not parked, the normal policy decides). Held: the first one for the URI `create` received. Every other while parked: ignored, named. Adopted
+/// before it came: it proceeds now, unreported (the popup's own load, not a page navigation).
+fn parked_policy(ev: &Events, decision: &webkit6::PolicyDecision, uri: &str) -> Option<bool> {
+    let mut park = ev.park.borrow_mut();
+    let p = park.as_mut()?;
+    if p.released {
+        let first = p.uri == uri;
+        *park = None;
+        if !first {
+            return None;
+        }
+        ev.navigating.replace(Some(uri.to_owned()));
+        decision.use_();
+        return Some(true);
+    }
+    if p.held.is_none() && p.uri == uri {
+        p.held = Some(decision.clone());
+    } else {
+        tracing::warn!(
+            "webview: popup_parked_navigation_ignored: a navigation of a parked popup other than its first; ignored"
+        );
+        decision.ignore();
+    }
+    Some(true)
+}
+
+/// A pending popup (D only), one per opener key ([`PENDING`]).
+struct PendingPopup {
+    token: u64,
+    web: webkit6::WebView,
+    events: Rc<Events>,
+}
+
+thread_local! {
+    /// Pending popups by opener key.
+    static PENDING: RefCell<HashMap<i32, PendingPopup>> = RefCell::default();
+    /// The last token issued; tokens are nonzero, never reused.
+    static LAST_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A popup target `create` refuses: no URL, empty, or about:blank (`window.open('')`, `window.open('about:blank')`). Its document is written synchronously by the opener with no navigation
+/// decision to hold: written subresources reach the network before any Android decision (a34 probe case g); refused, the page's `window.open` returns null and nothing loads (gate g1, g2).
+fn unsupported_popup_target(uri: Option<&str>) -> bool {
+    match uri {
+        None | Some("") => true,
+        Some(u) => {
+            u == "about:blank" || u.starts_with("about:blank#") || u.starts_with("about:blank?")
+        }
+    }
+}
+
+/// Drops a pending popup: its held navigation ignored, its view silenced and closed.
+fn discard_popup(p: PendingPopup) {
+    if let Some(d) = p.events.park.take().and_then(|park| park.held) {
+        d.ignore();
+    }
+    p.events.retire();
+    p.web.try_close();
+}
+
+/// `create` and `close` of `web` ([`Events::key`] read at signal time: a popup's key changes at adoption).
+fn connect_popups(web: &webkit6::WebView, events: &Rc<Events>) {
+    let ev = events.clone();
+    web.connect_create(move |parent, action| {
+        let key = ev.key.get();
+        // a retired or parked view opens nothing (no recursive popup before adoption)
+        if !ev.active.get() || key == 0 {
+            return None;
+        }
+        // disabled: WebKit gets no view; same-view routing (WebSettings.java setSupportMultipleWindows false) is a later slice
+        if !ev.multiple_windows.get() {
+            return None;
+        }
+        let uri = action.request().and_then(|r| r.uri()).map(|u| u.to_string());
+        if unsupported_popup_target(uri.as_deref()) {
+            tracing::warn!("webview[{key}]: unsupported_popup_target: window.open with no URL or about:blank; refused");
+            return None;
+        }
+        if PENDING.with_borrow(|m| m.contains_key(&key)) {
+            tracing::warn!("webview[{key}]: popup_overlap_refused: a popup is already pending for this view; refused");
+            return None;
+        }
+        let gesture = action.is_user_gesture();
+        // the related view shares the opener's web process, script controller and (WebKit default) settings: the settings are made private here, the destination's replace them at adoption
+        let child = webkit6::WebView::builder().related_view(parent).build();
+        let private = webkit6::Settings::new();
+        private.set_enable_javascript(false);
+        private.set_enable_html5_local_storage(false);
+        child.set_settings(&private);
+        let cev = Events::new(SendCallback::new(|_: &WebEventView| {}));
+        cev.active.set(false);
+        cev.park.replace(Some(Park {
+            uri: uri.unwrap_or_default(),
+            held: None,
+            released: false,
+        }));
+        connect_view(&child, &cev);
+        connect_popups(&child, &cev);
+        let token = LAST_TOKEN.with(|t| {
+            t.set(t.get() + 1);
+            t.get()
+        });
+        PENDING.with_borrow_mut(|m| {
+            m.insert(
+                key,
+                PendingPopup {
+                    token,
+                    web: child.clone(),
+                    events: cev,
+                },
+            )
+        });
+        ev.push(Pending {
+            kind: web_event::POPUP_REQUESTED,
+            popup_token: token,
+            flags: if gesture { web_event::FLAG_GESTURE } else { 0 },
+            ..Pending::default()
+        });
+        Some(child.upcast())
+    });
+    let ev = events.clone();
+    web.connect_close(move |_| {
+        if ev.park.borrow().is_some() {
+            // a parked popup closed by its page before adoption: cancelled, its opener told
+            let Some((opener, p)) = PENDING.with_borrow_mut(|m| {
+                let k = m
+                    .iter()
+                    .find(|(_, p)| Rc::ptr_eq(&p.events, &ev))
+                    .map(|(k, _)| *k)?;
+                m.remove(&k).map(|p| (k, p))
+            }) else {
+                return;
+            };
+            let token = p.token;
+            discard_popup(p);
+            if let Some(oev) = VIEWS.with_borrow(|m| m.get(&opener).map(|v| Rc::clone(&v.events))) {
+                oev.push(Pending {
+                    kind: web_event::POPUP_CANCELLED,
+                    popup_token: token,
+                    ..Pending::default()
+                });
+            }
+            return;
+        }
+        // a retired view (view_drop's own try_close) pushes nothing; an adopted popup reports once
+        if ev.popup.get() && !ev.closed.replace(true) {
+            ev.emit(web_event::POPUP_CLOSED, "", "", 0, 0, None);
+        }
+    });
+}
+
+unsafe extern "C" fn view_cancel_popup(key: i32, token: u64) {
+    on_display(move || match take_popup(key, token) {
+        Some(p) => discard_popup(p),
+        None => {
+            tracing::warn!("webview[{key}]: cancel_popup for no pending popup {token}; ignored")
+        }
+    });
+}
+
+/// `key`'s pending popup if it is `token` (a stale token leaves a newer one in place).
+fn take_popup(key: i32, token: u64) -> Option<PendingPopup> {
+    PENDING.with_borrow_mut(|m| {
+        if m.get(&key).is_some_and(|p| p.token == token) {
+            m.remove(&key)
+        } else {
+            None
+        }
+    })
+}
+
+unsafe extern "C" fn view_adopt_popup(
+    key: i32,
+    token: u64,
+    destination: i32,
+    mut done: SendCallback<bool>,
+) {
+    let queued = on_display(move || {
+        let Some(p) = take_popup(key, token) else {
+            tracing::warn!("webview[{key}]: adopt_popup for no pending popup {token}: done(false)");
+            return done.call(&false);
+        };
+        if destination == key || !VIEWS.with_borrow(|m| m.contains_key(&destination)) {
+            tracing::warn!(
+                "webview[{key}]: adopt_popup into no view {destination}; popup cancelled"
+            );
+            discard_popup(p);
+            return done.call(&false);
+        }
+        adopt(p, destination);
+        done.call(&true);
+    });
+    if !queued {
+        tracing::error!("webview[{key}]: adopt_popup with no display thread");
+    }
+}
+
+/// Puts the popup's view under `destination`'s key in place of its blank page: the old page's sources silenced and its widget detached, then the destination's sink, settings, background,
+/// scale and scripts move to the popup, its widget is attached, and its held first navigation proceeds.
+fn adopt(p: PendingPopup, destination: i32) {
+    let Some(mut d) = VIEWS.with_borrow_mut(|m| m.remove(&destination)) else {
+        return discard_popup(p);
+    };
+    d.events.retire();
+    let sink = d
+        .events
+        .sink
+        .replace(SendCallback::new(|_: &WebEventView| {}));
+    let ce = p.events;
+    ce.sink.replace(sink);
+    ce.multiple_windows.set(d.events.multiple_windows.get());
+    ce.key.set(destination);
+    ce.popup.set(true);
+    // every setting command queued before this one has been applied to the destination's settings object; later ones reach it through the key
+    if let Some(s) = WebViewExt::settings(&d.web) {
+        p.web.set_settings(&s);
+    }
+    p.web.set_background_color(&d.web.background_color());
+    p.web.set_zoom_level(d.web.zoom_level());
+    d.shown.call(&std::ptr::null_mut());
+    use webkit6::glib::translate::ToGlibPtr;
+    let widget: *mut webkit6::gtk::ffi::GtkWidget =
+        p.web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
+    d.shown.call(&widget.cast());
+    let old = std::mem::replace(&mut d.web, p.web);
+    d.events = Rc::clone(&ce);
+    VIEWS.with_borrow_mut(|m| m.insert(destination, d));
+    ce.active.set(true);
+    let held = {
+        let mut park = ce.park.borrow_mut();
+        if park.as_ref().is_some_and(|pk| pk.held.is_some()) {
+            park.take().and_then(|pk| pk.held.map(|h| (pk.uri, h)))
+        } else {
+            if let Some(pk) = park.as_mut() {
+                pk.released = true;
+            }
+            None
+        }
+    };
+    if let Some((uri, decision)) = held {
+        ce.navigating.replace(Some(uri));
+        decision.use_();
+    }
+    old.try_close();
+}
+
 unsafe extern "C" fn view_create(
     key: i32,
     events: SendCallback<WebEventView>,
@@ -519,7 +802,9 @@ fn create(key: i32, events: SendCallback<WebEventView>, mut shown: SendCallback<
         );
     });
     let (web, events) = build_view(events);
+    events.key.set(key);
     connect_view(&web, &events);
+    connect_popups(&web, &events);
     use webkit6::glib::translate::ToGlibPtr;
     let widget: *mut webkit6::gtk::ffi::GtkWidget =
         web.upcast_ref::<webkit6::gtk::Widget>().to_glib_none().0;
@@ -673,12 +958,10 @@ fn connect_view(web: &webkit6::WebView, events: &Rc<Events>) {
             .prompt_get_default_text()
             .map(|m| m.to_string())
             .unwrap_or_default();
-        // answered asynchronously (WebKit keeps the dialog pending while a ref is held and close is not called); the answer may come from any thread, so it hops back to the main context.
-        // Always a later dispatch, never `invoke`: an answer given inside this handler (the bridge query is answered on D at once) closed the dialog before the handler returned, and
-        // WebKit's unref after it crashed (webkit_script_dialog_unref).
+        // answered asynchronously (WebKit keeps the dialog pending while a ref is held and close is not called), through [`defer`]
         let held = glib::thread_guard::ThreadGuard::new(dialog.clone());
         let reply = ReplyAbi::new(move |text: Option<String>| {
-            glib::idle_add_once(move || {
+            defer(move || {
                 let d = held.into_inner();
                 if let Some(t) = text {
                     d.prompt_set_text(&t);
@@ -694,6 +977,10 @@ fn connect_view(web: &webkit6::WebView, events: &Rc<Events>) {
 unsafe extern "C" fn view_drop(key: i32) {
     on_display(move || {
         // out of the map before anything runs: the detach and the close may run GTK code
+        // its pending popup goes with it (no event: the opener is gone)
+        if let Some(p) = PENDING.with_borrow_mut(|m| m.remove(&key)) {
+            discard_popup(p);
+        }
         let Some(v) = VIEWS.with_borrow_mut(|m| m.remove(&key)) else {
             return tracing::warn!("webview[{key}]: drop for no view; ignored");
         };
@@ -826,8 +1113,10 @@ fn settings(web: &webkit6::WebView) -> webkit6::Settings {
 
 // The core's setting table (atl-webview settings.rs) decides each value's kind; a setting of another kind here is a broken table row and only logged.
 unsafe extern "C" fn view_set_bool(key: i32, which: WebSetting, on: bool) {
-    on_view(key, "set_bool", move |web, _| {
-        set_bool(&settings(web), which, on)
+    on_view(key, "set_bool", move |web, ev| match which {
+        // no engine setting: this module's own switch for `create`
+        WebSetting::SupportMultipleWindows => ev.multiple_windows.set(on),
+        _ => set_bool(&settings(web), which, on),
     });
 }
 
@@ -1070,6 +1359,41 @@ mod tests {
         assert_eq!(scheme("1abc:x"), None);
         assert_eq!(scheme("a b:x"), None);
         assert_eq!(scheme("no-colon"), None);
+    }
+
+    /// A reply's engine step never runs inside the call that finishes it, even on the display thread: it waits for the next dispatch ([`defer`]).
+    #[test]
+    fn deferred_reply_runs_after_the_finishing_call() {
+        let ctx = glib::MainContext::default();
+        let _owner = ctx.acquire().expect("default context free in this test");
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let flag = glib::thread_guard::ThreadGuard::new(Rc::clone(&ran));
+        defer(move || flag.into_inner().set(true));
+        assert!(!ran.get(), "ran inside the finishing call (re-entrant)");
+        while ctx.iteration(false) {}
+        assert!(ran.get(), "never ran");
+    }
+
+    /// The refusal rule (a34 gate g1, g2): no URL, empty, about:blank with or without a fragment or query; anything else, about:blank-like or not, is held.
+    #[test]
+    fn unsupported_popup_targets() {
+        for u in [
+            None,
+            Some(""),
+            Some("about:blank"),
+            Some("about:blank#x"),
+            Some("about:blank?a"),
+        ] {
+            assert!(unsupported_popup_target(u), "{u:?}");
+        }
+        for u in [
+            "about:blankx",
+            "https://a.example/",
+            "about:srcdoc",
+            "data:text/html,x",
+        ] {
+            assert!(!unsupported_popup_target(Some(u)), "{u}");
+        }
     }
 
     use std::sync::{Arc, Mutex};

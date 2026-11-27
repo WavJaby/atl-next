@@ -98,6 +98,35 @@ pub trait WebView {
     fn claim_input(&self, claim: InputClaim, time_ns: i64) -> ClaimReply;
     /// Android focus: the view takes the toolkit's keyboard focus (and with it the desktop input method, through the engine's own context), or gives it back.
     fn set_focused(&self, on: bool);
+    /// Refuses the popup `token` this view (its opener) reported ([`WebEvent::PopupRequested`]): the parked engine view is destroyed, its held first navigation ignored. A token that no longer
+    /// names this view's pending popup (cancelled, closed, adopted, or a newer one) is ignored.
+    fn cancel_popup(&self, token: PopupToken);
+    /// Adopts the popup `token` this view opened into `destination`: the engine's browsing context replaces `destination`'s blank page under `destination`'s key, sink, settings and scripts,
+    /// and its held first navigation proceeds. `done` once, on the display thread, in command order: true = adopted; false = the token no longer names a pending popup of this view, or
+    /// `destination` is gone (the popup is then cancelled).
+    fn adopt_popup(
+        &self,
+        token: PopupToken,
+        destination: &Self,
+        done: Box<dyn FnOnce(bool) + Send>,
+    ) where
+        Self: Sized;
+}
+
+/// A pending popup's one-shot capability ([`WebEvent::PopupRequested`]): process-unique, never 0, never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PopupToken(u64);
+
+impl PopupToken {
+    /// The ABI form; None for 0 (no token).
+    pub fn of_raw(raw: u64) -> Option<Self> {
+        (raw != 0).then_some(Self(raw))
+    }
+
+    /// The ABI form.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 /// What a claim ([`WebView::claim_input`]) answers synchronously; what the claim's replay finds later is reported as a [`WebEvent`] ([`WebEvent::PressNotCancelled`]).
@@ -231,6 +260,21 @@ pub enum WebEvent {
         /// The answer channel.
         reply: Box<dyn NavigationReply>,
     },
+    /// The page opened a window (`window.open`, a `target=_blank` link) and multiple windows are on ([`WebSetting::SupportMultipleWindows`]): the engine made the new browsing context and
+    /// parks it, its first navigation held, until [`WebView::adopt_popup`] or [`WebView::cancel_popup`]. At most one per view at a time; a further open meanwhile is refused (null to the page).
+    PopupRequested {
+        /// The capability naming it.
+        token: PopupToken,
+        /// Opened by a user gesture (the open's own, not its navigation's).
+        gesture: bool,
+    },
+    /// The engine dropped the pending popup `token` before adoption (the page closed it): it names nothing any more.
+    PopupCancelled {
+        /// The cancelled popup.
+        token: PopupToken,
+    },
+    /// The page asked this (adopted popup) view to close (`window.close()`): reported once; never after the view is dropped.
+    PopupClosed,
 }
 
 /// A [`WebEvent::Navigation`]'s request (WebResourceRequest's fields).
@@ -342,6 +386,8 @@ pub enum WebSetting {
     FantasyFontFamily = 17,
     /// default-charset.
     DefaultCharset = 18,
+    /// WebSettings.setSupportMultipleWindows: no engine setting; the backend reports [`WebEvent::PopupRequested`] only while on (default off).
+    SupportMultipleWindows = 19,
 }
 
 /// The value kinds of settings.
@@ -365,7 +411,8 @@ impl WebSetting {
             | Self::AllowUniversalAccessFromFileUrls
             | Self::AllowFileAccessFromFileUrls
             | Self::JavaScriptCanOpenWindowsAutomatically
-            | Self::AutoLoadImages => SettingKind::Bool,
+            | Self::AutoLoadImages
+            | Self::SupportMultipleWindows => SettingKind::Bool,
             Self::MinimumFontSize | Self::DefaultFontSize | Self::DefaultMonospaceFontSize => {
                 SettingKind::Int
             }

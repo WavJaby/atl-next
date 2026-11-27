@@ -16,12 +16,16 @@ use std::thread::ThreadId;
 use atl_looper::{LooperApi, Poster};
 
 use atl_platform_ui::webview::{
-    ClaimReply, InputClaim, LoadError, NavigationRequest, PromptReply, SettingValue,
+    ClaimReply, InputClaim, LoadError, NavigationRequest, PopupToken, PromptReply, SettingValue,
     WebEngine as _, WebEvent, WebSetting, WebView as _,
 };
 use atl_platform_ui::{PlatformWebEngine, PlatformWebView};
 
 use crate::bridge;
+use popup::{ContentState, Effect, Target};
+
+#[path = "popup.rs"]
+mod popup;
 use crate::settings::{AppDefaults, Setting, Settings};
 
 mod generated {
@@ -643,6 +647,12 @@ struct Shared {
     keys: RefCell<VecDeque<(i64, usize, i32, i32)>>,
     /// Keycodes whose press the page left unhandled while their release had not reached the view yet: that release is reported unhandled when it comes.
     unhandled_presses: RefCell<Vec<i32>>,
+    /// This view as an opener: its one pending popup ([`popup::PopupSlot`]).
+    popup: RefCell<popup::PopupSlot>,
+    /// This view as a popup destination: what it has loaded ([`ContentState`]).
+    content: Cell<ContentState>,
+    /// This view as an adopted popup: onCloseWindow once, never after destroy.
+    close: RefCell<popup::CloseState>,
 }
 
 /// Key copies a view keeps at most ([`Shared::keys`]): a report comes one engine round trip after its key (WebKitGTK: after the release), so a few keys are in flight; 32 is a fast typist's second of presses and releases.
@@ -753,6 +763,9 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewChromiumFactoryProvid
         id: Cell::new(-1),
         keys: RefCell::default(),
         unhandled_presses: RefCell::default(),
+        popup: RefCell::default(),
+        content: Cell::new(ContentState::Pristine),
+        close: RefCell::default(),
     }));
     let sink_shared = Arc::clone(&shared);
     let sink_poster = poster.clone();
@@ -913,6 +926,16 @@ fn on_event(shared: &Shared, ev: WebEvent) {
         );
         return reply.finish(take);
     }
+    let ev = match ev {
+        WebEvent::PopupRequested { token, gesture } => {
+            return on_popup_requested(env, shared, token, gesture);
+        }
+        WebEvent::PopupCancelled { token } => {
+            return shared.popup.borrow_mut().engine_cancelled(token);
+        }
+        WebEvent::PopupClosed => return on_popup_closed(env, shared),
+        ev => ev,
+    };
     match &ev {
         WebEvent::LoadStarted(url) => {
             tracing::info!(
@@ -1749,6 +1772,9 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_destroy(
     // SAFETY: the Box createWebView leaked; the field is cleared first, so no native reaches it again.
     let n = unsafe { Box::from_raw(p) };
     tracing::info!("webview[{}]: destroyed", n.shared.id.get());
+    // the engine drops a pending popup with the view; a close report after this is not the app's
+    n.shared.popup.borrow_mut().destroyed();
+    n.shared.close.borrow_mut().destroy();
     n.set_third_party(false);
     // under the lock ([`Interfaces`])
     for (_, g, _) in interfaces(&n.shared.interfaces).drain(..) {
@@ -1766,6 +1792,7 @@ pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_destroy(
 }
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, (env, n, url: Obj, headers: Obj) -> () = (), {
+    started(n);
     if !headers.is_null() && !call_bool(env, headers, c"isEmpty", c"()Z", &[]) {
         return throw_uoe(env, "WebViewProvider.loadUrl(additionalHttpHeaders)");
     }
@@ -1787,6 +1814,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadUrl, 
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadData, (env, n, data: Obj, mime: Obj, encoding: Obj) -> () = (), {
+    started(n);
     let data = string(env, data).unwrap_or_default();
     let url = bridge::data_url(&data, string(env, mime).as_deref(), string(env, encoding).as_deref());
     n.shared.mirror.borrow_mut().seed(&url);
@@ -1794,6 +1822,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadData,
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataWithBaseURL, (env, n, base: Obj, data: Obj, mime: Obj, encoding: Obj, history: Obj) -> () = (), {
+    started(n);
     let data = string(env, data).unwrap_or_default();
     let mime = string(env, mime);
     let encoding = string(env, encoding);
@@ -1824,6 +1853,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_loadDataW
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_evaluateJavaScript, (env, n, script: Obj, callback: Obj) -> () = (), {
+    started(n);
     let script = string(env, script).unwrap_or_default();
     let cb = (!callback.is_null()).then(|| jni_call!(env, NewGlobalRef, callback) as usize);
     let poster = n.poster.clone();
@@ -1847,6 +1877,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_stopLoadi
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_reload, (env, n) -> () = (), {
+    started(n);
     let _ = env;
     n.view.reload();
 });
@@ -1857,6 +1888,7 @@ provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_canGoBack
 });
 
 provider_native!(Java_com_android_webview_chromium_WebViewProviderImpl_goBackOrForward, (env, n, steps: i32) -> () = (), {
+    started(n);
     let _ = env;
     n.shared.mirror.borrow_mut().go(steps);
     n.view.go_back_or_forward(steps);
@@ -2157,6 +2189,197 @@ pub extern "C" fn Java_com_android_webview_chromium_CookieManagerImpl_onMainLoop
     );
     if let MainLooper::Waiting(queue) = waiting {
         queue.into_iter().for_each(|f| f());
+    }
+}
+
+/// The app starts content on `n` before any engine hop: it can no longer take a popup ([`ContentState::start`]). Attachment, settings and interfaces leave it eligible.
+fn started(n: &Native) {
+    n.shared.content.set(n.shared.content.get().start());
+}
+
+/// PopupRequested on the opener's thread: WebChromeClient.onCreateWindow(view, isDialog=false, gesture, resultMsg) with the current client. isDialog: the ordinary-window mapping, not verified
+/// against a device. resultMsg: a Message on a Handler of this Looper with a real WebViewTransport (WebViewProviderImpl.newPopupMessage). No client, false, a throw or no message: cancelled
+/// once (a throw stays pending for the Looper, as on Android).
+fn on_popup_requested(env: Env, shared: &Shared, token: PopupToken, gesture: bool) {
+    shared.popup.borrow_mut().offer(token);
+    let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
+    if provider.is_null() {
+        return; // the app's WebView was collected: its view goes with it
+    }
+    let chrome = object_field(
+        env,
+        provider,
+        c"mWebChromeClient",
+        c"Landroid/webkit/WebChromeClient;",
+    );
+    let accepted = !chrome.is_null() && {
+        let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+        let msg = call_obj(
+            env,
+            provider,
+            c"newPopupMessage",
+            c"(J)Landroid/os/Message;",
+            &[jvalue {
+                j: token.raw() as i64,
+            }],
+        );
+        let ok = !msg.is_null()
+            && !pending(env)
+            && call_bool(
+                env,
+                chrome,
+                c"onCreateWindow",
+                c"(Landroid/webkit/WebView;ZZLandroid/os/Message;)Z",
+                &[
+                    l(web_view),
+                    jvalue { z: 0 },
+                    jvalue {
+                        z: u8::from(gesture),
+                    },
+                    l(msg),
+                ],
+            )
+            && !pending(env);
+        delete_local(env, msg);
+        delete_local(env, web_view);
+        ok
+    };
+    delete_local(env, chrome);
+    // app code ran: the opener may be destroyed (the engine then dropped the popup with it)
+    let n = native(env, provider);
+    delete_local(env, provider);
+    let effect = shared.popup.borrow_mut().answered(token, accepted);
+    if let (Effect::Cancel(t, why), Some(n)) = (effect, n) {
+        tracing::info!("webview[{}]: popup {why}", shared.id.get());
+        n.view.cancel_popup(t);
+    }
+}
+
+/// PopupClosed on an adopted popup's thread: WebChromeClient.onCloseWindow with the current client, once; removing the view is the app's.
+fn on_popup_closed(env: Env, shared: &Shared) {
+    if !shared.close.borrow_mut().close(shared.content.get()) {
+        return;
+    }
+    let provider = jni_call!(env, NewLocalRef, shared.provider.get() as Obj);
+    if provider.is_null() {
+        return;
+    }
+    let chrome = object_field(
+        env,
+        provider,
+        c"mWebChromeClient",
+        c"Landroid/webkit/WebChromeClient;",
+    );
+    if !chrome.is_null() {
+        let web_view = object_field(env, provider, c"mWebView", c"Landroid/webkit/WebView;");
+        call_void(
+            env,
+            chrome,
+            c"onCloseWindow",
+            c"(Landroid/webkit/WebView;)V",
+            &[l(web_view)],
+        );
+        delete_local(env, web_view);
+    }
+    delete_local(env, chrome);
+    delete_local(env, provider);
+}
+
+/// What `transport.getWebView()` names, judged on the opener's thread; the native only for a live target of this provider and thread.
+fn popup_target<'a>(env: Env, target: Obj, opener: Obj) -> (Target, Option<&'a Native>) {
+    if target.is_null() {
+        return (Target::Null, None);
+    }
+    if jni_call!(env, IsSameObject, target, opener) != 0 {
+        return (Target::SelfView, None);
+    }
+    let provider = call_obj(
+        env,
+        target,
+        c"getWebViewProvider",
+        c"()Landroid/webkit/WebViewProvider;",
+        &[],
+    );
+    let class = jni_call!(
+        env,
+        FindClass,
+        c"com/android/webview/chromium/WebViewProviderImpl".as_ptr()
+    );
+    let ours = !provider.is_null()
+        && !class.is_null()
+        && jni_call!(env, IsInstanceOf, provider, class) != 0;
+    delete_local(env, class);
+    if !ours {
+        delete_local(env, provider);
+        return (Target::OtherProvider, None);
+    }
+    let n = native(env, provider);
+    delete_local(env, provider);
+    match n {
+        None => (Target::Destroyed, None),
+        Some(d) if !d.shared.is_current() => (Target::WrongLooper, None),
+        Some(d) => (Target::Live(d.shared.content.get()), Some(d)),
+    }
+}
+
+/// The popup message's Handler (WebViewProviderImpl.newPopupMessage) on the opener's Looper: `transport` is the one onCreateWindow got; its WebView is checked now and the popup adopted into
+/// it or cancelled by name. A token no longer pending (declined, cancelled, adopted, newer) does nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_android_webview_chromium_WebViewProviderImpl_completePopup(
+    env: Env,
+    this: Obj,
+    token: i64,
+    transport: Obj,
+) {
+    let Some(n) = native(env, this) else { return };
+    let Some(token) = PopupToken::of_raw(token as u64) else {
+        return;
+    };
+    if !n.shared.is_current() || transport.is_null() {
+        return;
+    }
+    let target = call_obj(
+        env,
+        transport,
+        c"getWebView",
+        c"()Landroid/webkit/WebView;",
+        &[],
+    );
+    let me = object_field(env, this, c"mWebView", c"Landroid/webkit/WebView;");
+    let (t, dest) = popup_target(env, target, me);
+    delete_local(env, target);
+    delete_local(env, me);
+    let effect = n.shared.popup.borrow_mut().message(token, t);
+    match (effect, dest) {
+        (Effect::Adopt(token), Some(dest)) => {
+            dest.shared.content.set(ContentState::AdoptionQueued);
+            let (opener, child, poster) = (
+                Arc::clone(&n.shared),
+                Arc::clone(&dest.shared),
+                n.poster.clone(),
+            );
+            n.view.adopt_popup(
+                token,
+                &dest.view,
+                Box::new(move |ok| {
+                    poster.post(Box::new(move || {
+                        opener.popup.borrow_mut().completed(token);
+                        child.content.set(child.content.get().adopted(ok));
+                        if !ok {
+                            tracing::warn!(
+                                "webview[{}]: popup adoption failed in the engine",
+                                child.id.get()
+                            );
+                        }
+                    }))
+                }),
+            );
+        }
+        (Effect::Cancel(t, why), _) => {
+            tracing::info!("webview[{}]: popup {why}", n.shared.id.get());
+            n.view.cancel_popup(t);
+        }
+        _ => {}
     }
 }
 

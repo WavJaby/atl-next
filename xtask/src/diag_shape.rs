@@ -19,6 +19,16 @@ const WORDS: [&str; 2] = ["refused", "unimplemented"];
 /// (file, a fragment of the literal, why it is not an API outcome of the family).
 const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
     (
+        "crates/atl-webview-linux/src/lib.rs",
+        "unsupported_popup_target: window.open with no URL or about:blank; refused",
+        "engine module (cdylib, no atl-diag): WebKit's create signal answers null to the page, no Android API call; named line until a core event carries it",
+    ),
+    (
+        "crates/atl-webview-linux/src/lib.rs",
+        "popup_overlap_refused: a popup is already pending for this view; refused",
+        "engine module (cdylib, no atl-diag): WebKit's create signal answers null to the page, no Android API call; named line until a core event carries it",
+    ),
+    (
         "crates/atl-composer/src/host.rs",
         "a second frame requester refused",
         "UI-thread mailbox protocol inside the app's composer, no API call",

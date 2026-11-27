@@ -12,8 +12,8 @@ use atl_platform_ui_api::abi::{
 };
 use atl_platform_ui_api::webview::{
     ClaimReply, Cookie, CookiePolicy, InputClaim, LoadError, NavigationReply, NavigationRequest,
-    PromptReply, SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent, WebSetting, WebView,
-    WebViewError,
+    PopupToken, PromptReply, SIDEBAND_WEB_VIEW, SettingValue, WebEngine, WebEvent, WebSetting,
+    WebView, WebViewError,
 };
 
 static MODULE: OnceLock<Result<&'static WebViewVtable, String>> = OnceLock::new();
@@ -127,6 +127,22 @@ impl WebEngine for PlatformWebEngine {
                     mime_type: unsafe { e.extra.get() }.into_owned(),
                     content_length: e.length,
                 },
+                web_event::POPUP_REQUESTED | web_event::POPUP_CANCELLED => {
+                    let Some(token) = PopupToken::of_raw(e.popup_token) else {
+                        return tracing::warn!(
+                            "atl-platform-ui: popup event without a token; dropped"
+                        );
+                    };
+                    if e.kind == web_event::POPUP_CANCELLED {
+                        WebEvent::PopupCancelled { token }
+                    } else {
+                        WebEvent::PopupRequested {
+                            token,
+                            gesture: e.flags & web_event::FLAG_GESTURE != 0,
+                        }
+                    }
+                }
+                web_event::POPUP_CLOSED => WebEvent::PopupClosed,
                 _ => return,
             };
             deliver(&events, ev);
@@ -330,6 +346,21 @@ impl WebView for PlatformWebView {
     fn set_focused(&self, on: bool) {
         // SAFETY: as above.
         unsafe { (self.ui.sideband_focus)(self.key, on) }
+    }
+
+    fn cancel_popup(&self, token: PopupToken) {
+        // SAFETY: see the impl comment.
+        unsafe { (self.m.view_cancel_popup)(self.key, token.raw()) }
+    }
+
+    fn adopt_popup(
+        &self,
+        token: PopupToken,
+        destination: &Self,
+        done: Box<dyn FnOnce(bool) + Send>,
+    ) {
+        // SAFETY: see the impl comment; `destination`'s key is its live view's.
+        unsafe { (self.m.view_adopt_popup)(self.key, token.raw(), destination.key, once(done)) }
     }
 }
 

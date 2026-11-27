@@ -77,7 +77,7 @@ settings_table! { app;
     // [infer] :748-768: no default stated; the boolean zero
     UseWideViewPort = false;
     // :777-778
-    SupportMultipleWindows = false;
+    SupportMultipleWindows = false => SupportMultipleWindows;
     // :996
     BlockNetworkImage = false;
     // :1022-1024: false when the app holds INTERNET, else true
@@ -355,6 +355,7 @@ mod tests {
             WebSetting::CursiveFontFamily,
             WebSetting::FantasyFontFamily,
             WebSetting::DefaultCharset,
+            WebSetting::SupportMultipleWindows,
         ];
         assert_eq!(seen.len(), engine.len());
         for e in engine {
@@ -371,7 +372,7 @@ mod tests {
         s.set(Setting::TextZoom, SettingValue::Int(150));
         assert_eq!(s.int(Setting::TextZoom), 150);
         assert_eq!(s.default_text(Setting::UserAgentString), "device-ua");
-        assert_eq!(s.engine_values().count(), 18);
+        assert_eq!(s.engine_values().count(), 19);
         assert!(s.internet());
     }
 }

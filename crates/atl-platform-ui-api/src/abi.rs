@@ -1215,7 +1215,13 @@ pub mod web_event {
     pub const FLAG_HAS_URI: u32 = 1;
     /// See [`FLAG_HAS_URI`].
     pub const FLAG_HAS_ORIGINAL_URI: u32 = 2;
-    /// `NAVIGATION` flag bits.
+    /// `PopupRequested { token = popup_token, gesture = flags & FLAG_GESTURE }`.
+    pub const POPUP_REQUESTED: u32 = 11;
+    /// `PopupCancelled { token = popup_token }`.
+    pub const POPUP_CANCELLED: u32 = 12;
+    /// `PopupClosed`.
+    pub const POPUP_CLOSED: u32 = 13;
+    /// `NAVIGATION` flag bits (`FLAG_GESTURE` also for `POPUP_REQUESTED`).
     pub const FLAG_MAIN_FRAME: u32 = 1;
     /// See [`FLAG_MAIN_FRAME`].
     pub const FLAG_REDIRECT: u32 = 2;
@@ -1312,6 +1318,8 @@ pub struct WebEventView {
     pub forward: u32,
     /// `PROMPT`, `NAVIGATION`: the reply, owned by the receiver.
     pub reply: ManuallyDrop<ReplyAbi>,
+    /// `POPUP_REQUESTED`, `POPUP_CANCELLED`: the token; 0 for every other kind.
+    pub popup_token: u64,
 }
 
 /// An `evaluate_javascript` result for one call.
@@ -1377,6 +1385,11 @@ pub struct WebViewVtable {
     pub view_set_background: unsafe extern "C" fn(key: i32, argb: u32),
     /// `WebView::set_initial_scale`.
     pub view_set_initial_scale: unsafe extern "C" fn(key: i32, percent: i32),
+    /// `WebView::cancel_popup` on the opener `key`.
+    pub view_cancel_popup: unsafe extern "C" fn(key: i32, token: u64),
+    /// `WebView::adopt_popup`: the opener `key`'s popup `token` into the view `destination`; `done` once, on the display thread, also when the opener key has no view (false).
+    pub view_adopt_popup:
+        unsafe extern "C" fn(key: i32, token: u64, destination: i32, done: SendCallback<bool>),
     /// `WebEngine::watch_cookies`; any thread (queued to the display thread). False = no display thread in the process (`changed` dropped).
     pub cookies_watch: unsafe extern "C" fn(changed: SendCallback<CookieList>) -> bool,
     /// `WebEngine::add_cookie`; any thread, the cookie copied before return; `done` once, on the display thread. False as `cookies_watch`.
