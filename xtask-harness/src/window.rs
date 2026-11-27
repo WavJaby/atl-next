@@ -192,6 +192,14 @@ pub struct Args {
     /// Stage move only: every app process's composer starts on a fixed display instead of asking the services (atl-composer feature `break-stale-display`), so the second process, started after the move, answers the start density and the second-process sub-gate must fail.
     #[arg(long)]
     break_stale_display: bool,
+    /// Stages move and orientation: the composers drop the services' display push (atl-composer feature `break-skip-display-push`), so the watch process keeps the start display after the move
+    /// (sub-gate watch must fail) and a declared display's turn never reaches the composer (orientation's composer sub-gate must fail).
+    #[arg(long)]
+    break_skip_display_push: bool,
+    /// Stage move only: the composers adopt the services' display push 2 s late (atl-composer feature `break-late-display-push`), after the apps heard of the change, so the watch process's
+    /// first display callback reads the old SurfaceFlinger mode and the watch sub-gate must fail (AOSP's order: the mode changes before the event).
+    #[arg(long)]
+    break_late_display_push: bool,
     /// Stage opening only: atld's `--monitor` is the output at scale 1 (density 160), not the only output's 1.6, so the window opens off atld's start monitor; adds the `instances` and `densities` sub-gates (one instance, no relaunch, no intermediate density).
     #[arg(long)]
     start_monitor_other: bool,
@@ -2633,6 +2641,14 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
                         "atl-composer/break-declared-adopt",
                     ),
                     (args.break_stale_display, "atl-composer/break-stale-display"),
+                    (
+                        args.break_skip_display_push,
+                        "atl-composer/break-skip-display-push",
+                    ),
+                    (
+                        args.break_late_display_push,
+                        "atl-composer/break-late-display-push",
+                    ),
                     (args.break_outbox, "atl-composer/break-outbox"),
                     (
                         args.break_bind_before_placed,
@@ -3374,6 +3390,7 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             Some(moved) => move_output::checks(
                 &app,
                 &read(&move_output::moved_log(&app_log)),
+                &read(&move_output::watch_log(&app_log)),
                 &services,
                 &liveness,
                 display,
@@ -3728,6 +3745,7 @@ fn fixture(stage: Stage, declared: bool) -> &'static str {
         Stage::Orientation if declared => REQUEST_LANDSCAPE_FIXTURE,
         Stage::Orientation => ORIENTATION_FIXTURE,
         Stage::Landscape => LANDSCAPE_FIXTURE,
+        Stage::Move => move_output::FIXTURE,
         Stage::AuxProcess => aux_process::FIXTURE,
         _ => FIXTURE,
     }

@@ -1460,10 +1460,14 @@ impl Inner {
         self.atm.task_relaunching(task)
     }
 
-    /// The display changed (a monitor report, or a launch's turn after the lock): the display event to the registered callbacks, then for a configuration change every attached
-    /// process's configuration and each listed Task's ([`Inner::task_changed`]). AOSP's order: DisplayManagerService delivers the event, then the global configuration, then each activity.
+    /// The display changed (a monitor report, or a launch's turn after the lock): every app's composer takes the display first ([`Inner::push_display`]), then the display event to the
+    /// registered callbacks, then for a configuration change every attached process's configuration and each listed Task's ([`Inner::task_changed`]). AOSP's order: the SurfaceFlinger mode
+    /// changes first (LocalDisplayAdapter -> SurfaceControl), then DisplayManagerService delivers the event, then the global configuration, then each activity.
     /// Takes the state lock: never called with it held.
     fn display_changed(&self, change: DisplayChange) {
+        if change != DisplayChange::Unchanged {
+            self.push_display();
+        }
         match change {
             DisplayChange::Unchanged => {}
             DisplayChange::Refresh => {
@@ -1484,6 +1488,21 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// The display now to every registered app's composer (UI agent DISPLAY, synchronous), before any app hears of the change: an app's SurfaceFlinger answers the new mode from its first
+    /// callback on (a process that did not report the monitor, and tilt's rotation, have no other route). Logged as `display <d> pushed to <n> composers[, <f> failed]`.
+    fn push_display(&self) {
+        let display = self.tasks.display().to_arg();
+        let (told, failed) = self.agents.push_display(&display);
+        let failed = if failed == 0 {
+            String::new()
+        } else {
+            format!(", {failed} failed")
+        };
+        log(format_args!(
+            "display {display} pushed to {told} composers{failed}"
+        ));
     }
 
     /// A display change that turns the display (a fixed-orientation request): [`Inner::display_changed`], then each turned Task's window takes the turned size ([`Inner::turn_window`]).

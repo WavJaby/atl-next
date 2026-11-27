@@ -221,9 +221,8 @@ impl TaskReports {
     fn deliver(&self, report: &Report) {
         match send(report, &self.composer.display()) {
             Ok(Some(answer)) => {
-                if self.composer.set_display(answer) {
-                    tracing::info!("atl-composer: ui: display {}", answer.to_arg());
-                }
+                // the services pushed a change to this composer before replying (UI agent DISPLAY); the reply still counts for an unchanged report from a process that registered after a change
+                crate::ui_agent::adopt(&self.composer, answer);
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("atl-composer: task reports: {e}"),

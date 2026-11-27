@@ -45,6 +45,8 @@ public class Main extends Activity {
     static final int FOREIGN_TASK = Integer.MAX_VALUE;
     /** The activity meta-data whose int value the activity requests with setRequestedOrientation (window-orientation; xtask-harness/src/window.rs stage orientation). */
     static final String REQUEST_ORIENTATION = "atl.requestOrientation";
+    /** The activity meta-data that makes the first instance start the watch process (Watch, `:watch`; window-move, xtask-harness/src/window/move_output.rs `watch`). */
+    static final String WATCH_PROCESS = "atl.watchProcess";
     /** The timeout sub-gate's delay (capture.rs `timeout`, armed by F11): the destroy waits this long, past KILL_TASK_PROCESSES_TIMEOUT (activity.rs, 1000 ms), so the services' timer ends the process first. */
     static final long DESTROY_DELAY_MS = 5000L;
 
@@ -69,6 +71,11 @@ public class Main extends Activity {
         getWindow().setAttributes(attrs);
         setContentView(new Quadrants(this));
         requestOrientation();
+        // the first instance of the move stage: a second process runs before the move and must hear it with its own SurfaceFlinger already changed (Watch)
+        Bundle meta = ownMetaData();
+        if (savedInstanceState == null && meta != null && meta.getBoolean(WATCH_PROCESS)) {
+            startService(new android.content.Intent(this, Watch.class));
+        }
         // a relaunch for a density change (the move stage): a new process starts now, after the monitor moved, and logs the display it got (Moved)
         createdDpi = getResources().getConfiguration().densityDpi;
         if (savedInstanceState != null && savedInstanceState.getInt(SAVED_DPI, createdDpi) != createdDpi) {
@@ -84,14 +91,18 @@ public class Main extends Activity {
     }
 
     /** Manifest meta-data REQUEST_ORIENTATION on this activity (window-orientation): setRequestedOrientation with its value at the first create, then the request read back (orientation stage). */
-    private void requestOrientation() {
-        Bundle meta;
+    /** This activity's manifest meta-data; null when it has none or its info is unreadable. */
+    private Bundle ownMetaData() {
         try {
-            meta = getPackageManager().getActivityInfo(getComponentName(), android.content.pm.PackageManager.GET_META_DATA).metaData;
+            return getPackageManager().getActivityInfo(getComponentName(), android.content.pm.PackageManager.GET_META_DATA).metaData;
         } catch (android.content.pm.PackageManager.NameNotFoundException e) {
             Log.w(TAG, "own activity info: " + e);
-            return;
+            return null;
         }
+    }
+
+    private void requestOrientation() {
+        Bundle meta = ownMetaData();
         if (meta == null || !meta.containsKey(REQUEST_ORIENTATION)) {
             return;
         }

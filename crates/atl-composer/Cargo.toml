@@ -36,6 +36,10 @@ break-stale-display = []
 break-bind-before-placed = []
 # a size is sent in the px it was measured in, not the services' display's (task_reports.rs Measured::at): a window opened off atld's start monitor reports the start monitor's px first
 break-size-at-measured-scale = []
+# the services' display push is dropped (ui_agent.rs set_display): a process that did not report the monitor keeps its display; the move stage's watch rows and the orientation stage's composer row must fail
+break-skip-display-push = []
+# the services' display push is adopted 2 s late (ui_agent.rs set_display), after the apps heard of the change: the move stage's watch-order row must fail
+break-late-display-push = []
 
 [dependencies]
 atl-aidl = { path = "../atl-aidl" }

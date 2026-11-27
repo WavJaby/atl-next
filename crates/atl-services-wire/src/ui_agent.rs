@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The app's UI agent (plan 8c, M3 slice 5): the binder an app process gives the compositor registry in REGISTER (compositor_registry.rs), and the call the window service makes on it.
-//! `IUiAgent` (descriptor `atl.IUiAgent`) has thirteen transactions. RESIZE (oneway, from an orientation request's reshape): the Task's wanted content size (width, height: i32, physical px) in; the agent asks the desktop for that window size, and the size the compositor grants comes back as the Task's bounds (SET_BOUNDS). TASK_TITLE (oneway, from setTaskDescription): the Task's TaskDescription label (nullable String16), then its root activity's package and class (String16) in; the agent titles its window with the label, else with that activity's label as the app's PackageManager loads it. MINIMIZE (oneway, from onBackPressed's moveTaskToBack): nothing in; the agent minimizes its window. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
+//! `IUiAgent` (descriptor `atl.IUiAgent`) has fourteen transactions. DISPLAY (synchronous, from every display change before any app hears of it): the display the services answer with now (String16, DisplayModel `to_arg`, as registry GET_DISPLAY) in, nothing out; the agent's composer answers SurfaceFlinger's queries with it from then on, as AOSP changes the SurfaceFlinger mode before DisplayManagerService's event. RESIZE (oneway, from an orientation request's reshape): the Task's wanted content size (width, height: i32, physical px) in; the agent asks the desktop for that window size, and the size the compositor grants comes back as the Task's bounds (SET_BOUNDS). TASK_TITLE (oneway, from setTaskDescription): the Task's TaskDescription label (nullable String16), then its root activity's package and class (String16) in; the agent titles its window with the label, else with that activity's label as the app's PackageManager loads it. MINIMIZE (oneway, from onBackPressed's moveTaskToBack): nothing in; the agent minimizes its window. DIM_LAYER: a dimming window's layer id, dim amount (f32), dim width and height (i32) in, nothing out; the agent keeps a black colour layer
 //! just below that layer (WMS Dimmer), amount <= 0 drops it. POST_DRAW_TRANSACTION: a window's post-draw Transaction (finishDrawing), its bytes and objects, in; the composer applies it. INPUT_METHOD: nothing in, the app's in-app input method (an IInputMethod binder, atl-ime) out, or null; IMMS-lite binds it where AOSP binds an IME service (ime_bind.rs). POINTER_ICON (oneway, from the input service's setPointerIcon): the icon type (i32, PointerIconType) in; the agent sets its window's cursor. WINDOW_SURFACE: the layer's name (String16) in, the window's SurfaceControl (codecs/android/view/SurfaceControl.rs, Part form) out.
 //! WINDOW_POSITION: a window's layer id (i32) and its frame's origin in its Task (x, y: i32) in, nothing out; the agent sets the layer's position, as WMS does on the window's SurfaceControl (WindowState.updateSurfacePosition -> Transaction.setPosition).
 //! INPUT_SERVER: a window's input channel token (strong binder, the token both channel ends carry: AOSP keys a dispatcher connection by it) and server end (an fd, ParcelFileDescriptor) and the window's LayoutParams flags (i32) in, nothing out.
@@ -45,6 +45,8 @@ pub const MINIMIZE: TransactionCode = 11;
 pub const TASK_TITLE: TransactionCode = 12;
 /// The Task's wanted content size (width, height: i32, physical px) in (oneway); nothing out. A request: the window's real size comes back as SET_BOUNDS.
 pub const RESIZE: TransactionCode = 13;
+/// The display the services answer with now (DisplayModel `to_arg`) in, nothing out. Synchronous: the services notify the apps only after every composer has it.
+pub const DISPLAY: TransactionCode = 14;
 /// The interface name counters use.
 const INTERFACE: &str = "IUiAgent";
 
@@ -65,6 +67,8 @@ pub trait IUiAgent: Interface {
     fn minimize(&self) -> Result<(), StatusCode>;
     /// The services want the app's Task at `width` x `height` physical px (an orientation request's reshape, DesktopActivityOrientationChangeHandler's setBounds): the window asks the desktop for that size.
     fn resize(&self, width: i32, height: i32) -> Result<(), StatusCode>;
+    /// The display changed: `display` (DisplayModel `to_arg`) is the one the app's composer answers with from now on (SurfaceFlinger's mode, the vsync interval, tilt's rotation).
+    fn set_display(&self, display: &str) -> Result<(), StatusCode>;
     /// The app's Task description changed: its window's title is `label` (Task.updateTaskDescription's merged label), else the label of the root activity `package`/`class` (what recents shows).
     fn task_title(&self, label: Option<&str>, package: &str, class: &str)
     -> Result<(), StatusCode>;
@@ -102,6 +106,7 @@ fn method_name(code: TransactionCode) -> Option<&'static str> {
         (POINTER_ICON, "POINTER_ICON"),
         (MINIMIZE, "MINIMIZE"),
         (RESIZE, "RESIZE"),
+        (DISPLAY, "DISPLAY"),
         (TASK_TITLE, "TASK_TITLE"),
         (WINDOW_POSITION, "WINDOW_POSITION"),
         (INPUT_METHOD, "INPUT_METHOD"),
@@ -170,6 +175,10 @@ fn dispatch(
             let width: i32 = data.read()?;
             let height: i32 = data.read()?;
             service.resize(width, height)
+        }
+        DISPLAY => {
+            let display: String = data.read()?;
+            service.set_display(&display)
         }
         TASK_TITLE => {
             let label: Option<String> = data.read()?;
@@ -269,6 +278,14 @@ impl IUiAgent for BpUiAgent {
         data.write(&width)?;
         data.write(&height)?;
         binder.submit_transact(RESIZE, data, binder::binder_impl::FLAG_ONEWAY)?;
+        Ok(())
+    }
+
+    fn set_display(&self, display: &str) -> Result<(), StatusCode> {
+        let binder = self.as_binder();
+        let mut data = binder.prepare_transact()?;
+        data.write(display)?;
+        binder.submit_transact(DISPLAY, data, 0)?;
         Ok(())
     }
 
@@ -413,6 +430,10 @@ impl IUiAgent for Binder<BnUiAgent> {
 
     fn resize(&self, width: i32, height: i32) -> Result<(), StatusCode> {
         self.0.resize(width, height)
+    }
+
+    fn set_display(&self, display: &str) -> Result<(), StatusCode> {
+        self.0.set_display(display)
     }
 
     fn task_title(

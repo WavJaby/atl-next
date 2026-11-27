@@ -63,6 +63,14 @@ const MOVED_SUFFIX: &str = ":moved";
 const SECOND_PROCESS_WAIT: Duration = Duration::from_secs(60);
 /// Main.java's last frame callback line prefix (FRAME_CALLBACKS = 31): each instance's resume runs the whole series.
 const LAST_FRAME: &str = "AtlWindow: frame 31 ";
+/// The stage's app: the window fixture whose first instance starts the watch process (Watch.java, `:watch`).
+pub const FIXTURE: &str = "xtask-harness/testdata/window-move";
+/// The watch process's name suffix (window-move AndroidManifest.xml).
+const WATCH_SUFFIX: &str = ":watch";
+/// The tag of the watch process's display line at its first vsync: it runs (and its composer is registered) before the move.
+const WATCH_START: &str = "watch-start";
+/// The tag of the watch process's display line at each display callback (onDisplayChanged).
+const WATCH_CHANGED: &str = "watch-changed";
 
 /// The probe: once the window has drawn on the first output, the first output goes off.
 /// `user_resize`: the window is first given [`USER_RESIZE`] (a configure, what a user's drag makes the compositor send).
@@ -110,6 +118,14 @@ pub fn drive(
         ))?;
         std::thread::sleep(INPUT_SETTLE);
     }
+    // the watch process runs on the opening display before the move (sub-gate watch)
+    until(&Wait::log(
+        "watch-process",
+        "the watch process never logged its display",
+        SECOND_PROCESS_WAIT,
+        &process_log(app_log, WATCH_SUFFIX),
+        &|t: &str| t.contains(&format!("{APP_DISPLAY_LINE}{WATCH_START} ")),
+    ))?;
     outputs.only(1).map_err(|e| format!("{e:#}"))?;
     // the relaunched (second) instance ran its frame callbacks: the move's configuration change is over
     until(&Wait::log(
@@ -149,10 +165,12 @@ pub fn drive(
 /// The sub-gates: display (the services took a display at `moved`'s density), density (the last instance's Configuration and DisplayMetrics say it; the first said `opened`'s), relaunch (AOSP's: one relaunch, ended, two instances), frames (the relaunched instance drew and ran its frame callbacks).
 /// `declared` (`--declare-display`) adds the declared sub-gate and changes display: a declared display keeps rotation 0, so the turned output changes nothing.
 /// `second`: the log of the second process (`:moved`, [`moved_log`]), started after the move: its first-vsync display line must be the moved display (second-process), not the run's start display.
+/// `watch`: the log of the watch process (`:watch`, [`watch_log`]), running before the move ([`watch_check`]).
 #[allow(clippy::too_many_arguments)]
 pub fn checks(
     app: &str,
     second: &str,
+    watch: &str,
     services: &str,
     liveness: &Result<Liveness, String>,
     opened: DisplayModel,
@@ -190,6 +208,7 @@ pub fn checks(
         ),
     ];
     subs.push(("second-process", second_check(second, moved, declared)));
+    subs.push(("watch", watch_check(watch, moved, declared)));
     if let Some(declared) = declared {
         subs.push(("declared", declared_check(app, declared, opened, moved)));
     }
@@ -198,11 +217,58 @@ pub fn checks(
 
 /// The log of the app's second process (`:moved`), beside `app_log` (atld names a process's log after the process).
 pub fn moved_log(app_log: &Path) -> std::path::PathBuf {
+    process_log(app_log, MOVED_SUFFIX)
+}
+
+/// The log of the app's watch process (`:watch`), beside `app_log`.
+pub fn watch_log(app_log: &Path) -> std::path::PathBuf {
+    process_log(app_log, WATCH_SUFFIX)
+}
+
+/// The log of the app's process named with `suffix`, beside `app_log` (atld names a process's log after the process).
+fn process_log(app_log: &Path, suffix: &str) -> std::path::PathBuf {
     let name = app_log
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    app_log.with_file_name(format!("{name}{MOVED_SUFFIX}.log"))
+    app_log.with_file_name(format!("{name}{suffix}.log"))
+}
+
+/// The watch process (`:watch`, running before the move, no window, no monitor report of its own): its first display callback whose DisplayInfo is the moved display must find its own
+/// SurfaceFlinger on that display too. AOSP changes the SurfaceFlinger mode before DisplayManagerService's event, so an app never hears of a change its SurfaceFlinger does not answer yet.
+/// Red: no push (the process keeps the opening display: its composer is never told) or a push after the event (its first callback reads the old mode).
+fn watch_check(
+    watch: &str,
+    moved: DisplayModel,
+    declared: Option<Declaration>,
+) -> Result<String, String> {
+    let want = match declared {
+        Some(d) => DisplayModel::of(moved, Some(d))?,
+        None => moved,
+    };
+    let lines = app_displays(watch);
+    if !lines.iter().any(|l| l.when == WATCH_START) {
+        return Err("the watch process never logged its display before the move".to_owned());
+    }
+    let heard = lines.iter().find(|l| {
+        l.when == WATCH_CHANGED
+            && l.info
+                .is_some_and(|i| (i.width, i.height, i.dpi) == (want.width, want.height, want.dpi))
+    });
+    if heard.is_none() {
+        return Err(format!(
+            "the watch process never heard of the move to {} ({} display callbacks)",
+            want.to_arg(),
+            lines.iter().filter(|l| l.when == WATCH_CHANGED).count()
+        ));
+    }
+    match app_display_problem(heard, "in the watch process's first callback", want) {
+        None => Ok(format!(
+            "{} in DisplayInfo and SurfaceFlinger at its first callback",
+            want.to_arg()
+        )),
+        Some(problem) => Err(problem),
+    }
 }
 
 /// The second process's display line: DisplayInfo and SurfaceFlinger at its first vsync answer the moved display (on a declared display, the declared size at the moved dpi).

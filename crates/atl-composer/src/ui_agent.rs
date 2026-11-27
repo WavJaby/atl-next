@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use atl_compositor::model::ColorLayer;
 use atl_parcelables::android::view::{SurfaceControl, SurfaceControl_Transaction};
 use atl_parcelables::codecs::android::view::SurfaceControl::NativeSurfaceControl;
+use atl_services_types::display_model::DisplayModel;
 use atl_services_wire::ui_agent::{BnUiAgent, IUiAgent};
 use binder::{BinderFeatures, Interface, SpIBinder, StatusCode};
 
@@ -17,6 +18,14 @@ use crate::host::{Composer, VmHost};
 use crate::input::{InputSender, Message};
 use crate::service;
 use crate::task_reports::TaskReports;
+
+/// `model` becomes the composer's display; a change is logged (`atl-composer: ui: display <d>`), whichever route brought it (the services' push or a report's reply, task_reports.rs).
+pub(crate) fn adopt(composer: &Composer, model: DisplayModel) {
+    if composer.set_display(model) {
+        // `model`, not `display`: inside tracing's macros `display` names tracing::field::display
+        tracing::info!("atl-composer: ui: display {}", model.to_arg());
+    }
+}
 
 /// PixelFormat.RGBA_8888 (`HAL_PIXEL_FORMAT_RGBA_8888` = 1), the format of every window layer.
 const RGBA_8888: u32 = 1;
@@ -137,6 +146,26 @@ impl IUiAgent for UiAgent {
             }
             _ => Err(StatusCode::BAD_VALUE),
         }
+    }
+
+    /// The services' display, pushed before any app hears of the change: SurfaceFlinger's mode, the vsync interval and tilt's rotation follow it from now on. An unparsable one is refused.
+    fn set_display(&self, display: &str) -> Result<(), StatusCode> {
+        let display = DisplayModel::parse_arg(display).map_err(|_| StatusCode::BAD_VALUE)?;
+        // break `skip-display-push`: the push is dropped, so a process keeps its display until its own report's reply
+        if cfg!(feature = "break-skip-display-push") {
+            return Ok(());
+        }
+        // break `late-display-push`: the push is adopted after the apps heard of the change (AOSP's order reversed)
+        if cfg!(feature = "break-late-display-push") {
+            let composer = Arc::clone(&self.composer);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                adopt(&composer, display);
+            });
+            return Ok(());
+        }
+        adopt(&self.composer, display);
+        Ok(())
     }
 
     /// The task's title as recents shows it: the TaskDescription label when it has text, else the root activity's label loaded by the app's PackageManager (Launcher3 TaskIconCache's fallback,

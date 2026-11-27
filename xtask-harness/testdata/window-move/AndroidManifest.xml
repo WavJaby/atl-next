@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- `xtask test window`, stage move: the window fixture (java/ links to it) with the watch process. The first instance starts Watch (meta-data atl.watchProcess), a second process with no
+     window that runs before the move and must hear it with its own SurfaceFlinger already on the moved display (xtask-harness/src/window/move_output.rs watch). The relaunch for the move
+     starts Moved as in the window fixture. -->
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.atlwindow"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="36" />
+
+    <application android:label="ATL window test">
+        <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <meta-data android:name="atl.watchProcess" android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".Moved" android:process=":moved" android:exported="false" />
+        <service android:name=".Watch" android:process=":watch" android:exported="false" />
+    </application>
+</manifest>

@@ -53,13 +53,38 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace().find_map(|w| w.strip_prefix(key))
 }
 
-/// The display answer the in-app compositor's start read logged (`atl-composer: ui: display WxH@hz,dpi,rotation`): its size and rotation.
+/// The displays the in-app compositor logged taking (`atl-composer: ui: display WxH@hz,dpi,rotation`: its start read, then each change pushed or answered), in order: size and rotation.
+fn composer_displays(app: &str) -> Vec<(i32, i32, i32)> {
+    app.lines()
+        .filter_map(|l| {
+            let rest = l.split_once(COMPOSER_DISPLAY_LINE)?.1;
+            let model = DisplayModel::parse_arg(rest.split_whitespace().next()?).ok()?;
+            Some((model.width, model.height, model.rotation))
+        })
+        .collect()
+}
+
+/// The display the in-app compositor's start read logged.
 fn composer_display(app: &str) -> Option<(i32, i32, i32)> {
-    let rest = app
-        .lines()
-        .find_map(|l| l.split_once(COMPOSER_DISPLAY_LINE).map(|(_, r)| r))?;
-    let model = DisplayModel::parse_arg(rest.split_whitespace().next()?).ok()?;
-    Some((model.width, model.height, model.rotation))
+    composer_displays(app).first().copied()
+}
+
+/// Sub-gate `composer` of stage `orientation` with `--declare-display`: the in-app compositor's last display is the turned one with its rotation. The turn happens while the app runs,
+/// so only the services' push (UI agent DISPLAY) brings it: the window reports no new monitor. Tilt reads the same value (atl-composer start.rs, `composer.display().rotation`).
+fn composer_turn_check(app: &str, shown: (i32, i32)) -> Result<String, String> {
+    let all = composer_displays(app);
+    match all.last() {
+        Some(&(w, h, rot)) if (w, h, rot) == (shown.0, shown.1, ROTATION_90) => Ok(format!(
+            "composer took {}x{} rotation {ROTATION_90} after {} display line(s)",
+            shown.0,
+            shown.1,
+            all.len()
+        )),
+        other => Err(format!(
+            "composer displays {all:?}, last {other:?}; want {}x{} rotation {ROTATION_90} after the request",
+            shown.0, shown.1
+        )),
+    }
 }
 
 /// Whether the services logged the turn `from -> to` with `why` (tasks.rs request_orientation): one line, from the rotation it leaves.
@@ -263,7 +288,7 @@ fn request_config_check(
 
 /// Sub-gates of stage `orientation` with `--declare-display` (fixture window-request-landscape): the activity's setRequestedOrientation(LANDSCAPE) turned the display (`rotation`:
 /// the services' turn line, then the last display line `settled` shows the turned display), the activity is told the change without a relaunch (`config`, `instances`), and the window is
-/// laid out at the turned size after the request (`window`).
+/// laid out at the turned size after the request (`window`), and the in-app compositor takes the turned display while the app runs (`composer`, [`composer_turn_check`]).
 pub(super) fn orientation_checks(
     app: &str,
     services: &str,
@@ -272,7 +297,7 @@ pub(super) fn orientation_checks(
 ) -> Vec<Sub> {
     let Some(shown) = declared.and_then(|d| turned_expected(d, display.dpi)) else {
         let why = "stage orientation with --declare-display needs WxH with width < height";
-        return ["rotation", "config", "instances", "window"]
+        return ["rotation", "config", "instances", "window", "composer"]
             .into_iter()
             .map(|name| (name, Err(why.to_owned())))
             .collect();
@@ -305,5 +330,6 @@ pub(super) fn orientation_checks(
         ("config", request_config_check(app, shown, display)),
         ("instances", one_create(app)),
         ("window", last_window_check(app, shown)),
+        ("composer", composer_turn_check(app, shown)),
     ]
 }

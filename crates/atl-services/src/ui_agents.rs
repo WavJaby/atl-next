@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use atl_services_wire::ui_agent::IUiAgent;
 use binder::{DeathRecipient, IBinder, SpIBinder, StatusCode, ThreadState};
 
 /// A binder caller's process: its uid and the pid binder reports for it (see the module doc for why that pid identifies one process).
@@ -111,6 +112,32 @@ impl UiAgents {
             .map(|e| e.composer.clone())
     }
 
+    /// Every registered process's agent takes `display` (DISPLAY, synchronous: each returns once its composer has it), with the table lock released (each call waits on an app).
+    /// A failed push is logged and counted; it leaves that process on its old display until its next report's reply. Returns (told, failed).
+    pub fn push_display(&self, display: &str) -> (usize, usize) {
+        let agents: Vec<(AppProcess, SpIBinder)> = self
+            .lock()
+            .entries
+            .iter()
+            .map(|(p, e)| (*p, e.agent.clone()))
+            .collect();
+        let mut failed = 0;
+        for (process, agent) in &agents {
+            let pushed = agent
+                .clone()
+                .into_interface::<dyn IUiAgent>()
+                .and_then(|a| a.set_display(display));
+            if let Err(e) = pushed {
+                failed += 1;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "services: display push to {process}: {e:?}"
+                );
+            }
+        }
+        (agents.len() - failed, failed)
+    }
+
     /// The agent of registration `registration` of `process` died: its entry goes, unless the process registered again since. Logged with what is left.
     fn died(&self, process: AppProcess, registration: u64) {
         let mut t = self.lock();
@@ -171,6 +198,19 @@ mod tests {
     }
 
     #[test]
+    fn a_display_push_reaches_every_registered_process() {
+        let t = Arc::new(UiAgents::default());
+        let (agent_a, pushed_a) = crate::ui_agents::tests_support::display_agent();
+        let (agent_b, pushed_b) = crate::ui_agents::tests_support::display_agent();
+        t.insert(A, agent_a, binder()).expect("insert");
+        t.insert(B, agent_b, binder()).expect("insert");
+        assert_eq!(t.push_display("658x1462@60,256,0"), (2, 0));
+        for pushed in [pushed_a, pushed_b] {
+            assert_eq!(*pushed.lock().expect("pushed"), ["658x1462@60,256,0"]);
+        }
+    }
+
+    #[test]
     fn a_death_removes_only_its_process_and_only_its_registration() {
         let t = Arc::new(UiAgents::default());
         let agent_a = binder();
@@ -204,6 +244,8 @@ pub(crate) mod tests_support {
     #[derive(Default)]
     pub(crate) struct RecordingAgent {
         pub(crate) surfaces: Arc<Mutex<Vec<String>>>,
+        /// the displays pushed to it (DISPLAY), in order
+        pub(crate) displays: Arc<Mutex<Vec<String>>>,
     }
 
     impl Interface for RecordingAgent {}
@@ -237,6 +279,13 @@ pub(crate) mod tests_support {
         fn resize(&self, _: i32, _: i32) -> Result<(), StatusCode> {
             Ok(())
         }
+        fn set_display(&self, display: &str) -> Result<(), StatusCode> {
+            self.displays
+                .lock()
+                .expect("displays")
+                .push(display.to_owned());
+            Ok(())
+        }
         fn task_title(&self, _: Option<&str>, _: &str, _: &str) -> Result<(), StatusCode> {
             Ok(())
         }
@@ -261,6 +310,16 @@ pub(crate) mod tests_support {
         (
             BnUiAgent::new_binder(agent, BinderFeatures::default()).as_binder(),
             surfaces,
+        )
+    }
+
+    /// A recording agent as a local binder, with the displays pushed to it.
+    pub(crate) fn display_agent() -> (SpIBinder, Arc<Mutex<Vec<String>>>) {
+        let agent = RecordingAgent::default();
+        let displays = Arc::clone(&agent.displays);
+        (
+            BnUiAgent::new_binder(agent, BinderFeatures::default()).as_binder(),
+            displays,
         )
     }
 
