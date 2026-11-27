@@ -12,6 +12,7 @@ pub mod logcat;
 pub mod native_libs;
 pub mod packages;
 pub mod permission;
+pub mod screen_layout;
 pub mod size_buckets;
 pub mod system_config;
 pub mod system_packages;

@@ -84,6 +84,9 @@ use crate::uid_state::{self, ProcessState, Settle, UidView};
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
+use atl_services_types::screen_layout::{
+    SCREENLAYOUT_LAYOUTDIR_MASK, SCREENLAYOUT_RESET, SCREENLAYOUT_ROUND_MASK, compute_screen_layout,
+};
 use atl_services_types::size_buckets::SizeBuckets;
 use atl_services_wire::ui_agent::IUiAgent;
 
@@ -158,11 +161,10 @@ pub(crate) const GLOBAL_UI_MODE: i32 = 0x11;
 
 /// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale (`locale`, the host's UI language tag; None: DEFAULT_LOCALE),
 /// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
+/// screenLayout: the AOSP rule from that dp, from the reset start (DisplayContent.java:2469-2471; screen_layout.rs).
 /// The input fields stay undefined (0) until the platform layer supplies input. Shared with window.rs (the MergedConfiguration of a relayout).
 pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>) -> Configuration {
-    let density = display.dpi as f32 / DENSITY_DEFAULT;
-    let width_dp = (display.width as f32 / density + 0.5) as i32;
-    let height_dp = (display.height as f32 / density + 0.5) as i32;
+    let (width_dp, height_dp) = display_dp(display);
     Configuration {
         font_scale: 1.0,
         locale_list: Some(locale.unwrap_or(DEFAULT_LOCALE).to_owned()),
@@ -170,6 +172,7 @@ pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>)
         screen_width_dp: width_dp,
         screen_height_dp: height_dp,
         smallest_screen_width_dp: width_dp.min(height_dp),
+        screen_layout: compute_screen_layout(SCREENLAYOUT_RESET, width_dp, height_dp),
         orientation: if width_dp <= height_dp {
             ORIENTATION_PORTRAIT
         } else {
@@ -191,6 +194,15 @@ pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>)
     }
 }
 
+/// The display's size in dp (DisplayContent.computeScreenAppConfiguration:2463-2464, one display): px / (dpi / 160), rounded. The global configuration's dp and the Tasks' parent's screenLayout come from it.
+fn display_dp(display: &DisplayModel) -> (i32, i32) {
+    let density = display.dpi as f32 / DENSITY_DEFAULT;
+    (
+        (display.width as f32 / density + 0.5) as i32,
+        (display.height as f32 / density + 0.5) as i32,
+    )
+}
+
 /// The display's logical rect from the origin (DisplayContent.computeScreenConfiguration's mTmpRect).
 fn display_rect(display: &DisplayModel) -> Rect {
     Rect {
@@ -209,11 +221,14 @@ const WINDOWING_MODE_FREEFORM: i32 = 5;
 
 /// The override of a Task of `size` on `display` (TaskFragment.computeConfigResourceOverrides, TaskFragment.java:2408, for a FREEFORM Task): the bounds from the origin, the mode, and
 /// the dp of the bounds. A floating Task is not restricted to the stable (inset) area (TaskFragment.java:2485), so the dp come from the bounds; the smallest width is min(w, h) / density (:2548-2552).
-/// Density stays the display's: a resize changes only screenWidthDp/HeightDp and what derives from them. screenLayout is left undefined (not computed yet).
+/// Density stays the display's: a resize changes only screenWidthDp/HeightDp and what derives from them, screenLayout included (the rule from the Task's dp, reduced from the display's LONG and SIZE: TaskFragment.java:2568-2584).
 pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configuration {
     let density = display.dpi as f32 / DENSITY_DEFAULT;
     let width_dp = (size.width as f32 / density + 0.5) as i32;
     let height_dp = (size.height as f32 / density + 0.5) as i32;
+    // TaskFragment.java:2583 reduces from the parent's (the display's) LONG and SIZE, not from the reset start: a Task keeps LONG_NO of a display that is not long.
+    let (display_width, display_height) = display_dp(display);
+    let parent = compute_screen_layout(SCREENLAYOUT_RESET, display_width, display_height);
     let rect = |right: i32, bottom: i32| Rect {
         left: 0,
         top: 0,
@@ -224,6 +239,7 @@ pub(crate) fn task_override(display: &DisplayModel, size: TaskSize) -> Configura
         screen_width_dp: width_dp,
         screen_height_dp: height_dp,
         smallest_screen_width_dp: width_dp.min(height_dp),
+        screen_layout: compute_screen_layout(parent, width_dp, height_dp),
         orientation: if width_dp <= height_dp {
             ORIENTATION_PORTRAIT
         } else {
@@ -267,6 +283,9 @@ pub(crate) fn task_configuration(
     config.screen_height_dp = over.screen_height_dp;
     config.smallest_screen_width_dp = over.smallest_screen_width_dp;
     config.orientation = over.orientation;
+    // the override's LONG, SIZE and COMPAT replace the global's (AOSP Configuration.updateFrom, Configuration.java:1700-1722); LAYOUTDIR and ROUND stay the display's
+    config.screen_layout = over.screen_layout
+        | (config.screen_layout & (SCREENLAYOUT_LAYOUTDIR_MASK | SCREENLAYOUT_ROUND_MASK));
     let rotations = (
         config.window_configuration.rotation,
         config.window_configuration.display_rotation,
@@ -5007,6 +5026,38 @@ mod tests {
         assert_eq!(config.locale_list.as_deref(), Some("zh-TW"));
         let config = global_configuration(&display, None);
         assert_eq!(config.locale_list.as_deref(), Some("en-US"));
+    }
+
+    /// screenLayout by hand (screen_layout.rs tests give the rule): the phone's 1080x2400 px at 420 dpi is 411x914 dp, 0x10000022 (NORMAL, LONG_YES, COMPAT); the 1920x1200 px tablet at 160 dpi is 0x10000014 (XLARGE, LONG_NO, COMPAT).
+    /// A 1000x1000 px Task at 420 dpi is 381x381 dp: SMALL, LONG_NO and no COMPAT (the display has it), so 0x11 in the override and in the merged configuration.
+    #[test]
+    fn screen_layout_is_the_display_rule_and_a_task_reduces_it() {
+        let phone = DisplayModel {
+            width: 1080,
+            height: 2400,
+            dpi: 420,
+            ..DisplayModel::default()
+        };
+        assert_eq!(
+            global_configuration(&phone, None).screen_layout,
+            0x1000_0022
+        );
+        let tablet = DisplayModel {
+            width: 1920,
+            height: 1200,
+            dpi: 160,
+            ..DisplayModel::default()
+        };
+        assert_eq!(
+            global_configuration(&tablet, None).screen_layout,
+            0x1000_0014
+        );
+        let task = TaskSize {
+            width: 1000,
+            height: 1000,
+        };
+        assert_eq!(task_override(&phone, task).screen_layout, 0x11);
+        assert_eq!(task_configuration(&phone, None, task).screen_layout, 0x11);
     }
 
     /// The declared 411x914 dp at 160 dpi (px = dp) and 256 dpi (px = dp x 1.6): 411 x 1.6 = 657.6 -> 658 px, 914 x 1.6 = 1462.4 -> 1462 px.

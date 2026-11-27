@@ -274,12 +274,14 @@ public class Main extends Activity {
         Log.i(TAG, "density " + when + " config=" + config.densityDpi
                 + " metrics=" + getResources().getDisplayMetrics().densityDpi);
         // the declared display (move_output.rs declared): sw = the application context's, the process's configuration (the Task's override in a freeform window, not the global);
-        // task_sw = this activity's (its Task's); real = the display's size in px
+        // task_sw = this activity's (its Task's); layout / task_layout = the same two configurations' screenLayout (hex); real = the display's size in px
         android.util.DisplayMetrics real = new android.util.DisplayMetrics();
         getWindowManager().getDefaultDisplay().getRealMetrics(real);
         Log.i(TAG, "size " + when
                 + " sw=" + getApplicationContext().getResources().getConfiguration().smallestScreenWidthDp
                 + " task_sw=" + config.smallestScreenWidthDp
+                + " layout=0x" + Integer.toHexString(getApplicationContext().getResources().getConfiguration().screenLayout)
+                + " task_layout=0x" + Integer.toHexString(config.screenLayout)
                 + " real=" + real.widthPixels + "x" + real.heightPixels);
         logDisplay(when);
     }

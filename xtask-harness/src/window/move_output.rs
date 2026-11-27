@@ -46,7 +46,7 @@ const DENSITY_LINE: &str = "AtlWindow: density ";
 const MONITOR_LINE: &str = "services: monitor ";
 /// The suffix of a monitor report that changed nothing.
 const UNCHANGED: &str = " unchanged";
-/// The fixture's size line (testdata Main.java logDensity): `AtlWindow: size <created|changed> sw=N task_sw=N real=WxH`, at each onCreate and onConfigurationChanged.
+/// The fixture's size line (testdata Main.java logDensity): `AtlWindow: size <created|changed> sw=N task_sw=N layout=0xN task_layout=0xN real=WxH` (layout: screenLayout, hex), at each onCreate and onConfigurationChanged.
 const SIZE_LINE: &str = "AtlWindow: size ";
 /// The fixture's layout line (testdata Main.java): `AtlWindow: size=WxH screenWidthDp=N window=WxH display=WxH orientation=N`, one per size change of the content view.
 const LAYOUT_LINE: &str = "AtlWindow: size=";
@@ -211,6 +211,7 @@ pub fn checks(
     subs.push(("watch", watch_check(watch, moved, declared)));
     if let Some(declared) = declared {
         subs.push(("declared", declared_check(app, declared, opened, moved)));
+        subs.push(("layout", screen_layout_check(app, declared)));
     }
     subs
 }
@@ -370,6 +371,9 @@ fn display_check(
 struct InstanceSize {
     sw: i32,
     task_sw: i32,
+    /// screenLayout of the application context's configuration and of the activity's.
+    layout: i32,
+    task_layout: i32,
     real: (i32, i32),
 }
 
@@ -379,10 +383,15 @@ fn sizes(app: &str) -> Vec<InstanceSize> {
         .filter_map(|l| {
             let rest = l.split_once(SIZE_LINE)?.1;
             let field = |key: &str| rest.split_whitespace().find_map(|w| w.strip_prefix(key));
+            let hex = |key: &str| -> Option<i32> {
+                i32::from_str_radix(field(key)?.strip_prefix("0x")?, 16).ok()
+            };
             let (w, h) = field("real=")?.split_once('x')?;
             Some(InstanceSize {
                 sw: field("sw=")?.parse().ok()?,
                 task_sw: field("task_sw=")?.parse().ok()?,
+                layout: hex("layout=")?,
+                task_layout: hex("task_layout=")?,
                 real: (w.parse().ok()?, h.parse().ok()?),
             })
         })
@@ -566,6 +575,49 @@ fn declared_check(
         want(moved).1,
         shown(opened).to_arg(),
         shown(moved).to_arg()
+    ))
+}
+
+/// The declared display's screenLayout SIZE, LONG and COMPAT bits in the app's configuration and the activity's, at both outputs (the Task is the display). Expected literals, derived by hand from the AOSP
+/// rule (Configuration.java:437-467; `long` = the longer side, `short` = the shorter, so orientation does not matter): 411x914 dp is NORMAL (914 < 960, 411 < 480), LONG_YES (914 x 3 / 5 = 548 >= 410),
+/// COMPAT (411 > 321) = 0x10000022; 1920x1200 dp is XLARGE (1920 >= 960, 1200 >= 720), LONG_NO (1920 x 3 / 5 = 1152 < 1199), COMPAT = 0x10000014. Any other size fails until its row is derived here.
+fn screen_layout_check(app: &str, declared: Declaration) -> Result<String, String> {
+    /// SIZE 0x0f, LONG 0x30, COMPAT 0x10000000 (Configuration.java:264-366); LAYOUTDIR and ROUND are not computed by the rule.
+    const JUDGED: i32 = 0x0f | 0x30 | 0x1000_0000;
+    let long = declared.width_dp.max(declared.height_dp);
+    let short = declared.width_dp.min(declared.height_dp);
+    let want = match (long, short) {
+        (914, 411) => 0x1000_0022,
+        (1920, 1200) => 0x1000_0014,
+        _ => {
+            return Err(format!(
+                "no expected screenLayout for {} dp: derive it from Configuration.java:437-467 and add a row",
+                declared.to_arg()
+            ));
+        }
+    };
+    let sized = sizes(app);
+    let [first, .., last] = sized.as_slice() else {
+        return Err(format!(
+            "{} size lines, want one per instance (opened, moved)",
+            sized.len()
+        ));
+    };
+    let mut problems = Vec::new();
+    for (at, s) in [("at open", first), ("after the move", last)] {
+        for (who, layout) in [("app", s.layout), ("activity", s.task_layout)] {
+            if (layout & JUDGED) != want {
+                problems.push(format!(
+                    "{who} screenLayout {at} 0x{layout:x}, want 0x{want:x}"
+                ));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+    Ok(format!(
+        "screenLayout 0x{want:x} (SIZE, LONG, COMPAT) at both outputs, app and activity"
     ))
 }
 

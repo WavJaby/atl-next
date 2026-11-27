@@ -8,10 +8,14 @@ pub const CONFIG_SCREEN_LAYOUT: u32 = 0x0100;
 pub const CONFIG_SCREEN_SIZE: u32 = 0x0400;
 pub const CONFIG_SMALLEST_SCREEN_SIZE: u32 = 0x0800;
 
-/// Configuration.SCREENLAYOUT_SIZE_MASK (0x0f; undefined is 0), SCREENLAYOUT_LONG_MASK (0x30) and the non-size layout bits: layout direction (0xC0), round (0x300), compat needed (0x10000000).
-const SCREENLAYOUT_SIZE_MASK: i32 = 0x0f;
-const SCREENLAYOUT_LONG_MASK: i32 = 0x30;
-const SCREENLAYOUT_NON_SIZE_MASK: i32 = 0xC0 | 0x300 | 0x1000_0000;
+use crate::screen_layout::{
+    SCREENLAYOUT_COMPAT_NEEDED, SCREENLAYOUT_LAYOUTDIR_MASK, SCREENLAYOUT_LONG_MASK,
+    SCREENLAYOUT_ROUND_MASK, SCREENLAYOUT_SIZE_MASK,
+};
+
+/// The non-size layout bits: layout direction, round, compat needed (the masks are screen_layout.rs's, one copy).
+const SCREENLAYOUT_NON_SIZE_MASK: i32 =
+    SCREENLAYOUT_LAYOUTDIR_MASK | SCREENLAYOUT_ROUND_MASK | SCREENLAYOUT_COMPAT_NEEDED;
 
 /// The thresholds of one app (the fields of SizeConfigurationBuckets); None where no resource names any value.
 #[derive(Debug, Clone, Default, PartialEq)]
