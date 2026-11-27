@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test host-load`: the starvation rule (starvation.rs) on a process tree the gate controls, no atld. Each case is its own gate process
-//! (`test host-load --case <c>`, so its own `atl-gate-<pid>.scope` and sampler), pinned to one CPU with `taskset`: its sampler's CPU set is that CPU, so foreign load is what shares it.
+//! (`test host-load --case <c>`, its own sampler), pinned to one CPU with `taskset`: its sampler's CPU set is that CPU, so foreign load is what shares it. By hand each case relaunches into
+//! its own `atl-gate-<pid>.scope`; in a managed row (check_gates, land) it measures the row's leaf instead, which also holds this gate's waiting parent: the cases run one at a time, so the
+//! leaf's own CPU over a case is that case's tree (its `case tree cpu` line splits it out) and the parent's few ms.
 //! The case starts a worker (`host-load-child`, in its scope) and waits `host-load-event` for the worker's event line: bound [`BOUND`], need [`NEED`].
 //! Burners are `host-load-child --role burn` loops pinned to the same CPU, each in its own sibling scope (`systemd-run --user --scope -p CPUWeight=`): at [`STARVE_WEIGHT`] against the
 //! case scope's default 100 the worker gets about 1 % of the CPU, so its 50 ms of work takes about 5 s; at the default weight ("under load") it gets about half.
@@ -190,7 +192,7 @@ impl Case {
         match self {
             Self::Starved | Self::PassUnderLoad => Role::Work,
             Self::NoEvent | Self::AsleepUnderLoad => Role::Silent,
-            Self::CrashUnderLoad => Role::Abort,
+            Self::CrashUnderLoad => Role::Die,
             Self::WrongUnderLoad => Role::Wrong,
             Self::SelfInflicted => Role::Spin,
             Self::LateQuiet => Role::Late,
@@ -205,8 +207,9 @@ pub enum Role {
     Work,
     /// Never logs: sleeps.
     Silent,
-    /// Aborts at once.
-    Abort,
+    /// Dies of SIGKILL at once. Not abort(): SIGABRT is a core-dump signal, and a host with `kernel.print-fatal-signals=1` (WSL's default) has the dying task print its registers to the
+    /// console first, flushing every pending kernel line (other gates' crashes) to a slow console (hvc0): measured 1.3 s of the task's own CPU, past the bound. SIGKILL is never printed.
+    Die,
     /// Logs the event with a wrong value at once.
     Wrong,
     /// Sleeps [`LATE_SLEEP`], then works.
@@ -255,7 +258,13 @@ pub fn child(args: &ChildArgs) -> Result<ExitCode> {
             event(VALUE)
         }
         Role::Wrong => event(VALUE - 1),
-        Role::Abort => std::process::abort(),
+        Role::Die => {
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            unreachable!("SIGKILL to this process returned")
+        }
         Role::Silent => loop {
             std::thread::sleep(Duration::from_secs(3600));
         },
@@ -277,6 +286,22 @@ fn spend(cpu: Duration) {
     while ran().saturating_sub(start) < cpu {
         std::hint::spin_loop();
     }
+}
+
+/// This process's CPU and its reaped children's (`/proc/self/stat` utime+stime, cutime+cstime; USER_HZ 100). Read once the worker is reaped and before the burners are: the children's part is the worker's.
+fn tree_cpu() -> Option<(Duration, Duration)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // fields after the `(comm)`: state is field 3, utime 14 .. cstime 17
+    let f: Vec<u64> = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .skip(11)
+        .take(4)
+        .map(|v| v.parse().ok())
+        .collect::<Option<_>>()?;
+    let ms = |ticks: u64| Duration::from_millis(ticks * 10);
+    Some((ms(f[0] + f[1]), ms(f[2] + f[3])))
 }
 
 /// Busy for `limit` of wall time: a spinner's own bound (see [`SPIN_LIMIT`]).
@@ -495,6 +520,14 @@ fn judge(case: Case, cpus: &[u32], log: &Path, brk: Option<Break>) -> Result<Exi
     let outcome = until_child(&wait, &mut worker);
     let _ = worker.kill();
     let _ = worker.wait();
+    // the case's own tree, apart from the row leaf's counters (a managed row's leaf holds this gate's parent too): an excess here is the case's, not the host's
+    if let Some((own, reaped)) = tree_cpu() {
+        println!(
+            "host-load: case tree cpu: gate {} ms, worker {} ms",
+            own.as_millis(),
+            reaped.as_millis()
+        );
+    }
     // the burners starve this process too (its sampler, its judge): the samples past the wait come once they end
     drop(burners);
     let fault = match outcome {
@@ -535,7 +568,7 @@ fn role_name(role: Role) -> &'static str {
     match role {
         Role::Work => "work",
         Role::Silent => "silent",
-        Role::Abort => "abort",
+        Role::Die => "die",
         Role::Wrong => "wrong",
         Role::Late => "late",
         Role::Spin => "spin",
