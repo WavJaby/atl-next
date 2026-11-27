@@ -775,6 +775,455 @@ public class Main extends Activity {
         }
     }
 
+    /**
+     * The popup line (app.rs WEBVIEW_CREATE_WINDOW, webview plan A34 slice 4). An opener WebView on a HandlerThread (its Looper is the opener's getWebViewLooper()), JavaScript and popups on;
+     * window.open from script (no gesture) is answered by WebChromeClient.onCreateWindow. The cases run in order on a driver thread, each waiting for its callbacks with a bound. The loopback
+     * server counts popup requests; a count is read after a control request, which the server answers in order, so it includes every request sent before it. One verdict line: `ok`, or `fail`
+     * with each failed check. A watchdog logs `fail` if the run does not end.
+     */
+    private void webViewCreateWindow() {
+        final CreateWindow cw = new CreateWindow(this);
+        cw.start();
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+            @Override public void run() { cw.watchdog(); }
+        }, CreateWindow.WATCHDOG_MS);
+    }
+
+    /** webViewCreateWindow's state: the opener, the popup cases, the loopback server and the one verdict. */
+    public static final class CreateWindow implements Runnable {
+        static final long WAIT_MS = 10000;
+        static final long WATCHDOG_MS = 60000;
+        static final int RELEASE_TRIES = 1000;
+        static final String POPUP_PAGE = "<html><head><title>popup</title></head><body><script>atl.report(String(window.opener !== null));</script></body></html>";
+
+        final android.content.Context ctx;
+        final android.os.HandlerThread thread = new android.os.HandlerThread("popup-opener");
+        final java.util.List<String> failures = new java.util.ArrayList<String>();
+        final java.util.concurrent.atomic.AtomicBoolean logged = new java.util.concurrent.atomic.AtomicBoolean();
+        volatile String stage = "start";
+        volatile Popup current;
+        volatile android.webkit.WebView opener;
+        PopupServer server;
+        android.os.Handler oh;
+        boolean openerDestroyed;
+        int fences;
+
+        CreateWindow(android.content.Context ctx) { this.ctx = ctx; }
+
+        void start() {
+            try {
+                server = new PopupServer();
+            } catch (java.io.IOException e) {
+                finish("fail server: " + e);
+                return;
+            }
+            new Thread(this, "popup-driver").start();
+        }
+
+        void watchdog() { finish("fail watchdog at " + stage); }
+
+        void finish(String verdict) {
+            if (!logged.compareAndSet(false, true)) return;
+            if (verdict == null) verdict = failures.isEmpty() ? "ok" : "fail " + summary();
+            Log.i("AtlTest", "webview-create-window: " + verdict);
+        }
+
+        String summary() {
+            StringBuilder b = new StringBuilder();
+            for (String f : failures) {
+                if (b.length() > 0) b.append("; ");
+                b.append(f);
+            }
+            return b.toString();
+        }
+
+        @Override public void run() {
+            try {
+                drive();
+            } catch (Throwable e) {
+                failures.add("driver: " + e);
+            } finally {
+                teardown();
+                finish(null);
+            }
+        }
+
+        void drive() throws InterruptedException {
+            thread.start();
+            oh = new android.os.Handler(thread.getLooper());
+            final java.util.concurrent.CountDownLatch made = new java.util.concurrent.CountDownLatch(1);
+            oh.post(new Runnable() {
+                @Override public void run() {
+                    android.webkit.WebView w = new android.webkit.WebView(ctx);
+                    opener = w;
+                    android.webkit.WebSettings s = w.getSettings();
+                    s.setJavaScriptEnabled(true);
+                    s.setJavaScriptCanOpenWindowsAutomatically(true);
+                    s.setSupportMultipleWindows(true);
+                    w.setWebChromeClient(new android.webkit.WebChromeClient() {
+                        @Override public boolean onCreateWindow(android.webkit.WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+                            return createWindow(view, isUserGesture, resultMsg);
+                        }
+                    });
+                    made.countDown();
+                }
+            });
+            if (!await(made, "opener")) return;
+            // 1: a permitted open, the message kept across two nested posts and sent after a fence; the child reports window.opener and closes twice (one close)
+            Popup c1 = new Popup("c1", Popup.Mode.OPEN);
+            if (!openSent(c1) || !closeChild(c1)) return;
+            // 2: declined, nothing sent
+            Popup c2 = new Popup("c2", Popup.Mode.DECLINE);
+            open(c2);
+            if (!await(c2.created, "c2 callback")) return;
+            expect(c2.createCount == 1, "c2: onCreateWindow " + c2.createCount + " times, want 1");
+            fence("c2 after decline");
+            expect(server.hits(c2.path) == 0, "c2: request after decline");
+            // 3: declined with a queued send: stale, nothing reaches the child
+            Popup c3 = new Popup("c3", Popup.Mode.DECLINE_SEND);
+            open(c3);
+            if (!await(c3.created, "c3 callback") || !await(c3.sent, "c3 send")) return;
+            sync();
+            fence("c3 after declined send");
+            expect(c3.createCount == 1, "c3: onCreateWindow " + c3.createCount + " times, want 1");
+            expect(server.hits(c3.path) == 0 && c3.reported.getCount() == 1, "c3: a declined popup's send reached the child");
+            // 4: another valid open after the declined ones
+            Popup c4 = new Popup("c4", Popup.Mode.OPEN);
+            if (!openSent(c4) || !closeChild(c4)) return;
+            // 5: c5a's message replayed after c5b's callback: stale, must not take c5b's request
+            Popup c5a = new Popup("c5a", Popup.Mode.OPEN);
+            if (!openSent(c5a)) return;
+            Popup c5b = new Popup("c5b", Popup.Mode.KEEP);
+            open(c5b);
+            if (!await(c5b.created, "c5b callback")) return;
+            c5a.requestMessage.sendToTarget();
+            sync();
+            fence("c5b after stale send");
+            expect(server.hits(c5b.path) == 0 && c5b.reported.getCount() == 1, "c5b: a stale send reached the newer request");
+            c5b.gate = true;
+            if (!await(c5b.sent, "c5b send") || !await(c5b.reported, "c5b child report")) return;
+            sync();
+            fence("c5b after send");
+            expect(server.hits(c5b.path) == 1, "c5b: " + server.hits(c5b.path) + " requests, want 1");
+            expect("true".equals(c5b.openerReport), "c5b: child window.opener " + c5b.openerReport + ", want true");
+            // 6: the child's content used before the send: the send is refused, nothing loads
+            Popup c6 = new Popup("c6", Popup.Mode.PREMATURE);
+            open(c6);
+            if (!await(c6.created, "c6 callback")) return;
+            c6.gate = true;
+            if (!await(c6.sent, "c6 send")) return;
+            sync();
+            fence("c6 after send");
+            expect(server.hits(c6.path) == 0 && c6.reported.getCount() == 1, "c6: the child loaded after its content was used");
+            // a close from the child's own page: an adopted popup's view would report it (onCloseWindow); a refused one reports nothing
+            oh.post(new Runnable() {
+                @Override public void run() { c6.child.evaluateJavascript("window.close();", null); }
+            });
+            if (c6.closed.await(2000, java.util.concurrent.TimeUnit.MILLISECONDS)) failures.add("c6: onCloseWindow after a refused send (the popup was adopted)");
+            // 7: multiple windows off, JavaScript opening on: no callback, no request
+            Popup c7 = new Popup("c7", Popup.Mode.DECLINE);
+            current = c7;
+            final String url7 = base() + c7.path;
+            final java.util.concurrent.CountDownLatch scripted = new java.util.concurrent.CountDownLatch(1);
+            oh.post(new Runnable() {
+                @Override public void run() {
+                    opener.getSettings().setSupportMultipleWindows(false);
+                    opener.evaluateJavascript("window.open('" + url7 + "') !== null", new android.webkit.ValueCallback<String>() {
+                        @Override public void onReceiveValue(String value) { scripted.countDown(); }
+                    });
+                }
+            });
+            if (!await(scripted, "c7 script")) return;
+            expect(c7.createCount == 0, "c7: onCreateWindow with multiple windows off");
+            fence("c7 after script");
+            expect(server.hits(c7.path) == 0, "c7: request with multiple windows off");
+            oh.post(new Runnable() {
+                @Override public void run() { opener.getSettings().setSupportMultipleWindows(true); }
+            });
+            sync();
+            // 8: accepted, unsent; the opener is destroyed; the held message arrives after: no request, no close. Last, it destroys the opener.
+            Popup c8 = new Popup("c8", Popup.Mode.KEEP);
+            open(c8);
+            if (!await(c8.created, "c8 callback")) return;
+            openerDestroyed = true;
+            oh.post(new Runnable() {
+                @Override public void run() { opener.destroy(); }
+            });
+            c8.requestMessage.sendToTarget();
+            sync();
+            fence("c8 after destroy");
+            expect(server.hits(c8.path) == 0, "c8: request after the opener was destroyed");
+            expect(c8.closeCount == 0, "c8: onCloseWindow after the opener was destroyed");
+        }
+
+        String base() { return "http://127.0.0.1:" + server.port(); }
+
+        /** Loads this attempt's opener page; its script opens the popup while the page parses, so no user gesture (WebKitGTK reports one for an evaluateJavascript open). */
+        void open(final Popup p) {
+            current = p;
+            final String html = "<html><head><title>opener</title></head><body><script>window.open('" + base() + p.path + "');</script></body></html>";
+            oh.post(new Runnable() {
+                @Override public void run() { opener.loadDataWithBaseURL("https://atl.test/" + p.caseId, html, "text/html", null, null); }
+            });
+        }
+
+        /** A permitted open: one callback on the opener's Looper, no request before the send, then one request to the child and its report. */
+        boolean openSent(Popup p) throws InterruptedException {
+            open(p);
+            if (!await(p.created, p.caseId + " callback")) return false;
+            expect(p.createCount == 1, p.caseId + ": onCreateWindow " + p.createCount + " times, want 1");
+            expect(p.opener == opener, p.caseId + ": onCreateWindow view is not the opener");
+            expect(p.ownerLooper == thread.getLooper(), p.caseId + ": onCreateWindow Looper is not the opener's");
+            expect(!p.gesture, p.caseId + ": isUserGesture set for a script open");
+            expect(p.transport, p.caseId + ": resultMsg has no WebViewTransport");
+            fence(p.caseId + " before send");
+            expect(server.hits(p.path) == 0, p.caseId + ": request before send");
+            p.gate = true;
+            if (!await(p.sent, p.caseId + " send") || !await(p.reported, p.caseId + " child report")) return false;
+            sync();
+            fence(p.caseId + " after send");
+            expect(server.hits(p.path) == 1, p.caseId + ": " + server.hits(p.path) + " requests, want 1");
+            expect("true".equals(p.openerReport), p.caseId + ": child window.opener " + p.openerReport + ", want true");
+            return true;
+        }
+
+        /** The child's window.close() twice: one onCloseWindow, on the child's Looper, with the child. */
+        boolean closeChild(final Popup p) throws InterruptedException {
+            oh.post(new Runnable() {
+                @Override public void run() { p.child.evaluateJavascript("window.close();window.close();", null); }
+            });
+            if (!await(p.closed, p.caseId + " close")) return false;
+            sync();
+            fence(p.caseId + " after close");
+            expect(p.closeCount == 1, p.caseId + ": onCloseWindow " + p.closeCount + " times, want 1");
+            expect(p.closeLooper == thread.getLooper(), p.caseId + ": onCloseWindow Looper is not the child's");
+            expect(p.closeView == p.child, p.caseId + ": onCloseWindow view is not the child");
+            return true;
+        }
+
+        /** onCreateWindow on the opener's Looper: the child is created and attached here, the message is kept and sent after two nested posts once the driver lets it go. */
+        boolean createWindow(android.webkit.WebView view, boolean gesture, android.os.Message msg) {
+            final Popup p = current;
+            if (p == null) return false;
+            p.createCount++;
+            p.opener = view;
+            p.ownerLooper = android.os.Looper.myLooper();
+            p.gesture = gesture;
+            p.transport = msg != null && msg.obj instanceof android.webkit.WebView.WebViewTransport;
+            if (msg == null || p.mode == Popup.Mode.DECLINE) {
+                p.created.countDown();
+                return false;
+            }
+            final android.webkit.WebView child = new android.webkit.WebView(ctx);
+            child.getSettings().setJavaScriptEnabled(true);
+            child.addJavascriptInterface(new Reporter(p), "atl");
+            child.setWebChromeClient(new android.webkit.WebChromeClient() {
+                @Override public void onCloseWindow(android.webkit.WebView window) {
+                    p.closeCount++;
+                    p.closeLooper = android.os.Looper.myLooper();
+                    p.closeView = window;
+                    p.closed.countDown();
+                }
+            });
+            p.child = child;
+            ((android.webkit.WebView.WebViewTransport) msg.obj).setWebView(child);
+            p.requestMessage = android.os.Message.obtain(msg);
+            final android.os.Handler h = new android.os.Handler(android.os.Looper.myLooper());
+            final android.os.Message m = msg;
+            if (p.mode == Popup.Mode.DECLINE_SEND) p.gate = true;
+            // a history entry marks the content used; with no history it leaves the popup's navigation alone (an evaluateJavascript on the child lost that navigation in WebKit)
+            if (p.mode == Popup.Mode.PREMATURE) child.goBack();
+            h.post(new Runnable() {
+                @Override public void run() {
+                    h.post(new Runnable() {
+                        @Override public void run() { release(p, h, m, 0); }
+                    });
+                }
+            });
+            p.created.countDown();
+            return p.mode != Popup.Mode.DECLINE_SEND;
+        }
+
+        void release(final Popup p, final android.os.Handler h, final android.os.Message m, final int tries) {
+            if (!p.gate) {
+                if (tries < RELEASE_TRIES) {
+                    h.postDelayed(new Runnable() {
+                        @Override public void run() { release(p, h, m, tries + 1); }
+                    }, 10);
+                }
+                return;
+            }
+            m.sendToTarget();
+            p.sent.countDown();
+        }
+
+        /** A Looper barrier: everything queued on the opener's Looper before this call has run when it returns. */
+        void sync() throws InterruptedException {
+            final java.util.concurrent.CountDownLatch l = new java.util.concurrent.CountDownLatch(1);
+            oh.post(new Runnable() {
+                @Override public void run() { l.countDown(); }
+            });
+            await(l, "sync");
+        }
+
+        boolean await(java.util.concurrent.CountDownLatch l, String what) throws InterruptedException {
+            stage = what;
+            if (l.await(WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) return true;
+            failures.add(what + ": timed out");
+            return false;
+        }
+
+        void expect(boolean ok, String why) {
+            if (!ok) failures.add(why);
+        }
+
+        /** A control request to the loopback server (a raw socket: HttpURLConnection refuses cleartext here): its 200 comes after every earlier request was counted. */
+        void fence(String what) {
+            stage = what;
+            try {
+                java.net.Socket s = new java.net.Socket();
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", server.port()), 5000);
+                s.setSoTimeout(5000);
+                try {
+                    s.getOutputStream().write(("GET /ctl/" + (++fences) + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").getBytes("US-ASCII"));
+                    String status = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "US-ASCII")).readLine();
+                    expect(status != null && status.startsWith("HTTP/1.1 200"), what + ": control request answered " + status);
+                } finally {
+                    s.close();
+                }
+            } catch (java.io.IOException e) {
+                failures.add(what + ": control request: " + e);
+            }
+        }
+
+        void teardown() {
+            if (oh != null) {
+                final boolean destroyed = openerDestroyed;
+                oh.post(new Runnable() {
+                    @Override public void run() {
+                        if (!destroyed && opener != null) opener.destroy();
+                        thread.quitSafely();
+                    }
+                });
+            }
+            if (server != null) server.close();
+        }
+
+        /** One popup attempt: the opener's callback, the child, its close, and the path the server counts. */
+        public static final class Popup {
+            enum Mode { OPEN, DECLINE, DECLINE_SEND, KEEP, PREMATURE }
+
+            final String caseId;
+            final String path;
+            final Mode mode;
+            final java.util.concurrent.CountDownLatch created = new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch sent = new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch reported = new java.util.concurrent.CountDownLatch(1);
+            final java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
+            volatile boolean gate;
+            volatile boolean gesture;
+            volatile boolean transport;
+            volatile int createCount;
+            volatile int closeCount;
+            volatile android.webkit.WebView opener;
+            volatile android.webkit.WebView child;
+            volatile android.webkit.WebView closeView;
+            volatile android.os.Looper ownerLooper;
+            volatile android.os.Looper closeLooper;
+            volatile android.os.Message requestMessage;
+            volatile String openerReport;
+
+            Popup(String caseId, Mode mode) {
+                this.caseId = caseId;
+                this.path = "/p/" + caseId;
+                this.mode = mode;
+            }
+        }
+
+        /** The popup child's JS object: the page reports whether it has an opener. */
+        public static final class Reporter {
+            final Popup p;
+
+            Reporter(Popup p) { this.p = p; }
+
+            @android.webkit.JavascriptInterface
+            public void report(String openerSeen) {
+                p.openerReport = openerSeen;
+                p.reported.countDown();
+            }
+        }
+
+        /** A loopback HTTP server: /p/<case> counts a popup request and answers POPUP_PAGE; /ctl/<n> answers ok after the requests before it. Sequential, so a fence is ordered. */
+        public static final class PopupServer implements Runnable {
+            final java.net.ServerSocket ss;
+            final java.util.HashMap<String, Integer> hits = new java.util.HashMap<String, Integer>();
+
+            PopupServer() throws java.io.IOException {
+                ss = new java.net.ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1"));
+                Thread t = new Thread(this, "popup-server");
+                t.setDaemon(true);
+                t.start();
+            }
+
+            int port() { return ss.getLocalPort(); }
+
+            synchronized int hits(String path) {
+                Integer n = hits.get(path);
+                return n == null ? 0 : n;
+            }
+
+            void close() {
+                try {
+                    ss.close();
+                } catch (java.io.IOException e) {
+                    // already closed
+                }
+            }
+
+            @Override public void run() {
+                while (!ss.isClosed()) {
+                    try {
+                        java.net.Socket s = ss.accept();
+                        try {
+                            serve(s);
+                        } finally {
+                            s.close();
+                        }
+                    } catch (java.io.IOException e) {
+                        // a bad connection or the listener closing: the next accept goes on
+                    }
+                }
+            }
+
+            void serve(java.net.Socket s) throws java.io.IOException {
+                s.setSoTimeout(3000);
+                java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream(), "US-ASCII"));
+                String request = in.readLine();
+                String header = in.readLine();
+                while (header != null && !header.isEmpty()) header = in.readLine();
+                String[] parts = request == null ? new String[0] : request.split(" ");
+                String path = parts.length > 1 ? parts[1] : "";
+                String status = "200 OK";
+                String body = "";
+                synchronized (this) {
+                    if (path.startsWith("/ctl/")) {
+                        body = "ok";
+                    } else if (path.startsWith("/p/")) {
+                        hits.put(path, hits(path) + 1);
+                        body = POPUP_PAGE;
+                    } else {
+                        status = "404 Not Found";
+                    }
+                }
+                byte[] bytes = body.getBytes("UTF-8");
+                java.io.OutputStream out = s.getOutputStream();
+                out.write(("HTTP/1.1 " + status + "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + bytes.length + "\r\nConnection: close\r\n\r\n").getBytes("US-ASCII"));
+                out.write(bytes);
+                out.flush();
+            }
+        }
+    }
+
     /** The WebView package line (app.rs WEBVIEW_PACKAGE): WebView.getCurrentWebViewPackage's name and whether it is a system app; `null` without one. */
     private String webViewPackage() {
         android.content.pm.PackageInfo p = android.webkit.WebView.getCurrentWebViewPackage();
@@ -860,6 +1309,7 @@ public class Main extends Activity {
                     @Override public void run() {
                         Log.i("AtlTest", "webview-ua: " + ua);
                         webViewSettings();
+                        webViewCreateWindow();
                         webViewPage();
                         webViewCookies();
                         webViewDownload();

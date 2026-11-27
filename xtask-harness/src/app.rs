@@ -136,7 +136,7 @@ const REMOTE_SKIPPED: [(&str, &str); 4] = [
         "atld ends at the target's limit (timeout), not at the gate's stop, so the exit rows have nothing to compare",
     ),
     (
-        "webview-ua, webview-settings, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-threads, webview-reenter, webview-bridge-views, webview-bridge-latency, webview-slow-callback, webview-looper-thread, webview-classloader",
+        "webview-ua, webview-settings, webview-create-window, webview-cookie-set, webview-cookie-web, webview-download, webview-scale, webview-override, webview-scheme, webview-http, webview-threads, webview-reenter, webview-bridge-views, webview-bridge-latency, webview-slow-callback, webview-looper-thread, webview-classloader",
         "WebKitSettings needs a GDK display: no compositor on a headless run",
     ),
     (
@@ -592,6 +592,14 @@ const WEBVIEW_SETTINGS: Line = Line {
     ),
     timing: Timing::Create,
 };
+/// Main.webViewCreateWindow's line (webview plan A34 slice 4): the popup cases on a HandlerThread's opener, one verdict after all of them. Judged by [`once_why`]: exactly one `ok`;
+/// a missing, duplicate or `fail ...` line fails and names its case.
+const WEBVIEW_CREATE_WINDOW: Line = Line {
+    row: "webview-create-window",
+    prefix: "AtlTest: webview-create-window: ",
+    want: Want::Once("ok"),
+    timing: Timing::Async,
+};
 /// Main.webViewCookies's line (webview plan D5, W4b): CookieManager.setCookie from a thread without a Looper is readable at once on that thread (the copy), `a=1` being the cookie it set and
 /// hasCookies true; the ValueCallback reports success on the main Looper (CookieManager.java javadoc: the caller's Looper, the main one for a caller without).
 const WEBVIEW_COOKIE_SET: Line = Line {
@@ -807,7 +815,23 @@ enum Timing {
 enum Want {
     Exact(&'static str),
     Prefix(&'static str),
+    /// The line with the prefix appears exactly once, with this value; absent, a second line or another value fails ([`once_why`]).
+    Once(&'static str),
     Host,
+}
+
+/// A `Want::Once(want)` row's verdict: exactly one line carrying `prefix`, its value (trailing blanks cut) equal to `want`. Absent, a second line and another value each name the failure.
+fn once_why(app: &str, prefix: &str, want: &str) -> Option<String> {
+    let values: Vec<&str> = app
+        .lines()
+        .filter_map(|l| l.split_once(prefix).map(|(_, r)| r.trim_end()))
+        .collect();
+    match values.as_slice() {
+        [v] if *v == want => None,
+        [v] => Some(format!("want {want:?} once, got {v:?}")),
+        [] => Some(format!("no line with {prefix:?}")),
+        many => Some(format!("{} lines with {prefix:?}, want one", many.len())),
+    }
 }
 
 /// A fixture log line the gate judges: `row` names it in verdicts, `prefix` finds it in the app log, `want` is its value, `timing` says when the fixture logs it.
@@ -840,7 +864,7 @@ struct Line {
 /// stopService's onDestroy; STOPSELF's stopSelf(1) then onDestroy. The STICKY restart and the NOT_STICKY process are judged by [`StickyCase`], from their own processes' logs.
 /// fgsnotype: Main.foregroundStarts' AtlFgsNoType (targetSdk 36, no foregroundServiceType, main process): startForeground without a type throws `Starting FGS without a type` (AS :2883-2886); the line carries the message's start.
 /// The `fgs` and `fgstimeout` rows are [`ForegroundCase`]'s, from their own processes' logs.
-const LOG_LINES: [Line; 35] = [
+const LOG_LINES: [Line; 36] = [
     START_APP_CONTEXT,
     START_STALE_RESULT_TO,
     Line {
@@ -930,6 +954,7 @@ const LOG_LINES: [Line; 35] = [
     WEBVIEW_PACKAGE,
     WEBVIEW_PAGE,
     WEBVIEW_SETTINGS,
+    WEBVIEW_CREATE_WINDOW,
     WEBVIEW_COOKIE_SET,
     WEBVIEW_COOKIE_WEB,
     WEBVIEW_DOWNLOAD,
@@ -3795,6 +3820,7 @@ fn judge(j: &AppJudge) -> Result<ExitCode> {
             }
             Want::Prefix(want) => (!got.as_deref().is_some_and(|g| g.starts_with(want)))
                 .then(|| format!("want a value starting {want:?}, got {got:?}")),
+            Want::Once(want) => once_why(&app, line.prefix, want),
             Want::Host => match facts
                 .as_ref()
                 .map_err(Clone::clone)
@@ -4328,6 +4354,25 @@ mod tests {
             .is_some()
         );
         assert!(webview_ua_why(None, Some(engine)).is_some());
+    }
+
+    /// The webview-create-window row's verdict (`Want::Once("ok")`): the one `ok` line passes; absent, a second line, a failure line and an empty value each fail.
+    #[test]
+    fn webview_create_window_judge() {
+        let p = WEBVIEW_CREATE_WINDOW.prefix;
+        let ok = "01-01 00:00:00.000 I AtlTest: webview-create-window: ok\n";
+        assert_eq!(once_why(ok, p, "ok"), None);
+        assert!(once_why("I AtlTest: webview-settings: js=true\n", p, "ok").is_some());
+        assert!(once_why(&format!("{ok}{ok}"), p, "ok").is_some());
+        assert!(
+            once_why(
+                "I AtlTest: webview-create-window: fail c1 callback: timed out\n",
+                p,
+                "ok"
+            )
+            .is_some()
+        );
+        assert!(once_why("I AtlTest: webview-create-window: \n", p, "ok").is_some());
     }
 
     /// The features line: AEP is the host's, so it must equal the app's own GL list (`gl-aep`). The break run (no static files), a GL ES mismatch and a probe that disagrees with the app's GL fail.
