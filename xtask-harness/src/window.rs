@@ -572,8 +572,8 @@ const RELAUNCH_COUNTER: &str = "configuration change relaunch (ActivityRelaunchI
 /// registry_service.rs set_bounds: a size change that reaches the windows only when the relaunch ends.
 const RESIZE_HELD: &str = "held for the relaunch";
 const RELAUNCHED_COUNTER: &str = "IActivityClientController.activityRelaunched ";
-/// Relaunches the relaunch stage may see: the shrink's, then at most two for the burst (its first size, and the last read when that one ends). More means the pending relaunch does not hold back the sizes behind it.
-const MAX_RELAUNCHES: u32 = 3;
+/// The smallest-width bucket of the relaunch stage's fixture: window-sized's res/values-sw600dp, its only size qualifier (no width, height or long one). The window fixture has no qualifier.
+const SW600_BUCKET: i32 = 600;
 /// The fixture's blocking touch: an UP past this view x sleeps the UI thread (Main.java BLOCK_MIN_X). The probe's click lands past it, under the window's decorations.
 const BLOCK_MIN_X: f32 = 500.0;
 const BTN_LEFT: u32 = 0x110;
@@ -2069,10 +2069,8 @@ fn counter(services: &str, method: &str) -> u32 {
 /// What a fixture's activity must do across the resizes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Lifecycle {
-    /// No thresholds: nothing crosses, the activity lives on and the configuration is sent. Whether it is told is not read: the item's alwaysReportChange tells it, the window's copy (no such flag) does not, and the two race.
-    Kept,
-    /// The sw600dp bucket, undeclared: the grow crosses nothing, the shrink relaunches.
-    Relaunches,
+    /// Undeclared: relaunched exactly at the crossings of the stage's sizes ([`stage_relaunches`]); the first relaunch comes after the grow's layout. Was `Kept` until the screenLayout rule (F1): the layout size drop (XLARGE to NORMAL) is a crossing with no bucket (SizeConfigurationBuckets.java:169-171).
+    Relaunches(u32),
     /// The sw600dp bucket, declared: no relaunch, onConfigurationChanged at each size.
     Told,
 }
@@ -2098,7 +2096,6 @@ fn lifecycle_check(
         "{creates} onCreate, {sent} sent, {relaunches} relaunches ({relaunched} ended), told {told:?}"
     );
     let ok = match want {
-        Lifecycle::Kept => creates == 1 && relaunches == 0 && sent >= 2,
         Lifecycle::Told => {
             // dp = px at the gate's density (display_check holds that)
             creates == 1
@@ -2106,15 +2103,15 @@ fn lifecycle_check(
                 && told.contains(&grow.0)
                 && told.last() == Some(&shrink.0)
         }
-        Lifecycle::Relaunches => {
+        Lifecycle::Relaunches(expected) => {
             let grown = app
                 .find(&format!("{LAYOUT_LINE}{}x{}", grow.0, grow.1))
                 .unwrap_or(usize::MAX);
             let second = app.match_indices(CREATE_LINE).nth(1).map(|(at, _)| at);
-            (1..=MAX_RELAUNCHES).contains(&relaunches)
+            relaunches == expected
                 && relaunched == relaunches
                 && creates == relaunches + 1
-                && second.is_some_and(|at| at > grown)
+                && (relaunches == 0 || second.is_some_and(|at| at > grown))
         }
     };
     if ok {
@@ -2122,6 +2119,63 @@ fn lifecycle_check(
     } else {
         Err(format!("{seen}, want {want:?}"))
     }
+}
+
+/// Configuration.SCREENLAYOUT_SIZE classes (reduceScreenLayout, Configuration.java:437-455), in order: a drop is a step down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LayoutSize {
+    Small,
+    Normal,
+    Large,
+    XLarge,
+}
+
+/// The layout size of a dp size: SMALL when the long side is under 470; XLARGE from 960 x 720, LARGE from 640 x 480 (long x short), NORMAL otherwise.
+fn layout_size((width, height): (i32, i32)) -> LayoutSize {
+    let (long, short) = (width.max(height), width.min(height));
+    if long < 470 {
+        LayoutSize::Small
+    } else if long >= 960 && short >= 720 {
+        LayoutSize::XLarge
+    } else if long >= 640 && short >= 480 {
+        LayoutSize::Large
+    } else {
+        LayoutSize::Normal
+    }
+}
+
+/// Whether AOSP relaunches an undeclared activity from `first` to `second` (dp): a smallest-width bucket lies between them (SizeConfigurationBuckets.crossesSizeThreshold, :224-235, the sides of `t` differ), or the layout size drops (crossesScreenLayoutSizeThreshold, :169-171: a drop crosses with no bucket).
+fn crosses(first: (i32, i32), second: (i32, i32), buckets: &[i32]) -> bool {
+    let (a, b) = (first.0.min(first.1), second.0.min(second.1));
+    buckets.iter().any(|&t| (a >= t) != (b >= t)) || layout_size(second) < layout_size(first)
+}
+
+/// The relaunches a sequence of sizes causes: one per crossing between consecutive sizes. The activity reads every size: the probe's burst lands 30 ms apart, and the relaunch its first size starts reads the last one when it ends.
+fn expected_relaunches(sizes: &[(i32, i32)], buckets: &[i32]) -> u32 {
+    sizes
+        .windows(2)
+        .filter(|pair| crosses(pair[0], pair[1], buckets))
+        .count() as u32
+}
+
+/// The relaunches a resize-family stage must see, from its sizes in the order the probe configures them: the opening Task, grow, the burst (content as burst_check derives it), shrink; in dp at the display's density.
+/// Buckets: the relaunch stage's sw600dp ([`SW600_BUCKET`]); the resize stage's fixture has no size qualifier. 0 when the steps failed (the sub-gate names that).
+fn stage_relaunches(stage: Stage, display: DisplayModel, steps: &Result<Steps, String>) -> u32 {
+    let Ok(&(grow, shrink)) = steps.as_ref() else {
+        return 0;
+    };
+    let chrome = RESIZE_STEPS[0].1 - grow.1;
+    let mut px = vec![opening_size_i32(display), grow];
+    px.extend(BURST_STEPS.map(|(width, height, _)| (width, height - chrome)));
+    px.push(shrink);
+    // AOSP's dp: px / (dpi / DENSITY_DEFAULT), rounded (DisplayContent.computeScreenAppConfiguration:2463)
+    let dp = |v: i32| (v * DENSITY_DEFAULT + display.dpi / 2) / display.dpi;
+    let sizes: Vec<(i32, i32)> = px.into_iter().map(|(w, h)| (dp(w), dp(h))).collect();
+    let buckets: &[i32] = match stage {
+        Stage::Relaunch => &[SW600_BUCKET],
+        _ => &[],
+    };
+    expected_relaunches(&sizes, buckets)
 }
 
 /// Stage `hwui`: the fixture drew on hwui's RecordingCanvas. Else the first onDraw line, or that none came, plus hwui's own fatal line (EglManager's `LOG_ALWAYS_FATAL` text names the failing EGL call and its error).
@@ -3454,12 +3508,11 @@ fn judge(j: &Judged, out: LiveOut, heard: Option<webview::Heard>) -> Result<Exit
             None => vec![("policy", Err("no proxy".to_owned()))],
         },
         (Stage::Resize | Stage::Relaunch | Stage::Declared | Stage::StartFinish, Some(_)) => {
-            let want = match args.stage {
-                Stage::Relaunch => Lifecycle::Relaunches,
-                Stage::Declared | Stage::StartFinish => Lifecycle::Told,
-                _ => Lifecycle::Kept,
-            };
             let steps = resize_steps(&task_bounds(&services), opening_size_i32(display));
+            let want = match args.stage {
+                Stage::Declared | Stage::StartFinish => Lifecycle::Told,
+                stage => Lifecycle::Relaunches(stage_relaunches(stage, display, &steps)),
+            };
             let mut sub = resize_checks(&app, &services, display, &liveness, &captured);
             sub.push((
                 "click",
@@ -4772,9 +4825,9 @@ mod tests {
         );
     }
 
-    /// Each Lifecycle against a log of what it wants, and the one defect each must catch. Sizes are arbitrary: grow (6, 4), shrink (3, 1).
+    /// Each Lifecycle against a log of what it wants, and the defect each must catch. Sizes are arbitrary: grow (6, 4), shrink (3, 1).
     #[test]
-    fn lifecycle_check_tells_the_three_lives_apart() {
+    fn lifecycle_check_tells_the_lives_apart() {
         let steps: Result<Steps, String> = Ok(((6, 4), (3, 1)));
         let count = |name: &str, n: u32| format!("diag: count answered I.{name} {n} at=1.000\n");
         let create = format!("{CREATE_LINE}\n");
@@ -4782,30 +4835,89 @@ mod tests {
         let told = |dp: i32| format!("{CHANGED_LINE} screenWidthDp={dp}\n");
         let check = |app: &str, services: &str, want| lifecycle_check(app, services, &steps, want);
         let sent = count(SENT_COUNTER, 2);
-        assert!(check(&create, &sent, Lifecycle::Kept).is_ok());
-        assert!(check(&create, "", Lifecycle::Kept).is_err(), "never sent");
+        // a kept activity (no relaunch) is what one expected relaunch must not be
+        assert!(check(&create, &sent, Lifecycle::Relaunches(1)).is_err());
+        assert!(
+            check(&create, "", Lifecycle::Relaunches(1)).is_err(),
+            "never sent"
+        );
         let twice = format!("{create}{grown}{create}");
-        assert!(check(&twice, &sent, Lifecycle::Kept).is_err());
+        assert!(check(&twice, &sent, Lifecycle::Relaunches(1)).is_err());
 
         let relaunched = format!(
             "{}diag: first answered {RELAUNCHED_COUNTER}1 at=1.000\n",
             count(RELAUNCH_COUNTER, 1)
         );
-        assert!(check(&twice, &relaunched, Lifecycle::Relaunches).is_ok());
+        assert!(check(&twice, &relaunched, Lifecycle::Relaunches(1)).is_ok());
+        // exact: one relaunch against two expected fails, and so does a relaunch with no second instance
+        assert!(
+            check(&twice, &relaunched, Lifecycle::Relaunches(2)).is_err(),
+            "one relaunch, two expected"
+        );
         let early = format!("{create}{create}{grown}");
         assert!(
-            check(&early, &relaunched, Lifecycle::Relaunches).is_err(),
+            check(&early, &relaunched, Lifecycle::Relaunches(1)).is_err(),
             "relaunched before the grow"
         );
-        assert!(check(&create, &relaunched, Lifecycle::Relaunches).is_err());
-        let many = count(RELAUNCH_COUNTER, MAX_RELAUNCHES + 1);
-        assert!(check(&twice, &many, Lifecycle::Relaunches).is_err());
+        assert!(check(&create, &relaunched, Lifecycle::Relaunches(1)).is_err());
+        let two = format!(
+            "{}diag: first answered {RELAUNCHED_COUNTER}2 at=1.000\n",
+            count(RELAUNCH_COUNTER, 2)
+        );
+        assert!(
+            check(&twice, &two, Lifecycle::Relaunches(1)).is_err(),
+            "two relaunches, one expected"
+        );
 
         let both = format!("{create}{}{}", told(6), told(3));
         assert!(check(&both, "", Lifecycle::Told).is_ok());
         let wrong_last = format!("{create}{}{}", told(3), told(6));
         assert!(check(&wrong_last, "", Lifecycle::Told).is_err());
         assert!(check(&create, "", Lifecycle::Told).is_err());
+    }
+
+    /// The crossings by hand, dp at 160 dpi. Sizes: opening 1440x900, grow 1600x961, burst 1200x761, 900x461, 1100x661, shrink 800x461. Smallest widths 900, 961, 761, 461, 661, 461; layout sizes XLARGE, XLARGE, XLARGE, NORMAL, LARGE, NORMAL.
+    /// With the sw600dp bucket, 761 -> 461, 461 -> 661 and 661 -> 461 cross and the rest do not: 3. With no bucket, the drops XLARGE -> NORMAL and LARGE -> NORMAL cross: 2.
+    #[test]
+    fn expected_relaunches_are_the_crossings_of_the_stage_sizes() {
+        let sizes = [
+            (1440, 900),
+            (1600, 961),
+            (1200, 761),
+            (900, 461),
+            (1100, 661),
+            (800, 461),
+        ];
+        assert_eq!(expected_relaunches(&sizes, &[600]), 3);
+        assert_eq!(expected_relaunches(&sizes, &[]), 2);
+        assert_eq!(expected_relaunches(&sizes[..2], &[600]), 0);
+    }
+
+    /// Configuration.java:437-455 by hand: a long side under 470 is SMALL; 960 x 720 is XLARGE, 640 x 480 LARGE, the rest NORMAL, either orientation.
+    #[test]
+    fn layout_size_classes_by_hand() {
+        assert_eq!(layout_size((469, 300)), LayoutSize::Small);
+        assert_eq!(layout_size((470, 300)), LayoutSize::Normal);
+        assert_eq!(layout_size((900, 461)), LayoutSize::Normal);
+        assert_eq!(layout_size((1100, 661)), LayoutSize::Large);
+        assert_eq!(layout_size((1200, 761)), LayoutSize::XLarge);
+        assert_eq!(layout_size((761, 1200)), LayoutSize::XLarge);
+    }
+
+    /// The stage's derivation from its steps (grow 1600x961, shrink 800x461 on a 1920x1200 display at 160 dpi): the relaunch stage's sw600dp gives 3, the resize stage's window fixture 2; no steps, no count.
+    #[test]
+    fn stage_relaunches_follow_the_stage_fixture() {
+        let display = DisplayModel {
+            width: 1920,
+            height: 1200,
+            dpi: 160,
+            ..DisplayModel::default()
+        };
+        let steps: Result<Steps, String> = Ok(((1600, 961), (800, 461)));
+        assert_eq!(stage_relaunches(Stage::Relaunch, display, &steps), 3);
+        assert_eq!(stage_relaunches(Stage::Resize, display, &steps), 2);
+        let none: Result<Steps, String> = Err("no steps".to_owned());
+        assert_eq!(stage_relaunches(Stage::Relaunch, display, &none), 0);
     }
 
     /// Only a layout straight before an onCreate drops out; the layout after it and one followed by another layout stay.

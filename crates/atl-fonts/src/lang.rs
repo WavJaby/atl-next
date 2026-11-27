@@ -34,6 +34,23 @@ pub fn script(expander: &LocaleExpander, tag: &str) -> Option<String> {
     max.script.map(|s| s.to_string())
 }
 
+/// The scripts icu4c flags RTL (common/uscript_props.cpp, SCRIPT_PROPS rows with `RTL`, RTL = 1 << 24; CLDR script metadata: letters with Bidi_Class R or AL). Copied from that table; any other script is LTR.
+const RTL_SCRIPTS: &[&str] = &[
+    "Adlm", "Arab", "Armi", "Avst", "Chrs", "Cprt", "Elym", "Gara", "Hatr", "Hebr", "Hung", "Khar",
+    "Lydi", "Mand", "Mani", "Mend", "Merc", "Mero", "Narb", "Nbat", "Nkoo", "Orkh", "Ougr", "Palm",
+    "Phli", "Phlp", "Phnx", "Prti", "Rohg", "Samr", "Sarb", "Sogd", "Sogo", "Syrc", "Thaa", "Yezi",
+];
+
+/// UScript.isRightToLeft (ICU4J UScript.java:1491) for a 4-letter script code.
+pub fn is_rtl_script(script: &str) -> bool {
+    RTL_SCRIPTS.contains(&script)
+}
+
+/// TextUtils.getLayoutDirectionFromLocale's test (TextUtils.java:2131-2138) through ULocale.isRightToLeft (ULocale.java:1885-1910): the tag's script (its own, else CLDR's likely one) is RTL. An unparsable tag is LTR.
+pub fn right_to_left(expander: &LocaleExpander, tag: &str) -> bool {
+    script(expander, tag).is_some_and(|s| is_rtl_script(&s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +82,28 @@ mod tests {
     fn emoji_never_falls_to_a_language() {
         let e = LocaleExpander::new_common();
         assert_eq!(candidates(&e, "und-Zsye"), ["und-zsye"]);
+    }
+
+    // Hand-derived from CLDR likelySubtags: en -> Latn, ar -> Arab, he -> Hebr, fa -> Arab; an explicit script wins (ar-Latn is Latn).
+    #[test]
+    fn right_to_left_is_the_script_of_the_tag() {
+        let e = LocaleExpander::new_common();
+        assert!(!right_to_left(&e, "en-US"));
+        for tag in ["ar", "he", "fa"] {
+            assert!(right_to_left(&e, tag), "{tag}");
+        }
+        assert!(!right_to_left(&e, "ar-Latn"));
+        assert!(!right_to_left(&e, "zh-Hant"));
+        assert!(!right_to_left(&e, ""));
+    }
+
+    // icu4c's RTL flag: Arab and Hebr are RTL; Latn, Hans and Jpan are not.
+    #[test]
+    fn rtl_scripts_are_icus_flagged_set() {
+        assert!(is_rtl_script("Arab"));
+        assert!(is_rtl_script("Hebr"));
+        assert!(!is_rtl_script("Latn"));
+        assert!(!is_rtl_script("Hans"));
+        assert!(!is_rtl_script("Jpan"));
     }
 }

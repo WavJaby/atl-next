@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Configuration.screenLayout's SIZE, LONG and COMPAT bits: the AOSP rule (Configuration.reduceScreenLayout, Configuration.java:428-488) and the caller that applies it to a screen's dp (WindowContainer.computeScreenLayout, WindowContainer.java:1728-1735). Pure; the default test step runs it.
-//! LAYOUTDIR (0xC0) and ROUND (0x300) are not computed here: AOSP sets LAYOUTDIR from the locale (Configuration.setLayoutDirection, Configuration.java:2419) and ROUND from the display's shape (DisplayContent.java:2493). The rule keeps the bits it is given; the caller drops them.
+//! LAYOUTDIR (0xC0) and ROUND (0x300) are not computed by the rule: the caller adds them (activity.rs global_configuration): LAYOUTDIR from the locale (`layout_direction_bits`, Configuration.setLayoutDirection:2419-2424), ROUND_NO (DisplayContent.java:2493-2496). The rule keeps the bits it is given; compute_screen_layout drops them.
 
 /// Configuration.SCREENLAYOUT_SIZE_MASK (0x0f): SMALL 0x01, NORMAL 0x02, LARGE 0x03, XLARGE 0x04 (Configuration.java:264-299); undefined is 0.
 pub const SCREENLAYOUT_SIZE_MASK: i32 = 0x0f;
@@ -15,6 +15,11 @@ pub const SCREENLAYOUT_LONG_YES: i32 = 0x20;
 /// SCREENLAYOUT_LAYOUTDIR_MASK (0xC0, Configuration.java:318) and SCREENLAYOUT_ROUND_MASK (0x300, :332): not computed here.
 pub const SCREENLAYOUT_LAYOUTDIR_MASK: i32 = 0xC0;
 pub const SCREENLAYOUT_ROUND_MASK: i32 = 0x300;
+/// LAYOUTDIR_LTR / _RTL (Configuration.java:326, :329): View's LAYOUT_DIRECTION + 1, shifted by 6.
+pub const SCREENLAYOUT_LAYOUTDIR_LTR: i32 = 0x40;
+pub const SCREENLAYOUT_LAYOUTDIR_RTL: i32 = 0x80;
+/// ROUND_NO (Configuration.java:344). Every ATL display is not round: DisplayModel has no round flag, and DisplayContent.java:2493-2496 sets ROUND from FLAG_ROUND.
+pub const SCREENLAYOUT_ROUND_NO: i32 = 0x100;
 /// SCREENLAYOUT_COMPAT_NEEDED (Configuration.java:366).
 pub const SCREENLAYOUT_COMPAT_NEEDED: i32 = 0x1000_0000;
 /// The start of a display's rule: what resetScreenLayout (Configuration.java:421-425) leaves in LONG and SIZE, the only bits computeScreenLayout keeps (DisplayContent.java:2469-2471).
@@ -58,6 +63,15 @@ pub fn reduce_screen_layout(cur: i32, long_dp: i32, short_dp: i32) -> i32 {
 pub fn compute_screen_layout(source: i32, width_dp: i32, height_dp: i32) -> i32 {
     let source = source & (SCREENLAYOUT_LONG_MASK | SCREENLAYOUT_SIZE_MASK);
     reduce_screen_layout(source, width_dp.max(height_dp), width_dp.min(height_dp))
+}
+
+/// Configuration.setLayoutDirection (Configuration.java:2419-2424) for a locale whose direction is `rtl` (TextUtils.getLayoutDirectionFromLocale): the LAYOUTDIR bits.
+pub fn layout_direction_bits(rtl: bool) -> i32 {
+    if rtl {
+        SCREENLAYOUT_LAYOUTDIR_RTL
+    } else {
+        SCREENLAYOUT_LAYOUTDIR_LTR
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +209,12 @@ mod tests {
             reduce_screen_layout(0x40 | SCREENLAYOUT_RESET, 1920, 1200),
             0x1000_0054
         );
+    }
+
+    /// Configuration.java:326 and :329: LTR = 0x01 << 6, RTL = 0x02 << 6.
+    #[test]
+    fn layout_direction_bits_are_0x40_for_ltr_and_0x80_for_rtl() {
+        assert_eq!(layout_direction_bits(false), 0x40);
+        assert_eq!(layout_direction_bits(true), 0x80);
     }
 }

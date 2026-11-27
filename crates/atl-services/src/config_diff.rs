@@ -4,6 +4,7 @@
 //! Undefined values are AOSP's: 0, except grammaticalGender (-1) and fontWeightAdjustment (Integer.MAX_VALUE).
 //! The window part compares by plain equality. Its CONFIG_WINDOW_CONFIGURATION bit never reaches a relaunch (getConfigurationChanges clears it), so only "changed at all" reads it.
 
+use atl_services_types::screen_layout::SCREENLAYOUT_LAYOUTDIR_MASK;
 pub use atl_services_types::size_buckets::{
     CONFIG_SCREEN_LAYOUT, CONFIG_SCREEN_SIZE, CONFIG_SMALLEST_SCREEN_SIZE,
 };
@@ -28,8 +29,7 @@ pub const CONFIG_WINDOW_CONFIGURATION: u32 = 0x2000_0000;
 pub const CONFIG_FONT_SCALE: u32 = 0x4000_0000;
 pub const CONFIG_ASSETS_PATHS: u32 = 0x8000_0000;
 
-/// Configuration.SCREENLAYOUT_LAYOUTDIR_MASK (0xC0), COLOR_MODE_HDR_MASK (0xC), COLOR_MODE_WIDE_COLOR_GAMUT_MASK (0x3).
-const SCREENLAYOUT_LAYOUTDIR_MASK: i32 = 0xC0;
+/// Configuration.COLOR_MODE_HDR_MASK (0xC), COLOR_MODE_WIDE_COLOR_GAMUT_MASK (0x3). The screenLayout masks are screen_layout.rs's.
 const COLOR_MODE_HDR_MASK: i32 = 0xC;
 const COLOR_MODE_WIDE_COLOR_GAMUT_MASK: i32 = 0x3;
 /// Configuration.GRAMMATICAL_GENDER_UNDEFINED (-1) and FONT_WEIGHT_ADJUSTMENT_UNDEFINED (Integer.MAX_VALUE).

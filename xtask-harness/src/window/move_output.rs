@@ -578,17 +578,15 @@ fn declared_check(
     ))
 }
 
-/// The declared display's screenLayout SIZE, LONG and COMPAT bits in the app's configuration and the activity's, at both outputs (the Task is the display). Expected literals, derived by hand from the AOSP
-/// rule (Configuration.java:437-467; `long` = the longer side, `short` = the shorter, so orientation does not matter): 411x914 dp is NORMAL (914 < 960, 411 < 480), LONG_YES (914 x 3 / 5 = 548 >= 410),
-/// COMPAT (411 > 321) = 0x10000022; 1920x1200 dp is XLARGE (1920 >= 960, 1200 >= 720), LONG_NO (1920 x 3 / 5 = 1152 < 1199), COMPAT = 0x10000014. Any other size fails until its row is derived here.
+/// The declared display's screenLayout SIZE, LONG, COMPAT, LAYOUTDIR and ROUND bits in the app's configuration and the activity's, at both outputs (the Task is the display). Expected literals, derived by hand from the AOSP rule (Configuration.java:437-467; `long` = the longer side, `short` = the shorter, so orientation does not matter): 411x914 dp is NORMAL (914 < 960, 411 < 480), LONG_YES (914 x 3 / 5 = 548 >= 410), COMPAT (411 > 321) = 0x10000022; 1920x1200 dp is XLARGE (1920 >= 960, 1200 >= 720), LONG_NO (1920 x 3 / 5 = 1152 < 1199), COMPAT = 0x10000014. LAYOUTDIR is LTR (0x40: the stage's desktop locale is en-US or another LTR tag, Configuration.setLayoutDirection:2419-2424) and ROUND is NO (0x100: no display here is round, DisplayContent.java:2493-2496): 0x10000162 and 0x10000154. Any other size fails until its row is derived here.
 fn screen_layout_check(app: &str, declared: Declaration) -> Result<String, String> {
-    /// SIZE 0x0f, LONG 0x30, COMPAT 0x10000000 (Configuration.java:264-366); LAYOUTDIR and ROUND are not computed by the rule.
-    const JUDGED: i32 = 0x0f | 0x30 | 0x1000_0000;
+    /// SIZE 0x0f, LONG 0x30, LAYOUTDIR 0xC0, ROUND 0x300, COMPAT 0x10000000 (Configuration.java:264-366).
+    const JUDGED: i32 = 0x0f | 0x30 | 0xC0 | 0x300 | 0x1000_0000;
     let long = declared.width_dp.max(declared.height_dp);
     let short = declared.width_dp.min(declared.height_dp);
     let want = match (long, short) {
-        (914, 411) => 0x1000_0022,
-        (1920, 1200) => 0x1000_0014,
+        (914, 411) => 0x1000_0162,
+        (1920, 1200) => 0x1000_0154,
         _ => {
             return Err(format!(
                 "no expected screenLayout for {} dp: derive it from Configuration.java:437-467 and add a row",
@@ -617,7 +615,7 @@ fn screen_layout_check(app: &str, declared: Declaration) -> Result<String, Strin
         return Err(problems.join("; "));
     }
     Ok(format!(
-        "screenLayout 0x{want:x} (SIZE, LONG, COMPAT) at both outputs, app and activity"
+        "screenLayout 0x{want:x} (SIZE, LONG, COMPAT, LTR, ROUND_NO) at both outputs, app and activity"
     ))
 }
 

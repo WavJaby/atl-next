@@ -85,7 +85,8 @@ use atl_services_types::display_model::DisplayModel;
 use atl_services_types::packages::SCREEN_ORIENTATION_UNSPECIFIED;
 use atl_services_types::permission::{self, ROOT_UID, SHELL_UID, SYSTEM_UID};
 use atl_services_types::screen_layout::{
-    SCREENLAYOUT_LAYOUTDIR_MASK, SCREENLAYOUT_RESET, SCREENLAYOUT_ROUND_MASK, compute_screen_layout,
+    SCREENLAYOUT_LAYOUTDIR_MASK, SCREENLAYOUT_RESET, SCREENLAYOUT_ROUND_MASK,
+    SCREENLAYOUT_ROUND_NO, compute_screen_layout, layout_direction_bits,
 };
 use atl_services_types::size_buckets::SizeBuckets;
 use atl_services_wire::ui_agent::IUiAgent;
@@ -161,18 +162,21 @@ pub(crate) const GLOBAL_UI_MODE: i32 = 0x11;
 
 /// The global configuration a started app gets (ActivityTaskManagerService's `getGlobalConfiguration`), from the display model: font scale 1 (the `font_scale` setting's default), the locale (`locale`, the host's UI language tag; None: DEFAULT_LOCALE),
 /// and the display's density and size. The size is DisplayContent.computeScreenAppConfiguration:2462-2468 for the one display: dp = px / (dpi / 160), rounded; portrait when width <= height.
-/// screenLayout: the AOSP rule from that dp, from the reset start (DisplayContent.java:2469-2471; screen_layout.rs).
+/// screenLayout: the AOSP rule from that dp, from the reset start (DisplayContent.java:2469-2471; screen_layout.rs), LAYOUTDIR of the locale (Configuration.setLayoutDirection:2419-2424; atl_fonts::is_right_to_left) and ROUND_NO (DisplayContent.java:2493-2496: no ATL display is round).
 /// The input fields stay undefined (0) until the platform layer supplies input. Shared with window.rs (the MergedConfiguration of a relayout).
 pub(crate) fn global_configuration(display: &DisplayModel, locale: Option<&str>) -> Configuration {
     let (width_dp, height_dp) = display_dp(display);
+    let locale = locale.unwrap_or(DEFAULT_LOCALE);
     Configuration {
         font_scale: 1.0,
-        locale_list: Some(locale.unwrap_or(DEFAULT_LOCALE).to_owned()),
+        locale_list: Some(locale.to_owned()),
         density_dpi: display.dpi,
         screen_width_dp: width_dp,
         screen_height_dp: height_dp,
         smallest_screen_width_dp: width_dp.min(height_dp),
-        screen_layout: compute_screen_layout(SCREENLAYOUT_RESET, width_dp, height_dp),
+        screen_layout: compute_screen_layout(SCREENLAYOUT_RESET, width_dp, height_dp)
+            | layout_direction_bits(atl_fonts::is_right_to_left(locale))
+            | SCREENLAYOUT_ROUND_NO,
         orientation: if width_dp <= height_dp {
             ORIENTATION_PORTRAIT
         } else {
@@ -5028,8 +5032,8 @@ mod tests {
         assert_eq!(config.locale_list.as_deref(), Some("en-US"));
     }
 
-    /// screenLayout by hand (screen_layout.rs tests give the rule): the phone's 1080x2400 px at 420 dpi is 411x914 dp, 0x10000022 (NORMAL, LONG_YES, COMPAT); the 1920x1200 px tablet at 160 dpi is 0x10000014 (XLARGE, LONG_NO, COMPAT).
-    /// A 1000x1000 px Task at 420 dpi is 381x381 dp: SMALL, LONG_NO and no COMPAT (the display has it), so 0x11 in the override and in the merged configuration.
+    /// screenLayout by hand (screen_layout.rs tests give the rule) with en-US's LTR (0x40) and ROUND_NO (0x100): the phone's 1080x2400 px at 420 dpi is 411x914 dp, 0x10000162 (NORMAL, LONG_YES, COMPAT, LTR, ROUND_NO); the 1920x1200 px tablet at 160 dpi is 0x10000154 (XLARGE, LONG_NO, COMPAT, LTR, ROUND_NO).
+    /// A 1000x1000 px Task at 420 dpi is 381x381 dp: SMALL, LONG_NO and no COMPAT (the display has it), so 0x11 in the override; the merged configuration keeps the display's LTR and ROUND_NO: 0x151.
     #[test]
     fn screen_layout_is_the_display_rule_and_a_task_reduces_it() {
         let phone = DisplayModel {
@@ -5040,7 +5044,7 @@ mod tests {
         };
         assert_eq!(
             global_configuration(&phone, None).screen_layout,
-            0x1000_0022
+            0x1000_0162
         );
         let tablet = DisplayModel {
             width: 1920,
@@ -5050,14 +5054,44 @@ mod tests {
         };
         assert_eq!(
             global_configuration(&tablet, None).screen_layout,
-            0x1000_0014
+            0x1000_0154
         );
         let task = TaskSize {
             width: 1000,
             height: 1000,
         };
         assert_eq!(task_override(&phone, task).screen_layout, 0x11);
-        assert_eq!(task_configuration(&phone, None, task).screen_layout, 0x11);
+        assert_eq!(task_configuration(&phone, None, task).screen_layout, 0x151);
+    }
+
+    /// LAYOUTDIR from the locale (TextUtils.getLayoutDirectionFromLocale, TextUtils.java:2131-2138; Configuration.setLayoutDirection, Configuration.java:2419-2424) and ROUND_NO (DisplayContent.java:2493-2496), by hand: en-US is LTR (0x40); ar, he and fa are RTL (0x80) with the phone's SIZE and LONG; a Task of the display keeps the locale's bit and ROUND_NO: 0x11 | 0x80 | 0x100 = 0x191.
+    #[test]
+    fn layout_direction_follows_the_locale_and_round_is_no() {
+        let phone = DisplayModel {
+            width: 1080,
+            height: 2400,
+            dpi: 420,
+            ..DisplayModel::default()
+        };
+        assert_eq!(
+            global_configuration(&phone, Some("en-US")).screen_layout,
+            0x1000_0162
+        );
+        for tag in ["ar", "he", "fa"] {
+            assert_eq!(
+                global_configuration(&phone, Some(tag)).screen_layout,
+                0x1000_01A2,
+                "{tag}"
+            );
+        }
+        let task = TaskSize {
+            width: 1000,
+            height: 1000,
+        };
+        assert_eq!(
+            task_configuration(&phone, Some("ar"), task).screen_layout,
+            0x191
+        );
     }
 
     /// The declared 411x914 dp at 160 dpi (px = dp) and 256 dpi (px = dp x 1.6): 411 x 1.6 = 657.6 -> 658 px, 914 x 1.6 = 1462.4 -> 1462 px.

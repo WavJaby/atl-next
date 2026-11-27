@@ -792,6 +792,7 @@ dependencies = [
  "atl-bridgegen",
  "atl-broker",
  "atl-diag",
+ "atl-fonts",
  "atl-gralloc",
  "atl-gralloc-dmabuf",
  "atl-libgui-parcel",

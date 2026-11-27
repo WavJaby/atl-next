@@ -299,6 +299,15 @@ pub fn build(
     })
 }
 
+/// AOSP's text direction of a BCP-47 tag (TextUtils.getLayoutDirectionFromLocale, TextUtils.java:2131-2138): true when its script is right to left.
+/// The CLDR expander is built once per thread: it holds Rc data, so it is not Sync and cannot be a static.
+pub fn is_right_to_left(tag: &str) -> bool {
+    thread_local! {
+        static EXPANDER: icu_locale::LocaleExpander = const { icu_locale::LocaleExpander::new_common() };
+    }
+    EXPANDER.with(|e| lang::right_to_left(e, tag))
+}
+
 /// atld's start report: one line per fallback group with a missing lang (`no <name> face on this desktop (<langs> render as boxes); install: <cmds>`), then the counted `diag` line.
 pub fn report(model: &Model, groups: &[Group]) -> Vec<String> {
     let e = icu_locale::LocaleExpander::new_common();
