@@ -53,8 +53,6 @@ const INTERNET: &str = "android.permission.INTERNET";
 const DRM_DIR: &str = "/dev/dri";
 /// A host sysfs file outside every DRM device's dir and outside atl_broker::CPU_SYSFS: the probe must not read it.
 const SYS_OTHER: &str = "/sys/kernel/uevent_seqnum";
-/// The Landlock ABI that enforces the network rights; below it TCP is not restricted, so the net check is not judged.
-const NET_ABI: u32 = 4;
 /// errno values (asm-generic/errno-base.h) a refusal may carry.
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
@@ -133,12 +131,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     lines.extend(pw_lines);
     for (tag, run) in runs {
         let p = run?;
-        match p.abi {
-            Some(a) if a >= NET_ABI => {}
-            Some(a) => println!(
-                "sandbox: [{tag}] net not judged: landlock abi {a} < {NET_ABI}, TCP is not restricted here"
-            ),
-            None => fails.push(format!("[{tag}] no landlock line in the probe's log")),
+        if p.abi.is_none() {
+            fails.push(format!("[{tag}] no landlock line in the probe's log"));
         }
         fails.extend(p.fails.iter().map(|f| format!("[{tag}] {f}")));
         lines.push(format!("[{tag}] {}", p.line));
@@ -271,11 +265,11 @@ fn probe_once(
     spawn.mounts.extend(ui.mounts.iter().cloned());
     spawn.devices = vec![PathBuf::from(DRM_DIR)];
     // the rights come from the manifest permissions, as the app process's own do (atl-broker PERMISSION_RIGHTS)
-    spawn.rights = if internet {
+    spawn.rights = Some(if internet {
         rights_of(&[INTERNET])
     } else {
         rights_of::<&str>(&[])
-    };
+    });
     let log = work.join(if internet {
         "probe-internet.log"
     } else {
@@ -301,7 +295,7 @@ fn probe_once(
         Some(s) => fails.push(format!("probe exited {s}")),
         None => fails.push(format!("probe still running after {LIMIT:?}, killed")),
     }
-    fails.extend(judge(&line, internet, abi));
+    fails.extend(judge(&line, internet));
     if internet {
         fails.extend(judge_resolv(&line, &host_resolv()));
     }
@@ -381,8 +375,9 @@ fn judge_resolv(line: &str, want: &str) -> Option<String> {
     })
 }
 
-/// The verdict on one probe line: the file checks in every run; the TCP connect by the run's rights, judged only where Landlock enforces the network rights (ABI >= NET_ABI).
-fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
+/// The verdict on one probe line: the file checks in every run; the socket rows by the run's rights, on every Landlock ABI (socket creation is the seccomp INTERNET rule's:
+/// AF_INET / AF_INET6 are refused with EPERM without INTERNET, AF_UNIX never; plan internet-permission G).
+fn judge(line: &str, internet: bool) -> Vec<String> {
     let checks: BTreeMap<&str, &str> = line
         .strip_prefix("probe: ")
         .unwrap_or("")
@@ -439,17 +434,22 @@ fn judge(line: &str, internet: bool, abi: Option<u32>) -> Vec<String> {
     .into_iter()
     .flatten()
     .collect();
-    if abi.is_some_and(|a| a >= NET_ABI) {
-        fails.extend(if internet {
-            succeeded("net-connect", "TCP connect refused with INTERNET")
+    let inet = |key: &str| {
+        if internet {
+            succeeded(key, "AF_INET socket refused with INTERNET")
         } else {
-            refused(
-                "net-connect",
-                &[EACCES],
-                "TCP connect not refused without INTERNET",
-            )
-        });
-    }
+            refused(key, &[EPERM], "AF_INET socket not refused without INTERNET")
+        }
+    };
+    fails.extend(
+        ["net-connect", "socket-inet", "socket-inet6"]
+            .into_iter()
+            .filter_map(inet),
+    );
+    fails.extend(succeeded(
+        "socket-unix",
+        "an AF_UNIX socket is refused: no rule covers it",
+    ));
     fails
 }
 

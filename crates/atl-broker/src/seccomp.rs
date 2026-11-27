@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The sandboxes' seccomp filters, one per [`Profile`]. bwrap installs it (`--seccomp FD`) before the sandboxed program runs, so every thread inherits it.
 //! BinderDaemon: a measured allow-list, everything else kills ([`binderd_program`]; derivation in arch.rs).
-//! App: the first rule of the planned per-app filter (seccompiler 0.5); every other syscall is allowed, so this is not yet the allow-list.
+//! App: the INTERNET rule (socket(AF_INET | AF_INET6) -> EPERM unless the process holds Net, [`inet_rules`]), io_uring_setup -> EACCES, then the thread-priority rule (seccompiler 0.5); every other syscall is allowed.
 //! Installer: a measured allow-list like BinderDaemon's ([`arch::INSTALLER_SYSCALLS`]), socket only for AF_UNIX; anything else kills the process.
 //! Both allow-lists add newer.rs's rows (calls newer glibc / Rust std / kernels substitute), each answered Allow or ENOSYS per profile: a hand-written prefix returns ENOSYS before seccompiler's
 //! program runs (seccompiler 0.5 has one match action per filter). A kill is reported by [`death`]: the parent's error names SIGSYS and the audit record, and counts it per profile.
@@ -98,14 +98,15 @@ impl NiceTiers {
     }
 }
 
-/// `profile`'s program.
-pub fn program(profile: Profile) -> io::Result<BpfProgram> {
+/// `profile`'s program. `net`: the process holds INTERNET (App, WebProcess; Adb is always net; the allow-lists ignore it).
+pub fn program(profile: Profile, net: bool) -> io::Result<BpfProgram> {
     match profile {
-        // adbd and its shell are Android processes: the app's allow-list (drop_privileges' setgroups/setres*id/capset included, or the gate shows the kill)
-        // a WebKit web process: the app's program, the app being what it runs for (narrowing to WebKit's own seccomp list is a step still to measure)
-        Profile::App | Profile::Adb | Profile::WebProcess => {
-            app_program(NiceTiers::for_limit(granted_nice()))
+        // a WebKit web process: the app's program, the app being what it runs for (narrowing to WebKit's own seccomp list is a step still to measure); `net` = the app's INTERNET
+        Profile::App | Profile::WebProcess => {
+            app_program(NiceTiers::for_limit(granted_nice()), net)
         }
+        // adbd listens on loopback TCP, and its shell uid holds INTERNET (platform.xml:177): never refused a socket
+        Profile::Adb => app_program(NiceTiers::for_limit(granted_nice()), true),
         Profile::BinderDaemon => binderd_program(),
         Profile::Installer => installer_program(),
     }
@@ -234,8 +235,8 @@ pub fn deaths(profile: Profile) -> u64 {
     DEATHS[profile_index(profile)].load(Ordering::Relaxed)
 }
 
-/// The app filter as seccompiler's program: setpriority below `tiers`' floor returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
-fn app_program(tiers: NiceTiers) -> io::Result<BpfProgram> {
+/// The app filter: [`inet_rules`], then seccompiler's program: setpriority below `tiers`' floor returns 0 (`SECCOMP_RET_ERRNO` with errno 0, the kernel's return value -0), every other call is allowed.
+fn app_program(tiers: NiceTiers, net: bool) -> io::Result<BpfProgram> {
     let rules: BTreeMap<i64, Vec<SeccompRule>> = tiers
         .ignored()?
         .map(|r| (libc::SYS_setpriority, r))
@@ -248,12 +249,85 @@ fn app_program(tiers: NiceTiers) -> io::Result<BpfProgram> {
         arch::HOST,
     )
     .map_err(io::Error::other)?;
-    filter.try_into().map_err(io::Error::other)
+    let program: BpfProgram = filter.try_into().map_err(io::Error::other)?;
+    let mut p = inet_rules(net)?;
+    p.extend(program);
+    Ok(p)
+}
+
+/// The app filter without the thread-priority rule (atld `--no-app-seccomp`): [`inet_rules`] and every other call allowed. The INTERNET right is kept: it is not part of the check the switch drops.
+pub fn inet_filter(net: bool) -> io::Result<Vec<u8>> {
+    let mut p = inet_rules(net)?;
+    p.push(seccompiler::sock_filter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: libc::SECCOMP_RET_ALLOW,
+    });
+    Ok(bytes(&p))
+}
+
+/// `x32` syscall numbers on x86_64 carry bit 30; the kernel's x32 ABI would pass a call under that number past a rule keyed on the plain one. Other arches' numbers never have it.
+const X32_BIT: u32 = 0x4000_0000;
+/// seccomp_data.args[0]'s low 32 bits (little-endian: every arch here): socket(2)'s domain, which the kernel reads as an int.
+const DATA_ARG0: u32 = 16;
+
+/// The INTERNET rule and io_uring's, hand-written: seccompiler 0.5 has one match action per filter, and these answer EPERM and EACCES. Leads every app filter.
+/// io_uring_setup -> EACCES for every app process (AOSP app_neverallows.te: no anon_inode, so no IORING_OP_SOCKET around the socket rule). Without `net`, socket(AF_INET | AF_INET6, ...)
+/// -> EPERM: AOSP's netd cgroup check, loopback included, answered before any address exists. AF_UNIX and the other domains pass. Calls the rules do not match fall through.
+fn inet_rules(net: bool) -> io::Result<BpfProgram> {
+    let ins = |code: u16, jt: u8, jf: u8, k: u32| seccompiler::sock_filter { code, jt, jf, k };
+    let errno = |e: i32| libc::SECCOMP_RET_ERRNO | u32::try_from(e).expect("a positive errno");
+    let mut p = vec![
+        ins(BPF_LD_W_ABS, 0, 0, DATA_ARCH),
+        ins(BPF_JEQ_K, 1, 0, arch::AUDIT_ARCH),
+        ins(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        ins(BPF_LD_W_ABS, 0, 0, DATA_NR),
+    ];
+    p.extend(row(
+        libc::SYS_io_uring_setup,
+        &[ins(BPF_RET_K, 0, 0, errno(libc::EACCES))],
+    )?);
+    if !net {
+        let body = [
+            ins(BPF_LD_W_ABS, 0, 0, DATA_ARG0),
+            ins(BPF_JEQ_K, 1, 0, libc::AF_INET.unsigned_abs()),
+            ins(BPF_JEQ_K, 0, 1, libc::AF_INET6.unsigned_abs()),
+            ins(BPF_RET_K, 0, 0, errno(libc::EPERM)),
+        ];
+        p.extend(row(libc::SYS_socket, &body)?);
+    }
+    Ok(p)
+}
+
+/// The rule for `call` and its x32 number: a header per number (equal -> the body; none left -> past the body), then `body`. Each number is tested on its own, so a
+/// `jt` counts the headers left below it, and the last header's `jf` skips the body.
+fn row(call: i64, body: &[seccompiler::sock_filter]) -> io::Result<Vec<seccompiler::sock_filter>> {
+    let nr = u32::try_from(call).map_err(io::Error::other)?;
+    let numbers = [nr, nr | X32_BIT];
+    let body_len = u8::try_from(body.len()).map_err(io::Error::other)?;
+    let mut rows = Vec::with_capacity(numbers.len() + body.len());
+    for (i, k) in numbers.iter().enumerate() {
+        let to_body = u8::try_from(numbers.len() - i - 1).map_err(io::Error::other)?;
+        let past_body = if i + 1 == numbers.len() { body_len } else { 0 };
+        rows.push(seccompiler::sock_filter {
+            code: BPF_JEQ_K,
+            jt: to_body,
+            jf: past_body,
+            k: *k,
+        });
+    }
+    rows.extend_from_slice(body);
+    Ok(rows)
 }
 
 /// `profile`'s filter as the bytes bwrap reads from `--seccomp`'s fd: a `struct sock_filter` array in host byte order (code u16, jt u8, jf u8, k u32).
-pub fn filter(profile: Profile) -> io::Result<Vec<u8>> {
-    Ok(program(profile)?
+pub fn filter(profile: Profile, net: bool) -> io::Result<Vec<u8>> {
+    Ok(bytes(&program(profile, net)?))
+}
+
+fn bytes(program: &[seccompiler::sock_filter]) -> Vec<u8> {
+    program
         .iter()
         .flat_map(|i| {
             let mut bytes = Vec::with_capacity(8);
@@ -263,7 +337,7 @@ pub fn filter(profile: Profile) -> io::Result<Vec<u8>> {
             bytes.extend(i.k.to_ne_bytes());
             bytes
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -311,7 +385,7 @@ mod tests {
                 },
             )
             .expect("soft = hard");
-            seccompiler::apply_filter(&program(Profile::App).expect("program"))
+            seccompiler::apply_filter(&program(Profile::App, true).expect("program"))
                 .expect("apply_filter");
         }
         let outcome = |r: rustix::io::Result<()>| match r {
@@ -336,7 +410,7 @@ mod tests {
     /// Under the installer filter, std file calls whose glibc syscall differs per arch (x86_64 mkdir / rename / unlink, riscv64 mkdirat / renameat2 / unlinkat) in DIR_ENV, then clock_nanosleep (ART's seqlock sleep, arch.rs item 5); prints `probe: mode=installer done=1` only if the kernel let all of them through.
     fn installer_probe() {
         let dir = std::path::PathBuf::from(std::env::var_os(DIR_ENV).expect("the probe dir"));
-        seccompiler::apply_filter(&program(Profile::Installer).expect("program"))
+        seccompiler::apply_filter(&program(Profile::Installer, true).expect("program"))
             .expect("apply_filter");
         std::fs::create_dir(dir.join("d")).expect("mkdir");
         std::fs::File::create(dir.join("a")).expect("openat");
@@ -374,7 +448,7 @@ mod tests {
     /// `probe: mode=binderd-grow done=1` only if the kernel let every call through.
     fn binderd_grow_probe() {
         let frag = vec![0u8; FRAGMENT];
-        seccompiler::apply_filter(&program(Profile::BinderDaemon).expect("program"))
+        seccompiler::apply_filter(&program(Profile::BinderDaemon, true).expect("program"))
             .expect("apply_filter");
         let mut msg = frag[8..].to_vec();
         while msg.len() < LARGEST_TRANSACTION {
@@ -491,15 +565,15 @@ mod tests {
                 .is_some_and(|r| r.is_empty())
         );
         for h in [0, 1, 19, 20, 21, 30, 39, 40] {
-            app_program(NiceTiers::for_limit(h)).expect("a program per limit");
+            app_program(NiceTiers::for_limit(h), true).expect("a program per limit");
         }
     }
 
     /// bwrap reads whole `sock_filter` instructions: the bytes are the program's instruction count times the struct's size.
     #[test]
     fn filter_bytes_are_whole_instructions() {
-        let program = program(Profile::App).expect("program");
-        let bytes = filter(Profile::App).expect("bytes");
+        let program = program(Profile::App, true).expect("program");
+        let bytes = filter(Profile::App, true).expect("bytes");
         assert!(!program.is_empty());
         assert_eq!(
             bytes.len(),

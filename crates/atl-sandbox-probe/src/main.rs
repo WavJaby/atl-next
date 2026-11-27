@@ -3,15 +3,16 @@
 //! Usage: `atl-sandbox-probe HOME_FILE HOME_NEW OUTSIDE OWN_FILE PORT SOCKET OTHER_SOCKET FONTCONF FONTCONF_SIBLING SYSFS SYS_OTHER RESOLV`:
 //! HOME_FILE an existing file in the real $HOME, HOME_NEW a name in it that does not exist, OUTSIDE a file the app's grants do not cover for writing, OWN_FILE a path in the app's own data dir, PORT a loopback TCP port the gate listens on;
 //! SOCKET the granted compositor socket and OTHER_SOCKET a host socket beside it, FONTCONF the granted fontconfig file and FONTCONF_SIBLING a file beside it, SYSFS a file in the granted DRM device's sysfs and SYS_OTHER a sysfs file outside it, RESOLV the resolver configuration (/etc/resolv.conf).
-//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads),
+//! Checks: `home-read`, `home-create`, `outside-write`, `own-write` + `own-read`, `net-connect`, `socket-inet` / `socket-inet6` / `socket-unix` (socket(2) creation alone), then `socket` / `socket-other` (unix connect), `fontconf` / `fontconf-sibling`, `drm-sysfs` / `sys-other` (reads),
 //! `resolv` (`ok:<first nameserver, or none>` when RESOLV reads). An outcome is `ok` or `err:<errno>`. Last, `env=<names>`: the names of its whole environment, sorted, comma-joined, no values. Exits 0 once every check ran; the gate judges the outcomes.
 //! Second form `atl-sandbox-probe wayland SOCKET NAME INTERFACE VERSION`: the Wayland interfaces the compositor offers through SOCKET and a bind attempt of one global (fn `wayland`); a raw wire client, so no libwayland in the sandbox's way.
 //! Third form `atl-sandbox-probe pipewire REMOTE SINK SOURCE PULSE`: the PipeWire graph as the app's client sees it through REMOTE, a capture attempt from SOURCE and silence played into SINK (module `pipewire`), and a connect to PULSE (the host's pulse socket path: must not be shown).
-//! Built on std, stays inside the app seccomp filter (allow-all but setpriority) and the stub's Landlock domain: no probe of its own beyond the file calls.
+//! Built on std and rustix's socket(2) (no unsafe), stays inside the app seccomp filter (the INTERNET rule, the thread priority rule) and the stub's Landlock domain: no probe of its own beyond the file and socket calls.
 #![forbid(unsafe_code)]
 
 mod pipewire;
 
+use rustix::net::{AddressFamily, SocketType};
 use std::fs;
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -43,12 +44,21 @@ fn connect(p: &Path) -> String {
     outcome(UnixStream::connect(p).map(drop))
 }
 
-/// A TCP connect to the gate's loopback listener: `ok`, or the errno of Landlock's network refusal (EACCES).
+/// A TCP connect to the gate's loopback listener: `ok`, or the errno of its socket's creation (EPERM without the INTERNET right: the seccomp rule refuses AF_INET before any address exists).
 fn net(port: &str) -> String {
     match port.parse::<u16>() {
         Ok(p) => outcome(TcpStream::connect(("127.0.0.1", p)).map(drop)),
         Err(_) => format!("bad-port:{port}"),
     }
+}
+
+/// socket(domain, kind) alone, closed at once: `ok`, or the errno of the creation.
+fn open_socket(domain: AddressFamily, kind: SocketType) -> String {
+    outcome(
+        rustix::net::socket(domain, kind, None)
+            .map(drop)
+            .map_err(io::Error::from),
+    )
 }
 
 /// The resolver file as the sandbox shows it: `ok:<first nameserver>` (`ok:none` without one), or the read's errno (ENOENT: a link that dangles in the sandbox).
@@ -260,6 +270,18 @@ fn main() -> ExitCode {
         ("own-write", write(p(own))),
         ("own-read", read(p(own))),
         ("net-connect", net(port)),
+        (
+            "socket-inet",
+            open_socket(AddressFamily::INET, SocketType::STREAM),
+        ),
+        (
+            "socket-inet6",
+            open_socket(AddressFamily::INET6, SocketType::DGRAM),
+        ),
+        (
+            "socket-unix",
+            open_socket(AddressFamily::UNIX, SocketType::STREAM),
+        ),
         ("socket", connect(p(socket))),
         ("socket-other", connect(p(other_socket))),
         ("fontconf", read(p(fontconf))),

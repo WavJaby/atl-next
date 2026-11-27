@@ -18,7 +18,7 @@ mod seccomp;
 pub mod webspawn;
 pub use seccomp::{
     NiceTiers, death as seccomp_death, deaths as seccomp_deaths, filter as seccomp_filter,
-    granted_nice, newer as seccomp_newer,
+    granted_nice, inet_filter as seccomp_inet_filter, newer as seccomp_newer,
 };
 
 use std::ffi::{OsStr, OsString};
@@ -92,8 +92,9 @@ pub struct Spawn {
     pub devices: Vec<PathBuf>,
     /// The property area file, mounted read-only at [`PROPERTY_AREA`].
     pub property_area: Option<PathBuf>,
-    /// What the app's manifest permissions give beyond its mounts ([`rights_of`]): [`Right::Net`] leaves TCP unrestricted; without it TCP is refused (Landlock ABI >= 4).
-    pub rights: Vec<Right>,
+    /// What the app's manifest permissions give ([`rights_of`]). Some: an app process; [`Right::Net`] leaves TCP unrestricted (Landlock ABI >= 4) and lets it create AF_INET / AF_INET6 sockets (seccomp).
+    /// None: not an app (a system service, the shell uid, adbd, a probe run by hand). No manifest means no Landlock grants, as before; AOSP's netd gives such a uid INTERNET by default, so its sockets are not refused.
+    pub rights: Option<Vec<Right>>,
     /// The app's desktop identity (`atl.<package>`, atl_launch::app_id) the host gives the web processes it spawns for this process ([`webspawn::AppView::app_id`]); None: a process of no package.
     pub app_id: Option<String>,
     pub program: PathBuf,
@@ -188,6 +189,20 @@ pub enum Profile {
     /// A WebKit web process an app asked for ([`webspawn`]): built inside the app's mount namespace (bind sources are app paths) as a child of its pid namespace, the app's uid,
     /// no further user namespaces, its own network (loopback only), ipc, uts and session, no `/dev/socket`, `/.flatpak-info` (WebKit's route switch), Landlock over exactly its binds, TCP refused, the app seccomp program.
     WebProcess,
+}
+
+impl Spawn {
+    /// Whether the process holds `right` from its manifest (None holds none).
+    fn has_right(&self, right: Right) -> bool {
+        self.rights.as_deref().unwrap_or_default().contains(&right)
+    }
+
+    /// Whether the process may create AF_INET / AF_INET6 sockets: a non-app process may, an app when its manifest gives Net.
+    fn inet(&self) -> bool {
+        self.rights
+            .as_deref()
+            .is_none_or(|r| r.contains(&Right::Net))
+    }
 }
 
 /// The uid and gid binderd runs as inside its user namespace: the overflow id (nobody), which owns nothing binderd could reach.
@@ -449,7 +464,7 @@ pub fn rights_of<S: AsRef<str>>(permissions: &[S]) -> Vec<Right> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Right {
-    /// TCP bind and connect on any port: the Landlock network rights are left unhandled.
+    /// TCP bind and connect on any port (the Landlock network rights are left unhandled), and AF_INET / AF_INET6 sockets (the seccomp INTERNET rule, seccomp.rs).
     Net,
     /// The desktop's audio sources through the process's PipeWire security context (atld grants them).
     RecordAudio,
@@ -788,7 +803,7 @@ pub struct Broker {
     admin: OwnedFd,
     /// Held across a spawn: the fds made inheritable for it must not reach another spawn's child. Shared with the web-process channels' threads, whose starts inherit fds too.
     spawning: Arc<Mutex<()>>,
-    /// Whether apps get the app seccomp filter (seccomp.rs); off only for the `--no-app-seccomp` check.
+    /// Whether apps get the thread-priority rule of the app seccomp filter (seccomp.rs); off only for the `--no-app-seccomp` check. The INTERNET rules are on regardless.
     app_seccomp: bool,
     /// The sandbox stub every app process runs under (bwrap execs it, it restricts itself and execs the program).
     stub: PathBuf,
@@ -925,7 +940,7 @@ impl Broker {
             None,
         )?;
         let (info_r, info_w) = io::pipe()?;
-        let seccomp = seccomp_memfd(Profile::BinderDaemon)?;
+        let seccomp = seccomp_memfd(Profile::BinderDaemon, true)?;
         let allow = elf_closure(program)?;
         let mut files = allow.clone();
         for f in elf_closure(stub)? {
@@ -978,7 +993,7 @@ impl Broker {
         self
     }
 
-    /// Apps start without the seccomp filter: the deliberate-failure check that shows what the filter answers (atld `--no-app-seccomp`, test only).
+    /// Apps start without the thread-priority rule of the seccomp filter: the deliberate-failure check of that rule (atld `--no-app-seccomp`, test only). Their INTERNET rules stay.
     pub fn without_app_seccomp(mut self) -> Self {
         self.app_seccomp = false;
         self
@@ -1011,10 +1026,8 @@ impl Broker {
         // std's pipe ends are close-on-exec
         let (info_r, info_w) = io::pipe()?;
         // the app's seccomp program, read by bwrap from this fd before the program runs
-        let seccomp = self
-            .app_seccomp
-            .then(|| seccomp_memfd(Profile::App))
-            .transpose()?;
+        let inet = spawn.inet();
+        let seccomp = Some(app_seccomp_memfd(Profile::App, inet, self.app_seccomp)?);
         let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::App,
@@ -1039,7 +1052,7 @@ impl Broker {
             None => None,
         };
         // the stub applies the grants, then execs the program with the spawn's arguments
-        let mut args = stub_args(&grants, spawn.rights.contains(&Right::Net), &spawn.program);
+        let mut args = stub_args(&grants, spawn.has_right(Right::Net), &spawn.program);
         // the app's thread-priority tiers (seccomp.rs NiceTiers): the stub raises the soft RLIMIT_NICE to the hard one and logs the tier line once per process
         if self.app_seccomp {
             let tiers = seccomp::NiceTiers::for_limit(seccomp::granted_nice());
@@ -1075,6 +1088,7 @@ impl Broker {
                 .collect(),
             pulse: self.webspawn.as_ref().and_then(|w| w.pulse.clone()),
             app_id: spawn.app_id.clone(),
+            inet,
         };
         let Process {
             child,
@@ -1194,7 +1208,8 @@ impl WebSpawner {
                 vec![]
             },
             property_area: None,
-            rights: vec![],
+            // the web process's grants stay as they were (no resolver view, Landlock TCP refused); its INTERNET rule is the app's (`app.inet`)
+            rights: Some(vec![]),
             app_id: None,
             program: plan.program.clone(),
             args: vec![],
@@ -1207,10 +1222,11 @@ impl WebSpawner {
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         complete_mounts(&mut spawn)?;
         let (info_r, info_w) = io::pipe()?;
-        let seccomp = self
-            .app_seccomp
-            .then(|| seccomp_memfd(Profile::WebProcess))
-            .transpose()?;
+        let seccomp = Some(app_seccomp_memfd(
+            Profile::WebProcess,
+            app.inet,
+            self.app_seccomp,
+        )?);
         // the stub as the app's view shows it: its host path is not in that view
         let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
@@ -1283,7 +1299,7 @@ impl Broker {
         let _one_at_a_time = self.spawning.lock().unwrap_or_else(|e| e.into_inner());
         complete_mounts(&mut spawn)?;
         let (info_r, info_w) = io::pipe()?;
-        let seccomp = seccomp_memfd(Profile::Installer)?;
+        let seccomp = seccomp_memfd(Profile::Installer, true)?;
         let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::Installer,
@@ -1334,7 +1350,7 @@ impl Broker {
         complete_mounts(&mut spawn)?;
         let (info_r, info_w) = io::pipe()?;
         let (block_r, mut block_w) = io::pipe()?;
-        let seccomp = seccomp_memfd(Profile::Adb)?;
+        let seccomp = seccomp_memfd(Profile::Adb, true)?;
         let (mut bwrap_args, mut grants) = bwrap_args(
             &spawn,
             Profile::Adb,
@@ -1378,7 +1394,7 @@ fn installer_refusal(spawn: &Spawn) -> Option<&'static str> {
         Some("uid is not INSTALLER_UID")
     } else if !spawn.devices.is_empty() {
         Some("devices: the installer has no device nodes")
-    } else if !spawn.rights.is_empty() {
+    } else if !spawn.rights.as_deref().unwrap_or_default().is_empty() {
         Some("rights: the installer has no manifest right, network included")
     } else if !spawn.links.is_empty() {
         Some("links: the installer's view is mounts only")
@@ -1415,7 +1431,7 @@ fn complete_mounts(spawn: &mut Spawn) -> io::Result<()> {
         }
     }
     // INTERNET: the host's resolver configuration, where /etc links it out of the shown root (resolver_view)
-    if spawn.rights.contains(&Right::Net) {
+    if spawn.has_right(Right::Net) {
         let (mounts, links) = resolver_view(Path::new(RESOLV_CONF))?;
         spawn.mounts.extend(mounts);
         spawn.links.extend(links);
@@ -1526,10 +1542,24 @@ fn context_file(
     Ok(file.into())
 }
 
-/// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`.
-fn seccomp_memfd(profile: Profile) -> io::Result<OwnedFd> {
+/// `profile`'s seccomp program in a memfd, rewound: bwrap reads it from `--seccomp`. `net`: the process holds INTERNET ([`seccomp::filter`]).
+fn seccomp_memfd(profile: Profile, net: bool) -> io::Result<OwnedFd> {
+    memfd_of(&seccomp::filter(profile, net)?)
+}
+
+/// An app profile's program: the full app program, or with `priority` off (`--no-app-seccomp`) the INTERNET rules alone ([`seccomp::inet_filter`]).
+fn app_seccomp_memfd(profile: Profile, net: bool, priority: bool) -> io::Result<OwnedFd> {
+    if priority {
+        seccomp_memfd(profile, net)
+    } else {
+        memfd_of(&seccomp::inet_filter(net)?)
+    }
+}
+
+/// The bytes in a memfd, rewound.
+fn memfd_of(bytes: &[u8]) -> io::Result<OwnedFd> {
     let mut file = File::from(memfd_create("atl-seccomp", MemfdFlags::CLOEXEC)?);
-    file.write_all(&seccomp::filter(profile)?)?;
+    file.write_all(bytes)?;
     file.rewind()?;
     Ok(file.into())
 }
@@ -1617,7 +1647,7 @@ mod tests {
             links: vec![],
             devices: vec!["/dev/dri".into()],
             property_area: Some("/r/properties".into()),
-            rights: vec![],
+            rights: Some(vec![]),
             app_id: None,
             program: "/bin/true".into(),
             args: vec![],
@@ -1862,9 +1892,9 @@ mod tests {
         sp.devices.push("/dev/dri".into());
         assert!(installer_refusal(&sp).is_some());
         sp.devices.clear();
-        sp.rights.push(Right::Net);
+        sp.rights = Some(vec![Right::Net]);
         assert!(installer_refusal(&sp).is_some());
-        sp.rights.clear();
+        sp.rights = None;
         sp.links.push(Link {
             target: "/x".into(),
             at: "/y".into(),

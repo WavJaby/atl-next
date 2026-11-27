@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 # pw-dump's JSON (the pipewire form)
 serde_json.workspace = true
+# socket(2) with its errno: std hides the creation error behind bind / connect
+rustix.workspace = true
 
 [lints]
 workspace = true

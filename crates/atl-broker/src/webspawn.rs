@@ -106,6 +106,8 @@ pub struct AppView {
     pub pulse: Option<PathBuf>,
     /// The app's desktop identity (crate::Spawn::app_id): the web process's sound carries it ([`PULSE_APP_ID`]), so the desktop shows it, and keeps its saved volume, as the app's. None: a process of no package.
     pub app_id: Option<String>,
+    /// The app holds INTERNET (crate::Spawn::inet): its web process's seccomp filter refuses AF_INET / AF_INET6 sockets only when it does not.
+    pub inet: bool,
 }
 
 /// An admitted request: what the broker starts.
@@ -435,6 +437,7 @@ mod tests {
             }],
             pulse: None,
             app_id: Some("atl.com.example".into()),
+            inet: true,
         }
     }
 

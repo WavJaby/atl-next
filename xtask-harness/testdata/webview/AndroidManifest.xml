@@ -7,6 +7,8 @@
     android:versionName="1.0">
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="36" />
+    <!-- the socket line: the loopback ServerSocket that serves the page (Main.java); AOSP refuses every AF_INET socket without INTERNET -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application android:label="ATL WebView test">
         <activity android:name=".Main" android:exported="true" android:hardwareAccelerated="false"

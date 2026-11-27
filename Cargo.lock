@@ -716,6 +716,7 @@ dependencies = [
 name = "atl-sandbox-probe"
 version = "0.0.0"
 dependencies = [
+ "rustix",
  "serde_json",
 ]
 

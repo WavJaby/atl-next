@@ -527,6 +527,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         ),
     ];
     checks.extend(connectivity_checks(root, &mut rt, &work)?);
+    checks.extend(internet_checks(&s));
     let mut whys = Vec::new();
     let total = checks.len();
     for (what, ok) in checks {
@@ -552,6 +553,32 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     println!("---- services log (last {TAIL})\n{}", tail(&services, TAIL));
     println!("{}", crate::verdict::gate("broadcast", &whys));
     Ok(ExitCode::FAILURE)
+}
+
+/// The sender's INTERNET rows (Main.java internetRows; the sender has no INTERNET): a loopback ServerSocket fails at socket() with EPERM, a name lookup throws SecurityException
+/// ("missing INTERNET permission?", libcore Inet6AddressImpl), and localhost still resolves from the hosts file. A row whose line is absent fails.
+fn internet_checks(sender_log: &str) -> Vec<(&'static str, bool)> {
+    let value = |key: &str| {
+        sender_log
+            .lines()
+            .find_map(|l| l.split_once(&format!("net {key}=")).map(|(_, v)| v))
+            .unwrap_or("")
+    };
+    vec![
+        (
+            "net: a loopback ServerSocket without INTERNET fails EPERM at socket()",
+            value("server-socket").contains("EPERM"),
+        ),
+        (
+            "net: a name lookup without INTERNET throws SecurityException (missing INTERNET permission)",
+            value("dns").starts_with("SecurityException")
+                && value("dns").contains("missing INTERNET permission"),
+        ),
+        (
+            "net: localhost resolves to 127.0.0.1 without INTERNET",
+            value("localhost") == "127.0.0.1",
+        ),
+    ]
 }
 
 /// The connectivity row (NetworkCallback + CONNECTIVITY_ACTION sticky): atld runs in a private network namespace with a default route; the gate removes the route and restores
@@ -657,6 +684,25 @@ mod tests {
     #[test]
     fn own_ping_then_done_passes() {
         assert!(once_before_done(&log(&[RUNTIME, DONE_RECEIVED])));
+    }
+
+    /// The lines an app without INTERNET logs (AOSP's answers, as the sender's Main.java prints them) pass every row; an app whose sockets are open fails the first two.
+    #[test]
+    fn internet_rows_pass_only_the_refusals_of_an_app_without_internet() {
+        let refused = log(&[
+            "AtlBcast: net server-socket=java.net.SocketException: socket failed: EPERM (Operation not permitted)",
+            "AtlBcast: net dns=SecurityException: Permission denied (missing INTERNET permission?)",
+            "AtlBcast: net localhost=127.0.0.1",
+        ]);
+        assert!(internet_checks(&refused).iter().all(|(_, ok)| *ok));
+        let open = log(&[
+            "AtlBcast: net server-socket=ok",
+            "AtlBcast: net dns=UnknownHostException",
+            "AtlBcast: net localhost=127.0.0.1",
+        ]);
+        let failed = internet_checks(&open).iter().filter(|(_, ok)| !ok).count();
+        assert_eq!(failed, 2);
+        assert!(internet_checks("").iter().all(|(_, ok)| !ok));
     }
 
     #[test]

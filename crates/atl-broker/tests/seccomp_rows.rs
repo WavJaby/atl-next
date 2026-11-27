@@ -8,7 +8,7 @@
 )]
 
 use atl_broker::seccomp_newer::{Answer, ROWS, Row};
-use atl_broker::{Profile, seccomp_death, seccomp_deaths, seccomp_filter};
+use atl_broker::{Profile, seccomp_death, seccomp_deaths, seccomp_filter, seccomp_inet_filter};
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, ExitStatus};
@@ -18,7 +18,16 @@ const DIR_ENV: &str = "ATL_SECCOMP_ROWS_DIR";
 
 /// `profile`'s filter applied to this thread from the bytes bwrap reads (sock_filter: code u16, jt u8, jf u8, k u32, host order).
 fn apply(profile: Profile) {
-    let bytes = seccomp_filter(profile).expect("filter bytes");
+    apply_net(profile, true);
+}
+
+/// [`apply`] for a process that holds INTERNET (`net`) or not: the app profiles' INTERNET rule depends on it.
+fn apply_net(profile: Profile, net: bool) {
+    apply_bytes(&seccomp_filter(profile, net).expect("filter bytes"));
+}
+
+/// The filter bytes of one program, applied to this thread.
+fn apply_bytes(bytes: &[u8]) {
     let (whole, rest) = bytes.as_chunks::<8>();
     assert!(rest.is_empty(), "whole instructions");
     let program: Vec<seccompiler::sock_filter> = whole
@@ -48,6 +57,10 @@ fn probe() {
     };
     match mode.to_str() {
         Some("stat") => stat_probe(),
+        Some("rows-inet") => rows_probe(true),
+        Some("rows-no-inet") => rows_probe(false),
+        Some("rows-no-priority-inet") => inet_only_probe(true),
+        Some("rows-no-priority-no-inet") => inet_only_probe(false),
         Some("denied") => denied_probe(),
         Some("table-installer") => table_probe(Profile::Installer, |r| r.installer),
         Some("table-binderd") => table_probe(Profile::BinderDaemon, |r| r.binderd),
@@ -56,6 +69,117 @@ fn probe() {
         #[cfg(target_arch = "riscv64")]
         Some("hwprobe-binderd") => hwprobe_probe(Profile::BinderDaemon),
         other => panic!("unknown probe mode {other:?}"),
+    }
+}
+
+/// The x32 ABI's bit on x86_64 syscall numbers: a call under `nr | X32` passes a rule keyed on the plain number unless the filter names both.
+const X32: i64 = 0x4000_0000;
+
+/// `ok` when the call returned >= 0 (a socket or ring fd, closed when the child exits), else `err:<errno>`.
+fn answer(rc: i64) -> String {
+    if rc >= 0 {
+        "ok".to_owned()
+    } else {
+        format!(
+            "err:{}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        )
+    }
+}
+
+/// socket(domain, type, 0) as a raw call. The probe's filter is already applied.
+fn socket_row(domain: i32, kind: i32, nr: i64) -> String {
+    // SAFETY: socket(2) takes integers only; the answer is a fd or an errno
+    let rc = unsafe { libc::syscall(nr, i64::from(domain), i64::from(kind), 0_i64) };
+    answer(rc)
+}
+
+/// io_uring_setup(1, zeroed params) as a raw call (struct io_uring_params, 120 bytes).
+fn ring_row(nr: i64) -> String {
+    let mut params = [0_u8; 120];
+    // SAFETY: the kernel reads and writes one io_uring_params at params (120 bytes, zeroed); the probe child exits at once
+    let rc = unsafe { libc::syscall(nr, 1_i64, params.as_mut_ptr()) };
+    answer(rc)
+}
+
+/// Under the app filter, with INTERNET (`net`) or without: socket(AF_INET, SOCK_STREAM), socket(AF_INET6, SOCK_DGRAM), socket(AF_UNIX, SOCK_STREAM), io_uring_setup,
+/// and on x86_64 the x32 numbers of the socket and of io_uring_setup (`inet_x32`, `io_uring_x32`). One line; the child exits after it.
+fn rows_probe(net: bool) -> ! {
+    apply_net(Profile::App, net);
+    print_rows()
+}
+
+/// `--no-app-seccomp`'s program ([`seccomp_inet_filter`]): the INTERNET rules and io_uring_setup, without the thread-priority rule. Same rows as [`rows_probe`].
+fn inet_only_probe(net: bool) -> ! {
+    apply_bytes(&seccomp_inet_filter(net).expect("inet filter bytes"));
+    print_rows()
+}
+
+/// The [`rows_probe`] rows under the filter already applied, one line; the child exits after it.
+fn print_rows() -> ! {
+    let mut rows = vec![
+        (
+            "inet",
+            socket_row(libc::AF_INET, libc::SOCK_STREAM, libc::SYS_socket),
+        ),
+        (
+            "inet6",
+            socket_row(libc::AF_INET6, libc::SOCK_DGRAM, libc::SYS_socket),
+        ),
+        (
+            "unix",
+            socket_row(libc::AF_UNIX, libc::SOCK_STREAM, libc::SYS_socket),
+        ),
+        ("io_uring", ring_row(libc::SYS_io_uring_setup)),
+    ];
+    if cfg!(target_arch = "x86_64") {
+        rows.push((
+            "inet_x32",
+            socket_row(libc::AF_INET, libc::SOCK_STREAM, libc::SYS_socket + X32),
+        ));
+        rows.push(("io_uring_x32", ring_row(libc::SYS_io_uring_setup + X32)));
+    }
+    let line: Vec<String> = rows.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    finish(&line.join(" "))
+}
+
+/// The app filter's two INTERNET-related rules, per the process's INTERNET right. Without it AF_INET and AF_INET6 sockets are refused EPERM (AOSP's netd answer, loopback
+/// included), AF_UNIX and the other calls pass. io_uring_setup is EACCES either way: AOSP's app_neverallows.te denies anon_inode, so no app socket can come through
+/// IORING_OP_SOCKET. The x32 numbers answer as the plain ones (x86_64). Break: removing either rule turns the matching key red.
+#[test]
+fn app_filter_refuses_inet_sockets_without_internet_and_io_uring_always() {
+    let no_net = probe_line("rows-no-inet", &[]);
+    assert_eq!(no_net["inet"], "err:1");
+    assert_eq!(no_net["inet6"], "err:1");
+    assert_eq!(no_net["unix"], "ok");
+    assert_eq!(no_net["io_uring"], "err:13");
+    let net = probe_line("rows-inet", &[]);
+    assert_eq!(net["inet"], "ok");
+    assert_eq!(net["inet6"], "ok");
+    assert_eq!(net["unix"], "ok");
+    assert_eq!(net["io_uring"], "err:13");
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(no_net["inet_x32"], "err:1");
+        assert_eq!(no_net["io_uring_x32"], "err:13");
+        assert_eq!(net["io_uring_x32"], "err:13");
+    }
+}
+
+/// `--no-app-seccomp` (PM Q3): without the thread-priority rule the INTERNET rules and io_uring_setup still hold; expected values per AOSP (EPERM, EACCES).
+#[test]
+fn no_priority_filter_keeps_the_inet_rules_and_io_uring() {
+    let no_net = probe_line("rows-no-priority-no-inet", &[]);
+    assert_eq!(no_net["inet"], "err:1");
+    assert_eq!(no_net["inet6"], "err:1");
+    assert_eq!(no_net["unix"], "ok");
+    assert_eq!(no_net["io_uring"], "err:13");
+    let net = probe_line("rows-no-priority-inet", &[]);
+    assert_eq!(net["inet"], "ok");
+    assert_eq!(net["inet6"], "ok");
+    assert_eq!(net["io_uring"], "err:13");
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(no_net["inet_x32"], "err:1");
+        assert_eq!(no_net["io_uring_x32"], "err:13");
     }
 }
 

@@ -34,9 +34,48 @@ public class Main extends Activity {
     /** How long onCreate waits for DONE: under the gate's 180 s LIMIT; a cold start of the receiver app takes ~1 s. */
     static final long DONE_WAIT_S = 60;
 
+    /**
+     * The INTERNET rows (judged by broadcast.rs judge_internet): this app has no android.permission.INTERNET, so AOSP refuses its AF_INET socket
+     * (EPERM at socket(), a loopback ServerSocket included), a name lookup throws SecurityException, and localhost resolves from the hosts file.
+     */
+    static void internetRows() {
+        try {
+            new java.net.ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1")).close();
+            Log.i("AtlBcast", "net server-socket=ok");
+        } catch (java.io.IOException e) {
+            Log.i("AtlBcast", "net server-socket=" + e);
+        }
+        try {
+            java.net.InetAddress.getByName("atl-nonet.invalid");
+            Log.i("AtlBcast", "net dns=ok");
+        } catch (SecurityException e) {
+            Log.i("AtlBcast", "net dns=SecurityException: " + e.getMessage());
+        } catch (java.net.UnknownHostException e) {
+            Log.i("AtlBcast", "net dns=UnknownHostException");
+        }
+        try {
+            Log.i("AtlBcast", "net localhost=" + java.net.InetAddress.getByName("localhost").getHostAddress());
+        } catch (java.net.UnknownHostException e) {
+            Log.i("AtlBcast", "net localhost=UnknownHostException");
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // off the main thread: libcore throws NetworkOnMainThreadException for a socket or lookup on it
+        Thread net = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                internetRows();
+            }
+        }, "atl-net");
+        net.start();
+        try {
+            net.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         // the application's context: the receivers are the process's, not this activity's (an activity's own registrations are dropped as leaked when it finishes)
         Context app = getApplicationContext();
         // DONE on a thread of its own: the main thread waits for it below. The PING receiver shares that looper, so DONE is delivered FIFO behind any PING (broadcast_queue.rs:4-6)

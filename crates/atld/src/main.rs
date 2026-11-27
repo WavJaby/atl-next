@@ -222,7 +222,7 @@ struct Args {
     /// The dex jar(s) that hold --run-class (repeat): mounted as /system/framework/<file name> and appended to that command's boot classpath (zygoteInit loads the class with the boot class loader).
     #[arg(long = "run-boot-jar")]
     run_boot_jars: Vec<PathBuf>,
-    /// Test only: apps start without the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of its thread-priority rule: without the filter queued-work-looper dies with SecurityException.
+    /// Test only: apps start without the thread-priority rule of the app seccomp filter (atl-broker seccomp.rs), the deliberate-failure check of that rule: without it queued-work-looper dies with SecurityException. The INTERNET rules stay.
     #[arg(long)]
     no_app_seccomp: bool,
     /// A variable every app process gets (repeat): `KEY=VALUE`. The only way besides the desktop's forwarded names (atl-broker app_env::APP_ENV) a value reaches an app; e.g. a run's RUST_LOG or GDK_DEBUG. Not the allocator, the probes or the services.
@@ -1210,7 +1210,7 @@ impl Host {
                 links: vec![],
                 devices: vec![],
                 property_area: Some(self.root.properties()),
-                rights: vec![],
+                rights: None,
                 app_id: None,
                 program: i.installer.clone(),
                 // in place: the installer's boot-scan mode, no library copied
@@ -1394,7 +1394,7 @@ impl Host {
             links: vec![],
             devices: vec![],
             property_area: Some(self.root.properties()),
-            rights: vec![],
+            rights: None,
             app_id: None,
             program: i.installer.clone(),
             args: i.vm.iter().cloned().chain([OsString::from(dir)]).collect(),
@@ -1880,7 +1880,8 @@ impl Host {
                 links: vec![],
                 devices: self.app_devices.clone(),
                 property_area: Some(self.process_properties(uid, name)?),
-                rights: vec![],
+                // an app process (a package) holds the rights its request carries; run_class's uid has no package, so it keeps INTERNET as a non-app process
+                rights: package.map(|_| rights.to_vec()),
                 app_id,
                 program: self.launcher.clone(),
                 args: launcher_args,
@@ -2034,7 +2035,6 @@ impl Host {
                 writable: true,
             });
         }
-        spawn.rights = req.rights.clone();
         let pid = self.start(spawn, held, false, Some(&req.package))?;
         let _ = self.first_app_ms.set(wall_ms());
         log(format_args!(
@@ -2143,7 +2143,7 @@ impl Host {
                 links: vec![],
                 devices: vec![],
                 property_area: Some(self.root.properties()),
-                rights: vec![],
+                rights: None,
                 app_id: None,
                 program: am.clone(),
                 args: vec!["start".into(), component.into()],
@@ -2201,7 +2201,7 @@ impl Host {
                 links: vec![],
                 devices: vec![],
                 property_area: Some(self.root.properties()),
-                rights: vec![],
+                rights: None,
                 app_id: None,
                 program: screencap.clone(),
                 args: vec![package.into()],
@@ -2586,7 +2586,7 @@ fn run(a: &Args) -> Result<ExitCode> {
             links: vec![],
             devices: vec![],
             property_area: Some(r.properties()),
-            rights: vec![],
+            rights: None,
             app_id: None,
             program: program.to_owned(),
             args,

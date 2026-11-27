@@ -8,6 +8,8 @@
 
     <!-- minSdkVersion: the JNI fixture's API level (xtask test app, option fixture-api), injected at link (atld_run.rs NativeLibs) -->
     <uses-sdk android:targetSdkVersion="36" />
+    <!-- the socket line: PopupServer's loopback ServerSocket (Main.java); AOSP refuses every AF_INET socket without INTERNET -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- the connectivity line (app.rs CONNECTIVITY): ConnectivityService.enforceAccessPermission -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- the permission-request line (app.rs PERMISSION_REQUEST): a runtime (dangerous) permission Main asks for -->

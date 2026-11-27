@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Fri, 27 Nov 2026 23:16:32 +0800
+Subject: [PATCH] fix(libcore): bind atl-bionic's android_getaddrinfofornet on
+ glibc builds
+
+The glibc branch of Portability.h forwarded to getaddrinfo, so a failed
+lookup never reached atl-bionic's android_getaddrinfofornet, which fails
+EAI_SYSTEM with EPERM when the process has no INTERNET (AOSP: SecurityException,
+not UnknownHostException).
+
+Upstream-Status: Inappropriate [ATL glibc build; AOSP host builds keep the forwarder]
+Patch-Reason: ATL is glibc with atl-bionic supplying the bionic-only API; libjavacore already NEEDs libatl_bionic, so the bionic seam is the one to call.
+---
+SPDX-License-Identifier: Apache-2.0
+ luni/src/main/native/Portability.h | 8 +-------
+ 1 file changed, 1 insertion(+), 7 deletions(-)
+
+diff --git a/luni/src/main/native/Portability.h b/luni/src/main/native/Portability.h
+index 887a47b9209881d12933e3b867d49722fb277ce0..72dc7a64627a1b6b9124cfb680d6332a580e311e 100644
+--- a/luni/src/main/native/Portability.h
++++ b/luni/src/main/native/Portability.h
+@@ -22,14 +22,8 @@
+ #include <sys/statvfs.h>
+ 
+ #include <netdb.h>
+-#if defined(__BIONIC__)
++// ATL: the glibc build binds atl-bionic's android_getaddrinfofornet (libjavacore NEEDs libatl_bionic), not a forwarder to getaddrinfo: no INTERNET answer otherwise.
+ extern "C" int android_getaddrinfofornet(const char*, const char*, const struct addrinfo*, unsigned, unsigned, struct addrinfo**);
+-#else
+-static inline int android_getaddrinfofornet(const char* hostname, const char* servname,
+-    const struct addrinfo* hints, unsigned /*netid*/, unsigned /*mark*/, struct addrinfo** res) {
+-  return getaddrinfo(hostname, servname, hints, res);
+-}
+-#endif
+ 
+ #if __has_include(<linux/vm_sockets.h>)
+ #include <linux/vm_sockets.h>

@@ -372,8 +372,32 @@ pub unsafe extern "C" fn android_getaddrinfofornet(
         ) -> c_int;
     }
     // SAFETY: the caller's arguments under getaddrinfo's own contract, unchanged (the same pointers bionic forwards)
-    unsafe { getaddrinfo(node, service, hints, res) }
+    let rc = unsafe { getaddrinfo(node, service, hints, res) };
+    if rc == 0 {
+        return rc;
+    }
+    // glibc drops the refused resolver socket's errno, so a failed lookup reports UnknownHostException without INTERNET. AOSP's resolver
+    // answers EAI_SYSTEM with the errno (libcore: SecurityException "missing INTERNET permission?"). So a failed lookup probes AF_INET:
+    // EPERM -> EAI_SYSTEM with EPERM; any other outcome keeps glibc's answer and errno.
+    let glibc_errno = errno::errno();
+    match rustix::net::socket(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        None,
+    ) {
+        Err(e) if e == rustix::io::Errno::PERM => {
+            errno::set_errno(errno::Errno(e.raw_os_error()));
+            EAI_SYSTEM
+        }
+        _ => {
+            errno::set_errno(glibc_errno);
+            rc
+        }
+    }
 }
+
+/// netdb.h's EAI_SYSTEM: -11 in glibc and bionic alike (the host's values, see [`android_getaddrinfofornet`]).
+const EAI_SYSTEM: c_int = -11;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn android_set_abort_message(msg: *const c_char) {

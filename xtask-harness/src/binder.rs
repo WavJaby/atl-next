@@ -134,7 +134,8 @@ pub(crate) fn spawn_of(cmd: &Command, uid: u32, context: &str) -> Result<Spawn> 
         links: vec![],
         devices: vec![],
         property_area: None,
-        rights: vec![],
+        // a probe run by the gate is not an app: no manifest, so no INTERNET rule (the callers that test an app's rights set them)
+        rights: None,
         app_id: None,
         program: cmd.get_program().into(),
         args: cmd.get_args().map(OsStr::to_owned).collect(),
