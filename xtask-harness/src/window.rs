@@ -405,10 +405,12 @@ impl Stage {
 /// cut short, so the stop landed anywhere in the relaunch (its bind missing, the death counted from the exit summary, the relaunched process's half-started counters judged). LIMIT still bounds it.
 /// webview-overlay: its probe waits for every answer it judges (the last Esc's back line or decision line), so the rest of its 30 s watch was idle time (rows 49-55 s, 2026-11-21).
 /// aux-process: its probe waits for the dialog after a cold start of the new `:aux` process, as long as the ime relaunch.
+/// webview: the input cases, Esc and the popup phase (two settled pictures, two clicks, each waiting for its fixture line) run 12-25 s past the marker under load; the 12 s watch tore the app
+/// down mid-popup (4-6 of 6 runs red, 2026-11-27: the anchor or child click into a stopping app).
 fn probe_ends_run(stage: Stage) -> bool {
     matches!(
         stage,
-        Stage::Ime | Stage::WebViewOverlay | Stage::AuxProcess
+        Stage::Ime | Stage::WebViewOverlay | Stage::WebView | Stage::AuxProcess
     )
 }
 
@@ -416,11 +418,11 @@ fn probe_ends_run(stage: Stage) -> bool {
 /// sub-gates judge, so after it the watch only looks for a fault its last input caused, and the resume path's derivation of WINDOW_MS (a failure shows within ms) holds for that input too.
 /// The composer's counters line lags work by at most 1 s (atl-composer host.rs COUNTERS_PERIOD_NS), inside the grace. Per stage (check rows):
 /// surface-view: its last wait is the offscreen commit line, then the second settled picture; tiled: the tile rewrite and pictures come at the first draw, the probe's last wait the block's pong;
-/// ime: the relaunched window's rebind line; webview-overlay: the last Esc's back or decision line. Not here: slow-display (warm-up / steady / block / tail phases are the assertion), ui-block (its timed commit-flow check spans the watch), and stages nobody audited for this. `--hold` keeps the fixed watch.
+/// ime: the relaunched window's rebind line; webview-overlay: the last Esc's back or decision line; webview: the popup script-open line. Not here: slow-display (warm-up / steady / block / tail phases are the assertion), ui-block (its timed commit-flow check spans the watch), and stages nobody audited for this. `--hold` keeps the fixed watch.
 fn probe_bounds_watch(stage: Stage) -> bool {
     matches!(
         stage,
-        Stage::SurfaceView | Stage::Tiled | Stage::Ime | Stage::WebViewOverlay
+        Stage::SurfaceView | Stage::Tiled | Stage::Ime | Stage::WebViewOverlay | Stage::WebView
     )
 }
 
