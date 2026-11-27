@@ -35,6 +35,8 @@ const CONSTANTS: &[(&str, &str)] = &[
     ("ro.product.model", "ATL"),
     ("ro.product.device", "atl"),
     ("ro.product.name", "atl"),
+    // a Wi-Fi tablet, no telephony (manager 2026-11-27, Q1): the characteristics AOSP's tablet products set. SettingsLib PhoneMediaDevice.isTablet and DeviceIconUtil read "tablet"; OMXStore isTV reads "tv" only
+    ("ro.build.characteristics", "tablet"),
     // no boot sequence: an app process starts on a booted system. Android sets it in ActivityManagerService finishBooting
     ("sys.boot_completed", "1"),
     // the NativeBridge core (atl-native-bridge `LIBRARY`): AndroidRuntime::startVm turns it into `-XX:NativeBridge=` for zygote's children, as atl-app-launcher's app mode does
@@ -330,6 +332,11 @@ mod tests {
             Some("0")
         );
         assert_eq!(read(&a, "debug.force_rtl").as_deref(), Some("false"));
+        // Wi-Fi tablet, no telephony (Q1, manager 2026-11-27): SettingsLib PhoneMediaDevice.isTablet and DeviceIconUtil read this prop for "tablet"
+        assert_eq!(
+            read(&a, "ro.build.characteristics").as_deref(),
+            Some("tablet")
+        );
         // the boot state of an unlocked device with no verified boot (CONSTANTS): orange, never green
         assert_eq!(
             read(&a, "ro.boot.verifiedbootstate").as_deref(),
