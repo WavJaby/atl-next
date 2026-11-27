@@ -16,7 +16,13 @@ public class Moved extends Service {
     public void onCreate() {
         super.onCreate();
         Log.i(Main.TAG, "moved process created pid=" + android.os.Process.myPid());
-        Choreographer.getInstance().postFrameCallback(frameTimeNanos -> Main.logDisplay("moved-process"));
+        // an anonymous class: the fixtures compile without the lambda metafactory
+        Choreographer.getInstance().postFrameCallback(new Choreographer.FrameCallback() {
+            @Override
+            public void doFrame(long frameTimeNanos) {
+                Main.logDisplay("moved-process");
+            }
+        });
     }
 
     @Override

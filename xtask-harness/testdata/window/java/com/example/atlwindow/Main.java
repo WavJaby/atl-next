@@ -53,6 +53,8 @@ public class Main extends Activity {
     private boolean destroyDelayed;
     /** The saved-state key holding the density this instance had: a relaunch at another density starts Moved. */
     static final String SAVED_DPI = "atl.dpi";
+    /** This instance's density at its create. */
+    private int createdDpi;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,8 +70,8 @@ public class Main extends Activity {
         setContentView(new Quadrants(this));
         requestOrientation();
         // a relaunch for a density change (the move stage): a new process starts now, after the monitor moved, and logs the display it got (Moved)
-        int dpi = getResources().getConfiguration().densityDpi;
-        if (savedInstanceState != null && savedInstanceState.getInt(SAVED_DPI, dpi) != dpi) {
+        createdDpi = getResources().getConfiguration().densityDpi;
+        if (savedInstanceState != null && savedInstanceState.getInt(SAVED_DPI, createdDpi) != createdDpi) {
             startService(new android.content.Intent(this, Moved.class));
         }
     }
@@ -77,7 +79,8 @@ public class Main extends Activity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        outState.putInt(SAVED_DPI, getResources().getConfiguration().densityDpi);
+        // the density at create: by the relaunch's save the resources already hold the new configuration
+        outState.putInt(SAVED_DPI, createdDpi);
     }
 
     /** Manifest meta-data REQUEST_ORIENTATION on this activity (window-orientation): setRequestedOrientation with its value at the first create, then the request read back (orientation stage). */
