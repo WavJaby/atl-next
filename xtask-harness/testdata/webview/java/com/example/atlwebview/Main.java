@@ -3,13 +3,26 @@ package com.example.atlwebview;
 
 import android.app.Activity;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewTreeObserver;
 import android.view.WindowManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The WebView gate: `xtask test window --stage webview` (xtask-harness/src/window/webview.rs). A software window of colour WINDOW holding, at fixed pixel rectangles, a WebView whose page
@@ -91,6 +104,36 @@ public class Main extends Activity {
             return false;
         }
     }
+
+    /**
+     * The popup gate (webview.rs drive_popup, popup_check, script_check). preparePopupGate runs in onCreate; startPopupGate runs when the keyboard cases end (title key2Escape).
+     * Phases: control (the control route's script clicks its anchor with popups disabled: no create), real (a compositor click on the opener's anchor: one create, gesture true; the
+     * destination is attached, gets UA and bridge, two Handler posts, then the transport), script (evaluateJavascript window.open with popups enabled: gesture false; refused).
+     * Lines `wv popup ...`; a failure names its assertion (`wv popup failed <name>`), each bounded by POPUP_TIMEOUT_MS.
+     */
+    static final String UA = "A34-UA/1.0";
+    static final int[] OPENER_RECT = {400, 40, 720, 240};
+    static final int[] CHILD_RECT = {400, 280, 720, 480};
+    static final int POPUP_TIMEOUT_MS = 10000;
+    static final int PHASE_CONTROL = 0, PHASE_REAL = 1, PHASE_SCRIPT = 2;
+    private Handler main;
+    private WebView opener;
+    private volatile int port;
+    private int phase = -1;
+    private int creates;
+    private boolean gesture;
+    private boolean attachedBeforeSend;
+    private boolean openerReady;
+    private boolean reloadPending;
+    private boolean childReady;
+    private String anchorBounds = "";
+    private String childBounds = "";
+    /** Reports from the child's page (the injection marker: one) and from the opener's page (none). */
+    private final AtomicInteger bridgeReports = new AtomicInteger();
+    private final AtomicInteger openerReports = new AtomicInteger();
+    private final AtomicInteger taps = new AtomicInteger();
+    private volatile String childUa = "";
+    private volatile String childOpenerNull = "";
 
     private FrameLayout root;
     private View web;
@@ -184,6 +227,10 @@ public class Main extends Activity {
                 @Override
                 public void onReceivedTitle(WebView view, String title) {
                     Log.i(TAG, "wv title " + title);
+                    // the last keyboard case's title: the existing input and readback cases are done, the popup gate starts
+                    if ("key2Escape".equals(title) && phase == -1) {
+                        startPopupGate();
+                    }
                 }
             });
             w.loadData(PAGE_HTML, "text/html", null);
@@ -226,6 +273,291 @@ public class Main extends Activity {
                 Log.i(TAG, "wv layout window=" + root.getWidth() + "x" + root.getHeight() + " web=" + rect(web) + " over=" + rect(over));
             }
         });
+        preparePopupGate();
+    }
+
+    /** Initializes the popup scenario: the handler, the loopback server, the opener WebView (placed by startPopupGate). */
+    private void preparePopupGate() {
+        main = new Handler(Looper.getMainLooper());
+        startServer();
+        try {
+            WebView o = new WebView(this);
+            WebSettings s = o.getSettings();
+            s.setJavaScriptEnabled(true);
+            s.setSupportMultipleWindows(true);
+            s.setJavaScriptCanOpenWindowsAutomatically(false);
+            o.setWebViewClient(new WebViewClient() {
+                @Override
+                public void onPageFinished(WebView view, String url) {
+                    // the reload after the child's tap: its document start asked the bridge list again (WebView.java:1888); its report is the opener's last word
+                    if (reloadPending && url.endsWith("/opener")) {
+                        reloadPending = false;
+                        summary();
+                        script();
+                        return;
+                    }
+                    if (phase == PHASE_REAL && !openerReady && url.endsWith("/opener")) {
+                        openerReady = true;
+                        anchorBounds = rect(view);
+                        Log.i(TAG, "wv popup opener ready anchorBounds=" + anchorBounds);
+                        main.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (creates == 0) {
+                                    Log.i(TAG, "wv popup failed create");
+                                }
+                            }
+                        }, POPUP_TIMEOUT_MS);
+                    }
+                }
+            });
+            o.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public void onReceivedTitle(WebView view, String title) {
+                    if (phase == PHASE_CONTROL && "control-clicked".equals(title)) {
+                        Log.i(TAG, "wv popup control clicked creates=" + creates);
+                        if (creates != 0) {
+                            Log.i(TAG, "wv popup failed control-creates");
+                            return;
+                        }
+                        phase = PHASE_REAL;
+                        view.loadUrl(base() + "/opener");
+                    }
+                }
+
+                @Override
+                public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                    return onPopup(isUserGesture, resultMsg);
+                }
+            });
+            opener = o;
+        } catch (Throwable t) {
+            Log.i(TAG, "wv popup no webview: " + t);
+        }
+    }
+
+    /** WebChromeClient.onCreateWindow of the opener, on the main thread. Real phase: the destination is attached, gets UA and bridge, two posts, then the transport. Others refused. */
+    private boolean onPopup(boolean isUserGesture, final Message resultMsg) {
+        creates++;
+        Log.i(TAG, "wv popup create n=" + creates + " gesture=" + isUserGesture + " phase=" + phase);
+        if (phase == PHASE_SCRIPT) {
+            Log.i(TAG, "wv popup script-open gesture=" + isUserGesture + " creates=" + creates);
+            return false;
+        }
+        if (phase != PHASE_REAL || creates != 1) {
+            if (phase == PHASE_CONTROL) {
+                Log.i(TAG, "wv popup failed control-creates");
+            }
+            return false;
+        }
+        gesture = isUserGesture;
+        final WebView c = new WebView(this);
+        c.getSettings().setJavaScriptEnabled(true);
+        c.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (childReady || !url.endsWith("/popup")) {
+                    return;
+                }
+                childReady = true;
+                childBounds = rect(view);
+                if (bridgeReports.get() == 0) {
+                    Log.i(TAG, "wv popup failed child-bridge");
+                } else if (openerReports.get() != 0) {
+                    Log.i(TAG, "wv popup failed opener-bridge");
+                } else if (!UA.equals(childUa)) {
+                    Log.i(TAG, "wv popup failed child-ua");
+                }
+                Log.i(TAG, "wv popup child ready childBounds=" + childBounds);
+                main.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (taps.get() == 0) {
+                            Log.i(TAG, "wv popup failed child-tap");
+                        }
+                    }
+                }, POPUP_TIMEOUT_MS);
+            }
+        });
+        place(c, CHILD_RECT[0], CHILD_RECT[1], CHILD_RECT[2] - CHILD_RECT[0], CHILD_RECT[3] - CHILD_RECT[1]);
+        c.getSettings().setUserAgentString(UA);
+        c.addJavascriptInterface(new PopupBridge(), "atlBridge");
+        final WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        boolean attached = c.getParent() != null;
+                        attachedBeforeSend = attached;
+                        if (!attached) {
+                            Log.i(TAG, "wv popup failed attached-before-send");
+                        }
+                        transport.setWebView(c);
+                        resultMsg.sendToTarget();
+                        Log.i(TAG, "wv popup sent attached=" + attached);
+                    }
+                });
+            }
+        });
+        return true;
+    }
+
+    /** Starts the popup scenario (after the keyboard cases): the opener is placed and loads the control route, whose script clicks the anchor with popups disabled. */
+    private void startPopupGate() {
+        if (opener == null) {
+            Log.i(TAG, "wv popup failed no-opener");
+            return;
+        }
+        if (port == 0) {
+            Log.i(TAG, "wv popup failed server");
+            return;
+        }
+        phase = PHASE_CONTROL;
+        place(opener, OPENER_RECT[0], OPENER_RECT[1], OPENER_RECT[2] - OPENER_RECT[0], OPENER_RECT[3] - OPENER_RECT[1]);
+        opener.loadUrl(base() + "/control");
+    }
+
+    /** After the child's tap: the opener reloads (a new document start asks its bridge list again); onPageFinished then writes the summary and runs the script open. */
+    private void reloadOpener() {
+        if (opener == null) {
+            return;
+        }
+        reloadPending = true;
+        opener.reload();
+        main.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (reloadPending) {
+                    Log.i(TAG, "wv popup failed opener-reload");
+                }
+            }
+        }, POPUP_TIMEOUT_MS);
+    }
+
+    /** The script open: window.open from evaluateJavascript with popups enabled (AOSP: no user gesture). Refused by onPopup. */
+    private void script() {
+        if (opener == null) {
+            return;
+        }
+        phase = PHASE_SCRIPT;
+        opener.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
+        opener.evaluateJavascript("window.open('" + base() + "/popup?script')", null);
+    }
+
+    /** One line: the popup's fields once its target was tapped (the bridge's answer). */
+    private void summary() {
+        Log.i(TAG, "wv popup summary anchorBounds=" + anchorBounds + " childBounds=" + childBounds + " createCount=" + creates + " gesture=" + gesture
+                + " attachedBeforeSend=" + attachedBeforeSend + " childUa=" + childUa + " openerIsNull=" + childOpenerNull + " bridgeCount=" + bridgeReports.get()
+                + " openerMarks=" + openerReports.get() + " childTapCount=" + taps.get());
+    }
+
+    private String base() {
+        return "http://127.0.0.1:" + port;
+    }
+
+    /** The loopback server: one thread, one request per connection, `wv popup request <route>` per request. */
+    private void startServer() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ServerSocket ss = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
+                    port = ss.getLocalPort();
+                    Log.i(TAG, "wv popup server port=" + port);
+                    while (true) {
+                        serveOne(ss.accept());
+                    }
+                } catch (Exception e) {
+                    Log.i(TAG, "wv popup server failed " + e);
+                }
+            }
+        }, "wv-popup-server").start();
+    }
+
+    private static void serveOne(Socket s) {
+        try {
+            s.setSoTimeout(5000);
+            BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "US-ASCII"));
+            String request = in.readLine();
+            String[] parts = request == null ? new String[0] : request.split(" ");
+            String path = parts.length > 1 ? parts[1] : "";
+            int q = path.indexOf('?');
+            String route = q < 0 ? path : path.substring(0, q);
+            String ua = "-";
+            String header;
+            do {
+                header = in.readLine();
+                if (header != null && header.regionMatches(true, 0, "User-Agent:", 0, 11)) {
+                    ua = header.substring(11).trim();
+                }
+            } while (header != null && header.length() > 0);
+            Log.i(TAG, "wv popup request " + route + " ua=" + ua);
+            String body = page(route);
+            byte[] bytes = (body == null ? "" : body).getBytes("UTF-8");
+            String status = body == null ? "404 Not Found" : "200 OK";
+            OutputStream out = s.getOutputStream();
+            out.write(("HTTP/1.1 " + status + "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " + bytes.length + "\r\nConnection: close\r\n\r\n")
+                    .getBytes("US-ASCII"));
+            out.write(bytes);
+            out.flush();
+        } catch (Exception e) {
+            Log.i(TAG, "wv popup request failed " + e);
+        } finally {
+            try {
+                s.close();
+            } catch (Exception e) {
+                Log.i(TAG, "wv popup close failed " + e);
+            }
+        }
+    }
+
+    /** The route pages. Opener and control carry one anchor (target=_blank rel=noopener) over the whole page; the popup is solid #ffd800 (CHILD background) and taps through its bridge. */
+    private static String page(String route) {
+        String anchor = "<a id='a' href='/popup' target='_blank' rel='noopener' style='position:absolute;left:0;top:0;right:0;bottom:0;display:block;background:#2080ff;color:#fff'>open</a>";
+        if ("/control".equals(route)) {
+            return "<html><head><title>control</title></head><body style='margin:0;background:#204060'>" + anchor
+                    + "<script>window.onload=function(){document.getElementById('a').click();document.title='control-clicked';};</script></body></html>";
+        }
+        if ("/opener".equals(route)) {
+            return "<html><head><title>opener</title></head><body style='margin:0;background:#204060'>" + anchor
+                    + "<script>if (window.atlBridge) atlBridge.report('opener', navigator.userAgent, String(window.opener === null));</script></body></html>";
+        }
+        if ("/popup".equals(route)) {
+            return "<html><head><title>popup</title></head><body style='margin:0;background:#ffd800' onclick='atlBridge.tap()'>"
+                    + "<script>atlBridge.report('child', navigator.userAgent, String(window.opener === null));</script></body></html>";
+        }
+        return null;
+    }
+
+    /** The child's bridge: the page reports once at load (the injection marker, UA, window.opener), and each tap on its target. */
+    final class PopupBridge {
+        @JavascriptInterface
+        public void report(String who, String ua, String openerNull) {
+            Log.i(TAG, "wv popup bridge who=" + who + " ua=" + ua + " openerNull=" + openerNull);
+            if ("child".equals(who)) {
+                childUa = ua;
+                childOpenerNull = openerNull;
+                bridgeReports.incrementAndGet();
+            } else {
+                openerReports.incrementAndGet();
+            }
+        }
+
+        @JavascriptInterface
+        public void tap() {
+            int n = taps.incrementAndGet();
+            Log.i(TAG, "wv popup child tap n=" + n);
+            if (n == 1) {
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        reloadOpener();
+                    }
+                });
+            }
+        }
     }
 
     @Override

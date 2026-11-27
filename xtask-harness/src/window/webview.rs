@@ -12,6 +12,7 @@
 //! tone's, with atld's count of the `share-sound` grant ([`sound_check`]).
 //! Break `--break-webview-engine`: the run's library dir lacks the engine module, the fixture's WebView cannot be made, the readback must fail. Break `--esc-back --break-esc-back`: esc-back must fail.
 //! Break `--break-webview-sound`: atld finds no pulse server, `share-sound` grants nothing, sound must fail.
+//! Popup (drive_popup; create-window, create-script-gesture): a real click on the opener's anchor (`target=_blank rel=noopener`) creates one popup with gesture true; the child is attached before its transport is sent, gets the UA and one bridge marker (none on the opener), and its solid target, sampled after adoption, is tapped through its bridge. A window.open from evaluateJavascript reports gesture false.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -50,6 +51,34 @@ const DRAG_STEP_PX: u32 = 20;
 /// Between the drag's press and each move: past the toolkit's 1 ms event clock, so each move has its own time as a device's would; injected in one batch all share the press's ms, and the
 /// window drops motion samples timed at or before the last published event (input.rs `motion_samples`), so Android would see Down then Up and no MOVE for the parent to intercept.
 const DRAG_STEP_MS: u64 = 10;
+/// The popup gate's lines (Main.java `wv popup`, preparePopupGate / onPopup / summary): the opener is ready for the real click, the adopted child is ready, the summary at the child's
+/// tap, the script open. `POPUP_FAILED` is the fixture's named assertion (`wv popup failed <name>`).
+const POPUP: &str = "AtlWindow: wv popup ";
+const POPUP_OPENER_READY: &str = "AtlWindow: wv popup opener ready";
+const POPUP_CHILD_READY: &str = "AtlWindow: wv popup child ready";
+const POPUP_SUMMARY: &str = "AtlWindow: wv popup summary";
+const POPUP_SCRIPT: &str = "AtlWindow: wv popup script-open";
+const POPUP_FAILED: &str = "AtlWindow: wv popup failed ";
+/// The server's line for each request (Main.java serveOne): the child's first `/popup` request carries the UA on the wire, before any page script runs.
+const POPUP_REQUEST: &str = "AtlWindow: wv popup request /popup ";
+/// Each popup step's wait for the fixture's line: one page load or one Looper trip plus a web-process round trip; past the fixture's own POPUP_TIMEOUT_MS.
+const POPUP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The child's solid target (Main.java: page background #ffd800) and its user agent (Main.java UA): the literals the picture and the report are judged against.
+const CHILD: [u8; 4] = [0xff, 0xd8, 0x00, 0xff];
+/// The opener's anchor colour (Main.java: background #2080ff), its whole rectangle.
+const ANCHOR: [u8; 4] = [0x20, 0x80, 0xff, 0xff];
+const UA: &str = "A34-UA/1.0";
+
+/// The opener's picture before the click (index 1): the anchor's colour at its centre, or why there is none.
+fn anchor_before_click(app: &str, pictures: &Mutex<capture::Seen>) -> String {
+    let state = popup_rect(app, "anchorBounds").and_then(|a| {
+        let at = ((a.left + a.right) / 2, (a.top + a.bottom) / 2);
+        let shot = capture::picture(pictures, 1)?;
+        let i = (at.1 as usize * shot.size.0 as usize + at.0 as usize) * 4;
+        Ok(format!("{:?} at {at:?}", shot.rgba.get(i..i + 4)))
+    });
+    state.unwrap_or_else(|e| e)
+}
 
 /// The fixture's dir.
 pub const FIXTURE: &str = "xtask-harness/testdata/webview";
@@ -388,6 +417,8 @@ pub fn checks(
         ("esc-handled", esc_handled(app)),
         ("esc-back", esc_back_check(app, esc_back)),
         ("off-thread", off_thread(app)),
+        ("create-window", popup_check(app, pictures)),
+        ("create-script-gesture", script_check(app)),
     ]
 }
 
@@ -665,6 +696,174 @@ fn drive_input(proxy: &Proxy, app_log: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The fixture's `key=value` rectangle on a popup line (the first popup line that has the key).
+fn popup_rect(text: &str, key: &str) -> Result<Rect, String> {
+    text.lines()
+        .filter(|l| l.contains(POPUP))
+        .find_map(|l| word(l, key).and_then(Rect::parse))
+        .ok_or_else(|| format!("no {key} on a `wv popup` line"))
+}
+
+/// Pixels of `r` (window px) in an RGBA picture of `size` that are not `want`.
+fn solid(size: (u32, u32), rgba: &[u8], r: Rect, want: [u8; 4]) -> Result<usize, String> {
+    if r.right > size.0 || r.bottom > size.1 {
+        return Err(format!(
+            "{r:?} is outside the {}x{} picture",
+            size.0, size.1
+        ));
+    }
+    let mut differ = 0;
+    for y in r.top..r.bottom {
+        for x in r.left..r.right {
+            let i = (y as usize * size.0 as usize + x as usize) * 4;
+            if rgba.get(i..i + 4) != Some(&want[..]) {
+                differ += 1;
+            }
+        }
+    }
+    Ok(differ)
+}
+
+/// Sub-gate create-window: the fixture's summary after one real click on the opener's anchor and one on the adopted child's target. One create with gesture true; the child attached before
+/// its transport was sent; its UA the literal; one injection marker (the child's bridge report), none from the opener; one tap. The child's rectangle, sampled after adoption, is the literal colour.
+fn popup_check(app: &str, pictures: &Mutex<capture::Seen>) -> Result<String, String> {
+    if let Some(name) = app
+        .lines()
+        .find_map(|l| l.find(POPUP_FAILED).map(|i| &l[i + POPUP_FAILED.len()..]))
+    {
+        return Err(format!("the fixture failed its `{name}` assertion"));
+    }
+    let Some(line) = app.lines().find(|l| l.contains(POPUP_SUMMARY)) else {
+        return Err(format!(
+            "no `wv popup summary` line: the popup never reached the child's tap (opener before the click: {})",
+            anchor_before_click(app, pictures)
+        ));
+    };
+    let want = [
+        ("createCount", "1"),
+        ("gesture", "true"),
+        ("attachedBeforeSend", "true"),
+        ("childUa", UA),
+        ("openerIsNull", "true"),
+        ("bridgeCount", "1"),
+        ("openerMarks", "0"),
+        ("childTapCount", "1"),
+    ];
+    let bad: Vec<String> = want
+        .iter()
+        .filter(|(k, v)| word(line, k) != Some(*v))
+        .map(|(k, v)| format!("{k}={} (want {v})", word(line, k).unwrap_or("-")))
+        .collect();
+    if !bad.is_empty() {
+        return Err(bad.join(", "));
+    }
+    let request = app
+        .lines()
+        .find(|l| l.contains(POPUP_REQUEST))
+        .ok_or("no `wv popup request /popup` line: the child's request never reached the server")?;
+    if !request.ends_with(&format!("ua={UA}")) {
+        return Err(format!(
+            "the child's first request: {request}; want ua={UA}"
+        ));
+    }
+    let anchor = popup_rect(app, "anchorBounds")?;
+    let opener = capture::picture(pictures, 1)?;
+    let at = (
+        (anchor.left + anchor.right) / 2,
+        (anchor.top + anchor.bottom) / 2,
+    );
+    let shown = solid(
+        opener.size,
+        &opener.rgba,
+        Rect {
+            left: at.0,
+            top: at.1,
+            right: at.0 + 1,
+            bottom: at.1 + 1,
+        },
+        ANCHOR,
+    )?;
+    if shown != 0 {
+        return Err(format!(
+            "the anchor is not on screen before the click: {at:?} is not {ANCHOR:?}"
+        ));
+    }
+    let child = popup_rect(app, "childBounds")?;
+    let shot = capture::picture(pictures, 2)?;
+    let differ = solid(shot.size, &shot.rgba, child, CHILD)?;
+    if differ != 0 {
+        return Err(format!(
+            "{differ} pixels of the child's rectangle {child:?} are not {CHILD:?}"
+        ));
+    }
+    Ok(format!(
+        "one create (gesture true), attached before send, UA {UA}, one injection marker and none on the opener, one tap; the child's rectangle is {CHILD:?} after adoption"
+    ))
+}
+
+/// Sub-gate create-script-gesture: the window.open that evaluateJavascript started (popups enabled) reached onCreateWindow with gesture false, as AOSP reports a script-driven open (the
+/// `WebViewClientTest` evaluateJavascript click's hasGesture is false); the fixture refused it, so it is the second create.
+fn script_check(app: &str) -> Result<String, String> {
+    let line = app
+        .lines()
+        .find(|l| l.contains(POPUP_SCRIPT))
+        .ok_or("no `wv popup script-open` line: the evaluateJavascript open was not reported")?;
+    if word(line, "gesture") == Some("false") && word(line, "creates") == Some("2") {
+        Ok("window.open from evaluateJavascript: onCreateWindow gesture false".to_owned())
+    } else {
+        Err(format!("{line}: want gesture=false creates=2"))
+    }
+}
+
+/// The popup phase, after the input cases: a real click on the opener's anchor (the one create), the child's ready line and, after its paint settles, the picture the sub-gate samples
+/// (index 1), a real click on the child's target (its bridge reports the tap), then the fixture's script open. A missing fixture line is the sub-gate's failure, not the probe's.
+fn drive_popup(proxy: &Proxy, app_log: &Path, probe: &capture::Probe) -> Result<(), String> {
+    if !widgets::wait_until("popup-opener", app_log, POPUP_WAIT, |t| {
+        t.contains(POPUP_OPENER_READY)
+    }) {
+        return Ok(());
+    }
+    std::thread::sleep(PAINT_SETTLE);
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let (ox, oy) = super::content_origin(&text)?;
+    // the rectangle's centre in surface coordinates (window pixels, scale 1 on the gate output, as drive_input)
+    let centre = |r: Rect| {
+        (
+            f64::from((r.left + r.right) / 2) + f64::from(ox),
+            f64::from((r.top + r.bottom) / 2) + f64::from(oy),
+        )
+    };
+    let anchor_rect = popup_rect(&text, "anchorBounds")?;
+    let anchor = centre(anchor_rect);
+    // the opener as presented before the click (picture index 1): create-window judges the anchor's colour at its centre
+    probe.record_settled();
+    widgets::inject(
+        proxy,
+        vec![PointerAction::Enter {
+            x: anchor.0,
+            y: anchor.1,
+        }],
+    )?;
+    click(proxy, anchor)?;
+    if !widgets::wait_until("popup-child", app_log, POPUP_WAIT, |t| {
+        t.contains(POPUP_CHILD_READY)
+    }) {
+        return Ok(());
+    }
+    std::thread::sleep(PAINT_SETTLE);
+    let text = std::fs::read_to_string(app_log).map_err(|e| e.to_string())?;
+    let child = popup_rect(&text, "childBounds")?;
+    probe.record_settled();
+    click(proxy, centre(child))?;
+    let _ = widgets::wait_until("popup-summary", app_log, POPUP_WAIT, |t| {
+        t.contains(POPUP_SUMMARY) || t.contains(POPUP_FAILED)
+    });
+    let _ = widgets::wait_until("popup-script", app_log, POPUP_WAIT, |t| {
+        t.contains(POPUP_SCRIPT) || t.contains(POPUP_FAILED)
+    });
+    Ok(())
+}
+
 /// The probe: the window's configure is acked, the fixture laid out and its page loaded (or the fixture said it has no WebView), WebKit's paint settles, then one settled picture and a ping,
 /// then the input ([`drive_input`]).
 pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liveness, Miss> {
@@ -709,6 +908,7 @@ pub fn drive(proxy: Proxy, app_log: &Path, probe: &capture::Probe) -> Result<Liv
     .is_some();
     if !no_webview {
         drive_input(&proxy, app_log)?;
+        drive_popup(&proxy, app_log, probe)?;
     }
     Ok(Liveness {
         answered,

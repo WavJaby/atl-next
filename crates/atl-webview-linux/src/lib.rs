@@ -266,6 +266,9 @@ struct Events {
     popup: std::cell::Cell<bool>,
     /// POPUP_CLOSED was reported.
     closed: std::cell::Cell<bool>,
+    /// Evaluations this view started and has not finished ([`view_evaluate`]). A window opened while one runs is not a user gesture: AOSP reports none for an evaluateJavascript-driven
+    /// navigation (WebViewClientTest.testShouldOverrideUrlLoading: hasGesture false); WebKit's evaluate grants one.
+    evaluating: std::cell::Cell<u32>,
 }
 
 /// A parked popup's first navigation: the one whose URI equals what `create` received is held until adoption (`held`); adopted before it came -> `released`, it proceeds when it comes.
@@ -293,6 +296,7 @@ impl Events {
             park: RefCell::default(),
             popup: std::cell::Cell::new(false),
             closed: std::cell::Cell::new(false),
+            evaluating: std::cell::Cell::new(0),
         })
     }
 
@@ -610,7 +614,8 @@ fn connect_popups(web: &webkit6::WebView, events: &Rc<Events>) {
             tracing::warn!("webview[{key}]: popup_overlap_refused: a popup is already pending for this view; refused");
             return None;
         }
-        let gesture = action.is_user_gesture();
+        // an open inside an evaluate this view started is no gesture (AOSP; `Events::evaluating`), whatever WebKit's evaluate grants
+        let gesture = action.is_user_gesture() && ev.evaluating.get() == 0;
         // the related view shares the opener's web process, script controller and (WebKit default) settings: the settings are made private here, the destination's replace them at adoption
         let child = webkit6::WebView::builder().related_view(parent).build();
         let private = webkit6::Settings::new();
@@ -1055,7 +1060,9 @@ unsafe extern "C" fn view_go(key: i32, steps: i32) {
 unsafe extern "C" fn view_evaluate(key: i32, script: Str, done: SendCallback<EvalResultView>) {
     // SAFETY: `script` is alive for this call.
     let script = unsafe { script.get() }.into_owned();
-    on_view(key, "evaluate", move |web, _| {
+    on_view(key, "evaluate", move |web, events| {
+        events.evaluating.set(events.evaluating.get() + 1);
+        let events = Rc::clone(events);
         let mut done = Some(done);
         let mut finish = move |ok: bool, text: &str| {
             if let Some(mut d) = done.take() {
@@ -1070,15 +1077,20 @@ unsafe extern "C" fn view_evaluate(key: i32, script: Str, done: SendCallback<Eva
             None,
             None,
             None::<&webkit6::gio::Cancellable>,
-            move |r| match r {
-                // undefined, a function, a symbol: no JSON form -> "null", as Android's evaluateJavascript reports them
-                Ok(v) => finish(
-                    true,
-                    &v.to_json(0)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "null".into()),
-                ),
-                Err(e) => finish(false, e.message()),
+            move |r| {
+                events
+                    .evaluating
+                    .set(events.evaluating.get().saturating_sub(1));
+                match r {
+                    // undefined, a function, a symbol: no JSON form -> "null", as Android's evaluateJavascript reports them
+                    Ok(v) => finish(
+                        true,
+                        &v.to_json(0)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "null".into()),
+                    ),
+                    Err(e) => finish(false, e.message()),
+                }
             },
         );
     });
