@@ -36,11 +36,45 @@ fn cpu_of_stat(stat: &str, ticks_per_second: u64) -> Duration {
     Duration::from_secs_f64(ticks as f64 / ticks_per_second as f64)
 }
 
-/// One step: its wall time, its pool wait when it took a grant (build_pool.rs), its CPU time when measured.
+/// Pool grants that queued: how many, and their total queue time (enqueue -> grant, build_pool.rs). Summed per grant, so overlapping grants add up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolWaits {
+    pub count: u32,
+    pub total: Duration,
+}
+
+impl PoolWaits {
+    /// The grants recorded after `earlier` was read from the same tally.
+    pub fn since(self, earlier: PoolWaits) -> PoolWaits {
+        PoolWaits {
+            count: self.count - earlier.count,
+            total: self.total - earlier.total,
+        }
+    }
+}
+
+impl std::ops::Add for PoolWaits {
+    type Output = PoolWaits;
+
+    fn add(self, other: PoolWaits) -> PoolWaits {
+        PoolWaits {
+            count: self.count + other.count,
+            total: self.total + other.total,
+        }
+    }
+}
+
+impl std::iter::Sum for PoolWaits {
+    fn sum<I: Iterator<Item = PoolWaits>>(iter: I) -> PoolWaits {
+        iter.fold(PoolWaits::default(), |a, w| a + w)
+    }
+}
+
+/// One step: its wall time, the pool grants it queued (build_pool.rs), its CPU time when measured.
 struct Step {
     name: String,
     took: Duration,
-    wait: Option<Duration>,
+    wait: Option<PoolWaits>,
     cpu: Option<Duration>,
 }
 
@@ -68,8 +102,8 @@ impl Timings {
         });
     }
 
-    /// A step that queued `wait` for its pool grant before running `took`, its processes using `cpu`.
-    pub fn push_step(&mut self, step: &str, took: Duration, wait: Duration, cpu: Duration) {
+    /// A step that made `wait` in pool grants while running `took`, its processes using `cpu`.
+    pub fn push_step(&mut self, step: &str, took: Duration, wait: PoolWaits, cpu: Duration) {
         self.0.push(Step {
             name: step.to_owned(),
             took,
@@ -90,8 +124,8 @@ impl Timings {
                 if let Some(cpu) = r.cpu {
                     text.push_str(&format!(" (cpu {}, {:.1} cores)", secs(cpu), r.cores(cpu)));
                 }
-                if let Some(w) = r.wait.filter(|w| !w.is_zero()) {
-                    text.push_str(&format!(" wait {}", secs(w)));
+                if let Some(w) = r.wait.filter(|w| !w.total.is_zero()) {
+                    text.push_str(&format!(" wait {}", secs(w.total)));
                 }
                 text
             })
@@ -101,7 +135,8 @@ impl Timings {
 
     /// `<cmd> times:` then one row per step, longest first (ties keep run order): name, seconds, share of the total; then the total.
     /// With CPU recorded: the step's CPU seconds and its cores at work.
-    /// With pool waits recorded: a `wait` column (excluded from the step's seconds) and a `pool waits: <n>, <s>` line.
+    /// With pool waits recorded: a `wait` column (the step's queue time) and a `pool waits: <n>, <s>` line (grants queued, their queue time).
+    /// A class step's clock starts at its grant (check.rs), so its wait is outside its seconds; gates and test hold grants inside their work, so their seconds include it.
     pub fn table(&self, cmd: &str) -> String {
         let total: Duration = self.0.iter().map(|r| r.took).sum();
         let pooled = self.0.iter().any(|r| r.wait.is_some());
@@ -132,23 +167,18 @@ impl Timings {
                     step.cores(cpu)
                 ));
             }
-            if let Some(w) = step.wait.filter(|w| !w.is_zero()) {
-                out.push_str(&format!(" wait {}", secs(w)));
+            if let Some(w) = step.wait.filter(|w| !w.total.is_zero()) {
+                out.push_str(&format!(" wait {}", secs(w.total)));
             }
             out.push('\n');
         }
         out.push_str(&format!("  {:<width$} {:>8}\n", "total", secs(total)));
         if pooled {
-            let waits: Vec<Duration> = self
-                .0
-                .iter()
-                .filter_map(|r| r.wait)
-                .filter(|w| !w.is_zero())
-                .collect();
+            let waits: PoolWaits = self.0.iter().filter_map(|r| r.wait).sum();
             out.push_str(&format!(
                 "{cmd} pool waits: {}, {}\n",
-                waits.len(),
-                secs(waits.iter().sum())
+                waits.count,
+                secs(waits.total)
             ));
         }
         out
@@ -327,13 +357,29 @@ mod tests {
     }
 
     #[test]
-    fn pool_waits_show_beside_their_step_and_are_summed() {
+    fn pool_waits_count_grants_and_sum_their_queue_time_across_steps() {
         let mut t = Timings::default();
         let ms = Duration::from_millis;
-        t.push_step("test", ms(3_000), ms(2_000), ms(36_000));
-        t.push_step("fmt", ms(1_000), Duration::ZERO, ms(500));
-        // the wait is not in the step's seconds: shares 3/4 and 1/4; cores 36/3 and 0.5/1; one nonzero wait of 2 s; name column width 5 ("total")
-        let want = "check times:\n  test      3.0s  75.0% cpu    36.0s 12.0 cores wait 2.0s\n  fmt       1.0s  25.0% cpu     0.5s  0.5 cores\n  total     4.0s\ncheck pool waits: 1, 2.0s\n";
+        t.push_step(
+            "test",
+            ms(3_000),
+            PoolWaits {
+                count: 3,
+                total: ms(2_000),
+            },
+            ms(36_000),
+        );
+        t.push_step(
+            "fmt",
+            ms(1_000),
+            PoolWaits {
+                count: 1,
+                total: ms(500),
+            },
+            ms(500),
+        );
+        // seconds as pushed: shares 3/4 and 1/4; cores 36/3 and 0.5/1; grants 3 + 1 = 4 (counted per grant, not per step); queue time 2.0 + 0.5 = 2.5 s; name column width 5 ("total")
+        let want = "check times:\n  test      3.0s  75.0% cpu    36.0s 12.0 cores wait 2.0s\n  fmt       1.0s  25.0% cpu     0.5s  0.5 cores wait 0.5s\n  total     4.0s\ncheck pool waits: 4, 2.5s\n";
         assert_eq!(t.table("check"), want);
     }
 
@@ -341,10 +387,18 @@ mod tests {
     fn the_critical_line_names_the_three_longest() {
         let mut t = Timings::default();
         let s = Duration::from_secs;
-        t.push_step("fmt", s(1), Duration::ZERO, s(1));
-        t.push_step("gates", s(200), s(7), s(400));
-        t.push_step("test", s(40), Duration::ZERO, s(50));
-        t.push_step("tables", s(20), Duration::ZERO, s(160));
+        t.push_step("fmt", s(1), PoolWaits::default(), s(1));
+        t.push_step(
+            "gates",
+            s(200),
+            PoolWaits {
+                count: 2,
+                total: s(7),
+            },
+            s(400),
+        );
+        t.push_step("test", s(40), PoolWaits::default(), s(50));
+        t.push_step("tables", s(20), PoolWaits::default(), s(160));
         assert_eq!(
             t.critical(),
             "critical: gates 200.0s (cpu 400.0s, 2.0 cores) wait 7.0s, test 40.0s (cpu 50.0s, 1.2 cores), tables 20.0s (cpu 160.0s, 8.0 cores)"

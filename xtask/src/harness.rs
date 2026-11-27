@@ -8,9 +8,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::timing::secs;
+use crate::timing::{PoolWaits, secs};
 use crate::verdict::Outcome;
 
 use anyhow::{Context, Result, bail};
@@ -90,11 +90,44 @@ pub const RULING_PREFIX: &str = "starvation-ruling: ";
 /// The line an undecided gate prints as its verdict's [`Ruling`] as JSON (starvation.rs `undecided`). Read back by [`undecided_verdict`].
 pub const VERDICT_PREFIX: &str = "starvation-verdict: ";
 
-/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail.
+/// The line a harness check step prints last: the pool grants its process queued, as `<count> <nanos>` ([`pool_waits_of`]).
+pub const POOL_WAITS_PREFIX: &str = "pool-waits: ";
+
+/// The harness's `pool-waits:` line for `w` (xtask-harness main.rs `check_step` prints it on every successful step).
+pub fn pool_waits_line(w: PoolWaits) -> String {
+    format!("{POOL_WAITS_PREFIX}{} {}", w.count, w.total.as_nanos())
+}
+
+/// The grants the harness queued, from the last `pool-waits:` line of its stdout. Absent is an error: check never sums a step without its waits.
+fn pool_waits_of(step: &str, stdout: &str) -> Result<PoolWaits> {
+    let body = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(POOL_WAITS_PREFIX))
+        .with_context(|| {
+            format!("{step}: no `{POOL_WAITS_PREFIX}` line on the harness's stdout")
+        })?;
+    let (count, nanos) = body
+        .split_once(' ')
+        .with_context(|| format!("{step}: unreadable pool waits `{body}`"))?;
+    Ok(PoolWaits {
+        count: count
+            .parse::<u32>()
+            .with_context(|| format!("{step}: pool waits count `{count}`"))?,
+        total: Duration::from_nanos(
+            nanos
+                .parse::<u64>()
+                .with_context(|| format!("{step}: pool waits nanos `{nanos}`"))?,
+        ),
+    })
+}
+
+/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail; `pool_waits` = the grants its harness process queued (its own tally: check's is another process's).
 #[derive(Debug, Default)]
 pub struct StepDone {
     pub skipped: Option<String>,
     pub undecided: Vec<Undecided>,
+    pub pool_waits: PoolWaits,
 }
 
 impl From<Option<String>> for StepDone {
@@ -158,6 +191,7 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<StepDone> {
                     .with_context(|| format!("{step}: unreadable undecided line: {json}"))
             })
             .collect::<Result<_>>()?,
+        pool_waits: pool_waits_of(step, &stdout)?,
     })
 }
 
@@ -392,6 +426,39 @@ fn show_and_keep(from: impl Read) -> String {
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod pool_waits_tests {
+    use super::*;
+
+    /// Hand-written: 22 grants queued for 1411 s, encoded as nanoseconds.
+    #[test]
+    fn pool_waits_line_is_count_then_nanoseconds() {
+        let w = PoolWaits {
+            count: 22,
+            total: Duration::from_secs(1411),
+        };
+        assert_eq!(pool_waits_line(w), "pool-waits: 22 1411000000000");
+    }
+
+    #[test]
+    fn the_harness_pool_waits_line_is_read_back_exactly() {
+        let stdout = "skip: no native build dir\npool-waits: 22 1411000000000\n";
+        assert_eq!(
+            pool_waits_of("gates", stdout).expect("a pool-waits line"),
+            PoolWaits {
+                count: 22,
+                total: Duration::from_secs(1411),
+            }
+        );
+    }
+
+    /// A harness that exited without its line did not report its grants: check must fail, not sum without them.
+    #[test]
+    fn a_step_without_its_pool_waits_line_is_an_error() {
+        assert!(pool_waits_of("gates", "skip: no native build dir\n").is_err());
+    }
 }
 
 #[cfg(test)]

@@ -3,14 +3,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 
 use crate::build_pool::{self, Class};
 use crate::harness::StepDone;
-use crate::timing::{self, Timings};
+use crate::timing::{self, PoolWaits, Timings};
 use crate::unit_use::{self, Echo, Units};
 use crate::verdict::{self, Failure, Verdict};
 use crate::{
@@ -486,7 +486,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         crate::verdict::step(&format!("check:{}/{}:{}", i + 1, steps.len(), step.name()));
         eprintln!("== check: {}", step.name());
         let mut started = Instant::now();
-        let mut wait = Duration::ZERO;
+        let pool_before = build_pool::pool_waits_so_far(&ws);
+        // a harness step's grants are queued in its own process: its StepDone carries them
+        let mut harness_waits = PoolWaits::default();
         let cpu = timing::cpu_used();
         // every step ends with one `== check: <step> (<s>) <outcome>` line: the time sits on the line that names the outcome
         let outcome = if let Some(why) = step.skip(&out) {
@@ -497,7 +499,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             let run = match step.class() {
                 None => step.run(root, &out),
                 Some(class) => build_pool::acquire(&ws, root, class).and_then(|grant| {
-                    wait = grant.waited;
+                    // the clock starts at the grant: a class step's queue time is outside its seconds
                     started = Instant::now();
                     eprintln!(
                         "check: {} pool {} cpu {} of {}",
@@ -511,6 +513,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             };
             match run {
                 Ok(done) => {
+                    harness_waits = done.pool_waits;
                     let n = done.undecided.len();
                     undecided.extend(done.undecided.iter().map(ToString::to_string));
                     let open = if n == 0 {
@@ -534,11 +537,12 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         };
         let took = started.elapsed();
         let cpu = timing::cpu_used().saturating_sub(cpu);
-        times.push_step(step.name(), took, wait, cpu);
-        let waited = if wait.is_zero() {
+        let waits = build_pool::pool_waits_so_far(&ws).since(pool_before) + harness_waits;
+        times.push_step(step.name(), took, waits, cpu);
+        let waited = if waits.total.is_zero() {
             String::new()
         } else {
-            format!(", pool wait {}", timing::secs(wait))
+            format!(", pool wait {}", timing::secs(waits.total))
         };
         eprintln!(
             "== check: {} ({}{waited}, cpu {}) {outcome}",

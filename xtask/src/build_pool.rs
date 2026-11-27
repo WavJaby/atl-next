@@ -15,9 +15,11 @@ use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::flock::{Flock, Mode};
+use crate::timing::PoolWaits;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::ws_config::{self, PoolConfig};
@@ -176,8 +178,6 @@ pub struct Grant {
     /// CPU slots the pool has in total.
     pub cpu_of: u32,
     pub mem_gib: u32,
-    /// Time spent queued before the grant: zero when the slots were free (`check times` wait column).
-    pub waited: Duration,
     /// The slot files: their locks are the reservation, released when the grant drops.
     _files: Vec<Flock>,
     /// Thread-bound: the grant marker is per thread, so the grant must drop on the thread that made it.
@@ -239,6 +239,22 @@ pub static ADMITTED_AHEAD: AtomicU64 = AtomicU64::new(0);
 pub static PROMOTED: AtomicU64 = AtomicU64::new(0);
 /// Grants of the reserved interactive slot in this process ([`try_reserved`]).
 pub static RESERVED_GRANTS: AtomicU64 = AtomicU64::new(0);
+/// Queue time of the grants that queued, per pool dir, in this process. One write per queued grant, in [`wait_place`]; a step's share is a difference of two reads ([`pool_waits_so_far`]).
+static POOL_WAITS: Mutex<BTreeMap<PathBuf, PoolWaits>> = Mutex::new(BTreeMap::new());
+
+/// The queued grants of workspace `ws`'s pool in this process so far.
+pub fn pool_waits_so_far(ws: &Path) -> PoolWaits {
+    let tally = POOL_WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+    tally.get(&dir(ws)).copied().unwrap_or_default()
+}
+
+/// The one write per queued grant: the queue time its grant line printed.
+fn record_pool_wait(pool_dir: &Path, took: Duration) {
+    let mut tally = POOL_WAITS.lock().unwrap_or_else(PoisonError::into_inner);
+    let waits = tally.entry(pool_dir.to_path_buf()).or_default();
+    waits.count += 1;
+    waits.total += took;
+}
 
 /// Takes `class` for checkout `who` in workspace `ws`, waiting its turn ([`Tier::of`] `who`). Prints the wait once (`pool: ...`) and the grant when it waited.
 pub fn acquire(ws: &Path, who: &Path, class: Class) -> Result<Grant> {
@@ -363,18 +379,22 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
     } = queued;
     let starve_after = Duration::from_secs(pool.starve_after_s.value.into());
     let mut waited = false;
-    let grant = |cpu: u32, mem_gib: u32, waited: Duration, files: Vec<Flock>, record: String| {
-        HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
-        Grant {
-            class: class.name(),
-            cpu,
-            cpu_of: pool.cpu_slots.value,
-            mem_gib,
-            waited,
-            _files: files,
-            _thread: PhantomData,
-        }
-    };
+    // the one grant constructor: a grant that queued writes its queue time here, the value its grant line printed
+    let grant =
+        |cpu: u32, mem_gib: u32, queued: Option<Duration>, files: Vec<Flock>, record: String| {
+            HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
+            if let Some(took) = queued {
+                record_pool_wait(&dir, took);
+            }
+            Grant {
+                class: class.name(),
+                cpu,
+                cpu_of: pool.cpu_slots.value,
+                mem_gib,
+                _files: files,
+                _thread: PhantomData,
+            }
+        };
     loop {
         // the reserved slot first: it exists for this request, and taking it leaves the shared slots to the queue
         if class == Class::Light
@@ -382,15 +402,14 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
             && let Some(files) = try_reserved(&dir, &pool, &record)?
         {
             let n = RESERVED_GRANTS.fetch_add(1, Ordering::Relaxed) + 1;
-            let took = started.elapsed();
+            let queued = waited.then(|| started.elapsed());
             report(&format!(
                 "pool: light tier interactive granted the reserved slot cpu 1 mem {} after {:.1} s (reserved_grants={n})",
                 w.mem_gib,
-                took.as_secs_f64()
+                queued.unwrap_or_default().as_secs_f64()
             ));
             drop(ticket);
-            let waited = if waited { took } else { Duration::ZERO };
-            return Ok(grant(1, w.mem_gib, waited, files, record));
+            return Ok(grant(1, w.mem_gib, queued, files, record));
         }
         // starvation bound: a ticket waiting past it joins the top tier at its arrival, so later interactive tickets queue behind it
         if let Some(t) = &mut ticket
@@ -431,20 +450,17 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
                     ));
                 }
             }
-            let waited = if waited {
-                let took = started.elapsed();
+            let queued = waited.then(|| started.elapsed());
+            if let Some(took) = queued {
                 report(&format!(
                     "pool: {} granted cpu {cpu} mem {} after {:.1} s",
                     class.name(),
                     w.mem_gib,
                     took.as_secs_f64()
                 ));
-                took
-            } else {
-                Duration::ZERO
-            };
+            }
             drop(ticket);
-            return Ok(grant(cpu, w.mem_gib, waited, files, record));
+            return Ok(grant(cpu, w.mem_gib, queued, files, record));
         }
         if !waited {
             waited = true;
@@ -482,7 +498,6 @@ pub fn try_take_all(ws: &Path, who: &Path) -> Result<std::result::Result<Grant, 
         cpu,
         cpu_of: cpu,
         mem_gib: pool.mem_gib.value,
-        waited: Duration::ZERO,
         _files: files,
         _thread: PhantomData,
     }))
@@ -1125,6 +1140,8 @@ mod tests {
     const STILL_WAITING: Duration = Duration::from_millis(500);
     /// Upper bound on any wait a test expects to end.
     const WAIT: Duration = Duration::from_secs(10);
+    /// How long a holder keeps its slots after a waiter queued: the waiter's queue time is at least this.
+    const HOLD: Duration = Duration::from_millis(100);
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("xtask-pool-{}-{name}", std::process::id()));
@@ -1199,6 +1216,118 @@ mod tests {
             granted,
             release,
         }
+    }
+
+    /// A queued demand grant adds its queue time to the pool's tally, and its grant line prints that same value; a grant that finds the slots free adds nothing.
+    /// The waiter's place is taken before the holder lets go, so the waiter is refused once (it queued) before the hold; each count is hand-written.
+    #[test]
+    fn a_queued_demand_grant_is_counted_with_the_time_its_line_prints() {
+        let ws = scratch_ws(
+            "queued-demand",
+            Some("[pool]\ncpu_slots = 16\nmem_gib = 10\n"),
+        );
+        let before = pool_waits_so_far(&ws);
+        let holder = demand_contender(&ws, "holder", 10);
+        assert_eq!(
+            holder.granted.recv_timeout(WAIT).expect("holder granted"),
+            "mem 10"
+        );
+        let place = enqueue_demand(
+            &ws,
+            Path::new("waiter"),
+            Demand {
+                mem_gib: 5,
+                cores: 1.0,
+            },
+        )
+        .expect("waiter's place");
+        let (refused_tx, refused) = mpsc::channel::<()>();
+        let (done_tx, done) = mpsc::channel::<Vec<String>>();
+        let waiter = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let mut refused_once = false;
+            let grant = place
+                .wait(FAST, &mut |line: &str| {
+                    if !refused_once {
+                        refused_once = true;
+                        let _ = refused_tx.send(());
+                    }
+                    lines.push(line.to_owned());
+                })
+                .expect("waiter granted");
+            drop(grant);
+            let _ = done_tx.send(lines);
+        });
+        refused
+            .recv_timeout(WAIT)
+            .expect("the waiter was refused once, so it queued");
+        std::thread::sleep(HOLD);
+        holder.release.send(()).expect("holder still holds");
+        let lines = done.recv_timeout(WAIT).expect("the waiter's lines");
+        waiter.join().expect("waiter thread");
+        let queued = pool_waits_so_far(&ws).since(before);
+        // hand-written: one queued grant, kept back by the holder for at least HOLD
+        assert_eq!(queued.count, 1, "{queued:?}");
+        assert!(queued.total >= HOLD, "{queued:?}");
+        let granted = lines
+            .iter()
+            .find(|l| l.starts_with("pool: test granted"))
+            .expect("the grant line");
+        assert!(
+            granted.ends_with(&format!("after {:.1} s", queued.total.as_secs_f64())),
+            "{granted} vs {queued:?}"
+        );
+        let quiet = pool_waits_so_far(&ws);
+        let free = acquire_demand(
+            &ws,
+            Path::new("free"),
+            Demand {
+                mem_gib: 5,
+                cores: 1.0,
+            },
+        )
+        .expect("a free pool grants at once");
+        assert_eq!(pool_waits_so_far(&ws).since(quiet), PoolWaits::default());
+        drop(free);
+    }
+
+    /// A build's class grant that queued is counted in the same tally, and its grant line prints the value the tally holds (hand-written: one queued grant, held back at least HOLD).
+    #[test]
+    fn a_queued_class_grant_is_counted_with_the_time_its_line_prints() {
+        let ws = scratch_ws(
+            "queued-class",
+            Some(
+                "[pool]\ncpu_slots = 2\nmem_gib = 1\n[pool.cargo]\ncpu_min = 1\ncpu_max = 1\nmem_gib = 1\n",
+            ),
+        );
+        let before = pool_waits_so_far(&ws);
+        let holder = contender(&ws, "holder", Class::Cargo);
+        assert_eq!(
+            holder.granted.recv_timeout(WAIT).expect("holder granted"),
+            "cpu 1 mem 1"
+        );
+        let waiter = contender(&ws, "waiter", Class::Cargo);
+        let line = waiter.waits.recv_timeout(WAIT).expect("the waiter queued");
+        assert!(line.contains("cargo wants cpu >=1 mem 1 GiB"), "{line}");
+        std::thread::sleep(HOLD);
+        holder.release.send(()).expect("holder still holds");
+        assert_eq!(
+            waiter.granted.recv_timeout(WAIT).expect("waiter granted"),
+            "cpu 1 mem 1"
+        );
+        let queued = pool_waits_so_far(&ws).since(before);
+        assert_eq!(queued.count, 1, "{queued:?}");
+        assert!(queued.total >= HOLD, "{queued:?}");
+        let granted = waiter
+            .waits
+            .try_iter()
+            .find(|l| l.starts_with("pool: cargo granted"))
+            .expect("the grant line");
+        assert!(
+            granted.ends_with(&format!("after {:.1} s", queued.total.as_secs_f64())),
+            "{granted} vs {queued:?}"
+        );
+        waiter.release.send(()).expect("waiter still holds");
     }
 
     /// Two checkouts share one pool's memory: a holds 6 GiB of 10, so b's 5 GiB waits (6 + 5 > 10) and is granted once a releases. Neither claim is refused.

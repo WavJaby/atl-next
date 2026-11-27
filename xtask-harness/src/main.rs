@@ -623,6 +623,12 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
     if let Some(why) = skipped {
         println!("{}{why}", xtask::harness::SKIP_PREFIX);
     }
+    // the grants this process queued: a check step's own process, so check's summary takes them from this line
+    let ws = atl_layout::Layout::of(root)?.workspace().to_owned();
+    println!(
+        "{}",
+        xtask::harness::pool_waits_line(xtask::build_pool::pool_waits_so_far(&ws))
+    );
     Ok(ExitCode::SUCCESS)
 }
 

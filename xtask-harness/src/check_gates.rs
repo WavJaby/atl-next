@@ -537,10 +537,15 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     // every cargo product a row runs, built once before any row starts (gate_build.rs `Group::ALL`), under a cargo grant released before the rows take theirs. The rows read them from the
     // record (`test --prebuilt`) and run no cargo: the guard (`guard_dir`) refuses any cargo call they or their processes make
     let (built, waited, took) = {
-        let grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
+        let queued = build_pool::pool_waits_so_far(&ws);
+        let _grant = build_pool::acquire_quiet_stdout(&ws, root, Class::Cargo)?;
         let started = Instant::now();
         let built = gate_build::ensure(root, out, &Group::ALL)?;
-        (built, grant.waited, started.elapsed())
+        (
+            built,
+            build_pool::pool_waits_so_far(&ws).since(queued),
+            started.elapsed(),
+        )
     };
     let record_file = logs.join(RECORD_FILE);
     built.record().write(&record_file)?;
@@ -553,7 +558,7 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     eprintln!(
         "gates: prebuild {:.1}s (pool wait {:.1}s, {} products, {} record entries)",
         took.as_secs_f64(),
-        waited.as_secs_f64(),
+        waited.total.as_secs_f64(),
         products.len(),
         built.record().entries()
     );
