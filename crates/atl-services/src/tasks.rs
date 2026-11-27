@@ -645,7 +645,7 @@ mod tests {
         let sized = t.new_task(7, "com.example.app", three_quarters());
         let fresh = t.new_task(8, "com.example.other", three_quarters());
         t.set_size(sized, size(1000, 700));
-        let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0);
+        let monitor = DisplayModel::from_monitor(1920, 1080, Some(60.0), 2.0, 0, None);
         assert_eq!(
             t.set_monitor(monitor),
             Ok((DisplayChange::Config(vec![sized, fresh]), monitor))
@@ -659,7 +659,7 @@ mod tests {
             Ok((DisplayChange::Unchanged, monitor))
         );
         assert_eq!(t.config_seq(sized), 2);
-        let faster = DisplayModel::from_monitor(1920, 1080, Some(120.0), 2.0, 0);
+        let faster = DisplayModel::from_monitor(1920, 1080, Some(120.0), 2.0, 0, None);
         assert_eq!(t.set_monitor(faster), Ok((DisplayChange::Refresh, faster)));
         assert_eq!(t.display().refresh_hz, 120.0);
         assert_eq!((t.config_seq(sized), t.config_seq(fresh)), (2, 1));
@@ -668,14 +668,14 @@ mod tests {
     /// The laptop declared 411x914 dp shows 658x1462 px (see display_model.rs). A monitor at scale 5 (800 dpi) would need 4570 px on a side: refused, and the state stays.
     #[test]
     fn declared_display_follows_the_monitor_density_and_a_refusal_keeps_the_state() {
-        let laptop = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let laptop = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0, None);
         let declared = Declaration {
             width_dp: 411,
             height_dp: 914,
         };
         let t: Tasks<Handle> = Tasks::new(laptop, Some(declared), None).expect("in range");
         assert_eq!((t.display().width, t.display().height), (658, 1462));
-        let too_dense = DisplayModel::from_monitor(2560, 1600, None, 5.0, 0);
+        let too_dense = DisplayModel::from_monitor(2560, 1600, None, 5.0, 0, None);
         assert!(t.set_monitor(too_dense).is_err());
         let kept = t.display();
         assert_eq!(kept.width, 658);
@@ -695,7 +695,7 @@ mod tests {
             min_aspect: None,
             max_aspect: None,
         };
-        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0, None);
         let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
         assert_eq!(t.opening_size(&landscape), size(411, 914));
         let full = t.new_task(7, "com.example.app", t.opening_size(&landscape));
@@ -719,7 +719,7 @@ mod tests {
             width_dp: 411,
             height_dp: 914,
         };
-        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0, None);
         let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
         let task = t.new_task(7, "com.example.app", size(411, 914));
         assert_eq!(
@@ -752,7 +752,7 @@ mod tests {
             width_dp: 411,
             height_dp: 914,
         };
-        let at = |scale| DisplayModel::from_monitor(2560, 1600, Some(120.0), scale, 0);
+        let at = |scale| DisplayModel::from_monitor(2560, 1600, Some(120.0), scale, 0, None);
         let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
         let task = t.new_task(7, "com.example.app", size(411, 914));
         t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch");
@@ -775,7 +775,7 @@ mod tests {
             width_dp: 411,
             height_dp: 914,
         };
-        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0);
+        let at = |scale| DisplayModel::from_monitor(1920, 1200, Some(60.0), scale, 0, None);
         let t: Tasks<Handle> = Tasks::new(at(1.0), Some(declared), None).expect("in range");
         t.request_orientation(SCREEN_ORIENTATION_LANDSCAPE, "launch");
         assert_eq!(

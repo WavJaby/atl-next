@@ -21,7 +21,7 @@ pub use atl_compositor::scene::Scene;
 /// The DRM device a buffer was allocated on (gralloc handle): what [`Ui::attach`] is told the presented buffers must carry.
 pub use atl_gralloc::handle::DeviceNumber;
 /// The value types the host side shares (a window's monitor is the same type atld reads).
-pub use atl_platform_types::{Monitor, PhysSize, Rotation, Scale};
+pub use atl_platform_types::{MmSize, Monitor, PhysSize, Rotation, Scale};
 
 /// A position in physical pixels from the window content's top-left corner; fractional because pointers report sub-pixel positions.
 #[repr(C)]

@@ -204,11 +204,26 @@ impl DisplayManager {
     }
 }
 
+/// Millimetres per inch: the unit of the panel's size (`DisplayModel::physical_mm`) and of the dpi.
+const MM_PER_INCH: f64 = 25.4;
+
+/// AOSP LocalDisplayAdapter: the panel's dpi per natural axis (the mode's xDpi / yDpi = natural px x 25.4 / panel mm), so a turned panel keeps its own x and y (DisplayInfo.physicalXDpi is not swapped
+/// by rotation). No panel size (an overlay display, or a host reporting 0 mm): the density, as OverlayDisplayAdapter's xdpi = densityDpi (case (c)).
+pub fn physical_dpi(m: &DisplayModel) -> (f32, f32) {
+    let Some((width_mm, height_mm)) = m.physical_mm else {
+        return (m.dpi as f32, m.dpi as f32);
+    };
+    let (width, height) = m.natural_size();
+    let dpi = |px: i32, mm: u32| (f64::from(px) * MM_PER_INCH / f64::from(mm)) as f32;
+    (dpi(width, width_mm), dpi(height, height_mm))
+}
+
 /// The DisplayInfo of the model's display: its shown size as the app area and the logical size (no insets), its rotation, its one mode (the panel's natural size; refresh rate as both peak and vsync rate), its density
-/// (logicalDensityDpi, and physical dpi equal to it: no physical size is known), the state ON, the panel's kind TYPE_INTERNAL, the app vsync offset and presentation deadline the compositor's mode reports
+/// (logicalDensityDpi), its physical dpi ([`physical_dpi`]), the state ON, the panel's kind TYPE_INTERNAL, the app vsync offset and presentation deadline the compositor's mode reports
 /// (LocalDisplayAdapter copies them from SurfaceFlinger's mode). Values with no source in the model (unique id, brightness, owner) are test values until the platform layer supplies them; nested parcelables the codec does not model stay null.
 pub fn display_info(m: &DisplayModel) -> DisplayInfo {
     let (natural_width, natural_height) = m.natural_size();
+    let (physical_x_dpi, physical_y_dpi) = physical_dpi(m);
     let mode = DisplayMode {
         mode_id: MODE_ID,
         width: natural_width,
@@ -245,8 +260,8 @@ pub fn display_info(m: &DisplayModel) -> DisplayInfo {
         color_mode: COLOR_MODE_DEFAULT,
         supported_color_modes: vec![COLOR_MODE_DEFAULT],
         logical_density_dpi: m.dpi,
-        physical_x_dpi: m.dpi as f32,
-        physical_y_dpi: m.dpi as f32,
+        physical_x_dpi,
+        physical_y_dpi,
         state: STATE_ON,
         committed_state: STATE_ON,
         remove_mode: REMOVE_MODE_MOVE_CONTENT_TO_PRIMARY,
@@ -290,4 +305,57 @@ pub fn new_binder(
         BinderFeatures::default(),
     )
     .as_binder()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atl_services_types::display_model::Declaration;
+
+    /// A 2880x1800 panel of 302x189 mm: 2880 x 25.4 / 302 = 242.2 dpi across, 1800 x 25.4 / 189 = 241.9 dpi down (hand values, to 0.1). The density (256) is not the panel's dpi.
+    #[test]
+    fn physical_dpi_is_natural_px_over_panel_mm() {
+        let m = DisplayModel {
+            width: 2880,
+            height: 1800,
+            dpi: 256,
+            physical_mm: Some((302, 189)),
+            ..DisplayModel::default()
+        };
+        let (x, y) = physical_dpi(&m);
+        assert!((x - 242.2).abs() < 0.05, "{x}");
+        assert!((y - 241.9).abs() < 0.05, "{y}");
+        let info = display_info(&m);
+        assert_eq!((info.physical_x_dpi, info.physical_y_dpi), (x, y));
+        assert_eq!(info.logical_density_dpi, 256);
+    }
+
+    /// A quarter-turned panel shows 1800x2880 but its natural size is 2880x1800: the dpi is per natural axis, so the same 242.2 across and 241.9 down.
+    #[test]
+    fn physical_dpi_is_per_natural_axis_when_turned() {
+        let shown = DisplayModel::from_monitor(1800, 2880, None, 1.6, 1, Some((302, 189)));
+        let (x, y) = physical_dpi(&shown);
+        assert!((x - 242.2).abs() < 0.05, "{x}");
+        assert!((y - 241.9).abs() < 0.05, "{y}");
+    }
+
+    /// No panel size (a host that reports 0 mm, or a declared display with no panel): the physical dpi is the density on both axes.
+    #[test]
+    fn no_panel_size_is_the_density() {
+        let unknown = DisplayModel {
+            dpi: 256,
+            ..DisplayModel::default()
+        };
+        assert_eq!(physical_dpi(&unknown), (256.0, 256.0));
+        let declared = DisplayModel::of(
+            DisplayModel::from_monitor(2880, 1800, None, 1.6, 0, Some((302, 189))),
+            Some(Declaration {
+                width_dp: 411,
+                height_dp: 914,
+            }),
+        )
+        .expect("411x914 dp is in bounds");
+        assert_eq!(declared.physical_mm, None);
+        assert_eq!(physical_dpi(&declared), (256.0, 256.0));
+    }
 }

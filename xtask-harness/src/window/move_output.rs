@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn scaled_output_is_density_256() {
         let o = SCALED_OUTPUT;
-        let d = DisplayModel::from_monitor(o.width as u32, o.height as u32, None, o.scale, 0);
+        let d = DisplayModel::from_monitor(o.width as u32, o.height as u32, None, o.scale, 0, None);
         assert_eq!(d.dpi, 256);
     }
 

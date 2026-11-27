@@ -56,6 +56,8 @@ impl Output {
             Some(self.refresh_mhz as f32 / 1000.0),
             self.scale,
             ((4 - ccw) % 4) as u8,
+            // a headless output has no panel: its physical dpi is the density
+            None,
         )
     }
 }

@@ -34,7 +34,7 @@ pub fn period_ns(refresh_hz: f32) -> i64 {
 }
 
 /// The default display: size in pixels as shown now (a quarter-turned panel's sides swapped: DisplayInfo.logicalWidth/Height), refresh rate in Hz, density in dots per inch (DisplayMetrics.densityDpi),
-/// rotation (Surface.ROTATION_*, the compositor's output transform: platform layer `Monitor::rotation`).
+/// rotation (Surface.ROTATION_*, the compositor's output transform: platform layer `Monitor::rotation`), the panel's size in mm when known (`physical_mm`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayModel {
     pub width: i32,
@@ -42,10 +42,12 @@ pub struct DisplayModel {
     pub refresh_hz: f32,
     pub dpi: i32,
     pub rotation: i32,
+    /// The panel's width and height in mm, natural orientation (the platform's `Monitor::physical_mm`); `None`: unknown (the host reports 0) or a declared display (no panel: AOSP's overlay). Source of the physical dpi (display.rs `physical_dpi`).
+    pub physical_mm: Option<(u32, u32)>,
 }
 
 impl Default for DisplayModel {
-    /// 1280x800 at 60 Hz, 160 dpi (density 1), unrotated: a test value, not the desktop's.
+    /// 1280x800 at 60 Hz, 160 dpi (density 1), unrotated, no panel size: a test value, not the desktop's.
     fn default() -> Self {
         DisplayModel {
             width: 1280,
@@ -53,19 +55,22 @@ impl Default for DisplayModel {
             refresh_hz: 60.0,
             dpi: DENSITY_DEFAULT,
             rotation: ROTATION_0,
+            physical_mm: None,
         }
     }
 }
 
 impl DisplayModel {
-    /// The monitor as Android's display: its mode in physical pixels, its rate (`None`: the default's), and density `160 x scale` (maintainer, 2026-11-05: 1 dp = 1 desktop logical pixel; the panel's
-    /// physical DPI is not used). The scale is physical per logical pixel (Wayland `wp_fractional_scale_v1` / GDK monitor scale). `quarter_turns` is the rotation (clockwise, Surface.ROTATION_*), taken mod 4.
+    /// The monitor as Android's display: its mode in physical pixels, its rate (`None`: the default's), and density `160 x scale` (maintainer, 2026-11-05: 1 dp = 1 desktop logical pixel; the density is
+    /// not the panel's dpi, which is `physical_dpi` from `physical_mm`). The scale is physical per logical pixel (Wayland `wp_fractional_scale_v1` / GDK monitor scale). `quarter_turns` is the rotation (clockwise,
+    /// Surface.ROTATION_*), taken mod 4. `physical_mm`: the panel's size, `None` or a zero side = unknown.
     pub fn from_monitor(
         width: u32,
         height: u32,
         refresh_hz: Option<f32>,
         scale: f64,
         quarter_turns: u8,
+        physical_mm: Option<(u32, u32)>,
     ) -> Self {
         let clamp = |v: u32| i32::try_from(v).unwrap_or(i32::MAX).max(1);
         DisplayModel {
@@ -74,6 +79,7 @@ impl DisplayModel {
             refresh_hz: refresh_hz.unwrap_or(DisplayModel::default().refresh_hz),
             dpi: (f64::from(DENSITY_DEFAULT) * scale).round().max(1.0) as i32,
             rotation: i32::from(quarter_turns % 4),
+            physical_mm: physical_mm.filter(|&(w, h)| w > 0 && h > 0),
         }
     }
 
@@ -114,26 +120,40 @@ impl DisplayModel {
         }
     }
 
-    /// `WxH@hz,dpi,rotation`, e.g. `1920x1080@59.94,240,1`. Sizes, rate and dpi must be positive, the rotation a Surface.ROTATION_* value (0..=3).
+    /// `WxH@hz,dpi,rotation[,mmW,mmH]`, e.g. `1920x1080@59.94,240,1`, or `2880x1800@120,256,0,302,189` with the panel's size. Sizes, rate and dpi must be positive, the rotation a Surface.ROTATION_* value (0..=3),
+    /// a panel side positive.
     pub fn parse_arg(s: &str) -> Result<Self, String> {
-        let bad = || format!("{s}: not WxH@hz,dpi,rotation");
+        let bad = || format!("{s}: not WxH@hz,dpi,rotation[,mmW,mmH]");
         let (size, rest) = s.split_once('@').ok_or_else(bad)?;
         let (w, h) = size.split_once('x').ok_or_else(bad)?;
-        let (hz, rest) = rest.split_once(',').ok_or_else(bad)?;
-        let (dpi, rotation) = rest.split_once(',').ok_or_else(bad)?;
+        let fields: Vec<&str> = rest.split(',').collect();
+        let (hz, dpi, rotation, panel) = match fields[..] {
+            [hz, dpi, rotation] => (hz, dpi, rotation, None),
+            [hz, dpi, rotation, mm_w, mm_h] => (hz, dpi, rotation, Some((mm_w, mm_h))),
+            _ => return Err(bad()),
+        };
+        let physical_mm = match panel {
+            Some((mm_w, mm_h)) => Some((
+                mm_w.parse().map_err(|_| bad())?,
+                mm_h.parse().map_err(|_| bad())?,
+            )),
+            None => None,
+        };
         let model = DisplayModel {
             width: w.parse().map_err(|_| bad())?,
             height: h.parse().map_err(|_| bad())?,
             refresh_hz: hz.parse().map_err(|_| bad())?,
             dpi: dpi.parse().map_err(|_| bad())?,
             rotation: rotation.parse().map_err(|_| bad())?,
+            physical_mm,
         };
-        // NaN fails the refresh-rate test too
+        // NaN fails the refresh-rate test too; to_arg omits an unknown panel size, so a zero side is refused
         if model.width > 0
             && model.height > 0
             && model.refresh_hz > 0.0
             && model.dpi > 0
             && (ROTATION_0..=ROTATION_270).contains(&model.rotation)
+            && physical_mm.is_none_or(|(mm_w, mm_h)| mm_w > 0 && mm_h > 0)
         {
             Ok(model)
         } else {
@@ -141,10 +161,13 @@ impl DisplayModel {
         }
     }
 
-    /// The `WxH@hz,dpi,rotation` form of this model: what atld passes on as `--monitor`, and what the registry carries.
+    /// The `WxH@hz,dpi,rotation[,mmW,mmH]` form of this model: what atld passes on as `--monitor`, and what the registry carries.
     pub fn to_arg(&self) -> String {
+        let panel = self
+            .physical_mm
+            .map_or_else(String::new, |(mm_w, mm_h)| format!(",{mm_w},{mm_h}"));
         format!(
-            "{}x{}@{},{},{}",
+            "{}x{}@{},{},{}{panel}",
             self.width, self.height, self.refresh_hz, self.dpi, self.rotation
         )
     }
@@ -185,7 +208,8 @@ impl Declaration {
 
 impl DisplayModel {
     /// The display every reader takes: the monitor itself with no declaration. Declared: the dp size at the monitor's density (px = round(dp x dpi / 160)), the monitor's dpi and refresh,
-    /// rotation 0 (the monitor's turn is how the panel is mounted, invisible to the app). Refused when a side falls outside MIN_PX..=MAX_PX.
+    /// rotation 0 (the monitor's turn is how the panel is mounted, invisible to the app), no panel size (an overlay display has none: xdpi = densityDpi, AOSP OverlayDisplayAdapter).
+    /// Refused when a side falls outside MIN_PX..=MAX_PX.
     pub fn of(monitor: DisplayModel, declared: Option<Declaration>) -> Result<Self, String> {
         let Some(declared) = declared else {
             return Ok(monitor);
@@ -210,6 +234,7 @@ impl DisplayModel {
             refresh_hz: monitor.refresh_hz,
             dpi: monitor.dpi,
             rotation: ROTATION_0,
+            physical_mm: None,
         })
     }
 }
@@ -243,21 +268,21 @@ mod tests {
     /// The maintainer's laptop (2560x1600, 120 Hz, scale 1.6): 1 dp = 1 logical px, so 160 x 1.6 = 256 dpi; scale 1 is mdpi (160); 1.25 is 200; a rate the monitor does not report keeps the default's.
     #[test]
     fn monitor_values_and_density_from_scale() {
-        let m = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let m = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0, None);
         assert_eq!(
             (m.width, m.height, m.refresh_hz, m.dpi),
             (2560, 1600, 120.0, 256)
         );
         assert_eq!(
-            DisplayModel::from_monitor(1920, 1080, None, 1.0, 0).dpi,
+            DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, None).dpi,
             160
         );
         assert_eq!(
-            DisplayModel::from_monitor(1920, 1080, None, 1.25, 0).dpi,
+            DisplayModel::from_monitor(1920, 1080, None, 1.25, 0, None).dpi,
             200
         );
         assert_eq!(
-            DisplayModel::from_monitor(1920, 1080, None, 1.0, 0).refresh_hz,
+            DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, None).refresh_hz,
             DisplayModel::default().refresh_hz
         );
     }
@@ -265,11 +290,11 @@ mod tests {
     /// The laptop in portrait (a quarter turn): the shown size is 1600x2560, the panel's natural size stays 2560x1600; a half turn keeps the sides.
     #[test]
     fn rotation_and_natural_size() {
-        let p = DisplayModel::from_monitor(1600, 2560, None, 1.6, 1);
+        let p = DisplayModel::from_monitor(1600, 2560, None, 1.6, 1, None);
         assert_eq!((p.rotation, p.natural_size()), (1, (2560, 1600)));
-        let p = DisplayModel::from_monitor(1600, 2560, None, 1.6, 3);
+        let p = DisplayModel::from_monitor(1600, 2560, None, 1.6, 3, None);
         assert_eq!(p.natural_size(), (2560, 1600));
-        let f = DisplayModel::from_monitor(2560, 1600, None, 1.6, 2);
+        let f = DisplayModel::from_monitor(2560, 1600, None, 1.6, 2, None);
         assert_eq!((f.rotation, f.natural_size()), (2, (2560, 1600)));
     }
 
@@ -283,6 +308,7 @@ mod tests {
             refresh_hz: 120.0,
             dpi: 256,
             rotation: 0,
+            physical_mm: None,
         };
         let turned = unturned.turned(1);
         assert_eq!(
@@ -293,6 +319,7 @@ mod tests {
                 refresh_hz: 120.0,
                 dpi: 256,
                 rotation: 1,
+                physical_mm: None,
             }
         );
         assert_eq!(turned.natural_size(), (658, 1462));
@@ -337,6 +364,10 @@ mod tests {
             "1280x800@60,160,4",
             "1280x800@60,160,-1",
             "axb@60,160,0",
+            "1280x800@60,160,0,302",
+            "1280x800@60,160,0,302,0",
+            "1280x800@60,160,0,302,189,1",
+            "1280x800@60,160,0,302,x",
         ] {
             let e = DisplayModel::parse_arg(bad).expect_err(bad);
             assert!(e.starts_with(bad), "{e}");
@@ -347,7 +378,7 @@ mod tests {
     /// formula dp = px x 160 / dpi: 658 -> 411.25 -> 411, 1462 -> 913.75 -> 914.
     #[test]
     fn declared_size_at_the_monitor_density() {
-        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0, None);
         let d = DisplayModel::of(
             monitor,
             Some(Declaration {
@@ -367,7 +398,7 @@ mod tests {
     /// At scale 1 (160 dpi) the declared dp are the px. A monitor turned a quarter turn keeps the declared sides and gets rotation 0.
     #[test]
     fn declared_size_at_mdpi_ignores_the_monitor_turn() {
-        let monitor = DisplayModel::from_monitor(1080, 1920, None, 1.0, 1);
+        let monitor = DisplayModel::from_monitor(1080, 1920, None, 1.0, 1, None);
         let d = DisplayModel::of(
             monitor,
             Some(Declaration {
@@ -382,14 +413,51 @@ mod tests {
     /// No declaration: the display is the monitor itself, turn and refresh included.
     #[test]
     fn no_declaration_is_the_monitor() {
-        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 1);
+        let monitor = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 1, None);
         assert_eq!(DisplayModel::of(monitor, None), Ok(monitor));
+    }
+
+    /// The panel's size is the monitor's and turns with it (the natural size is the panel's), and it is kept with no declaration; the declared display has none: an overlay has no panel, so xdpi = densityDpi.
+    #[test]
+    fn panel_mm_is_the_monitors_and_the_declared_display_has_none() {
+        let monitor = DisplayModel::from_monitor(2880, 1800, Some(120.0), 1.6, 1, Some((302, 189)));
+        assert_eq!(monitor.physical_mm, Some((302, 189)));
+        assert_eq!(monitor.turned(3).physical_mm, Some((302, 189)));
+        assert_eq!(DisplayModel::of(monitor, None), Ok(monitor));
+        let declared = DisplayModel::of(
+            monitor,
+            Some(Declaration {
+                width_dp: 411,
+                height_dp: 914,
+            }),
+        )
+        .expect("in range");
+        assert_eq!(declared.physical_mm, None);
+    }
+
+    /// A panel side of 0 is no panel size (headless outputs report 0): from_monitor keeps none, and to_arg writes the 4-field form.
+    #[test]
+    fn zero_panel_side_is_no_panel() {
+        let m = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, Some((0, 189)));
+        assert_eq!(m.physical_mm, None);
+        assert_eq!(m.to_arg(), "1920x1080@60,160,0");
+    }
+
+    /// The panel's size rides the wire as `,mmW,mmH` after the rotation and round-trips; the 4-field form (no panel) parses to None.
+    #[test]
+    fn panel_mm_rides_the_wire() {
+        let m = DisplayModel::parse_arg("2880x1800@120,256,0,302,189").expect("parse");
+        assert_eq!(m.physical_mm, Some((302, 189)));
+        assert_eq!(m.to_arg(), "2880x1800@120,256,0,302,189");
+        assert_eq!(DisplayModel::parse_arg(&m.to_arg()).expect("parse"), m);
+        let bare = DisplayModel::parse_arg("2880x1800@120,256,0").expect("parse");
+        assert_eq!(bare.physical_mm, None);
     }
 
     /// The overlay bounds: 100 and 4096 px are accepted on each side, one px beyond either bound is refused. At mdpi px = dp.
     #[test]
     fn declared_sides_are_bounded_as_overlay_displays() {
-        let mdpi = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0);
+        let mdpi = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, None);
         let at = |width_dp, height_dp| {
             DisplayModel::of(
                 mdpi,

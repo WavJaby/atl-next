@@ -17,7 +17,8 @@ use atl_libgui_parcel::state::FloatRect;
 use crate::audio::AudioError;
 use crate::webview::{CookiePolicy, WebSetting};
 use crate::{
-    LooperPoster, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent, UiError,
+    LooperPoster, MmSize, Monitor, Painted, PhysSize, QuadRelease, Rotation, Scale, TextInputEvent,
+    UiError,
 };
 
 /// The module's file name, found by the dynamic loader's search path (the runtime library dir the process's `LD_LIBRARY_PATH` names, as for the GL driver).
@@ -537,7 +538,7 @@ impl WindowAttributesView {
     }
 }
 
-/// [`Monitor`] (its `Option<f32>` has no C layout).
+/// [`Monitor`] (its `Option`s have no C layout: `has_refresh` flags `refresh_hz`, a zero `physical_mm` is no panel size).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MonitorView {
@@ -546,6 +547,7 @@ pub struct MonitorView {
     has_refresh: bool,
     scale: f64,
     rotation: Rotation,
+    physical_mm: MmSize,
 }
 
 impl MonitorView {
@@ -557,6 +559,7 @@ impl MonitorView {
             has_refresh: m.refresh_hz.is_some(),
             scale: m.scale.get(),
             rotation: m.rotation,
+            physical_mm: m.physical_mm.unwrap_or_default(),
         }
     }
 
@@ -568,6 +571,7 @@ impl MonitorView {
             // a view is made from a valid Scale, so `new` refuses nothing here
             scale: Scale::new(self.scale).unwrap_or(Scale::ONE),
             rotation: self.rotation,
+            physical_mm: (self.physical_mm != MmSize::default()).then_some(self.physical_mm),
         }
     }
 }

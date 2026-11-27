@@ -1035,7 +1035,7 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
     let rotation = outputs::rotation(connector.as_deref());
     let surface_scale = shared.surface_scale.get();
     tracing::info!(
-        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}, surface scale {:?}, rotation {:?}",
+        "atl-platform-ui: window on monitor {} {}x{} at {},{} logical, {} mHz, scale {}, surface scale {:?}, rotation {:?}, panel {}x{} mm",
         connector.as_deref().unwrap_or_default(),
         g.width(),
         g.height(),
@@ -1044,7 +1044,9 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
         m.refresh_rate(),
         m.scale(),
         surface_scale,
-        rotation
+        rotation,
+        m.width_mm(),
+        m.height_mm()
     );
     let Some(mut monitor) = reported_monitor(
         g.width(),
@@ -1052,14 +1054,26 @@ fn report_monitor(shared: &Shared, m: &gdk::Monitor) {
         m.refresh_rate(),
         m.scale(),
         surface_scale,
+        m.width_mm(),
+        m.height_mm(),
     ) else {
         return;
     };
+    if monitor.physical_mm.is_none() {
+        // the density stands in for the physical dpi (atl-services display.rs); once per process, not per report
+        static NO_PANEL: std::sync::Once = std::sync::Once::new();
+        NO_PANEL.call_once(|| {
+            tracing::info!(
+                "atl-platform-ui: monitor {} reports no panel size: physical dpi = density",
+                connector.as_deref().unwrap_or_default()
+            )
+        });
+    }
     monitor.rotation = rotation;
     shared.on_monitor.call(|f| f(monitor));
 }
 
-/// The monitor a window reports, from GDK's monitor (logical size, milli-Hz, scale) and the window surface's scale. Size: logical x the monitor's scale (Monitor::from_desktop; the host side converts
+/// The monitor a window reports, from GDK's monitor (logical size, milli-Hz, scale, panel mm) and the window surface's scale. Size: logical x the monitor's scale (Monitor::from_desktop; the host side converts
 /// with the same function) = the mode, with or without xdg-output. Scale (-> density): the surface's fractional scale when it has one ([`crate::view::output_scale`]), else the monitor's.
 /// Why not the monitor's alone: without zxdg_output_manager_v1 (Hyprland withholds it from security-context clients, which every app process is) GDK knows only wl_output's integer scale, 2 on a
 /// 1.6 output, and its logical size is the mode / 2; the density then disagreed with atld's own (unsandboxed) reading of the same monitor, and the app saw a density change at start.
@@ -1069,8 +1083,17 @@ fn reported_monitor(
     millihz: i32,
     monitor_scale: f64,
     surface_scale: Option<f64>,
+    width_mm: i32,
+    height_mm: i32,
 ) -> Option<Monitor> {
-    let mut monitor = Monitor::from_desktop(logical_width, logical_height, millihz, monitor_scale)?;
+    let mut monitor = Monitor::from_desktop(
+        logical_width,
+        logical_height,
+        millihz,
+        monitor_scale,
+        width_mm,
+        height_mm,
+    )?;
     monitor.scale = Scale::new(crate::view::output_scale(
         surface_scale,
         Some(monitor_scale),
@@ -1191,8 +1214,8 @@ mod tests {
     /// surface's fractional scale was 1.6; atld's own connection said 1800 x 1125 at 1.6. Both must give the mode and scale 1.6 (density 160 x 1.6 = 256, not 160 x 2 = 320).
     #[test]
     fn no_xdg_output_reports_the_fractional_scale() {
-        let sandboxed = reported_monitor(1440, 900, 120_000, 2.0, Some(1.6)).unwrap();
-        let host = reported_monitor(1800, 1125, 120_000, 1.6, Some(1.6)).unwrap();
+        let sandboxed = reported_monitor(1440, 900, 120_000, 2.0, Some(1.6), 0, 0).unwrap();
+        let host = reported_monitor(1800, 1125, 120_000, 1.6, Some(1.6), 0, 0).unwrap();
         for m in [sandboxed, host] {
             assert_eq!((m.size.width, m.size.height), (2880, 1800));
             assert_eq!(m.scale.get(), 1.6);
@@ -1202,12 +1225,24 @@ mod tests {
     /// Before the fractional scale arrives (or on an integer output) the surface's scale is an integer: the monitor's scale stands.
     #[test]
     fn an_integer_surface_scale_leaves_the_monitor_scale() {
-        let m = reported_monitor(1920, 1200, 60_000, 1.5, Some(2.0)).unwrap();
+        let m = reported_monitor(1920, 1200, 60_000, 1.5, Some(2.0), 0, 0).unwrap();
         assert_eq!(m.scale.get(), 1.5);
-        let m = reported_monitor(1440, 900, 60_000, 2.0, None).unwrap();
+        let m = reported_monitor(1440, 900, 60_000, 2.0, None, 0, 0).unwrap();
         assert_eq!(
             (m.size.width, m.size.height, m.scale.get()),
             (2880, 1800, 2.0)
         );
+    }
+
+    /// GDK's panel size in mm rides with the monitor as reported; 0 on either side is no panel (headless outputs), so `physical_mm` is None and the density stands in.
+    #[test]
+    fn the_panel_mm_is_carried_or_unknown() {
+        let panel = reported_monitor(1800, 1125, 120_000, 1.6, Some(1.6), 302, 189).unwrap();
+        assert_eq!(
+            panel.physical_mm.map(|mm| (mm.width, mm.height)),
+            Some((302, 189))
+        );
+        let headless = reported_monitor(1920, 1200, 60_000, 1.0, None, 0, 0).unwrap();
+        assert_eq!(headless.physical_mm, None);
     }
 }

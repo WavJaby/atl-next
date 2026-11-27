@@ -343,8 +343,8 @@ mod tests {
     #[test]
     fn the_monitor_goes_first_and_needs_no_task() {
         let mut p = Pending::default();
-        let first = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0);
-        let second = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0);
+        let first = DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, None);
+        let second = DisplayModel::from_monitor(2560, 1600, Some(120.0), 1.6, 0, None);
         p.size = Some(size(800, 600));
         p.monitor = Some(first);
         p.monitor = Some(second);
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn a_monitor_posts_before_the_task_is_named() {
         let mut p = Pending::default();
-        p.monitor = Some(DisplayModel::from_monitor(1920, 1080, None, 1.0, 0));
+        p.monitor = Some(DisplayModel::from_monitor(1920, 1080, None, 1.0, 0, None));
         assert!(p.needs_flush(), "a monitor needs no Task");
         assert!(matches!(p.next(), Some(Report::Monitor(_))));
         assert!(p.next().is_none());

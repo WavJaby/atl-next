@@ -464,6 +464,7 @@ fn wire(window: Rc<PlatformWindow>, splash_started: Option<Instant>) {
                 m.refresh_hz,
                 m.scale.get(),
                 m.rotation.quarter_turns(),
+                m.physical_mm.map(|mm| (mm.width, mm.height)),
             );
             monitors.submit_monitor(model);
         });

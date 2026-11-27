@@ -401,7 +401,13 @@ fn host_monitor() -> DisplayModel {
                 m.refresh_hz,
                 m.scale.get(),
                 m.rotation.quarter_turns(),
+                m.physical_mm.map(|mm| (mm.width, mm.height)),
             );
+            if m.physical_mm.is_none() {
+                log(format_args!(
+                    "display: the monitor reports no panel size: physical dpi = density"
+                ));
+            }
             log(format_args!("display: monitor {m:?} -> {}", model.to_arg()));
             model
         }

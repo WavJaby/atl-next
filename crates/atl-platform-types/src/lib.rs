@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Value types both platform halves share: the app side (atl-platform-ui-api: a window's monitor) and the host side (atl-platform-host-api: the desktop's monitors for atld). One definition, so the two sides cannot disagree on a monitor.
-//! Sizes are physical pixels with an explicit [`Scale`]; [`Monitor::from_desktop`] is the one conversion from a desktop's report (logical size, milli-Hz, scale factor), used by every `-<os>` implementation.
+//! Sizes are physical pixels with an explicit [`Scale`]; [`Monitor::from_desktop`] is the one conversion from a desktop's report (logical size, milli-Hz, scale factor, panel mm), used by every `-<os>` implementation.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -72,7 +72,18 @@ impl Rotation {
     }
 }
 
-/// A monitor as the desktop reports it: its mode in physical pixels (as the desktop shows it, so a quarter-turned panel's sides are swapped), its refresh rate, its scale, its rotation.
+/// A monitor's panel size in millimetres, as the desktop reports it (wl_output geometry; GDK's `width_mm` / `height_mm`), in the panel's natural orientation: the output transform does not turn it.
+/// `repr(C)`: crosses the platform module's C ABI (atl-platform-ui-api `abi`) as it is.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MmSize {
+    /// Width in millimetres.
+    pub width: u32,
+    /// Height in millimetres.
+    pub height: u32,
+}
+
+/// A monitor as the desktop reports it: its mode in physical pixels (as the desktop shows it, so a quarter-turned panel's sides are swapped), its refresh rate, its scale, its rotation, its panel size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Monitor {
     /// The mode in physical pixels.
@@ -83,18 +94,23 @@ pub struct Monitor {
     pub scale: Scale,
     /// [`Rotation::Deg0`] from [`Monitor::from_desktop`]: the implementation sets it where the desktop reports one.
     pub rotation: Rotation,
+    /// The panel's size; `None` where the desktop reports 0 (headless and virtual outputs have no panel). The density stands in for the physical dpi then (atl-services display.rs).
+    pub physical_mm: Option<MmSize>,
 }
 
 impl Monitor {
-    /// A desktop's report as a monitor: `logical_width` x `logical_height` at `scale` (each side rounded to the nearest physical pixel; a negative side is 0), `millihz` (0 or negative: unknown). `None` for an unusable scale (see [`Scale::new`]).
+    /// A desktop's report as a monitor: `logical_width` x `logical_height` at `scale` (each side rounded to the nearest physical pixel; a negative side is 0), `millihz` (0 or negative: unknown), `width_mm` x `height_mm` (0 or negative on either side: no panel size). `None` for an unusable scale (see [`Scale::new`]).
     pub fn from_desktop(
         logical_width: i32,
         logical_height: i32,
         millihz: i32,
         scale: f64,
+        width_mm: i32,
+        height_mm: i32,
     ) -> Option<Monitor> {
         let scale = Scale::new(scale)?;
         let physical = |logical: i32| scale.to_physical(f64::from(logical.max(0))).round() as u32;
+        let mm = |side: i32| u32::try_from(side).ok().filter(|&side| side > 0);
         Some(Monitor {
             size: PhysSize {
                 width: physical(logical_width),
@@ -103,6 +119,10 @@ impl Monitor {
             refresh_hz: (millihz > 0).then(|| millihz as f32 / 1000.0),
             scale,
             rotation: Rotation::Deg0,
+            physical_mm: match (mm(width_mm), mm(height_mm)) {
+                (Some(width), Some(height)) => Some(MmSize { width, height }),
+                _ => None,
+            },
         })
     }
 }
@@ -137,24 +157,41 @@ mod tests {
     #[test]
     fn logical_is_physical_at_scale() {
         assert_eq!(
-            mode(Monitor::from_desktop(1600, 1000, 0, 1.6)),
+            mode(Monitor::from_desktop(1600, 1000, 0, 1.6, 0, 0)),
             Some((2560, 1600))
         );
         assert_eq!(
-            mode(Monitor::from_desktop(1229, -5, 0, 1.25)),
+            mode(Monitor::from_desktop(1229, -5, 0, 1.25, 0, 0)),
             Some((1536, 0))
         );
-        assert_eq!(Monitor::from_desktop(1, 1, 0, 0.0), None);
+        assert_eq!(Monitor::from_desktop(1, 1, 0, 0.0, 0, 0), None);
     }
 
     /// GDK's and Wayland's refresh rate is milli-Hz (60000 is 60 Hz), 0 when unknown.
     #[test]
     fn millihz_is_hz() {
-        let hz = |mhz| Monitor::from_desktop(1, 1, mhz, 1.0).and_then(|m| m.refresh_hz);
+        let hz = |mhz| Monitor::from_desktop(1, 1, mhz, 1.0, 0, 0).and_then(|m| m.refresh_hz);
         assert_eq!(hz(60_000), Some(60.0));
         assert_eq!(hz(120_000), Some(120.0));
         assert!((hz(59_940).expect("59.94 Hz") - 59.94).abs() < 1e-4);
         assert_eq!(hz(0), None);
         assert_eq!(hz(-1), None);
+    }
+
+    /// A 2880x1800 panel of 302x189 mm (16:10) reports both sides; 0 or negative on either side is no panel size (headless, virtual outputs), and so is a monitor without a size.
+    #[test]
+    fn panel_size_is_mm_or_unknown() {
+        let mm = |w, h| Monitor::from_desktop(1800, 1125, 0, 1.6, w, h).and_then(|m| m.physical_mm);
+        assert_eq!(
+            mm(302, 189),
+            Some(MmSize {
+                width: 302,
+                height: 189
+            })
+        );
+        assert_eq!(mm(0, 189), None);
+        assert_eq!(mm(302, 0), None);
+        assert_eq!(mm(0, 0), None);
+        assert_eq!(mm(-1, 189), None);
     }
 }

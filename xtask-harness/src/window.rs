@@ -1044,6 +1044,44 @@ fn initial_density_check(app: &str, display: DisplayModel) -> Result<String, Str
     }
 }
 
+/// The fixture's getRealMetrics line (Main.java logPhysicalDpi): the display's physical dpi as the app reads it (DisplayMetrics.xdpi / ydpi = DisplayInfo.physicalXDpi / physicalYDpi).
+const PHYSICAL_DPI_LINE: &str = "AtlWindow: physical dpi";
+/// The fixture logs Java floats; the expected values are rounded to 0.1 dpi, so a read within 0.05 dpi is the value.
+const DPI_TOLERANCE: f32 = 0.05;
+
+/// Sub-gate `physical-dpi`: the app's xdpi / ydpi are the display's physical dpi, judged from the spec (AOSP LocalDisplayAdapter: natural px x 25.4 / panel mm per axis; a display with no panel size
+/// is its density, as OverlayDisplayAdapter's xdpi = densityDpi). The gate's headless labwc output has no panel, so its row expects the density. The expected values are computed here, not read from display.rs.
+fn physical_dpi_check(app: &str, display: DisplayModel) -> Result<String, String> {
+    let want = match display.physical_mm {
+        Some((mm_w, mm_h)) => {
+            let (w, h) = if display.rotation % 2 == 1 {
+                (display.height, display.width)
+            } else {
+                (display.width, display.height)
+            };
+            (w as f32 * 25.4 / mm_w as f32, h as f32 * 25.4 / mm_h as f32)
+        }
+        None => (display.dpi as f32, display.dpi as f32),
+    };
+    let Some(line) = app.lines().find(|l| l.contains(PHYSICAL_DPI_LINE)) else {
+        return Err("the fixture never read getRealMetrics".to_owned());
+    };
+    let read = |key: &str| word(line, key).and_then(|v| v.parse::<f32>().ok());
+    match (read("xdpi"), read("ydpi")) {
+        (Some(x), Some(y))
+            if (x - want.0).abs() < DPI_TOLERANCE && (y - want.1).abs() < DPI_TOLERANCE =>
+        {
+            Ok(format!("xdpi={x} ydpi={y}"))
+        }
+        _ => Err(format!(
+            "{}: want xdpi={} ydpi={}",
+            line.trim(),
+            want.0,
+            want.1
+        )),
+    }
+}
+
 /// Sub-gates `process-opened` / `process-reshaped`: the process configuration `line` (Application's and Resources.getSystem()'s) is a window of `size` px on `display`: dp = px / (dpi / 160),
 /// rounded (DisplayContent.computeScreenAppConfiguration), portrait when width <= height. AOSP: the process follows its activity launched last (WindowProcessController.updateActivityConfigurationListener),
 /// so not the display's size.
@@ -1177,6 +1215,7 @@ fn orientation_checks(app: &str, display: DisplayModel) -> Vec<Sub> {
             process_config_check(line_of(PROCESS_CHANGED_LINE, true), want, display),
         ),
         ("initial-density", initial_density_check(app, display)),
+        ("physical-dpi", physical_dpi_check(app, display)),
     ]
 }
 
@@ -3887,6 +3926,7 @@ pub fn display_probe() -> Result<ExitCode> {
         m.refresh_hz,
         m.scale.get(),
         m.rotation.quarter_turns(),
+        m.physical_mm.map(|mm| (mm.width, mm.height)),
     );
     println!("{}{}", crate::remote::DISPLAY_PROBE_LINE, model.to_arg());
     Ok(ExitCode::SUCCESS)
@@ -4407,8 +4447,10 @@ mod tests {
         );
         // the display's 160 dpi; an unanswered transaction reads 0 in the AIDL proxy
         let initial = "AtlWindow: initial display density=160\n";
+        // the gate's labwc output has no panel: the physical dpi is the density
+        let physical = "AtlWindow: physical dpi xdpi=160.0 ydpi=160.0\n";
         let good = format!(
-            "{created}{proc_created}{initial}{requested}{}{told}{proc_changed}{}",
+            "{created}{proc_created}{initial}{physical}{requested}{}{told}{proc_changed}{}",
             layout(1440, 900, 2),
             layout(750, 900, 1)
         );
@@ -4425,7 +4467,7 @@ mod tests {
             orientation_checks(&good, display)
         );
         let kept = format!(
-            "{created}{proc_created}{initial}{requested}{}",
+            "{created}{proc_created}{initial}{physical}{requested}{}",
             layout(1440, 900, 2)
         );
         assert_eq!(failed(&kept), vec!["reshaped", "told", "process-reshaped"]);
@@ -4451,6 +4493,33 @@ mod tests {
         assert_eq!(failed(&unanswered), vec!["initial-density"]);
         let never_asked = good.replace(initial, "");
         assert_eq!(failed(&never_asked), vec!["initial-density"]);
+        // a fixture that never read getRealMetrics, and one that read a panel's dpi on a headless display, both fail the physical-dpi row
+        let never_read = good.replace(physical, "");
+        assert_eq!(failed(&never_read), vec!["physical-dpi"]);
+        let panel_dpi = good.replace("xdpi=160.0 ydpi=160.0", "xdpi=242.2 ydpi=241.9");
+        assert_eq!(failed(&panel_dpi), vec!["physical-dpi"]);
+    }
+
+    /// Sub-gate `physical-dpi` from the spec: a display with a panel size expects natural px x 25.4 / mm (2880 px / 302 mm = 242.2 dpi, 1800 px / 189 mm = 241.9 dpi); one without, its density.
+    #[test]
+    fn physical_dpi_is_the_panel_mm_or_the_density() {
+        let panel = DisplayModel {
+            width: 2880,
+            height: 1800,
+            dpi: 256,
+            physical_mm: Some((302, 189)),
+            ..DisplayModel::default()
+        };
+        let read = |xy: &str| format!("AtlWindow: physical dpi {xy}\n");
+        assert!(physical_dpi_check(&read("xdpi=242.2 ydpi=241.9"), panel).is_ok());
+        assert!(physical_dpi_check(&read("xdpi=256.0 ydpi=256.0"), panel).is_err());
+        let headless = DisplayModel {
+            dpi: 160,
+            ..DisplayModel::default()
+        };
+        assert!(physical_dpi_check(&read("xdpi=160.0 ydpi=160.0"), headless).is_ok());
+        assert!(physical_dpi_check(&read("xdpi=242.2 ydpi=241.9"), headless).is_err());
+        assert!(physical_dpi_check("AtlWindow: onCreate reached\n", headless).is_err());
     }
 
     /// Every layout must be the portrait size as content and as window frame, on the gate's display; one layout at another size fails the sub-gate.

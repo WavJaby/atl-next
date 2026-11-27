@@ -65,6 +65,7 @@ public class Main extends Activity {
         logDensity("created", getResources().getConfiguration());
         logProcessConfiguration("created");
         logInitialDensity();
+        logPhysicalDpi();
         // the title reaches the window's attributes only through them: Window.setTitle leaves the default (the component name)
         WindowManager.LayoutParams attrs = getWindow().getAttributes();
         attrs.setTitle(WINDOW_TITLE);
@@ -267,6 +268,16 @@ public class Main extends Activity {
         } catch (ReflectiveOperationException | RuntimeException e) {
             Log.i(TAG, "initial display density error=" + (e.getCause() != null ? e.getCause() : e));
         }
+    }
+
+    /**
+     * The display's physical dpi as the app reads it: getRealMetrics' xdpi / ydpi (DisplayInfo.physicalXDpi / physicalYDpi), logged as floats
+     * (xtask-harness/src/window.rs physical_dpi_check). A display with no panel size reports its density.
+     */
+    private void logPhysicalDpi() {
+        android.util.DisplayMetrics real = new android.util.DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(real);
+        Log.i(TAG, "physical dpi xdpi=" + real.xdpi + " ydpi=" + real.ydpi);
     }
 
     /** The density this instance sees (xtask-harness/src/window.rs move_checks): the Configuration's and the resources' DisplayMetrics, which must agree. */

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Linux, the host side's implementation of atl-platform-host-api: the desktop's monitors through gtk4-rs (GDK), the accelerometers through IIO (iio/: the kernel buffer or sysfs), the fonts through fontconfig (fonts.rs),
 //! the memory through /proc/meminfo (memory.rs), the network through the kernel's route tables, resolv.conf and GIO's network monitor, its change events through rtnetlink (network.rs), the UI language from the locale variables (locale.rs), the time zone from `TZ` and `/etc/localtime` (timezone.rs), notifications through the session bus's freedesktop notification service (notifications.rs, zbus), per-app Wayland security contexts (wayland_context.rs), per-app PipeWire security contexts + atld as their permission manager (pipewire_context.rs).
-//! GDK reports logical geometry and the refresh rate in milli-Hz (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts both.
+//! GDK reports logical geometry, the refresh rate in milli-Hz and the panel's size in mm (0: unknown); `Monitor::from_desktop` (atl-platform-types) converts them.
 // `unsafe` only in pipewire_context.rs `security_context_create`: the SecurityContext extension has no pipewire-rs / pipewire-sys binding, so its bind + create go through the raw method tables
 #![deny(unsafe_code)]
 
@@ -58,6 +58,8 @@ impl Desktop for GdkDesktop {
             geometry.height(),
             monitor.refresh_rate(),
             monitor.scale(),
+            monitor.width_mm(),
+            monitor.height_mm(),
         )
     }
 }
