@@ -220,100 +220,7 @@ impl Step {
         match self {
             Step::Fmt => cargo(root, &["fmt", "--all", "--check"], Units::Plain),
             Step::Spdx => spdx::check(root),
-            Step::Tables => {
-                let arches = arches::load(root)?;
-                let layout = Layout::of(root)?;
-                arches::check_kernel_arch(&layout, &arches)?;
-                arches::check_uapi_records(&layout, &arches)?;
-                arches::check_prebuilt_os(&layout, &arches)?;
-                arches::check_cross(root, &arches)?;
-                arches::check_qemu_target(&layout, &arches)?;
-                arches::check_guest_rust(root, &arches)?;
-                crate::isa_tiers::check(root, &arches)?;
-                eprintln!("tables: {} ok ({} arches)", arches::FILE, arches.len());
-                let sources = sources::load(root)?;
-                eprintln!(
-                    "tables: {} ok ({} aosp projects, {} other upstreams)",
-                    sources::FILE,
-                    sources.aosp.projects.len(),
-                    sources.git.len()
-                );
-                let workspace = workspace::load(root)?;
-                let consumers = deps::Consumers::new(&workspace, &sources, &arches);
-                let deps = deps::load(root, &consumers)?;
-                eprintln!("tables: {} ok ({} rows)", deps::FILE, deps.len());
-                gtk_baseline::check(root, &deps)?;
-                eprintln!(
-                    "tables: {} ok (row checked against [gtk4] min)",
-                    gtk_baseline::FILE
-                );
-                let providers = providers::load(
-                    root,
-                    &providers::Targets::new(&workspace.crates, &sources, &deps),
-                )?;
-                eprintln!("tables: {} ok ({} rows)", providers::FILE, providers.len());
-                let licenses = licenses::load(root, &consumers.upstreams)?;
-                eprintln!(
-                    "tables: {} ok ({} artifacts, deny.toml within runtime)",
-                    licenses::FILE,
-                    licenses.artifact.len()
-                );
-                let prune = prune::load(root, &sources)?;
-                eprintln!("tables: {} ok ({} rows)", prune::FILE, prune.len());
-                let cts = cts_table::load(root)?;
-                // the rows against the module index of the pinned tree and the modules' own sources
-                let index = aosp::Index::load(root, &sources.aosp)?;
-                cts_table::check(&cts, &index, &|tree_path| {
-                    layout.locate(&Path::new("aosp").join(tree_path)).dir
-                })?;
-                eprintln!("tables: {} ok ({} rows)", cts_table::FILE, cts.len());
-                let apk_rows = test_apks::check(root)?;
-                eprintln!("tables: {} ok ({apk_rows} rows)", test_apks::FILE);
-                let mirrors = service_mirrors::load(root)?;
-                let entries = service_mirrors::check(root, &mirrors, &sources.aosp, &|project| {
-                    layout.locate(&Path::new("aosp").join(project)).dir
-                })?;
-                eprintln!(
-                    "tables: {} ok ({} services, {entries} mirrored entries at the pin)",
-                    service_mirrors::FILE,
-                    mirrors.len()
-                );
-                // the OPS table and NUM_OP against AppOpsManager.sAppOpInfos at the pin, row by row
-                let app_ops = app_ops_table::check(&sources.aosp, &|project| {
-                    layout.locate(&Path::new("aosp").join(project)).dir
-                })?;
-                let flags = if app_ops.flags.is_empty() {
-                    "none".to_owned()
-                } else {
-                    app_ops
-                        .flags
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                eprintln!(
-                    "tables: app_ops ok ({} ops at the pin; flags assumed off: {flags})",
-                    app_ops.ops
-                );
-                // fonts.toml: rows = AOSP's named families at the pin
-                let fonts = atl_fonts_table::Table::parse(&std::fs::read_to_string(
-                    root.join("fonts.toml"),
-                )?)?;
-                let aosp_fonts = layout
-                    .locate(Path::new("aosp/frameworks/base"))
-                    .dir
-                    .join("data/fonts/fonts.xml");
-                fonts.check_against_aosp(
-                    &std::fs::read_to_string(&aosp_fonts)
-                        .with_context(|| aosp_fonts.display().to_string())?,
-                )?;
-                eprintln!(
-                    "tables: fonts.toml ok ({} rows = AOSP's named families)",
-                    fonts.rows.len()
-                );
-                Ok(())
-            }
+            Step::Tables => tables(root),
             Step::Deps => {
                 let report = deps::host_problems(root, None)?;
                 if !report.problems.is_empty() {
@@ -527,7 +434,131 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     })
 }
 
-/// The cross-bionic step: `cargo check -p atl-bionic --target <rust>` with the cross environment (cross::cargo_target) of every arches.toml host other than the build machine that names a sysroot. Its build script is the generation; `check` runs it without compiling the crate for the target.
+/// One independent table check of [`tables`]: its `tables:` lines on a pass.
+type TableCheck<'a> = Box<dyn Fn() -> Result<Vec<String>> + Sync + 'a>;
+
+/// The tables step's Rust half: the base tables (arches, sources, workspace) load first, then every check that reads only them runs on the step's grant width (`build_pool::held_jobs`).
+/// Same verdict as one after another: lines printed in table order, the first failing check in that order is the step's error.
+fn tables(root: &Path) -> Result<()> {
+    let arches = arches::load(root)?;
+    let layout = Layout::of(root)?;
+    let sources = sources::load(root)?;
+    let workspace = workspace::load(root)?;
+    let consumers = deps::Consumers::new(&workspace, &sources, &arches);
+    let aosp_dir = |project: &str| layout.locate(&Path::new("aosp").join(project)).dir;
+    let checks: Vec<TableCheck<'_>> = vec![
+        Box::new(|| {
+            arches::check_kernel_arch(&layout, &arches)?;
+            arches::check_uapi_records(&layout, &arches)?;
+            arches::check_prebuilt_os(&layout, &arches)?;
+            arches::check_cross(root, &arches)?;
+            arches::check_qemu_target(&layout, &arches)?;
+            arches::check_guest_rust(root, &arches)?;
+            crate::isa_tiers::check(root, &arches)?;
+            Ok(vec![
+                format!("{} ok ({} arches)", arches::FILE, arches.len()),
+                format!(
+                    "{} ok ({} aosp projects, {} other upstreams)",
+                    sources::FILE,
+                    sources.aosp.projects.len(),
+                    sources.git.len()
+                ),
+            ])
+        }),
+        Box::new(|| {
+            let deps = deps::load(root, &consumers)?;
+            let mut lines = vec![format!("{} ok ({} rows)", deps::FILE, deps.len())];
+            gtk_baseline::check(root, &deps)?;
+            lines.push(format!(
+                "{} ok (row checked against [gtk4] min)",
+                gtk_baseline::FILE
+            ));
+            let providers = providers::load(
+                root,
+                &providers::Targets::new(&workspace.crates, &sources, &deps),
+            )?;
+            lines.push(format!("{} ok ({} rows)", providers::FILE, providers.len()));
+            Ok(lines)
+        }),
+        Box::new(|| {
+            let licenses = licenses::load(root, &consumers.upstreams)?;
+            Ok(vec![format!(
+                "{} ok ({} artifacts, deny.toml within runtime)",
+                licenses::FILE,
+                licenses.artifact.len()
+            )])
+        }),
+        Box::new(|| {
+            let prune = prune::load(root, &sources)?;
+            Ok(vec![format!("{} ok ({} rows)", prune::FILE, prune.len())])
+        }),
+        Box::new(|| {
+            let cts = cts_table::load(root)?;
+            // the rows against the module index of the pinned tree and the modules' own sources
+            let index = aosp::Index::load(root, &sources.aosp)?;
+            cts_table::check(&cts, &index, &aosp_dir)?;
+            Ok(vec![format!("{} ok ({} rows)", cts_table::FILE, cts.len())])
+        }),
+        Box::new(|| {
+            let apk_rows = test_apks::check(root)?;
+            Ok(vec![format!("{} ok ({apk_rows} rows)", test_apks::FILE)])
+        }),
+        Box::new(|| {
+            let mirrors = service_mirrors::load(root)?;
+            let entries = service_mirrors::check(root, &mirrors, &sources.aosp, &aosp_dir)?;
+            Ok(vec![format!(
+                "{} ok ({} services, {entries} mirrored entries at the pin)",
+                service_mirrors::FILE,
+                mirrors.len()
+            )])
+        }),
+        Box::new(|| {
+            // the OPS table and NUM_OP against AppOpsManager.sAppOpInfos at the pin, row by row
+            let app_ops = app_ops_table::check(&sources.aosp, &aosp_dir)?;
+            let flags = if app_ops.flags.is_empty() {
+                "none".to_owned()
+            } else {
+                app_ops
+                    .flags
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Ok(vec![format!(
+                "app_ops ok ({} ops at the pin; flags assumed off: {flags})",
+                app_ops.ops
+            )])
+        }),
+        Box::new(|| {
+            // fonts.toml: rows = AOSP's named families at the pin
+            let fonts =
+                atl_fonts_table::Table::parse(&std::fs::read_to_string(root.join("fonts.toml"))?)?;
+            let aosp_fonts = layout
+                .locate(Path::new("aosp/frameworks/base"))
+                .dir
+                .join("data/fonts/fonts.xml");
+            fonts.check_against_aosp(
+                &std::fs::read_to_string(&aosp_fonts)
+                    .with_context(|| aosp_fonts.display().to_string())?,
+            )?;
+            Ok(vec![format!(
+                "fonts.toml ok ({} rows = AOSP's named families)",
+                fonts.rows.len()
+            )])
+        }),
+    ];
+    // the grant is this thread's (thread-local): read its width here, not on the workers
+    let workers = build_pool::held_jobs().map_or(1, |j| j as usize);
+    for result in crate::par::map(&checks, workers, |check| check()) {
+        for line in result? {
+            eprintln!("tables: {line}");
+        }
+    }
+    Ok(())
+}
+
+/// The cross-bionic step:`cargo check -p atl-bionic --target <rust>` with the cross environment (cross::cargo_target) of every arches.toml host other than the build machine that names a sysroot. Its build script is the generation; `check` runs it without compiling the crate for the target.
 /// A host whose rows are unmet (sysroot not fetched, rust std not added) is skipped and named, as `deps --check` skips cross-only rows.
 fn cross_bionic(root: &Path) -> Result<Option<String>> {
     let arches = arches::load(root)?;
