@@ -49,6 +49,15 @@ fn refused(msg: &str) {
     eprintln!("{msg}");
 }
 
+/// A failed guest load, said where it can be seen: the app log is the attempt's record for run-apk check_delivery. ART logs a failed dlopen at VLOG only, so no other line carries it.
+#[allow(
+    clippy::print_stderr,
+    reason = "the bridge has no logger; the launcher's stderr is the app process's log"
+)]
+fn load_failed(path: &Path, why: &str) {
+    eprintln!("atl-native-bridge: load {} failed: {why}", path.display());
+}
+
 /// The ELF machine of the process engine's libraries, read once.
 fn engine_machine() -> Option<obj_elf::Machine> {
     static MACHINE: OnceLock<Option<obj_elf::Machine>> = OnceLock::new();
@@ -128,12 +137,14 @@ pub unsafe fn loadLibrary(libpath: *const c_char, _flag: i32) -> *mut c_void {
     if let Err(e) = path.to_str().map_or(Ok(()), |p| {
         apk::check_mappable(p, engine::image::page() as u64)
     }) {
+        load_failed(path, &e);
         fail(format!("atl-native-bridge: {e}"));
         return std::ptr::null_mut();
     }
     match loader::load(path, &Config::installed) {
         Ok(h) => h as *mut c_void,
         Err(e) => {
+            load_failed(path, &e);
             fail(format!("atl-native-bridge: {e}"));
             std::ptr::null_mut()
         }

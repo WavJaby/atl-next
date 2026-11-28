@@ -26,6 +26,7 @@ use crate::atld_run::{
 };
 use crate::audio_pcm::{RouteSampler, Routing, RunClients, route_verdict, stream_routes};
 use crate::manifest::Manifest;
+use atl_android_paths::DATA_APP;
 use atl_services_types::display_model::Declaration;
 use atl_services_types::native_libs::{LIB_DIR_NAME, SupportedAbi};
 
@@ -1297,7 +1298,7 @@ pub(crate) fn shared_foreign(
 /// Whether `line` is the bridge's load line (atl-native-bridge loader.rs) for a library of `package` and ABI `a`: extracted, `/data/app/<package>/lib/<isa>/` (PackageManager's
 /// `lib/<instruction set>` dir), or straight from an APK (extractNativeLibs=false), `/data/app/<package>/<apk>!/lib/<abi>/` (the zip entry dir).
 fn is_delivery_line(line: &str, package: &str, a: &SupportedAbi) -> bool {
-    let prefix = format!("atl-native-bridge: loaded /data/app/{package}/");
+    let prefix = format!("atl-native-bridge: loaded {DATA_APP}/{package}/");
     let Some(path) = line.split_once(&prefix).map(|(_, p)| p) else {
         return false;
     };
@@ -1307,27 +1308,42 @@ fn is_delivery_line(line: &str, package: &str, a: &SupportedAbi) -> bool {
         })
 }
 
-/// The delivery check of a foreign-ISA app (`foreign`): the app log `app` has the bridge loading one of the package's libraries of that ABI into the guest, so ART handed the bridge the app's ISA and the engine took the library.
-/// Checked before the window verdict: without delivery nothing the app's native code does is the guest's.
+/// Whether `line` records a load attempt of a library under `/data/app/<package>/`: the bridge's success line (loader.rs `loaded`) or its failure line (exports.rs `load <path> failed:`).
+fn is_attempt_line(line: &str, package: &str) -> bool {
+    let under = format!("{DATA_APP}/{package}/");
+    let loaded = format!("atl-native-bridge: loaded {under}");
+    let failed = format!("atl-native-bridge: load {under}");
+    line.contains(&loaded) || (line.contains(&failed) && line.contains(" failed: "))
+}
+
+/// The delivery check of a foreign-ISA app (`foreign`) on its app log `app`: the bridge loaded one of `package`'s libraries of that ABI into the guest, so the engine took the app's ISA.
+/// An app that tried no library of its own never used its foreign library, which Android allows (an unloaded APK library is no failure): "not loaded", no red.
+/// A load it tried without delivery (failed, or another ISA's library) is red. Checked before the window verdict: without delivery nothing the app's native code does is the guest's.
 fn check_delivery(foreign: Option<&SupportedAbi>, package: &str, app: &str) -> Result<(), String> {
     let Some(a) = foreign else {
         return Ok(());
     };
     let isa = &a.isa;
-    let line = format!(
-        "atl-native-bridge: loaded /data/app/{package}/(lib/{isa}|<apk>!/lib/{})/",
-        a.abi
-    );
-    match app.lines().find(|l| is_delivery_line(l, package, a)) {
+    if let Some(l) = app.lines().find(|l| is_delivery_line(l, package, a)) {
+        println!("run-apk: guest delivery {isa}: ok ({})", l.trim());
+        return Ok(());
+    }
+    match app.lines().find(|l| is_attempt_line(l, package)) {
         Some(l) => {
-            println!("run-apk: guest delivery {isa}: ok ({})", l.trim());
-            Ok(())
+            println!(
+                "run-apk: guest delivery {isa}: FAIL (attempt `{}`; no `atl-native-bridge: loaded /data/app/{package}/(lib/{isa}|<apk>!/lib/{})/` line)",
+                l.trim(),
+                a.abi
+            );
+            Err(format!(
+                "guest delivery {isa}: a library of {package} tried the guest and none of lib/{isa} was delivered"
+            ))
         }
         None => {
-            println!("run-apk: guest delivery {isa}: FAIL (no `{line}` line in the app log)");
-            Err(format!(
-                "guest delivery {isa}: no library of lib/{isa} loaded into the guest"
-            ))
+            println!(
+                "run-apk: guest delivery {isa}: not loaded (no library of {package} tried the guest)"
+            );
+            Ok(())
         }
     }
 }
@@ -2043,31 +2059,61 @@ mod tests {
         }
     }
 
-    /// The load line as loader.rs prints it for CTR's arm64 libctro (measured 2026-11-12); the break is identity's run, which loads nothing into a guest of the app's ISA.
+    /// No attempt, no red: an APK that ships lib/arm64 and never loads it is valid on Android. Another package's loads, delivered or failed, are not this app's attempt.
     #[test]
-    fn delivery_needs_the_guest_load_of_the_apps_isa() {
+    fn delivery_is_not_judged_without_a_load_attempt() {
+        let pkg = "com.example.notes";
+        let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
+        let other = "atl-native-bridge: loaded /data/app/com.example.other/lib/arm64/libx.so into the guest\natl-native-bridge: load /data/app/com.example.other/lib/arm64/libx.so failed: cannot open\n";
+        assert!(check_delivery(Some(arm64), pkg, "").is_ok());
+        assert!(check_delivery(Some(arm64), pkg, "AtlTest: onCreate reached\n").is_ok());
+        assert!(check_delivery(Some(arm64), pkg, other).is_ok());
+        // a host-ISA app has nothing to deliver
+        assert!(check_delivery(None, pkg, other).is_ok());
+    }
+
+    /// Delivered: the load line the bridge prints for CTR's arm64 libctro (measured 2026-11-12).
+    #[test]
+    fn delivery_passes_when_the_foreign_library_loads() {
         let pkg = "com.zeptolab.ctr.ads";
         let app = "atl-native-bridge: loaded /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so into the guest\n";
         let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
-        let riscv64 = &abis(&[("riscv64", "riscv64")])[0];
         assert!(check_delivery(Some(arm64), pkg, app).is_ok());
-        assert!(check_delivery(Some(arm64), pkg, "").is_err());
-        assert!(check_delivery(Some(riscv64), pkg, app).is_err());
-        // a host-ISA app has nothing to deliver
-        assert!(check_delivery(None, pkg, "").is_ok());
+    }
+
+    /// Attempt without delivery is red: the guest refused the app's own library (the failure line), the app loaded another ISA's library of it, or an arm64 library is offered as riscv64.
+    #[test]
+    fn delivery_reds_an_attempt_without_delivery() {
+        let pkg = "com.zeptolab.ctr.ads";
+        let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
+        let riscv64 = &abis(&[("riscv64", "riscv64")])[0];
+        let failed = "atl-native-bridge: load /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so failed: guest dlopen /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so: cannot open\n";
+        let other_isa = "atl-native-bridge: loaded /data/app/com.zeptolab.ctr.ads/lib/arm/libctro.so into the guest\n";
+        let arm64_loaded = "atl-native-bridge: loaded /data/app/com.zeptolab.ctr.ads/lib/arm64/libctro.so into the guest\n";
+        assert!(check_delivery(Some(arm64), pkg, failed).is_err());
+        assert!(check_delivery(Some(arm64), pkg, other_isa).is_err());
+        assert!(check_delivery(Some(riscv64), pkg, arm64_loaded).is_err());
     }
 
     /// The load line of an extractNativeLibs=false app: ART passes the zip entry path (bionic `kZipFileSeparator`), the entry dir named by the ABI, not the ISA.
+    /// The failure line of the same entry (check_mappable refuses a compressed entry) is an attempt that delivered nothing.
     #[test]
     fn delivery_from_an_apk_entry_names_the_abi() {
         let pkg = "jp.co.ponos.battlecatstw";
-        let app = "atl-native-bridge: loaded /data/app/jp.co.ponos.battlecatstw/split_config.arm64_v8a.apk!/lib/arm64-v8a/libnative-lib.so into the guest\n";
+        let entry = format!(
+            "{DATA_APP}/jp.co.ponos.battlecatstw/split_config.arm64_v8a.apk!/lib/arm64-v8a/libnative-lib.so"
+        );
+        let app = format!("atl-native-bridge: loaded {entry} into the guest\n");
+        let failed = format!(
+            "atl-native-bridge: load {entry} failed: /data/app/jp.co.ponos.battlecatstw/split_config.arm64_v8a.apk: entry lib/arm64-v8a/libnative-lib.so is compressed (Deflated); bionic maps only stored entries\n"
+        );
         let arm64 = &abis(&[("arm64-v8a", "arm64")])[0];
         let armv7 = &abis(&[("armeabi-v7a", "arm")])[0];
-        assert!(check_delivery(Some(arm64), pkg, app).is_ok());
-        assert!(check_delivery(Some(armv7), pkg, app).is_err());
-        // another package's APK is not this app's delivery
-        assert!(check_delivery(Some(arm64), "com.other", app).is_err());
+        assert!(check_delivery(Some(arm64), pkg, &app).is_ok());
+        assert!(check_delivery(Some(arm64), pkg, &failed).is_err());
+        assert!(check_delivery(Some(armv7), pkg, &app).is_err());
+        // another package's APK is neither this app's delivery nor its attempt
+        assert!(check_delivery(Some(arm64), "com.other", &app).is_ok());
     }
 
     /// Lines as atld prints them (atld main.rs `run`): a GPU desktop, its display tier, the trial tier, and WSLg's vgem-only devices.
