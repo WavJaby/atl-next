@@ -2028,6 +2028,10 @@ impl Runtime {
         if let remote::Site::Remote(target) = &self.site
             && remote::ended_early(end, &run.scratch)
         {
+            // the target's display could not serve the run: undecided, not a failure
+            if let Some(limit) = remote::host_limit(&run.scratch) {
+                return Err(limit.into());
+            }
             return Err(target.failed(&run.root, end));
         }
         let log = std::fs::read_to_string(run.atld_log()).unwrap_or_default();

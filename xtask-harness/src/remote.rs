@@ -235,8 +235,8 @@ pub enum Break {
     TrustDmabuf,
 }
 
-/// The run script's exit when the target's display cannot serve the run at all ([`dmabuf_probe_sh`]): the property is not judged there ([`HostLimit`]). 5 = the display did not come up.
-const HOST_LIMIT_EXIT: i32 = 6;
+/// In a run's scratch: why the target's display cannot serve the run at all ([`dmabuf_probe_sh`]), one line; it comes back in the tar. A file, not an exit code: the transfer's exit is tar's.
+const HOST_LIMIT_FILE: &str = "host.limit";
 
 /// A run the target's display could not serve: neither pass nor fail (xtask-harness main: `<cmd>: undecided host: <why>`, exit [`crate::verdict::UNDECIDED_EXIT`]).
 #[derive(Debug)]
@@ -250,13 +250,25 @@ impl std::fmt::Display for HostLimit {
 
 impl std::error::Error for HostLimit {}
 
-/// Asks the run's labwc, after its setup, whether it imports a client dmabuf (the helper's `--dmabuf` line, appended to its log). A refusal stops the run before atld with [`HOST_LIMIT_EXIT`]:
+/// The [`HostLimit`] a returned run's scratch names ([`HOST_LIMIT_FILE`]), if any.
+pub(crate) fn host_limit(scratch: &Path) -> Option<HostLimit> {
+    let text = std::fs::read_to_string(scratch.join(HOST_LIMIT_FILE)).ok()?;
+    Some(HostLimit(text.trim().to_owned()))
+}
+
+/// Asks the run's labwc, after its setup, whether it imports a client dmabuf (the helper's `--dmabuf` line, appended to its log). A refusal stops the run before atld, its why in `limit_file`:
 /// GTK 4.14's GL renderer presents through Mesa's EGL, which sends dmabufs whatever GDK_DEBUG=dmabuf-disable says, and its Vulkan renderer crashed there; cairo would not render on the GPU
-/// (sifive, measured 2026-11-28). `logs` sends the display's logs back.
-fn dmabuf_probe_sh(tag: &str, setup: &str, setup_log: &str, logs: &str) -> String {
+/// (sifive, measured 2026-11-28). `logs` sends the display's logs and `limit_file` back.
+fn dmabuf_probe_sh(
+    tag: &str,
+    setup: &str,
+    setup_log: &str,
+    limit_file: &str,
+    logs: &str,
+) -> String {
     let refused = sh_quote(&format!("^{}", atl_labwc_setup::dmabuf::REFUSED_PREFIX));
     format!(
-        "{setup} --dmabuf \"$WL\" >> {setup_log} 2>&1 < /dev/null\nif grep -q {refused} {setup_log}; then\n  echo \"remote run {tag}: host limit: the compositor imports no client dmabuf ($(grep {refused} {setup_log} | tail -n 1)); GTK's GL renderer presents only through dmabufs\" >&2\n  {logs}\n  exit {HOST_LIMIT_EXIT}\nfi\n"
+        "{setup} --dmabuf \"$WL\" >> {setup_log} 2>&1 < /dev/null\nif grep -q {refused} {setup_log}; then\n  echo \"remote run {tag}: host limit: the compositor imports no client dmabuf ($(grep {refused} {setup_log} | tail -n 1)); GTK's GL renderer presents only through dmabufs\" | tee {limit_file} >&2\n  {logs}\n  exit 5\nfi\n"
     )
 }
 
@@ -1128,11 +1140,15 @@ impl Plan {
                     &tar_sh(&display_logs),
                 ));
                 if self.dmabuf_probe {
+                    let limit = format!("{}/{HOST_LIMIT_FILE}", self.scratch);
+                    let mut logs = display_logs.clone();
+                    logs.push(limit.clone());
                     s.push_str(&dmabuf_probe_sh(
                         &self.tag,
                         &setup,
                         &setup_log,
-                        &tar_sh(&display_logs),
+                        &word(&out_path(&limit)),
+                        &tar_sh(&logs),
                     ));
                 }
                 if let Some(port) = self.view {
@@ -1402,10 +1418,13 @@ impl RemoteRun {
             audio: self.audio.clone(),
             dmabuf_probe: self.dmabuf_probe,
         };
-        // the previous run's end record must not stand for this one's
-        let end = scratch.join(ATLD_RC);
-        if end.exists() {
-            std::fs::remove_file(&end).with_context(|| format!("removing {}", end.display()))?;
+        // the previous run's end record and host limit must not stand for this one's
+        for name in [ATLD_RC, HOST_LIMIT_FILE] {
+            let end = scratch.join(name);
+            if end.exists() {
+                std::fs::remove_file(&end)
+                    .with_context(|| format!("removing {}", end.display()))?;
+            }
         }
         let script = scratch.join(REMOTE_SCRIPT);
         let body = plan.script(&self.base);
@@ -1453,10 +1472,6 @@ impl RemoteRun {
             .filter(|l| !l.is_empty())
             .take(3)
             .collect();
-        if end.code() == Some(HOST_LIMIT_EXIT) {
-            let why = cause.first().map_or("no output", |l| l);
-            return HostLimit(format!("{why} (transcript {})", self.log.display())).into();
-        }
         anyhow!(
             "remote run {} ended {end}: {} (transcript {})",
             root.display(),
@@ -4059,8 +4074,8 @@ esac
         );
     }
 
-    /// The dmabuf probe: asked after the labwc setup is ready and before atld; a refusal line stops the run with [`HOST_LIMIT_EXIT`] and the display's logs, any other line goes on. Under
-    /// [`Break::TrustDmabuf`] (`dmabuf_probe` false) the run never asks. The run's end then reads as [`HostLimit`], not a failure.
+    /// The dmabuf probe: asked after the labwc setup is ready and before atld; a refusal line stops the run, its why in [`HOST_LIMIT_FILE`] (sent back with the display's logs, read as [`HostLimit`]);
+    /// any other line goes on. Under [`Break::TrustDmabuf`] (`dmabuf_probe` false) the run never asks.
     #[test]
     fn dmabuf_refusal_is_a_host_limit_before_atld() {
         let plan = Plan {
@@ -4089,8 +4104,9 @@ esac
         assert!(
             at("grep -qx ")
                 < at("\"$BASE/out/cargo/release/atl-labwc-setup\" --dmabuf \"$WL\" >> ")
-                && at(" --dmabuf ") < at(&format!("exit {HOST_LIMIT_EXIT}\n"))
-                && at(&format!("exit {HOST_LIMIT_EXIT}\n")) < at(" setsid timeout "),
+                && at(" --dmabuf ") < at("| tee \"$BASE/out/app/scratch/host.limit\" >&2\n")
+                && at("tee \"$BASE") < at(" 'app/scratch/host.limit'\n  exit 5\n")
+                && at("host.limit'\n  exit 5\n") < at(" setsid timeout "),
             "{s}"
         );
         let trusted = Plan {
@@ -4108,12 +4124,14 @@ esac
             std::fs::set_permissions(&setup, std::os::unix::fs::PermissionsExt::from_mode(0o755))
                 .unwrap();
             let _ = std::fs::remove_file(&log);
+            let _ = std::fs::remove_file(dir.join(HOST_LIMIT_FILE));
             let script = format!(
                 "WL=/x\n{}echo went on\n",
                 dmabuf_probe_sh(
                     "app",
                     &sh_quote(&setup.display().to_string()),
                     &sh_quote(&log.display().to_string()),
+                    &sh_quote(&dir.join(HOST_LIMIT_FILE).display().to_string()),
                     "echo logs"
                 )
             );
@@ -4123,13 +4141,14 @@ esac
                 .unwrap()
         };
         let refused = run("dmabuf: refused 64x64 fourcc 0x34325241 stride 256 modifier 0x0");
-        assert_eq!(refused.status.code(), Some(HOST_LIMIT_EXIT));
+        assert_eq!(refused.status.code(), Some(5));
         let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
-        assert!(
-            stderr.contains("remote run app: host limit: the compositor imports no client dmabuf (dmabuf: refused 64x64"),
-            "{stderr}"
-        );
+        let want = "remote run app: host limit: the compositor imports no client dmabuf (dmabuf: refused 64x64";
+        assert!(stderr.contains(want), "{stderr}");
         assert_eq!(String::from_utf8_lossy(&refused.stdout), "logs\n");
+        // the file the tar brings back is what the host reads
+        let limit = host_limit(&dir).expect("a host limit");
+        assert!(limit.0.starts_with(want), "{limit}");
         for line in [
             "dmabuf: imported 64x64",
             "dmabuf: not probed: no render node in /dev/dri",
@@ -4137,36 +4156,9 @@ esac
             let out = run(line);
             assert!(out.status.success(), "{line}");
             assert_eq!(String::from_utf8_lossy(&out.stdout), "went on\n", "{line}");
+            assert!(host_limit(&dir).is_none(), "{line}");
         }
 
-        let transcript = dir.join("app.log");
-        std::fs::write(&transcript, format!("== run app on local:/b\n{stderr}")).unwrap();
-        let remote = RemoteRun {
-            host: Host::Local(PathBuf::from("/b")),
-            base: "/b".to_owned(),
-            lib_dirs: Vec::new(),
-            limit: Duration::from_secs(1),
-            log: transcript,
-            display: Display::NestedHeadless,
-            dmabuf_probe: true,
-            view: None,
-            agent: None,
-            manifest_sha256: TEST_SHA.to_owned(),
-            audio: None,
-        };
-        let end = std::os::unix::process::ExitStatusExt::from_raw(HOST_LIMIT_EXIT << 8);
-        let e = remote.failed(Path::new("/w/out/app/root"), end);
-        let limit = e.downcast_ref::<HostLimit>().expect("a host limit");
-        assert!(
-            limit.0.starts_with("remote run app: host limit: "),
-            "{limit}"
-        );
-        let other = std::os::unix::process::ExitStatusExt::from_raw(5 << 8);
-        assert!(
-            !remote
-                .failed(Path::new("/w/out/app/root"), other)
-                .is::<HostLimit>()
-        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
