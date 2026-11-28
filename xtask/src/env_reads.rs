@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `check` step `env-reads`: product code reads no environment-variable switch (AGENTS Design: no env switches, no test-only product paths).
+//! Source rule `env-reads` (check step source-scan, source_scan.rs): product code reads no environment-variable switch (AGENTS Design: no env switches, no test-only product paths).
 //! A read = `env::var(` / `env::var_os(` / `env::vars(` / `env::vars_os(` / `env!(` / `option_env!(` in a crate's `src/` or `build.rs`, before its `#[cfg(test)]`; its name is the literal, or the `const` it names resolved (same file first, else the one workspace const of that name), else the argument text.
 //! Cargo's own build/test variables (`CARGO_*`, `OUT_DIR`, `TARGET`, ...) pass unlisted. Every other read is listed in [`ALLOWED`] with its class and reason; an entry no read matches fails, so the list cannot rot.
 //! Deliberate breaks and forced tiers are cargo features `break-<name>` / `tier-<name>` instead, enabled only by the harness on the command line: no Cargo.toml may enable one from another feature or a dependency spec.
@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-use crate::spdx;
+use crate::spdx::Tree;
 
 /// What an allowed read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,21 +194,17 @@ const CALLS: [&str; 6] = [
     "env!(",
 ];
 
-pub fn check(root: &Path) -> Result<()> {
-    let files: Vec<String> = spdx::candidate_files(root)?
-        .into_iter()
-        .filter(|f| {
-            f.starts_with("crates/")
-                && f.ends_with(".rs")
-                && (f.contains("/src/") || f.ends_with("/build.rs"))
-        })
+/// Source rule `env-reads` (source_scan.rs).
+pub fn check(_root: &Path, tree: &Tree) -> Result<()> {
+    let files = tree.texts(|f| {
+        f.starts_with("crates/")
+            && f.ends_with(".rs")
+            && (f.contains("/src/") || f.ends_with("/build.rs"))
+    })?;
+    let texts: BTreeMap<String, String> = files
+        .iter()
+        .map(|(rel, text)| ((*rel).to_owned(), (*text).to_owned()))
         .collect();
-    let mut texts = BTreeMap::new();
-    for rel in &files {
-        let text =
-            std::fs::read_to_string(root.join(rel)).with_context(|| format!("reading {rel}"))?;
-        texts.insert(rel.clone(), text);
-    }
     let consts = workspace_consts(&texts);
     let mut found = Vec::new();
     for (rel, text) in &texts {
@@ -217,14 +213,9 @@ pub fn check(root: &Path) -> Result<()> {
         }
     }
     let mut bad = judge(&found, ALLOWED);
-    for rel in spdx::candidate_files(root)?
-        .into_iter()
-        .filter(|f| f.ends_with("Cargo.toml"))
-    {
-        let text =
-            std::fs::read_to_string(root.join(&rel)).with_context(|| format!("reading {rel}"))?;
+    for (rel, text) in tree.texts(|f| f.ends_with("Cargo.toml"))? {
         bad.extend(
-            feature_enables(&text)
+            feature_enables(text)
                 .into_iter()
                 .map(|(n, l)| format!("{rel}:{n}: enables a break/tier feature: {l}")),
         );

@@ -33,7 +33,7 @@ crates = ["atl-broker", "atl-sandbox-stub", "atl-sandbox-probe", "atl-sandbox-jo
 exports = ["atl-broker"]
 uses = ["binder", "android-paths", "bwrap", "diag"]
 
-# the Android filesystem layout inside the sandbox: the only home of Android path literals (xtask check step android-paths)
+# the Android filesystem layout inside the sandbox: the only home of Android path literals (xtask check source rule android-paths)
 [android-paths]
 crates = ["atl-android-paths"]
 exports = ["atl-android-paths"]

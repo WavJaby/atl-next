@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The Android filesystem layout as an app process sees it inside its sandbox: the one place an Android path literal lives (plan S18 sandbox layout table, first cut), and the variable that names the property area on the host until the sandbox mounts it (`PROPERTY_AREA_ENV`).
-//! `xtask check` step `android-paths` fails on such a literal anywhere else in the workspace, unless android-paths.toml allows it with a reason; its roots are `ROOTS`.
+//! `xtask check` source rule `android-paths` fails on such a literal anywhere else in the workspace, unless android-paths.toml allows it with a reason; its roots are `ROOTS`.
 #![forbid(unsafe_code)]
 
 /// `ANDROID_ROOT` on a device: the platform partition, bound read-only.

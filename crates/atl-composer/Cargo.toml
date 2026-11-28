@@ -16,7 +16,7 @@ converter = ["device/libbinder_rs", "device/libatl_diag", "device/libatl_parcela
 
 [features]
 converter = ["atl-aidl/converter", "atl-ime/converter", "atl-libinput/converter", "atl-services-wire/converter", "atl-service-view/converter"]
-# Deliberate breaks (a gate failing on purpose: red with it, green without): only the harness's faulted builds enable one; no other feature may (xtask check step env-reads)
+# Deliberate breaks (a gate failing on purpose: red with it, green without): only the harness's faulted builds enable one; no other feature may (xtask check source rule env-reads)
 break-z-order = []
 break-post-draw = []
 break-queue = []

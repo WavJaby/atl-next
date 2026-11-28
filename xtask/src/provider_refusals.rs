@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MIT
-//! `check` step `provider-refusals`: the WebView provider (java/webview-provider) throws UnsupportedOperationException only for the class-C methods in [`CLASS_C`].
+//! Source rule `provider-refusals` (check step source-scan, source_scan.rs): the WebView provider (java/webview-provider) throws UnsupportedOperationException only for the class-C methods in [`CLASS_C`].
 //! AOSP's `android.webkit` contract never throws it, and SDKs call WebView methods unconditionally on the main thread, so every other unimplemented method answers the contract's
 //! default / failure value / no-op, counted (`Unimplemented.accept` / `answer`). A refusal not in the table fails, and so does a table entry no source refuses (the table cannot rot).
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+
+use crate::spdx::Tree;
 
 /// The provider's Java sources.
-const DIR: &str = "java/webview-provider/java";
+const DIR: &str = "java/webview-provider/java/";
 
 /// (api as passed to `Unimplemented.refuse`, why no contract-legal answer exists).
 const CLASS_C: &[(&str, &str)] = &[
@@ -67,14 +69,12 @@ const CLASS_C: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn check(root: &Path) -> Result<()> {
+/// Source rule `provider-refusals` (source_scan.rs).
+pub fn check(_root: &Path, tree: &Tree) -> Result<()> {
     let mut found = BTreeSet::new();
     let mut raw = Vec::new();
-    let dir = root.join(DIR);
-    for f in java_files(&dir)? {
-        let text = std::fs::read_to_string(&f).with_context(|| format!("read {}", f.display()))?;
-        let rel = f.strip_prefix(root).unwrap_or(&f).display().to_string();
-        let (apis, direct) = scan(&text);
+    for (rel, text) in tree.texts(|f| f.starts_with(DIR) && f.ends_with(".java"))? {
+        let (apis, direct) = scan(text);
         found.extend(apis);
         raw.extend(direct.into_iter().map(|l| format!("{rel}:{l}")));
     }
@@ -118,19 +118,6 @@ fn scan(text: &str) -> (Vec<String>, Vec<usize>) {
         }
     }
     (apis, direct)
-}
-
-fn java_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let p = e?.path();
-        if p.is_dir() {
-            out.extend(java_files(&p)?);
-        } else if p.extension().is_some_and(|x| x == "java") {
-            out.push(p);
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

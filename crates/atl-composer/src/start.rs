@@ -28,7 +28,7 @@ use crate::{service, surface_flinger, ui_agent, ui_window};
 
 /// How long the registry may be missing. atld starts an app process only after the services printed `services: ready`, which follows the registry's addService, so this covers a slow machine, not a race.
 const REGISTRY_WAIT: Duration = Duration::from_secs(5);
-// Deliberate breaks (a gate failing on purpose) are cargo features `break-<name>` (Cargo.toml), compiled in only by the harness's faulted launcher build (xtask packages.rs `bin_with_breaks`); shipped builds enable none (check step env-reads).
+// Deliberate breaks (a gate failing on purpose) are cargo features `break-<name>` (Cargo.toml), compiled in only by the harness's faulted launcher build (xtask packages.rs `bin_with_breaks`); shipped builds enable none (check source rule env-reads).
 /// How often the registry is looked up while it is missing.
 const REGISTRY_POLL: Duration = Duration::from_millis(50);
 

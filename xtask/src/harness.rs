@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The runtime harness (crate xtask-harness) as a process: `cargo xtask test|run-apk|remote` and check step `gl-proxies` run its binary.
+//! The runtime harness (crate xtask-harness) as a process: `cargo xtask test|run-apk|remote` and check step `gates` run its binary.
 //! It links the product crates, whose build scripts read fetched trees (bionic headers, native_bridge.h), so it builds only after `xtask fetch`; this tool must not link it.
 
 use std::ffi::OsString;

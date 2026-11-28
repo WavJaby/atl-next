@@ -1,11 +1,68 @@
 // SPDX-License-Identifier: MIT
-//! SPDX gate: every file we author carries `SPDX-License-Identifier: MIT` near the top.
+//! SPDX gate (source rule `spdx`, source_scan.rs): every file we author carries `SPDX-License-Identifier: MIT` near the top.
 //! Exception: a file translated from AOSP's Apache-2.0 sources (the Rust system services) is a derivative work: `Apache-2.0`, accepted only with an attribution line [`DERIVED`] naming the AOSP files right after the tag.
+//! Also the home of the tree the next commit can contain ([`candidate_files`], [`Tree`]): every source rule reads it.
 
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+
+/// The files the next commit can contain ([`candidate_files`]), read once: (path relative to the checkout, bytes), in `git ls-files` order.
+pub struct Tree {
+    files: Vec<(String, Vec<u8>)>,
+}
+
+impl Tree {
+    pub fn load(root: &Path) -> Result<Self> {
+        let files = candidate_files(root)?
+            .into_iter()
+            .map(|rel| {
+                let bytes =
+                    std::fs::read(root.join(&rel)).with_context(|| format!("reading {rel}"))?;
+                Ok((rel, bytes))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { files })
+    }
+
+    /// Every file as (path, bytes).
+    pub fn files(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.files
+            .iter()
+            .map(|(rel, b)| (rel.as_str(), b.as_slice()))
+    }
+
+    /// The files whose path passes `keep`, as UTF-8 text; a kept file that is not UTF-8 is an error naming it.
+    pub fn texts(&self, keep: impl Fn(&str) -> bool) -> Result<Vec<(&str, &str)>> {
+        self.files()
+            .filter(|(rel, _)| keep(rel))
+            .map(|(rel, b)| {
+                std::str::from_utf8(b)
+                    .map(|t| (rel, t))
+                    .with_context(|| format!("reading {rel}: not UTF-8"))
+            })
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn of(files: &[(&str, &[u8])]) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|(rel, bytes)| ((*rel).to_owned(), bytes.to_vec()))
+                .collect(),
+        }
+    }
+}
 
 const TAG: &str = "SPDX-License-Identifier:";
 const OUR_LICENSE: &str = "MIT";
@@ -50,22 +107,21 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn check(root: &Path) -> Result<()> {
+/// Source rule `spdx` (source_scan.rs).
+pub fn check(root: &Path, tree: &Tree) -> Result<()> {
     let mut bad = Vec::new();
-    let files = candidate_files(root)?;
-    for rel in &files {
-        if EXEMPT.iter().any(|(name, _)| rel == name) {
+    for (rel, bytes) in tree.files() {
+        if EXEMPT.iter().any(|(name, _)| rel == *name) {
             continue;
         }
-        let bytes = std::fs::read(root.join(rel)).with_context(|| format!("reading {rel}"))?;
         if rel.starts_with("patches/") {
-            if let Some(problem) = check_patch_dir_file(root, rel, &String::from_utf8_lossy(&bytes))
+            if let Some(problem) = check_patch_dir_file(root, rel, &String::from_utf8_lossy(bytes))
             {
                 bad.push(problem);
             }
             continue;
         }
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(bytes);
         match header_license(&text) {
             Some(OUR_LICENSE) => {}
             Some(AOSP_LICENSE) => {
@@ -82,7 +138,7 @@ pub fn check(root: &Path) -> Result<()> {
         }
     }
     if bad.is_empty() {
-        eprintln!("spdx: {} files ok", files.len());
+        eprintln!("spdx: {} files ok", tree.len());
         return Ok(());
     }
     for line in &bad {
@@ -91,7 +147,7 @@ pub fn check(root: &Path) -> Result<()> {
     bail!(
         "{} of {} files lack a valid SPDX header",
         bad.len(),
-        files.len()
+        tree.len()
     );
 }
 

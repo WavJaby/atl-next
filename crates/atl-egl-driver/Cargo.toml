@@ -13,7 +13,7 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Deliberate breaks and forced tiers (build.rs `BREAKS`, `TIERS`): only the harness's staging enables one (xtask-harness egl_driver.rs); no other feature may (xtask check step env-reads)
+# Deliberate breaks and forced tiers (build.rs `BREAKS`, `TIERS`): only the harness's staging enables one (xtask-harness egl_driver.rs); no other feature may (xtask check source rule env-reads)
 [features]
 break-no_config_filter = []
 break-no_window_connect = []

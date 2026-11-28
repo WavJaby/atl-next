@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Android path literals allowed outside crate atl-android-paths (xtask check step android-paths; xtask/src/android_paths.rs).
+# Android path literals allowed outside crate atl-android-paths (xtask check source rule android-paths; xtask/src/android_paths.rs).
 # One [[allow]] row per (file, literal): `literal` as written between the quotes, `reason` why the layout module is not the source.
 # A row matching nothing fails the step.
 

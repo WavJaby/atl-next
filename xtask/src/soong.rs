@@ -1,34 +1,33 @@
 // SPDX-License-Identifier: MIT
-//! `check` step `soong`: tracked code never invokes Soong (`soong_ui`, `build/soong/soong_ui.bash`, `lunch`). Soong is retired (a84d9b6, 2026-11-04). The converter reads Soong's `.go` sources as the reference for build behaviour, which stays allowed.
+//! Source rule `soong` (check step source-scan, source_scan.rs): tracked code never invokes Soong (`soong_ui`, `build/soong/soong_ui.bash`, `lunch`). Soong is retired (a84d9b6, 2026-11-04). The converter reads Soong's `.go` sources as the reference for build behaviour, which stays allowed.
 //! Allowed: whole-line comments, a trailing ` //` comment, and Markdown (prose, not code). This file names the tokens it looks for, so it is exempt by path.
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-use crate::spdx;
+use crate::spdx::Tree;
 
 /// Tokens that mean an invocation. `build/soong/soong_ui.bash` contains `soong_ui`, so it has no entry of its own.
 const TOKENS: [&str; 2] = ["soong_ui", "lunch"];
 /// This file: its own tokens and its test fixtures.
 const EXEMPT: &str = "xtask/src/soong.rs";
 
-pub fn check(root: &Path) -> Result<()> {
-    let files = spdx::candidate_files(root)?;
+/// Source rule `soong` (source_scan.rs).
+pub fn check(_root: &Path, tree: &Tree) -> Result<()> {
     let mut hits = Vec::new();
-    for rel in &files {
+    for (rel, bytes) in tree.files() {
         if rel == EXEMPT || rel.ends_with(".md") {
             continue;
         }
-        let bytes = std::fs::read(root.join(rel)).with_context(|| format!("reading {rel}"))?;
         // binary files carry no source line to invoke anything
-        let Ok(text) = std::str::from_utf8(&bytes) else {
+        let Ok(text) = std::str::from_utf8(bytes) else {
             continue;
         };
         hits.extend(violations(rel, text));
     }
     if hits.is_empty() {
-        eprintln!("soong: {} files ok", files.len());
+        eprintln!("soong: {} files ok", tree.len());
         return Ok(());
     }
     for hit in &hits {

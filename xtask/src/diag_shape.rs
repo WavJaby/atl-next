@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! `check` step `diag-shape`: no crate writes a free-text refusal or unimplemented line; an API outcome is counted through atl-diag (plan diagnostics-f4 D3), whose `diag:` lines the run summary ranks.
+//! Source rule `diag-shape` (check step source-scan, source_scan.rs): no crate writes a free-text refusal or unimplemented line; an API outcome is counted through atl-diag (plan diagnostics-f4 D3), whose `diag:` lines the run summary ranks.
 //! A shape = a log macro (`eprintln!`, `writeln!`, tracing's `warn!` ...) whose string literals hold the word `refused` or `unimplemented`, in a crate's `src/` before its `#[cfg(test)]` module.
 //! Lines of another subject (driver faults, capability tiers: plan "Out of this family by subject") are listed in [`OTHER_SUBJECT`] with their reason; an entry no line matches fails, so the list cannot rot.
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-use crate::spdx;
+use crate::spdx::Tree;
 
 /// Log macros, matched by their last path segment (`tracing::warn!` and `warn!` alike).
 const MACROS: [&str; 9] = [
@@ -50,19 +50,16 @@ const OTHER_SUBJECT: &[(&str, &str, &str)] = &[
     ),
 ];
 
-pub fn check(root: &Path) -> Result<()> {
-    let files: Vec<String> = spdx::candidate_files(root)?
-        .into_iter()
-        .filter(|f| f.starts_with("crates/") && f.contains("/src/") && f.ends_with(".rs"))
-        .collect();
+/// Source rule `diag-shape` (source_scan.rs).
+pub fn check(_root: &Path, tree: &Tree) -> Result<()> {
+    let files =
+        tree.texts(|f| f.starts_with("crates/") && f.contains("/src/") && f.ends_with(".rs"))?;
     let mut found = Vec::new();
-    for rel in &files {
-        let text =
-            std::fs::read_to_string(root.join(rel)).with_context(|| format!("reading {rel}"))?;
+    for (rel, text) in &files {
         found.extend(
-            shapes(&text)
+            shapes(text)
                 .into_iter()
-                .map(|(n, lit)| (rel.clone(), n, lit)),
+                .map(|(n, lit)| ((*rel).to_owned(), n, lit)),
         );
     }
     let bad = judge(&found, OTHER_SUBJECT);

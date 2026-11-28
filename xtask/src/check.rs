@@ -16,7 +16,7 @@ use crate::verdict::{self, Failure, Verdict};
 use crate::{
     aosp, app_ops_table, arches, build_state, converter, cts_table, deps, gtk_baseline,
     libcxx_gate, licenses, modules, out, packages, patch, providers, prune, service_mirrors,
-    sources, spdx, test_apks, workspace,
+    sources, test_apks, workspace,
 };
 use atl_layout::Layout;
 
@@ -34,8 +34,8 @@ pub struct Args {
 enum Step {
     /// rustfmt, check mode
     Fmt,
-    /// SPDX header on every tracked or new, non-ignored file
-    Spdx,
+    /// one walk of the tracked + new, non-ignored files, then each source rule over it, each with its own verdict line (source_scan.rs `RULES`): spdx (SPDX header on every file); seam (libbinder's driver I/O only through BinderDriver.h, patches/aosp/frameworks/native 0002, in the AOSP tree this checkout builds); android-paths (Android path literals only in atl-android-paths, others allowed by android-paths.toml); bwrap-flags (bwrap flag literals only in atl-bwrap, besides the golden argv tests); soong (code never invokes Soong, retired a84d9b6); diag-shape (no free-text `refused` / `unimplemented` log line: outcomes through atl-diag); provider-refusals (the WebView provider throws UnsupportedOperationException only for its listed class-C methods); env-reads (no environment-variable switch in product code; no Cargo.toml enables a `break-*` / `tier-*` feature)
+    SourceScan,
     /// repo tables (arches, sources, deps, providers, licenses, prune, cts, test-apks, isa-tiers, gtk-baseline) parse with their schema and invariants; the tracked APK scenarios (xtask-harness scenarios.rs `check`) name a row and pass their static rules
     Tables,
     /// deps.toml rows against this host: installed at the required version (`deps --check`)
@@ -50,20 +50,6 @@ enum Step {
     Bootstrap,
     /// fetched upstream checkouts match their pins and patches/ (no unexported or uncommitted work)
     Drift,
-    /// libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0002), in the tree this checkout builds
-    Seam,
-    /// Android path literals (`/system`, `/data`, ...) only in crate atl-android-paths, others allowed by android-paths.toml with a reason
-    AndroidPaths,
-    /// bwrap flag literals only in atl-broker's bwrap.rs, besides the golden argv tests
-    BwrapFlags,
-    /// tracked code never invokes Soong (`soong_ui`, `lunch`; Soong retired a84d9b6): comments and Markdown pass
-    Soong,
-    /// no crate logs a free-text `refused` / `unimplemented` line: API outcomes go through atl-diag; lines of another subject listed with a reason (diag_shape.rs)
-    DiagShape,
-    /// the WebView provider throws UnsupportedOperationException only for the class-C methods listed with a reason (provider_refusals.rs)
-    ProviderRefusals,
-    /// product code reads no environment-variable switch: each read is cargo's, or listed with its class and reason (env_reads.rs); no Cargo.toml enables a `break-*` / `tier-*` feature
-    EnvReads,
     /// clippy on all targets, warnings denied
     Clippy,
     /// cargo-deny: advisories, bans, licences, sources
@@ -84,9 +70,9 @@ enum Step {
     CrossBionic,
 }
 
-const ALL: [Step; 25] = [
+const ALL: [Step; 18] = [
     Step::Fmt,
-    Step::Spdx,
+    Step::SourceScan,
     Step::Tables,
     Step::Deps,
     Step::Keepset,
@@ -94,13 +80,6 @@ const ALL: [Step; 25] = [
     Step::Modules,
     Step::Bootstrap,
     Step::Drift,
-    Step::Seam,
-    Step::AndroidPaths,
-    Step::BwrapFlags,
-    Step::Soong,
-    Step::DiagShape,
-    Step::ProviderRefusals,
-    Step::EnvReads,
     Step::Clippy,
     Step::Deny,
     Step::Test,
@@ -116,7 +95,7 @@ impl Step {
     fn name(self) -> &'static str {
         match self {
             Step::Fmt => "fmt",
-            Step::Spdx => "spdx",
+            Step::SourceScan => "source-scan",
             Step::Tables => "tables",
             Step::Deps => "deps",
             Step::Keepset => "keepset",
@@ -124,13 +103,6 @@ impl Step {
             Step::Modules => "modules",
             Step::Bootstrap => "bootstrap",
             Step::Drift => "drift",
-            Step::Seam => "seam",
-            Step::AndroidPaths => "android-paths",
-            Step::BwrapFlags => "bwrap-flags",
-            Step::Soong => "soong",
-            Step::DiagShape => "diag-shape",
-            Step::ProviderRefusals => "provider-refusals",
-            Step::EnvReads => "env-reads",
             Step::Clippy => "clippy",
             Step::Deny => "deny",
             Step::Test => "test",
@@ -219,7 +191,7 @@ impl Step {
     fn run_whole(self, root: &Path) -> Result<()> {
         match self {
             Step::Fmt => cargo(root, &["fmt", "--all", "--check"], Units::Plain),
-            Step::Spdx => spdx::check(root),
+            Step::SourceScan => crate::source_scan::check(root),
             Step::Tables => tables(root),
             Step::Deps => {
                 let report = deps::host_problems(root, None)?;
@@ -247,13 +219,6 @@ impl Step {
             }
             Step::Bootstrap => crate::bootstrap_gate::check(root),
             Step::Drift => patch::check(root),
-            Step::Seam => crate::seam_gate::check(root),
-            Step::AndroidPaths => crate::android_paths::check(root),
-            Step::BwrapFlags => crate::bwrap_flags::check(root),
-            Step::Soong => crate::soong::check(root),
-            Step::DiagShape => crate::diag_shape::check(root),
-            Step::ProviderRefusals => crate::provider_refusals::check(root),
-            Step::EnvReads => crate::env_reads::check(root),
             Step::Clippy => cargo(
                 root,
                 &[

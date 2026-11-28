@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! Step `bwrap-flags` of `xtask check`: bwrap flag literals live only in crate atl-bwrap (the argv builder), so every sandbox argv is built through it and a flag's meaning has one home.
-//! Flags = the `--name` literals of bwrap.rs itself (derived, not listed here). A finding = a string literal elsewhere whose first whitespace-separated token is one of them (a flag inside another command's text, `mount --bind`, is not bwrap's), in any `.rs` file the next commit can contain (spdx.rs `candidate_files`); literals are read as android_paths.rs reads them.
+//! Source rule `bwrap-flags` (check step source-scan, source_scan.rs): bwrap flag literals live only in crate atl-bwrap (the argv builder), so every sandbox argv is built through it and a flag's meaning has one home.
+//! Flags = the `--name` literals of bwrap.rs itself (derived, not listed here). A finding = a string literal elsewhere whose first whitespace-separated token is one of them (a flag inside another command's text, `mount --bind`, is not bwrap's), in any `.rs` file the next commit can contain (spdx.rs `Tree`); literals are read as android_paths.rs reads them.
 //! Exempt: this file and the functions in [`EXEMPT`], each with its reason -- chiefly the golden argv tests, expected values written from the sandbox spec that must not be built by the code under test. A row whose function holds no flag literal fails (stale).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
 use crate::android_paths::literals;
+use crate::spdx::Tree;
 
 const BUILDER: &str = "crates/atl-bwrap/src/lib.rs";
 const SELF: &str = "xtask/src/bwrap_flags.rs";
@@ -134,19 +135,21 @@ fn judge(found: &[(String, usize, String, String)], exempt: &[(&str, &str, &str)
     fails
 }
 
-pub fn check(root: &Path) -> Result<()> {
+/// Source rule `bwrap-flags` (source_scan.rs).
+pub fn check(root: &Path, tree: &Tree) -> Result<()> {
     let builder = std::fs::read_to_string(root.join(BUILDER))
         .with_context(|| format!("reading {BUILDER}"))?;
     let flags = flags(&builder);
     if flags.is_empty() {
         bail!("{BUILDER}: no `--flag` literals found: the probe would pass anything");
     }
-    let files = crate::spdx::candidate_files(root)?;
-    let found = scan(
-        |f| std::fs::read_to_string(root.join(f)).ok(),
-        &files,
-        &flags,
-    );
+    // a file that is not UTF-8 holds no literal to read
+    let texts: BTreeMap<&str, &str> = tree
+        .files()
+        .filter_map(|(rel, b)| std::str::from_utf8(b).ok().map(|t| (rel, t)))
+        .collect();
+    let files: Vec<String> = tree.files().map(|(rel, _)| rel.to_owned()).collect();
+    let found = scan(|f| texts.get(f).map(|t| (*t).to_owned()), &files, &flags);
     let fails = judge(&found, EXEMPT);
     if !fails.is_empty() {
         bail!("{}", fails.join("\n"));

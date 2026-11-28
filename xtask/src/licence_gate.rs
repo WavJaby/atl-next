@@ -78,7 +78,7 @@ pub struct Report {
     pub generated: usize,
     pub system: usize,
     /// Members loaded from a providers.toml crate's archive (`<out>/crates/<crate>/lib/*.a`, cargo-c, linked whole into a `srcs` module): workspace code, whose licences step `deny`
-    /// (cargo-deny, the crate's dependency closure) and step `spdx` (our own sources) check, as for the crates provided as shared objects; counted, not followed.
+    /// (cargo-deny, the crate's dependency closure) and source rule `spdx` (our own sources) check, as for the crates provided as shared objects; counted, not followed.
     #[serde(default)]
     pub crates: usize,
     /// Licence expression -> files under it (as resolved: key-relative) -> the first artifact reaching it.

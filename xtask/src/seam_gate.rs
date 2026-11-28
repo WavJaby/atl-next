@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step `seam`: a static scan of libbinder's sources (patches/aosp/frameworks/native 0002) -- every driver call goes through `BinderDriver.h`. Text only; the runtime side is `xtask test binder` (binder.rs).
+//! Source rule `seam` (check step source-scan, source_scan.rs): a static scan of libbinder's sources (patches/aosp/frameworks/native 0002) -- every driver call goes through `BinderDriver.h`. Text only; the runtime side is `xtask test binder` (binder.rs).
 
 use std::path::Path;
 
@@ -46,8 +46,8 @@ fn seam_violations(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// `xtask check` step `seam`: no driver I/O in libbinder bypasses `BinderDriver.h`, in the tree this checkout builds (task copy or `src/`).
-pub fn check(root: &Path) -> Result<()> {
+/// Rule `seam`: no driver I/O in libbinder bypasses `BinderDriver.h`, in the AOSP tree this checkout builds (task copy or `src/`), not the tracked tree.
+pub fn check(root: &Path, _tracked: &crate::spdx::Tree) -> Result<()> {
     let layout = Layout::of(root)?;
     let mut bad = Vec::new();
     for f in SEAM_FILES {

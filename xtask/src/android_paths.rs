@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Step `android-paths` of `xtask check`: an Android path literal (a string literal equal to or below one of `atl_android_paths::ROOTS`) lives only in crate atl-android-paths, so the guest layout has one home (plan S18) and a port to another host layout edits one file.
-//! Scanned: every `.rs` file the next commit can contain (spdx.rs `candidate_files`), outside that crate and this file (its tests hold literals on purpose). A line is read up to `//` outside a string (comments, docs); a literal is `"..."` with `\` escapes, any prefix (`c`, `b`, `format!`). Raw strings (`r"..."`) and `/*` block comments are not handled.
+//! Source rule `android-paths` (check step source-scan, source_scan.rs): an Android path literal (a string literal equal to or below one of `atl_android_paths::ROOTS`) lives only in crate atl-android-paths, so the guest layout has one home (plan S18) and a port to another host layout edits one file.
+//! Scanned: every `.rs` file the next commit can contain (spdx.rs `Tree`), outside that crate and this file (its tests hold literals on purpose). A line is read up to `//` outside a string (comments, docs); a literal is `"..."` with `\` escapes, any prefix (`c`, `b`, `format!`). Raw strings (`r"..."`) and `/*` block comments are not handled.
 //! `android-paths.toml` `[[allow]]` rows exempt one literal in one file, with the reason: a test's independently derived expected value, a fixture path no layout owns. A row that matches nothing fails (stale).
 
 use std::collections::BTreeSet;
@@ -8,6 +8,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+
+use crate::spdx::Tree;
 
 pub const FILE: &str = "android-paths.toml";
 /// The crate that owns the literals: not scanned.
@@ -85,21 +87,13 @@ fn is_android_path(literal: &str) -> bool {
 }
 
 /// `(file, line, literal)` of every Android path literal outside HOME.
-fn scan(root: &Path, files: &[String]) -> Result<Vec<(String, usize, String)>> {
+fn scan(tree: &Tree) -> Result<Vec<(String, usize, String)>> {
     let mut found = Vec::new();
-    for f in files {
-        if !f.ends_with(".rs") || f.starts_with(HOME) || f == SELF {
-            continue;
-        }
-        let path = root.join(f);
-        if !path.is_file() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {f}"))?;
+    for (f, text) in tree.texts(|f| f.ends_with(".rs") && !f.starts_with(HOME) && f != SELF)? {
         for (i, line) in text.lines().enumerate() {
             for l in literals(line) {
                 if is_android_path(&l) {
-                    found.push((f.clone(), i + 1, l));
+                    found.push((f.to_owned(), i + 1, l));
                 }
             }
         }
@@ -107,7 +101,8 @@ fn scan(root: &Path, files: &[String]) -> Result<Vec<(String, usize, String)>> {
     Ok(found)
 }
 
-pub fn check(root: &Path) -> Result<()> {
+/// Source rule `android-paths` (source_scan.rs).
+pub fn check(root: &Path, tree: &Tree) -> Result<()> {
     let text =
         std::fs::read_to_string(root.join(FILE)).with_context(|| format!("reading {FILE}"))?;
     let table: Table = toml::from_str(&text).with_context(|| format!("parsing {FILE}"))?;
@@ -125,7 +120,7 @@ pub fn check(root: &Path) -> Result<()> {
             a.literal
         );
     }
-    let found = scan(root, &crate::spdx::candidate_files(root)?)?;
+    let found = scan(tree)?;
     let mut used = BTreeSet::new();
     let mut fails = Vec::new();
     for (file, line, lit) in &found {

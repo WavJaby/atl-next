@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! The one counter family: API outcomes of this process, keyed by (outcome, api). [`binder_reply`] is the aidl patch's `--rust_reply_hook` (patches/aosp/system/tools/aidl): every generated
 //! `on_transact` calls it once per non-OK outcome it sends back, and hand-written dispatchers call it the same way ([`unknown_code`] for a code they do not serve); hand-written code counts
-//! served-by-design calls with [`answered`], [`refused`], [`sent`], and an API it does not implement with [`unimplemented_api!`]. Free-text refusal lines are not written (xtask check step `diag-shape`).
+//! served-by-design calls with [`answered`], [`refused`], [`sent`], and an API it does not implement with [`unimplemented_api!`]. Free-text refusal lines are not written (xtask check source rule `diag-shape`).
 //! Log policy (maintainer 2026-11-14, M60 R2): a line at the first hit and at each power-of-two count, so a SIGKILLed process still leaves first-seen and a lower bound within 2x without flooding
 //! (50,708 hits of one key -> 16 lines); [`flush_totals`] writes the exact total per key on an orderly exit. Line shapes ([`summary`] parses them; outcome before api: an api may hold spaces, an
 //! outcome never does): `diag: first <outcome> <api> 1 at=<stamp>[ cause=<what>]`, `diag: count <outcome> <api> <n> at=<stamp>[ cause=<what>]`, `diag: total <outcome> <api> <n> first=<stamp>`.

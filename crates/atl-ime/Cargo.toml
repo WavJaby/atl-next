@@ -15,7 +15,7 @@ converter = ["device/libbinder_rs", "device/libatl_parcelables", "device/atl-aid
 
 [features]
 converter = ["atl-aidl/converter"]
-# Deliberate break (a gate failing on purpose: red with it, green without): only the harness's faulted builds enable it; no other feature may (xtask check step env-reads)
+# Deliberate break (a gate failing on purpose: red with it, green without): only the harness's faulted builds enable it; no other feature may (xtask check source rule env-reads)
 break-copy = []
 
 [dependencies]

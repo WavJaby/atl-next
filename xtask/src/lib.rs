@@ -81,6 +81,7 @@ pub mod seam_gate;
 pub mod selfbind_gate;
 pub mod service_mirrors;
 pub mod soong;
+pub mod source_scan;
 pub mod sources;
 pub mod spdx;
 pub mod stage_env;
