@@ -25,7 +25,7 @@ const PROPERTY_SERVICE: &str = "atl-property-service";
 /// The launcher package and its executable.
 const LAUNCHER: &str = "atl-app-launcher";
 /// The launcher's options for a process with no binder driver ([`HostArt::launch`]): no AudioFlinger (atl-app-launcher args.rs `--no-audio-service`), the one service it serves at start that talks to the real servicemanager.
-const NO_BINDER: &[&str] = &["--no-audio-service"];
+pub const NO_BINDER: &[&str] = &["--no-audio-service"];
 /// Written by the converter (bp2ninja buildprop.go) when it builds with a release config.
 pub const BUILD_PROP: &str = "gen/build.prop";
 /// Where Android installs the ICU data ART's ICU opens (external/icu/icu4c/source/stubdata/Android.bp apex_icu.dat: prebuilt_etc of `icu*.dat`, sub_dir icu, in the com.android.i18n APEX).
@@ -150,10 +150,7 @@ impl HostArt {
         verbose: bool,
     ) -> Result<Self> {
         let arches = arches::load(root)?;
-        let arch = arches
-            .get(host)
-            .filter(|a| a.host.is_some())
-            .with_context(|| format!("{host}: not a host arch in {}", arches::FILE))?;
+        let arch = arches::host(&arches, host)?.arch;
         let layout = Layout::of(root)?;
         let java_out = crate::out::out_dir(root, java_out)?;
         let (d8, jdk) = java_tools(root, &java_out)?;

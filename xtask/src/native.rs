@@ -78,14 +78,14 @@ impl Args {
     fn resolved(&self, root: &Path) -> Result<Args> {
         let mut a = self.clone();
         let wanted = crate::gate_goals::union(root, &self.for_gates)?;
+        // the host's own ISA as a guest is its arch row's name, also for a variant host
+        let arches = crate::arches::load(root)?;
+        let own = crate::arches::host(&arches, &a.host)?;
+        let own_arch = own.arch_name.to_owned();
         if !wanted.nb.is_empty() {
-            let arches = crate::arches::load(root)?;
-            let identity = arches
-                .get(&a.host)
-                .and_then(|r| r.host.as_ref())
-                .is_some_and(|h| h.identity);
+            let identity = own.host.identity;
             match (&a.native_bridge, identity) {
-                (None, true) => a.native_bridge = Some(a.host.clone()),
+                (None, true) => a.native_bridge = Some(own_arch.clone()),
                 // no identity guest: this run builds the host goals; the gates' foreign guest is a second run with --native-bridge <arch>
                 (None, false) => println!(
                     "native: --host {} has no identity engine (arches.toml): building the host goals of --for {}; its guest goals need --native-bridge <arch>",
@@ -93,7 +93,7 @@ impl Args {
                     self.for_gates.join(",")
                 ),
                 // a foreign --native-bridge on an identity host: the gates' guest for an app of that ABI (run-apk, build_state.rs `foreign_out`); the identity guest stays the host run's
-                (Some(arch), false) if *arch == a.host => bail!(
+                (Some(arch), false) if *arch == own_arch => bail!(
                     "--for {}: --host {} has no identity engine (arches.toml), so its own ISA is no native-bridge guest",
                     self.for_gates.join(","),
                     a.host
@@ -102,7 +102,7 @@ impl Args {
             }
         }
         // a foreign guest's graph (graph_dir) takes only the gates' nb goals; their host goals are the host run's (same --for, no --native-bridge), which takes no nb goal
-        let foreign = a.native_bridge.as_ref().is_some_and(|nb| *nb != a.host);
+        let foreign = a.native_bridge.as_ref().is_some_and(|nb| *nb != own_arch);
         for g in wanted.converter() {
             let nb = g.starts_with(NB_GOAL);
             if (foreign && !nb) || (a.native_bridge.is_none() && nb) {
@@ -237,19 +237,19 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         crate::disk_floor::check(&ws, &crate::ws_config::load(&ws)?)?;
     }
     let arches = arches::load(root)?;
-    let (pointer_bits, arch_variant, abi, host) = match arches.get(&args.host) {
-        Some(a @ arches::Arch { host: Some(h), .. }) => (
-            a.pointer_bits.to_string(),
-            a.soong_arch_variant.clone().unwrap_or_default(),
-            // Soong's Arch.Abi[0]: the lib/<abi>/ of an apk's JNI libraries
-            a.guest
-                .as_ref()
-                .and_then(|g| g.android_abis.first().cloned())
-                .unwrap_or_default(),
-            h,
-        ),
-        _ => anyhow::bail!("{}: not a host arch in {}", args.host, arches::FILE),
-    };
+    // `args.host` names out dirs and the cross target; Soong and the guest side see the arch row (`host_row.arch_name`)
+    let host_row = arches::host(&arches, &args.host)?;
+    let a = host_row.arch;
+    let (pointer_bits, arch_variant, abi, host) = (
+        a.pointer_bits.to_string(),
+        a.soong_arch_variant.clone().unwrap_or_default(),
+        // Soong's Arch.Abi[0]: the lib/<abi>/ of an apk's JNI libraries
+        a.guest
+            .as_ref()
+            .and_then(|g| g.android_abis.first().cloned())
+            .unwrap_or_default(),
+        &host_row.host,
+    );
     // the converter and its prebuilt build-only tools run on the build machine, so the prebuilt directory is that row's whatever the host; a host of another arch is compiled for its own row's target
     let (build_name, build) = arches::build_machine(root, &arches)?;
     let prebuilt_os = prebuilt_os(build_name, build)?;
@@ -277,7 +277,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let out = host_out(root, args.out.as_deref(), &args.host)?;
     // the converter graph and what it builds: the host's out dir, or a foreign guest's own dir (graph_dir), so a foreign run writes neither the host build.ninja nor its args file
     let graph_out = match &args.native_bridge {
-        Some(arch) => graph_dir(&out, &args.host, arch),
+        Some(arch) => graph_dir(&out, host_row.arch_name, arch),
         None => out.clone(),
     };
     let foreign = graph_out != out;
@@ -356,7 +356,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             cargo: cross_cargo.as_ref(),
             target,
             flags: &cross_flags,
-            cross_processor: cross.as_ref().map(|_| args.host.as_str()),
+            cross_processor: cross.as_ref().map(|_| host_row.arch_name),
             rust_triple: &host.rust,
         },
         &mut phases,
@@ -472,7 +472,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         argv.extend(
             [
                 "-arch",
-                &args.host,
+                host_row.arch_name,
                 "-pointer-bits",
                 &pointer_bits,
                 "-arch-variant",
@@ -762,10 +762,8 @@ fn native_bridge_flags(
         .get(arch)
         .filter(|a| a.guest.is_some())
         .with_context(|| format!("--native-bridge {arch}: no [guest] row in {}", arches::FILE))?;
-    let host_bits = arches
-        .get(&args.host)
-        .context("run checked the host row")?
-        .pointer_bits;
+    let own = arches::host(arches, &args.host)?;
+    let (host_arch, host_bits) = (own.arch_name, own.arch.pointer_bits);
     let side = vec![
         "-native-bridge".to_owned(),
         arch.clone(),
@@ -780,7 +778,7 @@ fn native_bridge_flags(
             .arg(tree)
             .arg("-out")
             .arg(out)
-            .args(["-arch", &args.host, "-pointer-bits", &host_bits.to_string()])
+            .args(["-arch", host_arch, "-pointer-bits", &host_bits.to_string()])
             // the ART plugin config is read on every run
             .arg("-llvm")
             .arg(llvm)
@@ -1093,7 +1091,7 @@ pub fn cross_host_of(root: &Path, out: &Path) -> Result<Option<String>> {
     Ok(out
         .file_name()
         .and_then(|n| n.to_str())
-        .filter(|n| *n != build_name && arches.get(*n).is_some_and(|r| r.host.is_some()))
+        .filter(|n| *n != build_name && arches::find_host(&arches, n).is_some())
         .map(str::to_owned))
 }
 

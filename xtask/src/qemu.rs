@@ -228,10 +228,7 @@ pub fn plan_on(
 /// The cross host `host` (arches::cross_target), None when it is the build machine. Its rows must be satisfied (deps::host_rows_problems names the fetch command).
 fn cross_host(root: &Path, arches: &arches::Arches, host: &str) -> Result<Option<Cross>> {
     let (build, _) = arches::build_machine(root, arches)?;
-    let row = arches
-        .get(host)
-        .and_then(|a| a.host.as_ref())
-        .with_context(|| format!("{}: no [{host}.host] row", arches::FILE))?;
+    let row = &arches::host(arches, host)?.host;
     let Some(t) = arches::cross_target(host, row, build)? else {
         return Ok(None);
     };
@@ -477,10 +474,8 @@ pub fn execute(root: &Path, b: &Build) -> Result<PathBuf> {
 /// A cross output cannot run here: the host's isa gate holds `path` to the row's isa closure, glibc_floor and sysroot libraries; summary lines print under `tag`.
 pub fn isa_gate_cross(root: &Path, c: &Cross, path: &Path, tag: &str) -> Result<()> {
     let arches = arches::load(root)?;
-    let host = arches
-        .get(&c.host)
-        .and_then(|a| a.host.as_ref())
-        .with_context(|| format!("{}: no [{}.host] row", arches::FILE, c.host))?;
+    let row = arches::host(&arches, &c.host)?;
+    let host = &row.host;
     let report = isa_gate::check_executable(path, host, &isa_gate::sysroot_dirs(root, host)?)?;
     for line in isa_gate::summary(&report) {
         println!("{tag}: isa gate: {line}");

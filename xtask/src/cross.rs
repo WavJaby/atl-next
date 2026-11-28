@@ -76,10 +76,8 @@ pub struct CargoTarget {
 /// The cargo target of cross host `arch`, once its rows are satisfied. `cross` runs cargo with it; `native` builds the host's crates with it.
 pub fn cargo_target(root: &Path, arch: &str) -> Result<CargoTarget> {
     let arches = arches::load(root)?;
-    let host = arches
-        .get(arch)
-        .and_then(|a| a.host.as_ref())
-        .with_context(|| format!("{}: no [{arch}.host] row", arches::FILE))?;
+    let row = arches::host(&arches, arch)?;
+    let host = &row.host;
     let (Some(isa), Some(clang), Some(sysroot), Some(cc)) =
         (&host.isa, &host.clang, &host.sysroot, &host.cc)
     else {

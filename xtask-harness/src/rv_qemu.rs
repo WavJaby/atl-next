@@ -81,10 +81,8 @@ struct Toolchain {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches_table = arches::load(root)?;
-    let host = arches_table
-        .get(&args.host)
-        .and_then(|a| a.host.as_ref())
-        .with_context(|| format!("{}: no [{}.host] row", arches::FILE, args.host))?;
+    let row = arches::host(&arches_table, &args.host)?;
+    let host = &row.host;
     let (Some(isa), Some(clang), Some(sysroot), Some(cc), Some(cxx)) =
         (&host.isa, &host.clang, &host.sysroot, &host.cc, &host.cxx)
     else {
@@ -242,7 +240,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
 }
 
 /// QEMU's bare `rv64i` with each extension of the row's closure switched on: `rv64gc_zba_zbb` -> `rv64i,a=true,c=true,d=true,...,zbb=true`. The implied ones (zmmul, zca, ...) are named too, so QEMU's own implication rules cannot differ from the row's.
-fn baseline_cpu(closure: &BTreeSet<String>) -> String {
+pub(crate) fn baseline_cpu(closure: &BTreeSet<String>) -> String {
     std::iter::once("rv64i".to_owned())
         .chain(
             closure

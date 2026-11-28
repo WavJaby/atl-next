@@ -55,10 +55,8 @@ pub fn llvm_lib_dir(root: &Path, out: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(LLVM_LIB_DIR));
     };
     let arches = arches::load(root)?;
-    let sysroot = arches
-        .get(&host)
-        .and_then(|r| r.host.as_ref())
-        .and_then(|h| h.sysroot.clone())
+    let sysroot = arches::find_host(&arches, &host)
+        .and_then(|r| r.host.sysroot)
         .with_context(|| format!("arches.toml `{host}`: a cross host without a sysroot"))?;
     Ok(xtask::deps::sysroot_root(root, &sysroot)?.join(LLVM_LIB_DIR.trim_start_matches('/')))
 }
@@ -206,20 +204,20 @@ pub struct TestArgs {
 /// `--arch` of a remote run (`remote test app`, `remote run-apk`): one declaration, one selection ([`TargetArch::resolve`]).
 #[derive(clap::Args, Clone, Default)]
 pub struct TargetArch {
-    /// The target's arch (an arches.toml row with `[host]`); its bundle comes from its out dir (a cross host's under the build dir, native.rs `host_out`). Default: the build machine's.
+    /// The target's host build (an arches.toml `[host]` row or `<arch>-<variant>`); its bundle comes from its out dir (a cross host's under the build dir, native.rs `host_out`). Default: the build machine's.
     #[arg(long)]
     pub(crate) arch: Option<String>,
 }
 
 impl TargetArch {
-    /// The target's arch: `--arch`, else the build machine's. A name without a `[host]` row is refused here, before any build or transfer.
+    /// The target's host: `--arch`, else the build machine's. A name that is no host is refused here, before any build or transfer.
     pub fn resolve(&self, root: &Path) -> Result<String> {
         let arches = arches::load(root)?;
         let (build, _) = arches::build_machine(root, &arches)?;
         let arch = self.arch.as_deref().unwrap_or(build);
         ensure!(
-            arches.get(arch).is_some_and(|r| r.host.is_some()),
-            "--arch {arch}: not a host arch (an arches.toml row with `[host]`)"
+            arches::find_host(&arches, arch).is_some(),
+            "--arch {arch}: not a host (an arches.toml `[host]` row or one of its variants)"
         );
         Ok(arch.to_owned())
     }
@@ -2610,12 +2608,11 @@ fn id_form(name: &str) -> bool {
     !name.starts_with('.') && valid_name(name)
 }
 
-/// The arches with a `[host]` row in arches.toml: the `<arch>` of a cross build dir's name.
+/// The host names of arches.toml (`[host]` rows and their variants): the `<arch>` of a cross build dir's name.
 fn host_arch_names(root: &Path) -> Result<BTreeSet<String>> {
-    Ok(arches::load(root)?
+    Ok(arches::hosts(&arches::load(root)?)
         .into_iter()
-        .filter(|(_, row)| row.host.is_some())
-        .map(|(name, _)| name)
+        .map(|h| h.name)
         .collect())
 }
 

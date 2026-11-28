@@ -701,6 +701,16 @@ min_reason = "observed 2026-11-07; older is untested"
 scope = ["test"]
 used_by = ["xtask:test"]
 
+# rv_art.rs: `setarch -R` runs qemu-user without address randomization, so two runs map libart at one address (its nterp range from a -strace run filters the next run's -d log)
+[setarch]
+debian = "util-linux"
+arch = "util-linux"
+binary = "setarch"
+min = "2.41.5"
+min_reason = "observed 2026-11-28; older is untested"
+scope = ["test"]
+used_by = ["xtask:test"]
+
 [unshare]
 debian = "util-linux"
 arch = "util-linux"

@@ -89,6 +89,8 @@ pub fn device_abis(arches: &crate::arches::Arches, host: &str) -> Result<Vec<Sup
                 .unwrap_or_default(),
         })
         .collect();
+    // a variant host's ABIs are its arch row's (abilist rows are arches)
+    let host = crate::arches::find_host(arches, host).map_or(host, |h| h.arch_name);
     Ok(abilist::device_abis(&rows, host)?
         .into_iter()
         .map(|a| SupportedAbi {

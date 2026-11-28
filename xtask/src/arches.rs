@@ -27,7 +27,7 @@ pub struct Arch {
     pub guest: Option<Guest>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Host {
     pub rust: String,
@@ -53,6 +53,59 @@ pub struct Host {
     /// Per-module departures from AOSP's flags on this cross host's product sides, each backed by a measurement; empty = none.
     #[serde(default)]
     pub module_flags: Vec<ModuleFlags>,
+    /// `[<arch>.host.variants.<v>]`: further builds of this host's arch at another isa, host name `<arch>-<v>`; every other column is this row's.
+    #[serde(default)]
+    pub variants: BTreeMap<String, Variant>,
+}
+
+/// One host variant: what differs from its `[<arch>.host]` row.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Variant {
+    pub isa: String,
+}
+
+/// A host build as tools address it: `name` keys out dirs, bases, bundles and `--host`; `arch` (the row key) is what Soong, ART and the guest side see.
+#[derive(Debug, Clone)]
+pub struct HostRow<'a> {
+    pub name: String,
+    pub arch_name: &'a str,
+    pub arch: &'a Arch,
+    /// The arch's `[host]` columns with the variant's applied (variants of a variant: none).
+    pub host: Host,
+}
+
+/// Every host build: each `[<arch>.host]` row, then its variants.
+pub fn hosts(arches: &Arches) -> Vec<HostRow<'_>> {
+    let mut out = Vec::new();
+    for (arch_name, arch) in arches {
+        let Some(base) = &arch.host else { continue };
+        let row = |name: String, isa: Option<String>| HostRow {
+            name,
+            arch_name,
+            arch,
+            host: Host {
+                isa,
+                variants: BTreeMap::new(),
+                ..base.clone()
+            },
+        };
+        out.push(row(arch_name.clone(), base.isa.clone()));
+        for (v, var) in &base.variants {
+            out.push(row(format!("{arch_name}-{v}"), Some(var.isa.clone())));
+        }
+    }
+    out
+}
+
+/// The host build named `name` (an arch with a `[host]` row, or `<arch>-<variant>`).
+pub fn host<'a>(arches: &'a Arches, name: &str) -> Result<HostRow<'a>> {
+    find_host(arches, name).with_context(|| format!("{name}: not a host in {FILE}"))
+}
+
+/// [`host`], None when no host has that name.
+pub fn find_host<'a>(arches: &'a Arches, name: &str) -> Option<HostRow<'a>> {
+    hosts(arches).into_iter().find(|h| h.name == name)
 }
 
 /// One `[[<arch>.host.module_flags]]` row: extra target flags of one Android.bp module's compiles and link (the converter fails on a module the tree lacks).
@@ -91,10 +144,7 @@ pub fn load(root: &Path) -> Result<Arches> {
 
 /// Whether host `host` has the identity engine (`[host] identity`): its own guest runs natively, so its guest is part of its graph. Elsewhere every guest is foreign (QEMU).
 pub fn identity(root: &Path, host: &str) -> Result<bool> {
-    Ok(load(root)?
-        .get(host)
-        .and_then(|r| r.host.as_ref())
-        .is_some_and(|h| h.identity))
+    Ok(find_host(&load(root)?, host).is_some_and(|h| h.host.identity))
 }
 
 /// The row of the machine xtask runs on: the `[host]` row whose `rust` triple is rustc's host (`rustc -vV` in `root`, so rust-toolchain.toml's rustc).
@@ -206,6 +256,28 @@ fn validate(arches: &Arches) -> Result<()> {
             }
             if let Some(floor) = &host.glibc_floor {
                 dotted_version(floor).with_context(|| format!("{name}: glibc_floor"))?;
+            }
+            // a variant changes a cross host's isa: the build machine's own isa is rustc's, not a column
+            ensure!(
+                host.variants.is_empty() || host.isa.is_some(),
+                "{name}: variants only on a cross host (one with isa)"
+            );
+            for (v, var) in &host.variants {
+                let full = format!("{name}-{v}");
+                ensure!(
+                    !v.is_empty()
+                        && v.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                    "{full}: variant name must be [a-z0-9]+ (it is part of a host name and a directory)"
+                );
+                ensure!(
+                    !arches.contains_key(&full),
+                    "{full}: variant host name is also an arch row"
+                );
+                ensure!(
+                    host.isa.as_deref() != Some(var.isa.as_str()),
+                    "{full}: same isa as [{name}.host]: not another build"
+                );
             }
         }
         if let Some(guest) = &arch.guest {
@@ -362,10 +434,8 @@ pub fn dotted_version(text: &str) -> Result<Vec<u32>> {
 /// The cross columns of every host row that has them: `isa` extensions are rustc target features of its Rust
 /// target, `clang` is a triple clang accepts with the arch name as its arch part, and `sysroot` names a `sysroot_debs` row.
 pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
-    for (name, host) in arches
-        .iter()
-        .filter_map(|(n, a)| Some((n, a.host.as_ref()?)))
-    {
+    for row in hosts(arches) {
+        let (name, host) = (&row.name, &row.host);
         if let Some(isa) = &host.isa {
             let features = rustc_features(root, &host.rust)?;
             for e in isa_extensions(isa)? {
@@ -385,8 +455,9 @@ pub fn check_cross(root: &Path, arches: &Arches) -> Result<()> {
                 .output()
                 .with_context(|| format!("running {cc} -print-target-triple"))?;
             ensure!(
-                out.status.success() && triple.split('-').next() == Some(name.as_str()),
-                "{FILE}: {name}: {cc} does not accept {triple} as a target with arch {name}"
+                out.status.success() && triple.split('-').next() == Some(row.arch_name),
+                "{FILE}: {name}: {cc} does not accept {triple} as a target with arch {}",
+                row.arch_name
             );
             // module_flags: the compiler takes each row's flags for the triple as used flags (an unused or unknown one fails under -Werror)
             for r in &host.module_flags {
@@ -789,6 +860,7 @@ mod tests {
             cxx: isa.map(|_| "cxx-row".into()),
             lld: isa.map(|_| "lld-row".into()),
             module_flags: isa.map(|_| vec![hwui_row()]).unwrap_or_default(),
+            variants: Default::default(),
         };
         // the build machine's own row is native, whatever it lists
         assert_eq!(
@@ -955,5 +1027,36 @@ mod tests {
         // the build machine (no isa) takes deps.toml clang: no toolchain columns, no module_flags
         assert!(err(&format!("{host}{tc}")).contains("go with isa"));
         assert!(err(&format!("{host}{}", row("m"))).contains("go with isa"));
+    }
+
+    #[test]
+    fn variant_is_a_second_host_of_the_arch() {
+        let host = "[a]\npointer_bits = 64\nkernel_arch = \"k\"\nuapi_records = [\"r\"]\n[a.host]\nrust = \"t\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\n";
+        let cross = "isa = \"rv64gc_zba_zbb\"\nglibc_floor = \"2.39\"\nclang = \"a-l\"\nsysroot = \"s\"\ncc = \"c\"\ncxx = \"x\"\nlld = \"l\"\n";
+        let variant = |v: &str, isa: &str| format!("[a.host.variants.{v}]\nisa = \"{isa}\"\n");
+        let arches = parse(&format!("{host}{cross}{}", variant("gc", "rv64gc"))).unwrap();
+        let names: Vec<String> = super::hosts(&arches).into_iter().map(|h| h.name).collect();
+        assert_eq!(names, ["a", "a-gc"]);
+        let gc = super::host(&arches, "a-gc").unwrap();
+        // the variant's isa, every other column the row's; Soong and the guest side see the arch
+        assert_eq!(
+            (gc.arch_name, gc.host.isa.as_deref(), gc.host.cc.as_deref()),
+            ("a", Some("rv64gc"), Some("c"))
+        );
+        assert_eq!(
+            super::host(&arches, "a").unwrap().host.isa.as_deref(),
+            Some("rv64gc_zba_zbb")
+        );
+        assert!(super::host(&arches, "a-zz").is_err());
+        let gc_target = super::cross_target("a-gc", &gc.host, "b").unwrap().unwrap();
+        assert_eq!(gc_target.isa, "rv64gc");
+        // refused: a variant of the build machine, the row's own isa, a name that is no directory-safe word
+        assert!(
+            err(&format!("{host}{}", variant("gc", "rv64gc"))).contains("only on a cross host")
+        );
+        assert!(
+            err(&format!("{host}{cross}{}", variant("gc", "rv64gc_zba_zbb"))).contains("same isa")
+        );
+        assert!(err(&format!("{host}{cross}{}", variant("G_c", "rv64gc"))).contains("[a-z0-9]+"));
     }
 }

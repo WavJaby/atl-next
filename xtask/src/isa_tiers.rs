@@ -123,14 +123,14 @@ fn is_ident(s: &str) -> bool {
 /// The `tables` step: every row's extension takes effect on every cross host's isa (the march derives and the closure names the extension).
 pub fn check(root: &Path, arches: &arches::Arches) -> Result<()> {
     let tiers = load(root)?;
-    for (name, arch) in arches {
-        let Some(isa) = arch.host.as_ref().and_then(|h| h.isa.as_deref()) else {
+    for host in arches::hosts(arches) {
+        let Some(isa) = host.host.isa.as_deref() else {
             continue;
         };
         for (module, row) in &tiers {
             march(isa, &row.ext)
                 .and_then(|_| closure(isa, &row.ext))
-                .with_context(|| format!("in {FILE} [{module}] for host {name}"))?;
+                .with_context(|| format!("in {FILE} [{module}] for host {}", host.name))?;
         }
     }
     Ok(())

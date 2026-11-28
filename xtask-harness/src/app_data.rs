@@ -85,9 +85,9 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     )?;
     let out = rt.out.clone();
     // the host arch's first Android ABI: the device's primary, so the installer extracts the fixture's library
-    let abi = arches::load(root)?
-        .get(&args.host)
-        .and_then(|a| a.guest.as_ref())
+    let arches = arches::load(root)?;
+    let abi = arches::find_host(&arches, &args.host)
+        .and_then(|h| h.arch.guest.as_ref())
         .and_then(|g| g.android_abis.first().cloned())
         .with_context(|| format!("arches.toml has no [{}.guest] android_abis", args.host))?;
     let build = |lib: &[u8]| -> Result<PathBuf> {

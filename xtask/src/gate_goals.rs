@@ -357,6 +357,8 @@ pub const GATES: &[(&str, GoalsOf)] = &[
     ("run-apk", || app().with(keystore_daemons())),
     // a riscv64 host's libz (its V-tier TU) and libunwindstack (vlenb in a ucontext unwind), run under qemu-user (rv_qemu.rs)
     ("rv-qemu", || Goals::host(&["libz", "libunwindstack"])),
+    // a riscv64 host's ART and launcher under qemu-user (rv_art.rs)
+    ("rv-art", || Goals::host(&HOST_ART)),
     ("sandbox", Goals::default),
     ("sensors", runtime_gralloc),
     // the compiled policy, its context files and the service access table (tools/bp2ninja sepolicy.go)
@@ -386,6 +388,7 @@ pub const OUTSIDE_CHECK_ROWS: &[(&str, &str)] = &[
     ("installer", "No reason recorded: candidate for check."),
     ("native-load", "No reason recorded: candidate for check."),
     ("run-apk", "Separate app launcher command."),
+    ("rv-art", "Requires a riscv64 build and qemu-user."),
     ("rv-qemu", "Requires a riscv64 build and qemu-user."),
     ("sensors", "No reason recorded: candidate for check."),
 ];
@@ -448,12 +451,10 @@ pub fn ensure_built(
 ) -> Result<()> {
     // union, not `of`: it also takes `all-gates` (land's build stage)
     let goals = union(root, &[name.to_owned()])?;
-    let identity = crate::arches::load(root)?
-        .get(host_arch)
-        .and_then(|r| r.host.as_ref())
-        .is_some_and(|h| h.identity);
-    let wanted = if identity {
-        goals.recorded(host_arch)
+    let arches = crate::arches::load(root)?;
+    let own = crate::arches::find_host(&arches, host_arch);
+    let wanted = if let Some(own) = own.filter(|h| h.host.identity) {
+        goals.recorded(own.arch_name)
     } else {
         goals.host
     };

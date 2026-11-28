@@ -185,7 +185,7 @@ pub fn stage(
 ) -> Result<Vec<String>> {
     let arches = crate::arches::load(root)?;
     ensure!(
-        arches.get(host_arch).is_some_and(|a| a.host.is_some()),
+        crate::arches::find_host(&arches, host_arch).is_some(),
         "{host_arch}: no {} row with [host]",
         crate::arches::FILE
     );

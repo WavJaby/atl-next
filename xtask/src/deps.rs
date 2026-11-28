@@ -526,13 +526,10 @@ fn is_host_row(dep: &Dep, arch: &str, rust: &str) -> bool {
         || dep.rustup_target.as_deref() == Some(rust)
 }
 
-/// The rust target triple of cross host `arch`: its `[<arch>.host]` row's `rust`.
-fn host_rust(arches: &arches::Arches, arch: &str) -> Result<String> {
-    arches
-        .get(arch)
-        .and_then(|a| a.host.as_ref())
-        .map(|h| h.rust.clone())
-        .with_context(|| format!("{}: no [{arch}.host] row", arches::FILE))
+/// The arch row and rust target triple of host `name` (a variant resolves to its arch: deps rows name `host:<arch>`).
+fn host_rust(arches: &arches::Arches, name: &str) -> Result<(String, String)> {
+    let row = arches::host(arches, name)?;
+    Ok((row.arch_name.to_owned(), row.host.rust))
 }
 
 /// What a deps check found: rows checked, one `name: problem` per unmet row, and the rows left out (`name (cross-only)` or `name (optional)`).
@@ -563,9 +560,9 @@ impl Report {
 pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
     let arches = arches::load(root)?;
     let (build, _) = arches::build_machine(root, &arches)?;
-    let mut targets = vec![(build.to_owned(), host_rust(&arches, build)?)];
-    if let Some(arch) = host {
-        targets.push((arch.to_owned(), host_rust(&arches, arch)?));
+    let mut targets = vec![host_rust(&arches, build)?];
+    if let Some(name) = host {
+        targets.push(host_rust(&arches, name)?);
     }
     check_rows(root, &arches, |_, dep| {
         !optional_only(dep)
@@ -580,8 +577,8 @@ pub fn host_problems(root: &Path, host: Option<&str>) -> Result<Report> {
 /// `rustup target add` command comes first.
 pub fn host_rows_problems(root: &Path, arch: &str) -> Result<Vec<String>> {
     let arches = arches::load(root)?;
-    let rust = host_rust(&arches, arch)?;
-    Ok(check_rows(root, &arches, |_, dep| is_host_row(dep, arch, &rust))?.problems)
+    let (arch, rust) = host_rust(&arches, arch)?;
+    Ok(check_rows(root, &arches, |_, dep| is_host_row(dep, &arch, &rust))?.problems)
 }
 
 /// The rows `select` picks, checked against this host; every other row is listed as skipped.

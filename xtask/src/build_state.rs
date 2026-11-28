@@ -233,7 +233,10 @@ pub fn foreign_goals(root: &Path, gate: &str, isa: &str) -> Result<BTreeSet<Stri
 
 /// Run-time gate `gate`'s foreign native-bridge graph for guest `isa` (native.rs `graph_dir` under the host's out dir `out`): refused unless built from the checkout now with every goal of [`foreign_goals`], else naming the `native --native-bridge <isa> --for <gate>` command that builds them.
 pub fn foreign_out(root: &Path, out: &Path, host: &str, isa: &str, gate: &str) -> Result<PathBuf> {
-    let dir = crate::native::graph_dir(out, host, isa);
+    // graph dirs are keyed by the host's arch (a variant host's own guest is its arch's)
+    let arches = crate::arches::load(root)?;
+    let own = crate::arches::find_host(&arches, host).map_or(host, |h| h.arch_name);
+    let dir = crate::native::graph_dir(out, own, isa);
     let fix = format!("cargo xtask native --host {host} --native-bridge {isa} --for {gate}");
     ensure_current(root, &dir).with_context(|| {
         format!("gate `{gate}`: the {isa} native-bridge graph is not current: run `{fix}`")

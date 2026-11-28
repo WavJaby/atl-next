@@ -43,10 +43,10 @@ const PRODUCT_MACHINE: u16 = elf::EM_RISCV.0;
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// The arch of arches.toml whose `[host]` row (isa, glibc_floor) the outputs are checked against.
+    /// The host of arches.toml (`<arch>` or `<arch>-<variant>`) whose isa and glibc_floor the outputs are checked against.
     #[arg(long)]
     arch: String,
-    /// Build dir root, as `native --out` (default: this checkout's build dir); the arch's outputs are `<out>/<arch>`.
+    /// Build dir root, as `native --out` (default: this checkout's build dir); the host's outputs are `<out>/<host>`.
     #[arg(long, conflicts_with = "elf")]
     out: Option<PathBuf>,
     /// Instead of an out dir: one ELF built outside it (a `cross` cargo output such as libatl_native_bridge.so), held to the row's isa closure (no tier applies), glibc_floor, and sysroot libraries for its DT_NEEDED (`check_executable`).
@@ -125,10 +125,8 @@ struct Index {
 
 pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let arches = arches::load(root)?;
-    let host = arches
-        .get(&args.arch)
-        .and_then(|a| a.host.as_ref())
-        .with_context(|| format!("{}: no [{}.host] row", arches::FILE, args.arch))?;
+    let row = arches::host(&arches, &args.arch)?;
+    let host = &row.host;
     let report = if let Some(elf) = &args.elf {
         check_executable(elf, host, &sysroot_dirs(root, host)?)?
     } else {
@@ -1218,6 +1216,7 @@ mod tests {
             cxx: Some("clang-21-cxx".to_owned()),
             lld: Some("lld-21".to_owned()),
             module_flags: Vec::new(),
+            variants: Default::default(),
         };
         let report = check(
             &out,

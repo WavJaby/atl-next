@@ -64,6 +64,7 @@ mod qemu_spike;
 mod qemu_thread;
 mod remote;
 mod run_apk;
+mod rv_art;
 mod rv_qemu;
 mod sandbox;
 mod scenarios;
@@ -354,6 +355,8 @@ enum Test {
     HostLoad(host_load::Args),
     /// The riscv64 host's CPU-side checks under qemu-user, once per CPU model: the host row's derived baseline and V models (default RVA23U64 at VLEN 128 and 256). Per model: AT_HWCAP/hwprobe probe with a V instruction (SIGILL without V), libz's V tier against an independent adler32, libunwindstack's vlenb in a ucontext unwind, the riscv64 unit tests, the translator's generated code (an arm64 NEON program under the host's qemu-aarch64). One verdict line per model, then the gate's. `--break baseline` must turn it red. Needs `native --host riscv64 --for rv-qemu` and the `qemu-user` deps row.
     RvQemu(rv_qemu::Args),
+    /// A riscv64 host build's ART under qemu-user, once per CPU model (the row's derived baseline, plus `--model`): hello, an nterp run (-Xusejit:false; QEMU translated code in libart's nterp range, -Xint control none) and a JIT run (-verbose:jit compiled the hot method), both printing the sum the gate recomputes. One verdict line per model, then the gate's. Needs `native --host <host> --for rv-art`, the build-machine build and the `qemu-user` deps row.
+    RvArt(rv_art::Args),
 }
 
 fn main() -> Result<ExitCode> {
@@ -413,6 +416,9 @@ fn main() -> Result<ExitCode> {
         Command::Test {
             test: Test::RvQemu(args),
         } => rv_qemu::run(&root, &args),
+        Command::Test {
+            test: Test::RvArt(args),
+        } => rv_art::run(&root, &args),
         Command::Test {
             test: Test::Installer(args),
         } => installer::run(&root, &args),
@@ -714,6 +720,7 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::HostFonts(_) => "host-fonts",
             Test::HostLoad(_) => "host-load",
             Test::RvQemu(_) => "rv-qemu",
+            Test::RvArt(_) => "rv-art",
         },
         Command::CheckStep { .. }
         | Command::WindowLive(_)

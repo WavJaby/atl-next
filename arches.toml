@@ -28,6 +28,8 @@
 #                     Checked: fields non-empty, cc takes the flags for the clang triple under -Werror, the converter fails on a module the tree lacks.
 #   native_bridge     guest rows (`[<guest>.guest]`, not this row) whose QEMU engine this host's build ships: AOSP's TARGET_NATIVE_BRIDGE_ABI / _2ND_ABI (board_config.mk:340-351). Their android_abis join ro.product.cpu.abilist (atl-property-service src/abilist.rs); a guest not listed is in no list. Absent = none.
 #                     Checked: each name is such a row, and its ISA has an engine in atl-native-bridge (engine/qemu/arch.rs `isa:`; xtask arches.rs check_native_bridge).
+#   variants          `[<arch>.host.variants.<v>]` rows, cross hosts only: another build of this host at `isa` (the row's only column; every other column is the host row's). Host name `<arch>-<v>`: `--host`, its out dir, base part and bundle.
+#                     Soong, ART, the guest side and the abilist see the arch (`<arch>`). Checked: v is [a-z0-9]+, `<arch>-<v>` is no row, isa differs from the row's, and every check of a host's isa (rustc features, isa-tiers marches, isa gate) runs for the variant too.
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -97,6 +99,10 @@ lld = "lld-21"
 module = "libskia"
 flags = ["-mno-relax"]
 reason = "measured 2026-11-13 / 2026-11-15: with relaxation (clang-21), .gcc_except_table relocations keep libskia's dead SkFontMgr_android_ndk.cpp code alive in libhwui's --gc-sections link (12 undefined AFont_* from libskia.a); clang-21 + -mno-relax on libskia's objects links"
+
+# maintainer 2026-11-25 (M82): host `riscv64-gc` for boards without Zba/Zbb/Zbs/V (Andes AX45: rv64imafdc). ART runs there through patches/aosp/art 0007 (asm) + 0008 (JIT), gated by `xtask test rv-art --host riscv64-gc`.
+[riscv64.host.variants.gc]
+isa = "rv64gc"
 
 [riscv64.guest]
 android_abis = ["riscv64"]
