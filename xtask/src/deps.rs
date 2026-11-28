@@ -187,7 +187,7 @@ fn parse(text: &str, consumers: &Consumers) -> Result<Deps> {
 }
 
 /// A sysroot pinning a distro row's `debian` package pins it at >= that row's `min`: a cross host links against the sysroot, so a pin below min builds a binary the row says is unsupported.
-/// One direction only: a pin above min (riscv64 libgtk-4-dev 4.18.6 vs [gtk4] min 4.14.0) links symbols newer than min without complaint, so this check proves no compatibility with min itself. For GTK that is gtk_imports.rs's: check step gtk-imports (x86_64 modules) and a runtime run's staging (each host's staged modules, riscv64 included).
+/// One direction only: a pin above min (riscv64 libgtk-4-dev 4.18.6 vs [gtk4] min 4.14.0) links symbols newer than min without complaint, so this check proves no compatibility with min itself. For GTK that is gtk_imports.rs's: check gates row gtk-imports (x86_64 modules) and a runtime run's staging (each host's staged modules, riscv64 included).
 fn check_sysroot_floors(deps: &Deps) -> Result<()> {
     for (name, dep) in deps {
         let (Some(package), Some(min)) = (&dep.debian, &dep.min) else {

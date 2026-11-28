@@ -36,7 +36,7 @@ libloading = "0.8"
 gbm = { version = "0.18", default-features = false }
 # GLib's unix fd sources (`g_unix_fd_add`), split out of glib-rs in 0.22; same gtk-rs release train as gtk4
 glib-unix = "0.22"
-# GTK4 bindings (re-exporting gdk, gsk, glib, gio, graphene): only atl-platform-ui-linux, atl-platform-host-linux and atl-webview-linux depend on it (deny.toml bans). v4_14 = the GTK baseline feature floor (plan Q10, re-decided 2026-11-17: 4.14, enforced by check step gtk-imports against gtk-baseline.toml; newer API only as probed tiers) and the X8 memory formats (opaque layers) on top of v4_12's fractional surface scale
+# GTK4 bindings (re-exporting gdk, gsk, glib, gio, graphene): only atl-platform-ui-linux, atl-platform-host-linux and atl-webview-linux depend on it (deny.toml bans). v4_14 = the GTK baseline feature floor (plan Q10, re-decided 2026-11-17: 4.14, enforced by check gates row gtk-imports against gtk-baseline.toml; newer API only as probed tiers) and the X8 memory formats (opaque layers) on top of v4_12's fractional surface scale
 gtk4 = { version = "0.11", features = ["v4_14"] }
 # GDK's own Wayland objects (`wl_display`, the window's `wl_surface`) as wayland-client proxies (`wayland_crate`): atl-platform-ui-linux binds wp_presentation on GDK's connection, the only one the window's surface exists on (presentation.rs)
 gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }

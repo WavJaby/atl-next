@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# The GTK baseline's symbol source (plan Q10, re-decided 2026-11-17): the Ubuntu 24.04 (noble) riscv64 `libgtk-4-1` deb of GTK 4.14.5, the build sifive runs. Check step gtk-imports reads the deb's library dynamic symbol table as the GTK 4.14 export set (xtask/src/gtk_baseline.rs) and fails any built UI module that imports a gtk_/gdk_/gsk_ name outside it.
+# The GTK baseline's symbol source (plan Q10, re-decided 2026-11-17): the Ubuntu 24.04 (noble) riscv64 `libgtk-4-1` deb of GTK 4.14.5, the build sifive runs. Check gates row gtk-imports reads the deb's library dynamic symbol table as the GTK 4.14 export set (xtask/src/gtk_baseline.rs) and fails any built UI module that imports a gtk_/gdk_/gsk_ name outside it.
 # Row key: lowercase letters, digits, `-`. One row: the baseline. Fields, all required:
 #   package   deb package name. Checked against the deb's own control data (`dpkg-deb -f`) at download and at every use of the cache.
 #   version   deb version. Same check. Its upstream part's major.minor must equal the series of deps.toml [gtk4] min (checked by `cargo xtask check` step tables).

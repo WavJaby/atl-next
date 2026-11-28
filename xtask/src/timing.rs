@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Wall time per step of a multi-step command (`check` steps, `land` stages): shown on each step's own line and as a closing table, so a build or check optimisation is chosen by measured share, not by guess.
-//! [`phase`] is the finer clock of one process (the drive-tap step): exclusive time per named phase, the cargo lock waits inside each, and [`report`] of both.
+//! [`phase`] is the finer clock of one process (the drive-tap gate): exclusive time per named phase, the cargo lock waits inside each, and [`report`] of both.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

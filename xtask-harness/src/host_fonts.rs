@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! The real-desktop font gate (check step `host-fonts`, `xtask test host-fonts`): a CJK and an emoji code point each resolve to a real font file through the product's own font list, built as atld builds it (atl_fonts::build over the platform layer's fontconfig, the desktop's own config, AOSP's alias/fallback data at the pin).
+//! The real-desktop font gate (`xtask test host-fonts`, a check gates row): a CJK and an emoji code point each resolve to a real font file through the product's own font list, built as atld builds it (atl_fonts::build over the platform layer's fontconfig, the desktop's own config, AOSP's alias/fallback data at the pin).
 //! Resolution = minikin's fallback walk over font_fallback.xml: families in document order, the first face whose cmap maps the code point; for an Emoji_Presentation code point a family whose lang has script Zsye first (FontCollection's emoji-style score), so a text font's monochrome glyph (DejaVu Sans maps U+1F431) does not answer for the emoji font. Other locale scoring is not modelled. The cmap is read here with read-fonts, not through atl-fonts.
 //! Three verdicts: ok (family + file per code point); FAIL = the desktop has a face for the code point (fontconfig lists it, for emoji under lang `und-zsye`; cmap read here) but the product's list resolves none; "host lacks a <group> font" = no listed face: a skip check names, not a product failure and not a pass.
 //! Breaks (each must leave the ok verdict): `empty-dir` re-runs the gate under a fontconfig config whose only dir is empty (this harness's fixture, FONTCONFIG_FILE on the child) -> host lacks both; `no-fallback` builds the list with an empty fallback order -> FAIL (the host still has the faces).
@@ -84,9 +84,10 @@ pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
             u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
         ));
     }
-    match check(root, args.brk == Some(Break::NoFallback))? {
-        None => {}
-        Some(why) => println!("host-fonts: {why}"),
+    // "host lacks": the row's skip line (check_gates.rs reads it) + an ok verdict naming it
+    if let Some(why) = check(root, args.brk == Some(Break::NoFallback))? {
+        println!("{}{why}", xtask::harness::SKIP_PREFIX);
+        println!("host-fonts: ok (skipped: {why})");
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

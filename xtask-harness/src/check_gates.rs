@@ -113,6 +113,12 @@ impl Row {
 /// The gates `check` runs, in report order (cheapest first). Serial rows are the timing assertions (time bounds that other rows' load would break).
 pub const ROWS: &[Row] = &[
     Row::new(&["task-bind"], false, false),
+    // a host with no CJK or emoji face is the row's skip, named (`host lacks a CJK font`); its --out is its own work dir, never the build dir
+    Row::new(&["host-fonts"], false, false),
+    // reads the prebuild's staged UI modules (gate_build.rs Group::Release)
+    Row::new(&["gtk-imports"], false, true),
+    // a build dir without the guest proxies and fronts is the row's skip, named
+    Row::new(&["gl-proxies"], true, true),
     // the starvation rule's own gate: a starved wait undecided, every real red still red (about 10 s on one CPU)
     Row::new(&["host-load"], false, false).self_test(),
     Row::new(&["sandbox"], true, true),
@@ -140,6 +146,8 @@ pub const ROWS: &[Row] = &[
     Row::new(&["composer"], true, true).serial(),
     Row::new(&["instrument"], true, true),
     Row::new(&["app"], true, true),
+    // one widgets run: first shot non-uniform + one tap that changes pixels (drive_gate.rs `tap`)
+    Row::new(&["drive-tap"], true, true),
     // reads the `app/` tree the app gate stages (its refusal otherwise: "missing <out>/app/root/system/lib64/x86_64 ... run `xtask test app`")
     Row::new(&["nb-identity"], false, true).after(&["app"]),
     // needs what nb-identity needs (the staged `app/`)
@@ -228,6 +236,8 @@ struct Done {
     oom: bool,
     /// the row's deciding attempt is its drained replay (`replay_ooms`): settle gives it no rerun
     replayed: bool,
+    /// a passed row that had nothing to check on this host or build dir: its `skip:` line (xtask harness SKIP_PREFIX)
+    skipped: Option<String>,
 }
 
 impl Done {
@@ -249,6 +259,7 @@ impl Done {
             waits: Vec::new(),
             oom: false,
             replayed: false,
+            skipped: None,
         }
     }
 
@@ -528,7 +539,23 @@ fn plan_of(
 
 /// Runs every row on build dir `out` for host `host`, logs under `<out>/check-gates/`; fails naming each red gate's verdict line. Ok: the undecided rows, neither pass nor fail ([`Outcome`]).
 /// Each row takes its own pool grant (memory admission decides how many run at once); no grant is held around the step ([`run_lanes`]).
-pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
+/// What a passing gates step reports: its undecided rows and its skipped rows (`<row> (<why>)`).
+pub struct Ran {
+    pub undecided: Vec<Undecided>,
+    pub skipped: Vec<String>,
+}
+
+/// A passed row's skip: its `skip:` line (xtask harness SKIP_PREFIX). A red or undecided row is judged as such, never skipped.
+fn skip_line(text: &str, outcome: Outcome) -> Option<String> {
+    if outcome != Outcome::Pass {
+        return None;
+    }
+    text.lines()
+        .find_map(|l| l.strip_prefix(xtask::harness::SKIP_PREFIX))
+        .map(str::to_owned)
+}
+
+pub fn run(root: &Path, host: &str, out: &Path) -> Result<Ran> {
     let exe = std::env::current_exe().context("the harness's own path")?;
     let ws = Layout::of(root)?.workspace().to_owned();
     let logs = out.join("check-gates");
@@ -695,7 +722,12 @@ pub fn run(root: &Path, host: &str, out: &Path) -> Result<Vec<Undecided>> {
     }
     failed.extend(moved);
     if failed.is_empty() {
-        return Ok(undecided);
+        let skipped = names
+            .iter()
+            .zip(&done)
+            .filter_map(|(n, d)| d.skipped.as_ref().map(|why| format!("{n} ({why})")))
+            .collect();
+        return Ok(Ran { undecided, skipped });
     }
     let open = if undecided.is_empty() {
         String::new()
@@ -1048,6 +1080,7 @@ impl RowRun<'_> {
             waits: gate_need::wait_samples(&text),
             oom: runtime.oom,
             replayed: false,
+            skipped: skip_line(&text, outcome),
         })
     }
 }
@@ -1369,6 +1402,19 @@ mod tests {
             verdict_line(signing, "signing"),
             Some("signing: PASS AtlSigningFixture: testkey role")
         );
+    }
+
+    /// A passed row's `skip:` line is its skip; a red or undecided row's is not (it is judged as such).
+    #[test]
+    fn only_a_passed_row_is_skipped() {
+        let text = "gl-proxies: starting\nskip: no guest proxies\ngl-proxies: ok (skipped: no guest proxies)\n";
+        assert_eq!(
+            skip_line(text, Outcome::Pass).as_deref(),
+            Some("no guest proxies")
+        );
+        assert_eq!(skip_line(text, Outcome::Fail), None);
+        assert_eq!(skip_line(text, Outcome::Undecided), None);
+        assert_eq!(skip_line("gl-proxies: ok\n", Outcome::Pass), None);
     }
 
     /// Every row is a command line `xtask test` accepts, as `run` builds it: a renamed gate, stage or flag, or a host/out the gate does not take, fails here rather than in a check run.

@@ -2,6 +2,7 @@
 //! `xtask test drive`: `run-apk --drive` on fixtures, the drive engine's own gate.
 //! Stage 1, xtask-harness/testdata/window: the PNG shots' pixels are the fixture's quadrants at the opening size and after a `resize` (pixel-exact, judged here). Stage 2, xtask-harness/testdata/widgets: the script's own checkpoints
 //! (`expect-same` before a tap on the Button: nothing else moves the picture; `expect-changed` after it).
+//! `xtask test drive-tap` ([`tap`]) is check's quick form of stage 2, a gates row.
 //! Breaks must turn it red: `--break-blank` blanks every shot (the drive itself must fail), `--break-colour` swaps R and B of the expectation, `--break-input` drops the injected input (stage 2 fails at its `expect-changed`).
 
 use std::path::{Path, PathBuf};
@@ -149,15 +150,33 @@ impl<'a> Gate<'a> {
     }
 }
 
-/// `cargo xtask check`'s form (check step drive-tap): one widgets run, first shot non-uniform (drive's own blank check) + one tap that changes pixels.
+#[derive(clap::Args)]
+pub struct TapArgs {
+    /// The host arch (an arches.toml row with `[host]`).
+    #[arg(long)]
+    host: String,
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Deliberate failure: `run-apk --break-input`, the tap is dropped, so the drive must fail at its `expect-changed`.
+    #[arg(long)]
+    break_input: bool,
+}
+
+/// `xtask test drive-tap`, check's form of this gate (a gates row): one widgets run, first shot non-uniform (drive's own blank check) + one tap that changes pixels.
 /// Catches a covered / unmapped window (blank first shot) and lost input (no change); the quadrants and the still-picture shots stay in `xtask test drive`.
-/// Prints the phase report on stderr (the check log shows it), also when the run fails: the phases say where the time went up to it.
-pub fn quick(root: &Path, host: &str, out: &Path) -> Result<()> {
+/// Prints the phase report on stderr (the row's log shows it), also when the run fails: the phases say where the time went up to it.
+pub fn tap(root: &Path, args: &TapArgs) -> Result<ExitCode> {
+    let out = xtask::out::out_dir(root, args.out.as_deref())?;
     let load_start = load1();
-    let result = timing::phase("drive-tap", || quick_run(root, host, out));
+    let result = timing::phase("drive-tap", || {
+        quick_run(root, &args.host, &out, args.break_input)
+    });
     eprintln!("drive-tap load1: start {load_start}, end {}", load1());
     eprintln!("{}", timing::report("drive-tap").trim_end());
-    result
+    result?;
+    println!("drive-tap: ok");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The 1-minute load average from /proc/loadavg, as the kernel prints it; `?` when unreadable.
@@ -168,9 +187,9 @@ fn load1() -> String {
         .unwrap_or_else(|| "?".to_owned())
 }
 
-fn quick_run(root: &Path, host: &str, out: &Path) -> Result<()> {
+fn quick_run(root: &Path, host: &str, out: &Path, break_input: bool) -> Result<()> {
     let gate = timing::phase("runtime: new", || {
-        Gate::new(root, host, Some(out.to_owned()), None, (false, false))
+        Gate::new(root, host, Some(out.to_owned()), None, (false, break_input))
     })?;
     let widgets = timing::phase("apk: build and sign", || {
         gate.apk(window::WIDGETS_FIXTURE, "apk-widgets")

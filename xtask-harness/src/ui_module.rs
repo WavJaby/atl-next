@@ -353,6 +353,22 @@ fn build_app(root: &Path, args: &Args, dir: &Path) -> Result<PathBuf> {
 /// `<out>/<DIR>` holds the platform module and the WebView libraries (gate_build.rs stages them): the library path of every process that uses the atl-platform-ui facade (the launcher in a runtime run, this gate's fixture).
 pub(crate) const DIR: &str = "ui-module-lib";
 
+#[derive(clap::Args)]
+pub struct GtkImportsArgs {
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`): the modules are its release build, staged in `<out>/ui-module-lib`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+/// `xtask test gtk-imports` (a check gates row): the UI module cdylibs as gate_build stages them (check's prebuild in a row, else built here) import no GTK/GDK/GSK name outside the GTK 4.14 baseline (xtask gtk_imports.rs).
+pub fn gtk_imports(root: &Path, args: &GtkImportsArgs) -> Result<ExitCode> {
+    let out = crate::out::out_dir(root, args.out.as_deref())?;
+    let products = crate::gate_build::ensure(root, &out, &[crate::gate_build::Group::Release])?;
+    xtask::gtk_imports::check_staged(root, &products.staged_dir(DIR))?;
+    println!("gtk-imports: ok");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The web engine module (atl-platform-ui-api `abi::WEBVIEW_MODULE_FILE`, webview plan S2.3), which the facade dlopens by name on the first WebView call.
 pub(crate) const WEBVIEW_MODULE_PACKAGE: &str = "atl-webview-linux";
 pub(crate) const WEBVIEW_MODULE_FILE: &str = "libatl_webview_linux.so";

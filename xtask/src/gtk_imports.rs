@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-//! The UI module cdylibs import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml). Two callers, one check ([`Baseline::check_lib`]):
-//! `xtask check` step gtk-imports builds each cdylib in release for this out dir's host (x86_64 in check), as the harness stages it, so a runtime gate's build is reused;
-//! a runtime run's staging (atld_run.rs, `stage_module` + `stage_webview`) checks the staged files, so a cross host's modules (riscv64, built only when a remote run stages them) are gated too and the run refuses a module importing a newer name.
+//! The UI module cdylibs import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml). One check ([`check_staged`]) on the files the harness staged (gate_build.rs), two callers:
+//! check's gates row gtk-imports (xtask-harness ui_module.rs `gtk_imports`, on the prebuild's staging), and a runtime run's staging (atld_run.rs, `stage_module` + `stage_webview`), so a cross host's
+//! modules (riscv64, built only when a remote run stages them) are gated too and the run refuses a module importing a newer name.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, ensure};
 use object::read::elf::ElfFile64;
 use object::{Endianness, Object, ObjectSymbol};
 
-use crate::{cdylib, gtk_baseline, timing, unit_use};
+use crate::gtk_baseline;
 
 /// The UI module cdylibs: the platform module the facade loads, and the web engine it dlopens on the first WebView call.
 pub const MODULES: [&str; 2] = ["atl-platform-ui-linux", "atl-webview-linux"];
@@ -54,18 +54,6 @@ impl Baseline {
         );
         Ok(())
     }
-}
-
-/// Builds each module and fails on the first one that imports a name the baseline does not export.
-pub fn check(root: &Path, out: &Path) -> Result<()> {
-    let baseline = Baseline::load(root)?;
-    for package in MODULES {
-        let (mut cmd, release) = cdylib::release_build(root, out, &[package])?;
-        let status = timing::phase("cdylib build", || unit_use::status(&mut cmd))?;
-        ensure!(status.success(), "building {package} failed");
-        baseline.check_lib(package, &release.join(lib_file(package)))?;
-    }
-    Ok(())
 }
 
 /// Checks each module as staged in `dir` (file [`lib_file`]); a module missing there is an error, the staging put both.

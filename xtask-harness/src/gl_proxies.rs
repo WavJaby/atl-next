@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-//! `xtask check` step gl-proxies: the guest proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`: the GL fronts and the NDK libraries of C3) against what an NDK app may call and what the host libraries serve. Static tier, on the build dir's built files:
+//! `xtask test gl-proxies` (a check gates row): the guest proxies (NBS `libnative_bridge_guest_*`, built by `xtask native --native-bridge`: the GL fronts and the NDK libraries of C3) against what an NDK app may call and what the host libraries serve. Static tier, on the build dir's built files:
 //! 1. every NDK name of an AOSP `<lib>.map.txt` (any `introduced` level; `# llndk` names are vendor-only, not NDK) is a defined dynamic symbol of the guest proxy, or an [`ABSENT`] entry;
 //! 2. every stub of the binding table (atl-native-bridge engine `bindings::rows`) of a checked library is a defined dynamic symbol of its host library, unless the table traps it as unbound (no prototype in the EGL/GLES headers, or C++ internals);
 //! 3. every [`ABSENT`] entry still holds: its map line names it, and neither the front nor the guest proxy exports it -- else the entry is stale (red).
 //!
-//! Skipped, naming why, when the build dir has no guest proxies or fronts (`xtask native` without the nb guest set).
+//! A row skip (its `skip:` line), naming why, when the build dir has no guest proxies or fronts (`xtask native` without the nb guest set).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -100,8 +100,30 @@ fn map_dir(lib: &str) -> &'static str {
     }
 }
 
-/// Runs the step on build dir `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the build dir lacks the inputs.
-pub fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
+#[derive(clap::Args)]
+pub struct Args {
+    /// The host arch (an arches.toml row with `[host]`): the identity engine's guest arch.
+    #[arg(long)]
+    host: String,
+    /// Native build directory (default: this checkout's build dir, see `cargo xtask out show`).
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+/// `xtask test gl-proxies`: [`check`] on the build dir; missing inputs = the row's skip line + an ok verdict naming it.
+pub fn run(root: &Path, args: &Args) -> Result<std::process::ExitCode> {
+    let out = crate::out::out_dir(root, args.out.as_deref())?;
+    // reads built binaries: a build from another source state would check stale proxies
+    crate::build_state::ensure_current(root, &out)?;
+    if let Some(why) = check(root, &out, &args.host)? {
+        println!("{}{why}", xtask::harness::SKIP_PREFIX);
+        println!("gl-proxies: ok (skipped: {why})");
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The gate on build dir `out` for guest arch `arch` (the identity engine: the host's); `Some(why)` when the build dir lacks the inputs.
+fn check(root: &Path, out: &Path, arch: &str) -> Result<Option<String>> {
     let libs = checked_libs();
     let missing: Vec<String> = libs
         .iter()

@@ -174,9 +174,6 @@ enum Command {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CheckStep {
-    GlProxies,
-    DriveTap,
-    HostFonts,
     Gates,
     /// step `tables`' scenario half: the static rules over `xtask-harness/scenarios` (scenarios.rs `check`); needs no build dir
     Scenarios,
@@ -251,6 +248,12 @@ enum Test {
     Window(window::Args),
     /// `run-apk --drive` on fixtures, judged from its PNGs: a shot's pixels are the known quadrants (also after `resize`), and a tap visibly changes the frame. `--break-blank` and `--break-colour` must turn it red.
     Drive(drive_gate::Args),
+    /// check's quick form of `drive` (a gates row): one widgets run, first shot non-uniform + one tap that changes pixels (drive_gate.rs `tap`). `--break-input` must turn it red.
+    DriveTap(drive_gate::TapArgs),
+    /// The guest GL proxies cover the NDK maps and the host fronts export every bound stub (gl_proxies.rs), on the build dir; a build dir without its guest proxies and fronts is the row's skip, named.
+    GlProxies(gl_proxies::Args),
+    /// The UI module cdylibs (gate_build's staged release build of this checkout) import no GTK/GDK/GSK name outside the GTK 4.14 baseline (gtk-baseline.toml; xtask gtk_imports.rs).
+    GtkImports(ui_module::GtkImportsArgs),
     /// Every tracked scenario (`xtask-harness/scenarios/<row>.drive`, scenarios.rs) as its own `run-apk <row> --scenario` process, sequentially; logs under `<out>/scenarios/`, one `scenarios:` summary line. On demand only: not a `check` gate.
     Scenarios(scenarios::Args),
     /// The sensor service: a fixture (xtask-harness/testdata/sensors) uses SensorManager under atld with a fake `/sys/bus` (private mount namespace). `--stage empty`: no sensor, no stall; `--stage iio`: a fake IIO accelerometer's events with hand-derived values; `--stage buffer`: the same on its kernel buffer (a FIFO at `/dev/iio:device0`). `--break` must turn it red.
@@ -474,6 +477,15 @@ fn main() -> Result<ExitCode> {
             test: Test::Drive(args),
         } => drive_gate::run(&root, &args),
         Command::Test {
+            test: Test::DriveTap(args),
+        } => drive_gate::tap(&root, &args),
+        Command::Test {
+            test: Test::GlProxies(args),
+        } => gl_proxies::run(&root, &args),
+        Command::Test {
+            test: Test::GtkImports(args),
+        } => ui_module::gtk_imports(&root, &args),
+        Command::Test {
             test: Test::Scenarios(args),
         } => scenarios::run(&root, &args),
         Command::Test {
@@ -590,29 +602,20 @@ fn main() -> Result<ExitCode> {
 /// Runs check step `step` on build dir `out`; a skip is printed for check (xtask harness.rs `check_step`) and exits 0.
 fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) -> Result<ExitCode> {
     let skipped = match step {
-        CheckStep::GlProxies => {
-            let arches = arches::load(root)?;
-            let (arch, _) = arches::build_machine(root, &arches)?;
-            gl_proxies::check(root, out, arch)?
-        }
-        CheckStep::DriveTap => {
-            let arches = arches::load(root)?;
-            let (arch, _) = arches::build_machine(root, &arches)?;
-            drive_gate::quick(root, arch, out)?;
-            None
-        }
-        CheckStep::HostFonts => host_fonts::check(root, false)?,
         CheckStep::Gates => {
             let arches = arches::load(root)?;
             let (arch, _) = arches::build_machine(root, &arches)?;
-            for gate in check_gates::run(root, arch, out)? {
+            let ran = check_gates::run(root, arch, out)?;
+            for gate in ran.undecided {
                 println!(
                     "{}{}",
                     xtask::harness::UNDECIDED_PREFIX,
                     serde_json::to_string(&gate)?
                 );
             }
-            None
+            // rows whose input this host or build dir lacks: the step checked only part of its rows
+            (!ran.skipped.is_empty())
+                .then(|| format!("rows not checked: {}", ran.skipped.join("; ")))
         }
         CheckStep::Scenarios => {
             let n = scenarios::check(root)?;
@@ -666,6 +669,9 @@ fn verdict_name(command: &Command) -> Option<&'static str> {
             Test::Composer(_) => "composer",
             Test::Window(_) => "window",
             Test::Drive(_) => "drive",
+            Test::DriveTap(_) => "drive-tap",
+            Test::GlProxies(_) => "gl-proxies",
+            Test::GtkImports(_) => "gtk-imports",
             Test::Scenarios(_) => "scenarios",
             Test::Sensors(_) => "sensors",
             Test::PlatformUi(_) => "platform-ui",
