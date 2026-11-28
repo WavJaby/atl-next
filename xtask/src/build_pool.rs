@@ -2,6 +2,7 @@
 //! Machine-wide admission: a weighted pool of CPU slots and memory (GiB). Heavy work holds a [`Grant`] around one leaf (a ninja build, a cargo run) and releases it after.
 //! A slot is an exclusive `flock` on `<workspace>/cache/build-pool/cpu-<i>` or `mem-<i>`: the kernel drops it when the holder's file closes, so exit, error, panic and SIGKILL all free it -- no stale-lock cleanup exists or is needed.
 //! Waiters queue as tickets in `cache/build-pool/queue/`, served in (tier, arrival) order ([`Tier`]: the maintainer's main checkout, then land, then agents), so a large request is not starved by small ones behind it; a ticket waiting past `starve_after_s` joins the top tier at its arrival. No grant is preempted: priority decides only who is admitted next.
+//! A waiter tries again on every slot release or queue change ([`watch`]), not on a clock: the head is served the moment it fits, and its grant (its ticket leaving) wakes the next.
 //! Light work takes a free CPU slot at once when the queue head could not use it (`bypass_allowed`); otherwise it queues like heavy work.
 //! Reserved slot (maintainer 2026-11-18, option B): one CPU slot beyond `cpu_slots` plus the `light` class's memory carved out of `mem_gib`, taken only by interactive-tier light work ([`try_reserved`]), so the maintainer's play launch never waits behind agents' full natives. Its grant prints `granted the reserved slot` and counts in [`RESERVED_GRANTS`].
 //! A grant takes CPU elastically (the free slots up to the class max, at least its min); the count is the tool's job count (ninja `-j`, cargo `CARGO_BUILD_JOBS`).
@@ -15,7 +16,7 @@ use std::io::{ErrorKind, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::flock::{Flock, Mode};
@@ -24,8 +25,91 @@ use anyhow::{Context, Result, bail, ensure};
 
 use crate::ws_config::{self, PoolConfig};
 
-/// Retry interval while a request waits: a build takes minutes, so a second of extra wait is noise.
+/// Backstop between tries while a request waits: admission is driven by the pool watch ([`watch`]), this bounds a missed or unavailable wakeup and the starvation check's clock.
 pub const POLL: Duration = Duration::from_secs(1);
+
+/// Change counter of one pool dir, bumped by its watch thread on every slot release and queue change.
+struct Watch {
+    changes: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Watch {
+    fn seen(&self) -> u64 {
+        *self.changes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits until the counter moves past `seen` or `backstop` passes.
+    fn wait_past(&self, seen: u64, backstop: Duration) {
+        let guard = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = self
+            .cv
+            .wait_timeout_while(guard, backstop, |n| *n == seen)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// One watch per pool dir per process: an inotify instance per waiter would pass `fs.inotify.max_user_instances` (128) with a test step's ~120 waiting binaries.
+static WATCHES: Mutex<BTreeMap<PathBuf, Arc<Watch>>> = Mutex::new(BTreeMap::new());
+
+/// The cross-process wakeup: inotify on the slot dir (`CLOSE_WRITE`: a holder's fd closes after `LOCK_UN`, on exit and SIGKILL alike, so holders of any xtask version wake waiters without cooperating) and on the queue (a ticket added, promoted or removed).
+/// Probes open slots read-only (`CLOSE_NOWRITE`, not watched), and [`try_take`] opens for writing only a slot a probe found free, so a refused try makes no event: waiters do not wake each other in a loop.
+/// `None` when inotify is unavailable: the waiter falls back to the backstop, logged once per pool dir.
+fn watch(dir: &Path, queue: &Path, report: &mut dyn FnMut(&str)) -> Option<Arc<Watch>> {
+    use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+    let mut watches = WATCHES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(w) = watches.get(dir) {
+        return Some(w.clone());
+    }
+    let start = || -> std::io::Result<Arc<Watch>> {
+        let fd = inotify::init(CreateFlags::CLOEXEC)?;
+        inotify::add_watch(&fd, dir, WatchFlags::CLOSE_WRITE)?;
+        inotify::add_watch(
+            &fd,
+            queue,
+            WatchFlags::MOVED_TO
+                | WatchFlags::MOVED_FROM
+                | WatchFlags::DELETE
+                | WatchFlags::CLOSE_WRITE,
+        )?;
+        let w = Arc::new(Watch {
+            changes: Mutex::new(0),
+            cv: Condvar::new(),
+        });
+        let bump = w.clone();
+        std::thread::Builder::new()
+            .name("pool-watch".into())
+            .spawn(move || {
+                // the events' content is not read: any change is a reason to try again
+                let mut buf = [0u8; 4096];
+                loop {
+                    match rustix::io::read(&fd, &mut buf) {
+                        Ok(_) => {
+                            *bump.changes.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+                            bump.cv.notify_all();
+                        }
+                        Err(rustix::io::Errno::INTR) => {}
+                        Err(_) => return,
+                    }
+                }
+            })?;
+        Ok(w)
+    };
+    match start() {
+        Ok(w) => {
+            watches.insert(dir.to_path_buf(), w.clone());
+            Some(w)
+        }
+        Err(e) => {
+            report(&format!(
+                "pool: no watch on {} ({e}): waiting by the {:.1} s backstop",
+                dir.display(),
+                POLL.as_secs_f64()
+            ));
+            None
+        }
+    }
+}
 
 /// Upper bound on the ancestor walk: a process tree is a few levels deep; the walk stops at init.
 const MAX_DEPTH: usize = 64;
@@ -179,7 +263,7 @@ pub struct Grant {
     pub cpu_of: u32,
     pub mem_gib: u32,
     /// The slot files: their locks are the reservation, released when the grant drops.
-    _files: Vec<Flock>,
+    _files: Vec<Slot>,
     /// Thread-bound: the grant marker is per thread, so the grant must drop on the thread that made it.
     _thread: PhantomData<*const ()>,
 }
@@ -381,7 +465,7 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
     let mut waited = false;
     // the one grant constructor: a grant that queued writes its queue time here, the value its grant line printed
     let grant =
-        |cpu: u32, mem_gib: u32, queued: Option<Duration>, files: Vec<Flock>, record: String| {
+        |cpu: u32, mem_gib: u32, queued: Option<Duration>, files: Vec<Slot>, record: String| {
             HELD.with(|h| *h.borrow_mut() = Some((record, cpu)));
             if let Some(took) = queued {
                 record_pool_wait(&dir, took);
@@ -395,7 +479,10 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
                 _thread: PhantomData,
             }
         };
+    let watch = watch(&dir, &queue, report);
     loop {
+        // read before the try: a change during it moves the counter, so the wait below returns at once
+        let seen = watch.as_ref().map_or(0, |w| w.seen());
         // the reserved slot first: it exists for this request, and taking it leaves the shared slots to the queue
         if class == Class::Light
             && tier == Tier::Interactive
@@ -435,7 +522,7 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
             ticket = Some(Ticket::new(&queue, std::process::id(), class, tier)?);
             continue;
         };
-        // the head of the queue gathers; nobody behind it is served
+        // the head gathers; nobody behind it is served: queue order holds among tickets that fit (the gates lane starts its longest row first), and a grant removes the head's ticket, which wakes the next at once
         if queue_state.is_none_or(|(ahead, _)| ahead == 0)
             && let Some((cpu, files)) = granted(&dir, &pool, w, demand, &record)?
         {
@@ -467,7 +554,10 @@ fn wait_place(queued: Queued, poll: Duration, report: &mut dyn FnMut(&str)) -> R
             let snap = snapshot(&dir, &pool)?;
             report(&wait_line(class, w, &pool, &snap, queue_state));
         }
-        std::thread::sleep(poll);
+        match &watch {
+            Some(w) => w.wait_past(seen, poll),
+            None => std::thread::sleep(poll),
+        }
     }
 }
 
@@ -560,7 +650,7 @@ fn shared_mem(pool: &PoolConfig) -> u32 {
 }
 
 /// Every reserved file at once, or none; only interactive light asks (`acquire_with`).
-fn try_reserved(dir: &Path, pool: &PoolConfig, record: &str) -> Result<Option<Vec<Flock>>> {
+fn try_reserved(dir: &Path, pool: &PoolConfig, record: &str) -> Result<Option<Vec<Slot>>> {
     let mut files = Vec::new();
     for path in reserved_slots(dir, pool) {
         match try_take(&path, record)? {
@@ -685,7 +775,7 @@ fn arrival(name: &str) -> &str {
 }
 
 /// Live tickets that arrived before `me` but sort after it: the ones a grant to `me` passes.
-fn passed_earlier(tickets: &[(String, Option<Class>)], me: &str) -> usize {
+fn passed_earlier<T>(tickets: &[(String, T)], me: &str) -> usize {
     tickets
         .iter()
         .filter(|(name, _)| name.as_str() > me && arrival(name) < arrival(me))
@@ -701,27 +791,50 @@ fn live_tickets(queue: &Path) -> Result<Vec<(String, Option<Class>)>> {
 }
 
 /// (live tickets ordered before `me`, all live tickets); `me` is a ticket's file name.
-fn queue_position(tickets: &[(String, Option<Class>)], me: &str) -> (usize, usize) {
+fn queue_position<T>(tickets: &[(String, T)], me: &str) -> (usize, usize) {
     crate::ticket::position(tickets, me)
 }
 
 /// Takes one slot without waiting. The holder record is written under the lock; a reader may see it half-written, which costs a garbled wait line, nothing else.
-fn try_take(path: &Path, record: &str) -> Result<Option<Flock>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    let Some(mut held) = Flock::try_take(file, Mode::Exclusive)
+/// The lock is taken on a read-only fd and the record written through a second, writable one, closed after the unlock ([`Slot`]): closing a write fd is the pool's wake event ([`watch`]), so a refused try (read-only fd) makes none and a release makes one.
+fn try_take(path: &Path, record: &str) -> Result<Option<Slot>> {
+    let open_ro = || OpenOptions::new().read(true).open(path);
+    let file = match open_ro() {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // a slot's first use: one write close, once per slot file's life
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            open_ro()
+        }
+        other => other,
+    }
+    .with_context(|| format!("opening {}", path.display()))?;
+    let Some(lock) = Flock::try_take(file, Mode::Exclusive)
         .with_context(|| format!("flock {}", path.display()))?
     else {
         return Ok(None);
     };
-    held.file().set_len(0)?;
-    held.file().write_all(record.as_bytes())?;
-    Ok(Some(held))
+    let mut rec = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    rec.set_len(0)?;
+    rec.write_all(record.as_bytes())?;
+    Ok(Some(Slot {
+        _lock: lock,
+        _record: rec,
+    }))
+}
+
+/// One held slot. Field order is drop order: the lock is released first, then the writable fd closes, so the wake event comes after the slot is free (on SIGKILL the kernel closes fds in fd order, the lock's fd first; a reorder costs one backstop).
+#[derive(Debug)]
+struct Slot {
+    _lock: Flock,
+    _record: File,
 }
 
 /// `Some(holder record)` when a holder has the slot, `None` when it is free. Takes nothing.
@@ -750,7 +863,7 @@ fn try_grant(
     pool: &PoolConfig,
     w: ClassWeight,
     record: &str,
-) -> Result<Option<(u32, Vec<Flock>)>> {
+) -> Result<Option<(u32, Vec<Slot>)>> {
     let mut files = Vec::new();
     let mut mem = 0;
     for i in 1..=shared_mem(pool) {
@@ -788,7 +901,7 @@ fn granted(
     w: ClassWeight,
     demand: Option<Demand>,
     record: &str,
-) -> Result<Option<(u32, Vec<Flock>)>> {
+) -> Result<Option<(u32, Vec<Slot>)>> {
     match demand {
         Some(d) => try_demand_grant(dir, pool, d, record),
         None => try_grant(dir, pool, w, record),
@@ -801,7 +914,7 @@ fn try_demand_grant(
     pool: &PoolConfig,
     d: Demand,
     record: &str,
-) -> Result<Option<(u32, Vec<Flock>)>> {
+) -> Result<Option<(u32, Vec<Slot>)>> {
     let snap = snapshot(dir, pool)?;
     let (running_cores, running) = snap.running_cores();
     if !cpu_fits(f64::from(snap.free_cpu), running_cores, running, d.cores) {
@@ -811,12 +924,7 @@ fn try_demand_grant(
 }
 
 /// `d.mem_gib` memory slots at once, or none. Free slots are counted first, so a refused demand takes none; a take that loses a race is released with the rest.
-fn try_demand(
-    dir: &Path,
-    pool: &PoolConfig,
-    d: Demand,
-    record: &str,
-) -> Result<Option<Vec<Flock>>> {
+fn try_demand(dir: &Path, pool: &PoolConfig, d: Demand, record: &str) -> Result<Option<Vec<Slot>>> {
     let mut free = 0;
     for i in 1..=shared_mem(pool) {
         if probe(&slot(dir, "mem", i))?.is_none() {
@@ -1216,6 +1324,161 @@ mod tests {
             granted,
             release,
         }
+    }
+
+    /// Backstop for the admission tests below: a grant that took one would arrive no earlier than this after the change that allowed it.
+    const BACKSTOP: Duration = Duration::from_secs(5);
+
+    fn one_gib() -> Demand {
+        Demand {
+            mem_gib: 1,
+            cores: 1.0,
+        }
+    }
+
+    /// Waits for `place` on a thread with the `BACKSTOP` backstop: sends `()` on its first refusal, then the instant of its grant, and holds the grant until `release` is dropped.
+    fn waiter(
+        place: Queued,
+        release: mpsc::Receiver<()>,
+    ) -> (mpsc::Receiver<()>, mpsc::Receiver<Instant>) {
+        let (refused_tx, refused) = mpsc::channel();
+        let (gtx, granted) = mpsc::channel();
+        std::thread::spawn(move || {
+            let grant = place
+                .wait(BACKSTOP, &mut |_| {
+                    let _ = refused_tx.send(());
+                })
+                .expect("granted");
+            let _ = gtx.send(Instant::now());
+            let _ = release.recv();
+            drop(grant);
+        });
+        (refused, granted)
+    }
+
+    /// A release wakes every waiter at once, and all that fit are admitted together: N one-GiB waiters queued behind a whole-pool holder are all granted before one backstop has passed since the release.
+    /// Derivation: the event path has no timed wait, so the bound is the backstop itself; a polled or head-only pool grants the first waiter only after one backstop.
+    #[test]
+    fn a_release_admits_every_fitting_waiter_without_a_backstop() {
+        const N: usize = 8;
+        let ws = scratch_ws(
+            "release-wakes",
+            Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"),
+        );
+        let holder = demand_contender(&ws, "holder", 20);
+        assert_eq!(holder.granted.recv_timeout(WAIT).expect("holder"), "mem 20");
+        // places first, in order, as the test step queues its binaries
+        let places: Vec<Queued> = (0..N)
+            .map(|_| enqueue_demand(&ws, Path::new("waiter"), one_gib()).expect("place"))
+            .collect();
+        // each waiter holds until the test ends: all N are granted side by side
+        let mut release = Vec::new();
+        let mut waiters = Vec::new();
+        for place in places {
+            let (tx, rx) = mpsc::channel();
+            release.push(tx);
+            waiters.push(waiter(place, rx));
+        }
+        for (refused, _) in &waiters {
+            refused.recv_timeout(WAIT).expect("each waiter queued");
+        }
+        let released = Instant::now();
+        holder.release.send(()).expect("holder holds");
+        for (_, granted) in &waiters {
+            let at = granted
+                .recv_timeout(BACKSTOP + WAIT)
+                .expect("every waiter granted");
+            let took = at.duration_since(released);
+            assert!(took < BACKSTOP, "granted {took:?} after the release");
+        }
+        drop(release);
+    }
+
+    /// Queue order holds among tickets that all fit (the gates lane takes its longest row's place first): A, B, C queued in that order and waited for in reverse, each later one refused before the earlier one starts, are granted A, B, C.
+    /// Order is read from the pool, not from clocks taken after `wait` returns (thread scheduling reorders those): when a ticket is granted, every earlier one already holds its slot.
+    #[test]
+    fn tickets_that_fit_are_granted_in_queue_order() {
+        let ws = scratch_ws("fit-order", Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"));
+        let names = ["a", "b", "c"];
+        let places: Vec<Queued> = names
+            .into_iter()
+            .map(|who| enqueue_demand(&ws, Path::new(who), one_gib()).expect("place"))
+            .collect();
+        let mut release = Vec::new();
+        let mut granted = Vec::new();
+        for place in places.into_iter().rev() {
+            let (tx, rx) = mpsc::channel::<()>();
+            release.push(tx);
+            let (refused_tx, refused) = mpsc::channel();
+            let (gtx, holders) = mpsc::channel::<Vec<String>>();
+            let ws = ws.clone();
+            std::thread::spawn(move || {
+                let grant = place
+                    .wait(BACKSTOP, &mut |_| {
+                        let _ = refused_tx.send(());
+                    })
+                    .expect("granted");
+                let pool = ws_config::load(&ws).unwrap().pool;
+                let snap = snapshot(&dir(&ws), &pool).unwrap();
+                let _ = gtx.send(snap.held.into_keys().collect());
+                let _ = rx.recv();
+                drop(grant);
+            });
+            // A, the head, is granted on its first try; B and C must be refused first (they fit, but are behind)
+            if granted.len() < 2 {
+                refused
+                    .recv_timeout(WAIT)
+                    .expect("a later ticket waits for the earlier");
+            }
+            granted.push(holders);
+        }
+        // granted[0] is C's, granted[2] A's
+        for (i, holders) in granted.iter().rev().enumerate() {
+            let held = holders.recv_timeout(BACKSTOP).expect("granted");
+            for earlier in &names[..i] {
+                assert!(
+                    held.iter()
+                        .any(|r| r.starts_with(&format!("{earlier} pid "))),
+                    "{} granted before {earlier}: held {held:?}",
+                    names[i]
+                );
+            }
+        }
+        drop(release);
+    }
+
+    /// A ticket behind one that does not fit waits, though it would fit itself (the starvation guarantee).
+    #[test]
+    fn a_fitting_ticket_waits_behind_a_blocked_one() {
+        let ws = scratch_ws(
+            "behind-blocked",
+            Some("[pool]\ncpu_slots = 16\nmem_gib = 20\n"),
+        );
+        let holder = demand_contender(&ws, "holder", 19);
+        assert_eq!(holder.granted.recv_timeout(WAIT).expect("holder"), "mem 19");
+        let big = enqueue_demand(
+            &ws,
+            Path::new("big"),
+            Demand {
+                mem_gib: 2,
+                cores: 1.0,
+            },
+        )
+        .expect("big's place");
+        let small = enqueue_demand(&ws, Path::new("small"), one_gib()).expect("small's place");
+        let (release, rrx) = mpsc::channel();
+        let (refused, granted) = waiter(small, rrx);
+        refused.recv_timeout(WAIT).expect("small queued");
+        assert!(
+            granted.recv_timeout(STILL_WAITING).is_err(),
+            "small took the GiB the blocked ticket ahead waits for"
+        );
+        drop(big);
+        granted
+            .recv_timeout(BACKSTOP)
+            .expect("served once the blocked ticket left");
+        drop(release);
+        drop(holder);
     }
 
     /// A queued demand grant adds its queue time to the pool's tally, and its grant line prints that same value; a grant that finds the slots free adds nothing.
@@ -1741,6 +2004,8 @@ mod tests {
             .recv_timeout(WAIT)
             .expect("the agent did not queue");
         let stuck = Ticket::new(&queue, 1, Class::NativeFull, Tier::Interactive).unwrap();
+        // the agent wakes on the new ticket and reads the queue while the slots are still held: a try begun before `stuck` existed must not meet the freed slots
+        std::thread::sleep(STILL_WAITING);
         drop(held);
         let lines: Vec<String> = std::iter::from_fn(|| agent.waits.recv_timeout(WAIT).ok())
             .take_while(|l| !l.contains("promoted"))
