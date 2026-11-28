@@ -1,0 +1,640 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 28 Nov 2026 20:45:35 +0800
+Subject: [PATCH] art: riscv64 JIT emits no Zba/Zbb without the extensions
+
+Riscv64Assembler gains ShiftAdd, MinS, MaxS, RotateLeft, RotateRight and RotateRightImm: the Zba/Zbb instruction when the extension is enabled, a base-ISA sequence otherwise. The code generator and intrinsics use them; the riscv64 simplifier makes ShiftAdd/BitwiseNegatedRight nodes only with Zba/Zbb; intrinsics built on Zbb (bit count, clz/ctz, reverse, reverse bytes, String.compareTo, byte-array views) stay unimplemented without it, as x86-64 does for popcnt. With the extensions enabled the emitted code is unchanged.
+
+Licence of the patched files: Apache-2.0 (their AOSP headers).
+
+Upstream-Status: Inappropriate [AOSP targets rv64gcv_zba_zbb_zbs]
+Patch-Reason: a riscv64 host target is plain rv64gc, where the JIT reads its features from the build (no Zba/Zbb) yet emitted them unconditionally (SIGILL); the instruction choice is inside the code generator, nothing outside the source can change it
+---
+SPDX-License-Identifier: Apache-2.0
+ compiler/optimizing/code_generator_riscv64.cc |  28 ++--
+ .../instruction_simplifier_riscv64.cc         |  27 ++--
+ .../instruction_simplifier_riscv64.h          |   9 +-
+ compiler/optimizing/intrinsics_riscv64.cc     |  69 ++++++---
+ compiler/optimizing/optimization.cc           |   2 +-
+ compiler/utils/riscv64/assembler_riscv64.cc   | 134 ++++++++++++++++++
+ compiler/utils/riscv64/assembler_riscv64.h    |   8 ++
+ 7 files changed, 232 insertions(+), 45 deletions(-)
+
+diff --git a/compiler/optimizing/code_generator_riscv64.cc b/compiler/optimizing/code_generator_riscv64.cc
+index ba2e307af503276b7f089df1c9140bb704850a49..1ed96dda0a9c1283f56817d2809578178d920592 100644
+--- a/compiler/optimizing/code_generator_riscv64.cc
++++ b/compiler/optimizing/code_generator_riscv64.cc
+@@ -1021,18 +1021,18 @@ void InstructionCodeGeneratorRISCV64::ShNAdd(
+     case DataType::Type::kUint16:
+     case DataType::Type::kInt16:
+       DCHECK_EQ(DataType::SizeShift(type), 1u);
+-      __ Sh1Add(rd, rs1, rs2);
++      __ ShiftAdd(rd, rs1, rs2, 1u);
+       break;
+     case DataType::Type::kInt32:
+     case DataType::Type::kReference:
+     case DataType::Type::kFloat32:
+       DCHECK_EQ(DataType::SizeShift(type), 2u);
+-      __ Sh2Add(rd, rs1, rs2);
++      __ ShiftAdd(rd, rs1, rs2, 2u);
+       break;
+     case DataType::Type::kInt64:
+     case DataType::Type::kFloat64:
+       DCHECK_EQ(DataType::SizeShift(type), 3u);
+-      __ Sh3Add(rd, rs1, rs2);
++      __ ShiftAdd(rd, rs1, rs2, 3u);
+       break;
+     case DataType::Type::kUint32:
+     case DataType::Type::kUint64:
+@@ -2192,11 +2192,11 @@ void InstructionCodeGeneratorRISCV64::HandleBinaryOp(HBinaryOperation* instructi
+         }
+       } else if (instruction->IsMin()) {
+         DCHECK_IMPLIES(use_imm, imm == 0);
+-        __ Min(rd, rs1, use_imm ? Zero : rs2);
++        __ MinS(rd, rs1, use_imm ? Zero : rs2);
+       } else {
+         DCHECK(instruction->IsMax());
+         DCHECK_IMPLIES(use_imm, imm == 0);
+-        __ Max(rd, rs1, use_imm ? Zero : rs2);
++        __ MaxS(rd, rs1, use_imm ? Zero : rs2);
+       }
+       break;
+     }
+@@ -2378,10 +2378,10 @@ void InstructionCodeGeneratorRISCV64::HandleShift(HBinaryOperation* instruction)
+           } else if (instruction->IsUShr()) {
+             __ Srliw(rd, rs1, shamt);
+           } else if (instruction->IsRol()) {
+-            __ Roriw(rd, rs1, shamt);
++            __ RotateRightImm(rd, rs1, shamt, /*is_word=*/ true);
+           } else {
+             DCHECK(instruction->IsRor());
+-            __ Roriw(rd, rs1, shamt);
++            __ RotateRightImm(rd, rs1, shamt, /*is_word=*/ true);
+           }
+         } else {
+           if (instruction->IsShl()) {
+@@ -2391,10 +2391,10 @@ void InstructionCodeGeneratorRISCV64::HandleShift(HBinaryOperation* instruction)
+           } else if (instruction->IsUShr()) {
+             __ Srli(rd, rs1, shamt);
+           } else if (instruction->IsRol()) {
+-            __ Rori(rd, rs1, shamt);
++            __ RotateRightImm(rd, rs1, shamt, /*is_word=*/ false);
+           } else {
+             DCHECK(instruction->IsRor());
+-            __ Rori(rd, rs1, shamt);
++            __ RotateRightImm(rd, rs1, shamt, /*is_word=*/ false);
+           }
+         }
+       } else {
+@@ -2407,10 +2407,10 @@ void InstructionCodeGeneratorRISCV64::HandleShift(HBinaryOperation* instruction)
+           } else if (instruction->IsUShr()) {
+             __ Srlw(rd, rs1, rs2);
+           } else if (instruction->IsRol()) {
+-            __ Rolw(rd, rs1, rs2);
++            __ RotateLeft(rd, rs1, rs2, /*is_word=*/ true);
+           } else {
+             DCHECK(instruction->IsRor());
+-            __ Rorw(rd, rs1, rs2);
++            __ RotateRight(rd, rs1, rs2, /*is_word=*/ true);
+           }
+         } else {
+           if (instruction->IsShl()) {
+@@ -2420,10 +2420,10 @@ void InstructionCodeGeneratorRISCV64::HandleShift(HBinaryOperation* instruction)
+           } else if (instruction->IsUShr()) {
+             __ Srl(rd, rs1, rs2);
+           } else if (instruction->IsRol()) {
+-            __ Rol(rd, rs1, rs2);
++            __ RotateLeft(rd, rs1, rs2, /*is_word=*/ false);
+           } else {
+             DCHECK(instruction->IsRor());
+-            __ Ror(rd, rs1, rs2);
++            __ RotateRight(rd, rs1, rs2, /*is_word=*/ false);
+           }
+         }
+       }
+@@ -3813,7 +3813,7 @@ void InstructionCodeGeneratorRISCV64::VisitIf(HIf* instruction) {
+         XRegister condition = instruction->GetLocations()->InAt(0).AsRegister<XRegister>();
+         XRegister temp = instruction->GetLocations()->GetTemp(0).AsRegister<XRegister>();
+         __ LoadConst64(temp, address);
+-        __ Sh1Add(temp, condition, temp);
++        __ ShiftAdd(temp, condition, temp, 1u);
+         ScratchRegisterScope srs(GetAssembler());
+         XRegister counter = srs.AllocateXRegister();
+         __ Loadhu(counter, temp, 0);
+diff --git a/compiler/optimizing/instruction_simplifier_riscv64.cc b/compiler/optimizing/instruction_simplifier_riscv64.cc
+index 6dc269f8c55505401bc84cfb10011ee367b0faeb..cdb6c2c0798223cbeaa9af52e670238020f14c9b 100644
+--- a/compiler/optimizing/instruction_simplifier_riscv64.cc
++++ b/compiler/optimizing/instruction_simplifier_riscv64.cc
+@@ -16,6 +16,7 @@
+ 
+ #include "instruction_simplifier_riscv64.h"
+ 
++#include "code_generator_riscv64.h"
+ #include "instruction_simplifier.h"
+ 
+ namespace art HIDDEN {
+@@ -24,10 +25,19 @@ namespace riscv64 {
+ 
+ class InstructionSimplifierRiscv64Visitor final : public HGraphVisitor {
+  public:
+-  InstructionSimplifierRiscv64Visitor(HGraph* graph, OptimizingCompilerStats* stats)
+-      : HGraphVisitor(graph), stats_(stats) {}
++  InstructionSimplifierRiscv64Visitor(HGraph* graph,
++                                      CodeGenerator* codegen,
++                                      OptimizingCompilerStats* stats)
++      : HGraphVisitor(graph),
++        codegen_(down_cast<CodeGeneratorRISCV64*>(codegen)),
++        stats_(stats) {}
+ 
+  private:
++  // The nodes made here map to single Zba (ShiftAdd) or Zbb (BitwiseNegatedRight) instructions:
++  // without the extension the plain Add/Shl and And/Or/Xor/Not code is as short.
++  bool HasZba() const { return codegen_->GetInstructionSetFeatures().HasZba(); }
++  bool HasZbb() const { return codegen_->GetInstructionSetFeatures().HasZbb(); }
++
+   void RecordSimplification() {
+     MaybeRecordStat(stats_, MethodCompilationStat::kInstructionSimplificationsArch);
+   }
+@@ -98,13 +108,13 @@ class InstructionSimplifierRiscv64Visitor final : public HGraphVisitor {
+   }
+ 
+   void VisitAnd(HAnd* inst) override {
+-    if (TryMergeNegatedInput(inst)) {
++    if (HasZbb() && TryMergeNegatedInput(inst)) {
+       RecordSimplification();
+     }
+   }
+ 
+   void VisitOr(HOr* inst) override {
+-    if (TryMergeNegatedInput(inst)) {
++    if (HasZbb() && TryMergeNegatedInput(inst)) {
+       RecordSimplification();
+     }
+   }
+@@ -115,28 +125,29 @@ class InstructionSimplifierRiscv64Visitor final : public HGraphVisitor {
+   // with
+   //    Riscv64ShiftAdd dst, a, b
+   void VisitShl(HShl* inst) override {
+-    if (TryReplaceAddsWithShiftAdds(inst)) {
++    if (HasZba() && TryReplaceAddsWithShiftAdds(inst)) {
+       RecordSimplification();
+     }
+   }
+ 
+   void VisitSub(HSub* inst) override {
+-    if (TryMergeWithAnd(inst)) {
++    if (HasZbb() && TryMergeWithAnd(inst)) {
+       RecordSimplification();
+     }
+   }
+ 
+   void VisitXor(HXor* inst) override {
+-    if (TryMergeNegatedInput(inst)) {
++    if (HasZbb() && TryMergeNegatedInput(inst)) {
+       RecordSimplification();
+     }
+   }
+ 
++  CodeGeneratorRISCV64* codegen_;
+   OptimizingCompilerStats* stats_ = nullptr;
+ };
+ 
+ bool InstructionSimplifierRiscv64::Run() {
+-  auto visitor = InstructionSimplifierRiscv64Visitor(graph_, stats_);
++  auto visitor = InstructionSimplifierRiscv64Visitor(graph_, codegen_, stats_);
+   visitor.VisitReversePostOrder();
+   return true;
+ }
+diff --git a/compiler/optimizing/instruction_simplifier_riscv64.h b/compiler/optimizing/instruction_simplifier_riscv64.h
+index 2fbfedddf406db7fb0991b1f467f9296f81d7fea..7d575c1d36d4d63f52d720aa4ab1c8b06f10d3db 100644
+--- a/compiler/optimizing/instruction_simplifier_riscv64.h
++++ b/compiler/optimizing/instruction_simplifier_riscv64.h
+@@ -23,17 +23,22 @@
+ 
+ namespace art HIDDEN {
+ 
++class CodeGenerator;
++
+ namespace riscv64 {
+ 
+ class InstructionSimplifierRiscv64 : public HOptimization {
+  public:
+-  InstructionSimplifierRiscv64(HGraph* graph, OptimizingCompilerStats* stats)
+-      : HOptimization(graph, kInstructionSimplifierRiscv64PassName, stats) {}
++  InstructionSimplifierRiscv64(HGraph* graph, CodeGenerator* codegen, OptimizingCompilerStats* stats)
++      : HOptimization(graph, kInstructionSimplifierRiscv64PassName, stats), codegen_(codegen) {}
+ 
+   static constexpr const char* kInstructionSimplifierRiscv64PassName =
+       "instruction_simplifier_riscv64";
+ 
+   bool Run() override;
++
++ private:
++  CodeGenerator* codegen_;
+ };
+ 
+ }  // namespace riscv64
+diff --git a/compiler/optimizing/intrinsics_riscv64.cc b/compiler/optimizing/intrinsics_riscv64.cc
+index 9379c8d3f65cad31d5d4557b21ff2202a3b5d69a..362b79800c01607f90483386bcf51e3104ba0873 100644
+--- a/compiler/optimizing/intrinsics_riscv64.cc
++++ b/compiler/optimizing/intrinsics_riscv64.cc
+@@ -275,6 +275,16 @@ static void CreateIntToIntNoOverlapLocations(ArenaAllocator* allocator, HInvoke*
+   locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+ }
+ 
++// Code built on Zbb instructions: without Zbb leave the intrinsic unimplemented, so it stays a call
++// (as x86-64 does for BitCount without popcnt).
++static void CreateIntToIntNoOverlapLocationsIfZbb(CodeGeneratorRISCV64* codegen,
++                                                  ArenaAllocator* allocator,
++                                                  HInvoke* invoke) {
++  if (codegen->GetInstructionSetFeatures().HasZbb()) {
++    CreateIntToIntNoOverlapLocations(allocator, invoke);
++  }
++}
++
+ template <typename EmitOp>
+ void EmitMemoryPeek(HInvoke* invoke, EmitOp&& emit_op) {
+   LocationSummary* locations = invoke->GetLocations();
+@@ -469,7 +479,7 @@ static void GenerateReverse(CodeGeneratorRISCV64* codegen, HInvoke* invoke, Data
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerReverse(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerReverse(HInvoke* invoke) {
+@@ -477,7 +487,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerReverse(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongReverse(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongReverse(HInvoke* invoke) {
+@@ -485,7 +495,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongReverse(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerReverseBytes(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerReverseBytes(HInvoke* invoke) {
+@@ -493,7 +503,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerReverseBytes(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongReverseBytes(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongReverseBytes(HInvoke* invoke) {
+@@ -501,7 +511,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongReverseBytes(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitShortReverseBytes(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitShortReverseBytes(HInvoke* invoke) {
+@@ -515,7 +525,7 @@ void EmitIntegralUnOp(HInvoke* invoke, EmitOp&& emit_op) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerBitCount(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerBitCount(HInvoke* invoke) {
+@@ -524,7 +534,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerBitCount(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongBitCount(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongBitCount(HInvoke* invoke) {
+@@ -533,7 +543,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongBitCount(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerHighestOneBit(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerHighestOneBit(HInvoke* invoke) {
+@@ -550,7 +560,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerHighestOneBit(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongHighestOneBit(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongHighestOneBit(HInvoke* invoke) {
+@@ -595,7 +605,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongLowestOneBit(HInvoke* invoke) {
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerNumberOfLeadingZeros(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerNumberOfLeadingZeros(HInvoke* invoke) {
+@@ -604,7 +614,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerNumberOfLeadingZeros(HInvoke* in
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongNumberOfLeadingZeros(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongNumberOfLeadingZeros(HInvoke* invoke) {
+@@ -613,7 +623,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongNumberOfLeadingZeros(HInvoke* invok
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitIntegerNumberOfTrailingZeros(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitIntegerNumberOfTrailingZeros(HInvoke* invoke) {
+@@ -622,7 +632,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitIntegerNumberOfTrailingZeros(HInvoke* i
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitLongNumberOfTrailingZeros(HInvoke* invoke) {
+-  CreateIntToIntNoOverlapLocations(allocator_, invoke);
++  CreateIntToIntNoOverlapLocationsIfZbb(codegen_, allocator_, invoke);
+ }
+ 
+ void IntrinsicCodeGeneratorRISCV64::VisitLongNumberOfTrailingZeros(HInvoke* invoke) {
+@@ -761,7 +771,7 @@ void IntrinsicCodeGeneratorRISCV64::HandleValueOf(HInvoke* invoke,
+     __ Bgeu(out, temp, &allocate);
+     // If the value is within the bounds, load the object directly from the array.
+     codegen_->LoadBootImageAddress(temp, info.array_data_boot_image_reference);
+-    __ Sh2Add(temp, out, temp);
++    __ ShiftAdd(temp, out, temp, 2u);
+     __ Loadwu(out, temp, 0);
+     codegen_->MaybeUnpoisonHeapReference(out);
+     __ J(&done);
+@@ -1894,7 +1904,13 @@ void IntrinsicCodeGeneratorRISCV64::VisitSystemArrayCopy(HInvoke* invoke) {
+         // reordering, and without using a memory barrier (which would be more expensive).
+         // `src` is unchanged by this operation (since Adduw adds low 32 bits
+         // which are zero after left shift), but its value now depends on `tmp`.
+-        __ AddUw(src, tmp, src);
++        if (codegen_->GetInstructionSetFeatures().HasZba()) {
++          __ AddUw(src, tmp, src);
++        } else {
++          // Same fake dependency, base ISA: add and subtract `tmp`.
++          __ Add(src, src, tmp);
++          __ Sub(src, src, tmp);
++        }
+ 
+         // Slow path used to copy array when `src` is gray.
+         read_barrier_slow_path = new (codegen_->GetScopedAllocator())
+@@ -3236,6 +3252,9 @@ void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeGetAndSetReference(HInvoke* in
+ }
+ 
+ void IntrinsicLocationsBuilderRISCV64::VisitStringCompareTo(HInvoke* invoke) {
++  if (!codegen_->GetInstructionSetFeatures().HasZbb()) {
++    return;  // The code below uses Minu, Ctz and Andn.
++  }
+   LocationSummary* locations =
+       new (allocator_) LocationSummary(invoke,
+                                        invoke->InputAt(1)->CanBeNull()
+@@ -3725,7 +3744,9 @@ static void GenerateVarHandleArrayChecks(HInvoke* invoke,
+     bool boot_image_available =
+         codegen->GetCompilerOptions().IsBootImage() ||
+         !Runtime::Current()->GetHeap()->GetBootImageSpaces().empty();
+-    bool can_be_view = (DataType::Size(value_type) != 1u) && boot_image_available;
++    // Byte-array views swap bytes with Zbb Rev8/Rori: without Zbb they take the slow path.
++    bool can_be_view = (DataType::Size(value_type) != 1u) && boot_image_available &&
++                       codegen->GetInstructionSetFeatures().HasZbb();
+     Riscv64Label* slow_path_label =
+         can_be_view ? slow_path->GetByteArrayViewCheckLabel() : slow_path->GetEntryLabel();
+     __ Li(temp2, enum_cast<int32_t>(primitive_type));
+@@ -4793,7 +4814,15 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
+             __ Rori(arg_reg, arg_reg, 48);
+           }
+         }
+-        __ Rolw(arg_reg, arg_reg, shift);
++        if (codegen->GetInstructionSetFeatures().HasZbb()) {
++          __ Rolw(arg_reg, arg_reg, shift);
++        } else {
++          // rolw(x | ~mask) == ~(sllw(~x & mask)): the field never wraps past bit 31, and both
++          // results are sign-extended from the same bit 31.
++          __ Not(arg_reg, arg_reg);
++          __ Sllw(arg_reg, arg_reg, shift);
++          __ Not(arg_reg, arg_reg);
++        }
+         break;
+       case GetAndUpdateOp::kOr:
+       case GetAndUpdateOp::kXor:
+@@ -5566,7 +5595,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitStringGetCharsNoCheck(HInvoke* invoke)
+   //    of the data in the destination array,
+   //    yet, due to sizeof(Char) being 2, formerly scaling must be performed
+   //    (destination_begin_offset * 2 that equals to destination_begin_offset << 1);
+-  __ Sh1Add(destination_ptr, destination_begin_offset, destination_ptr);
++  __ ShiftAdd(destination_ptr, destination_begin_offset, destination_ptr, 1u);
+ 
+   // Prepare a register with the source address
+   // to start copying from the address:
+@@ -5598,7 +5627,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitStringGetCharsNoCheck(HInvoke* invoke)
+ 
+   // Continue preparing the source register:
+   // proceed similarly to what was done for the destination register.
+-  __ Sh1Add(source_ptr, source_begin_index, source_ptr);
++  __ ShiftAdd(source_ptr, source_begin_index, source_ptr, 1u);
+ 
+   // If the string is not compressed, then perform ordinary copying.
+   // Copying will occur 4 characters (8 bytes) at a time, immediately after there are
+@@ -5849,7 +5878,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitMethodHandleInvokeExact(HInvoke* invoke
+ 
+     constexpr uint32_t vtable_offset =
+         mirror::Class::EmbeddedVTableOffset(art::PointerSize::k64).Int32Value();
+-    __ Sh3Add(temp, temp, receiver_class);
++    __ ShiftAdd(temp, temp, receiver_class, 3u);
+     __ Loadd(method, temp, vtable_offset);
+     __ J(&execute_target_method);
+     __ Bind(&non_virtual_dispatch);
+diff --git a/compiler/optimizing/optimization.cc b/compiler/optimizing/optimization.cc
+index 31780739bc218d86fccbf1f9fedc7a162f388daf..ab753313ea1c035c57be0bf5653eba25519c902f 100644
+--- a/compiler/optimizing/optimization.cc
++++ b/compiler/optimizing/optimization.cc
+@@ -328,7 +328,7 @@ ArenaVector<HOptimization*> ConstructOptimizations(
+         break;
+       case OptimizationPass::kInstructionSimplifierRiscv64:
+         DCHECK(alt_name == nullptr) << "arch-specific pass does not support alternative name";
+-        opt = new (allocator) riscv64::InstructionSimplifierRiscv64(graph, stats);
++        opt = new (allocator) riscv64::InstructionSimplifierRiscv64(graph, codegen, stats);
+         break;
+ #endif
+ #ifdef ART_ENABLE_CODEGEN_x86
+diff --git a/compiler/utils/riscv64/assembler_riscv64.cc b/compiler/utils/riscv64/assembler_riscv64.cc
+index 3a776648e1a024f8f51e656de880de51ecb7f2dd..a1211f4b938431b0954abb0e53cf103b6d96e6db 100644
+--- a/compiler/utils/riscv64/assembler_riscv64.cc
++++ b/compiler/utils/riscv64/assembler_riscv64.cc
+@@ -6243,6 +6243,140 @@ void Riscv64Assembler::ZextW(XRegister rd, XRegister rs) {
+   }
+ }
+ 
++void Riscv64Assembler::ShiftAdd(XRegister rd, XRegister rs1, XRegister rs2, uint32_t shift) {
++  DCHECK_LE(shift, 3u);
++  if (shift == 0u) {
++    Add(rd, rs1, rs2);
++  } else if (IsExtensionEnabled(Riscv64Extension::kZba)) {
++    if (shift == 1u) {
++      Sh1Add(rd, rs1, rs2);
++    } else if (shift == 2u) {
++      Sh2Add(rd, rs1, rs2);
++    } else {
++      Sh3Add(rd, rs1, rs2);
++    }
++  } else if (rd != rs2) {
++    Slli(rd, rs1, shift);
++    Add(rd, rd, rs2);
++  } else {
++    ScratchRegisterScope srs(this);
++    XRegister tmp = srs.AllocateXRegister();
++    Slli(tmp, rs1, shift);
++    Add(rd, tmp, rs2);
++  }
++}
++
++// Base-ISA min/max: rd = rs1, then a bare forward branch skips `mv rd, rs2` when rd already wins.
++// Min/max are commutative, so rd == rs2 swaps the operands instead of needing a scratch register.
++static void EmitMinMaxFallback(
++    Riscv64Assembler* assembler, XRegister rd, XRegister rs1, XRegister rs2, bool is_min) {
++  if (rs1 == rs2) {
++    assembler->Mv(rd, rs1);
++    return;
++  }
++  if (rd == rs2) {
++    std::swap(rs1, rs2);
++  }
++  if (rd != rs1) {
++    assembler->Mv(rd, rs1);
++  }
++  Riscv64Label done;
++  if (is_min) {
++    assembler->Blt(rd, rs2, &done, /*is_bare=*/ true);
++  } else {
++    assembler->Bge(rd, rs2, &done, /*is_bare=*/ true);
++  }
++  assembler->Mv(rd, rs2);
++  assembler->Bind(&done);
++}
++
++void Riscv64Assembler::MinS(XRegister rd, XRegister rs1, XRegister rs2) {
++  if (IsExtensionEnabled(Riscv64Extension::kZbb)) {
++    Min(rd, rs1, rs2);
++  } else {
++    EmitMinMaxFallback(this, rd, rs1, rs2, /*is_min=*/ true);
++  }
++}
++
++void Riscv64Assembler::MaxS(XRegister rd, XRegister rs1, XRegister rs2) {
++  if (IsExtensionEnabled(Riscv64Extension::kZbb)) {
++    Max(rd, rs1, rs2);
++  } else {
++    EmitMinMaxFallback(this, rd, rs1, rs2, /*is_min=*/ false);
++  }
++}
++
++// Base-ISA rotate by register: both shift halves go to scratch/free registers before rd is written,
++// so rd may alias rs1 or rs2. Shifts use only the low 5/6 bits of the amount, so -rs2 = width - rs2.
++// Word form: for a non-zero amount the logical half has bit 31 clear, so the OR keeps the
++// sign-extension of the other half; for zero both halves are sext.w(rs1).
++static void EmitRotateFallback(Riscv64Assembler* assembler,
++                               XRegister rd,
++                               XRegister rs1,
++                               XRegister rs2,
++                               bool is_word,
++                               bool is_left) {
++  ScratchRegisterScope srs(assembler);
++  XRegister tmp = srs.AllocateXRegister();
++  XRegister tmp2 = (rd != rs1 && rd != rs2) ? rd : srs.AllocateXRegister();
++  auto shift_left = [&](XRegister d, XRegister s, XRegister amount) {
++    is_word ? assembler->Sllw(d, s, amount) : assembler->Sll(d, s, amount);
++  };
++  auto shift_right = [&](XRegister d, XRegister s, XRegister amount) {
++    is_word ? assembler->Srlw(d, s, amount) : assembler->Srl(d, s, amount);
++  };
++  if (is_left) {
++    shift_left(tmp, rs1, rs2);
++  } else {
++    shift_right(tmp, rs1, rs2);
++  }
++  assembler->Neg(tmp2, rs2);
++  if (is_left) {
++    shift_right(rd, rs1, tmp2);
++  } else {
++    shift_left(rd, rs1, tmp2);
++  }
++  assembler->Or(rd, rd, tmp);
++}
++
++void Riscv64Assembler::RotateRight(XRegister rd, XRegister rs1, XRegister rs2, bool is_word) {
++  if (IsExtensionEnabled(Riscv64Extension::kZbb)) {
++    is_word ? Rorw(rd, rs1, rs2) : Ror(rd, rs1, rs2);
++  } else {
++    EmitRotateFallback(this, rd, rs1, rs2, is_word, /*is_left=*/ false);
++  }
++}
++
++void Riscv64Assembler::RotateLeft(XRegister rd, XRegister rs1, XRegister rs2, bool is_word) {
++  if (IsExtensionEnabled(Riscv64Extension::kZbb)) {
++    is_word ? Rolw(rd, rs1, rs2) : Rol(rd, rs1, rs2);
++  } else {
++    EmitRotateFallback(this, rd, rs1, rs2, is_word, /*is_left=*/ true);
++  }
++}
++
++void Riscv64Assembler::RotateRightImm(XRegister rd, XRegister rs1, uint32_t shamt, bool is_word) {
++  const uint32_t width = is_word ? 32u : kXlen;
++  DCHECK_LT(shamt, width);
++  if (IsExtensionEnabled(Riscv64Extension::kZbb)) {
++    is_word ? Roriw(rd, rs1, shamt) : Rori(rd, rs1, shamt);
++  } else if (shamt == 0u) {
++    is_word ? SextW(rd, rs1) : Mv(rd, rs1);
++  } else {
++    // Same sign-extension argument as EmitRotateFallback().
++    ScratchRegisterScope srs(this);
++    XRegister tmp = srs.AllocateXRegister();
++    if (is_word) {
++      Srliw(tmp, rs1, shamt);
++      Slliw(rd, rs1, width - shamt);
++    } else {
++      Srli(tmp, rs1, shamt);
++      Slli(rd, rs1, width - shamt);
++    }
++    Or(rd, rd, tmp);
++  }
++}
++
+ void Riscv64Assembler::Seqz(XRegister rd, XRegister rs) { Sltiu(rd, rs, 1); }
+ 
+ void Riscv64Assembler::Snez(XRegister rd, XRegister rs) { Sltu(rd, Zero, rs); }
+diff --git a/compiler/utils/riscv64/assembler_riscv64.h b/compiler/utils/riscv64/assembler_riscv64.h
+index 7586064a91998e1dc0eb2546435efaa82bad4d23..fbfba38e52eb98fdd6bd390190912f2ae966e473 100644
+--- a/compiler/utils/riscv64/assembler_riscv64.h
++++ b/compiler/utils/riscv64/assembler_riscv64.h
+@@ -1742,6 +1742,14 @@ class Riscv64Assembler final : public Assembler {
+   void ZextB(XRegister rd, XRegister rs);
+   void ZextH(XRegister rd, XRegister rs);
+   void ZextW(XRegister rd, XRegister rs);
++  // Zba/Zbb instruction when the extension is enabled, else a base-ISA sequence
++  // (may use a scratch register or a short forward branch).
++  void ShiftAdd(XRegister rd, XRegister rs1, XRegister rs2, uint32_t shift);  // (rs1 << shift) + rs2
++  void MinS(XRegister rd, XRegister rs1, XRegister rs2);
++  void MaxS(XRegister rd, XRegister rs1, XRegister rs2);
++  void RotateRight(XRegister rd, XRegister rs1, XRegister rs2, bool is_word);
++  void RotateLeft(XRegister rd, XRegister rs1, XRegister rs2, bool is_word);
++  void RotateRightImm(XRegister rd, XRegister rs1, uint32_t shamt, bool is_word);
+   void Seqz(XRegister rd, XRegister rs);
+   void Snez(XRegister rd, XRegister rs);
+   void Sltz(XRegister rd, XRegister rs);
