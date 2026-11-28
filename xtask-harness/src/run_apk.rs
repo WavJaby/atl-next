@@ -1015,7 +1015,14 @@ pub fn remote(root: &Path, a: &RemoteArgs) -> Result<ExitCode> {
         w.finish();
     }
     let transfer = match waited? {
-        Some(status) => rt.check_end(status, &run).map_err(|e| format!("{e:#}")),
+        Some(status) => match rt.check_end(status, &run) {
+            // the display could not serve the run: undecided (main), its logs kept
+            Err(e) if e.is::<remote::HostLimit>() => {
+                copy_logs(&run, &logs)?;
+                return Err(e);
+            }
+            ended => ended.map_err(|e| format!("{e:#}")),
+        },
         None => Err(format!(
             "the transfer to {} did not end within {} s and was stopped",
             target.label(),

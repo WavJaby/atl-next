@@ -592,6 +592,19 @@ fn main() -> Result<ExitCode> {
             result = result.map(|_| ExitCode::FAILURE);
         }
     }
+    // a remote run its target's display could not serve: neither pass nor fail
+    if let Err(e) = &result
+        && let Some(limit) = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<remote::HostLimit>())
+    {
+        println!(
+            "{}: {}host: {limit}",
+            name.unwrap_or("remote"),
+            verdict::UNDECIDED_WORD
+        );
+        return Ok(ExitCode::from(verdict::UNDECIDED_EXIT));
+    }
     // a run that ends in an error (`?`, bail!) still ends with its verdict line; main prints the error after it
     if let (Err(e), Some(name)) = (&result, name) {
         println!("{}", verdict::error(name, e));

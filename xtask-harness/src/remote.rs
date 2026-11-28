@@ -231,6 +231,33 @@ pub enum Break {
     DropLibunwind,
     /// Drops atld from the bundle: the prerequisite check names it as not delivered (`push --apply`), and a run without it stops at the executable check.
     DropAtld,
+    /// The run trusts the target's compositor with client dmabufs, its probe's refusal ignored ([`dmabuf_probe_sh`]): on a compositor that imports none, the app's first GTK frame ends it (Gdk Error 71) and the gate is red, not undecided.
+    TrustDmabuf,
+}
+
+/// The run script's exit when the target's display cannot serve the run at all ([`dmabuf_probe_sh`]): the property is not judged there ([`HostLimit`]). 5 = the display did not come up.
+const HOST_LIMIT_EXIT: i32 = 6;
+
+/// A run the target's display could not serve: neither pass nor fail (xtask-harness main: `<cmd>: undecided host: <why>`, exit [`crate::verdict::UNDECIDED_EXIT`]).
+#[derive(Debug)]
+pub struct HostLimit(pub String);
+
+impl std::fmt::Display for HostLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostLimit {}
+
+/// Asks the run's labwc, after its setup, whether it imports a client dmabuf (the helper's `--dmabuf` line, appended to its log). A refusal stops the run before atld with [`HOST_LIMIT_EXIT`]:
+/// GTK 4.14's GL renderer presents through Mesa's EGL, which sends dmabufs whatever GDK_DEBUG=dmabuf-disable says, and its Vulkan renderer crashed there; cairo would not render on the GPU
+/// (sifive, measured 2026-11-28). `logs` sends the display's logs back.
+fn dmabuf_probe_sh(tag: &str, setup: &str, setup_log: &str, logs: &str) -> String {
+    let refused = sh_quote(&format!("^{}", atl_labwc_setup::dmabuf::REFUSED_PREFIX));
+    format!(
+        "{setup} --dmabuf \"$WL\" >> {setup_log} 2>&1 < /dev/null\nif grep -q {refused} {setup_log}; then\n  echo \"remote run {tag}: host limit: the compositor imports no client dmabuf ($(grep {refused} {setup_log} | tail -n 1)); GTK's GL renderer presents only through dmabufs\" >&2\n  {logs}\n  exit {HOST_LIMIT_EXIT}\nfi\n"
+    )
 }
 
 #[derive(clap::Args)]
@@ -403,6 +430,8 @@ pub struct RemoteRun {
     audio: Option<RunAudio>,
     /// `--view`'s port: wayvnc serves the run's own labwc on the target's loopback there ([`view_script`]); None: no view.
     view: Option<u16>,
+    /// [`Target`]'s: the run's own labwc is asked for a client dmabuf import before atld ([`dmabuf_probe_sh`]).
+    dmabuf_probe: bool,
 }
 
 /// A remote run's audio: `sink` = the run's own null sink, made on the target before atld and gone with the run (audio_pcm.rs `holder_sh`); None = an audible run (the session's routing).
@@ -956,6 +985,8 @@ struct Plan {
     audio: Option<RunAudio>,
     /// `--view`'s port ([`RemoteRun::view`]): only with [`Display::NestedHeadless`].
     view: Option<u16>,
+    /// [`RemoteRun::dmabuf_probe`]: only with [`Display::NestedHeadless`] (its helper is the probe).
+    dmabuf_probe: bool,
 }
 
 fn out_path(rel: &str) -> String {
@@ -1086,17 +1117,24 @@ impl Plan {
                 display_logs.push(format!("{}/{LABWC_SETUP_LOG}", self.scratch));
                 // atld's sibling: both come from one release dir ([`RUN_PROGRAMS`]), a cross host's under its triple
                 let dir = self.program.rsplit_once('/').map_or("", |(d, _)| d);
+                let setup = word(&format!("{dir}/{LABWC_SETUP}"));
+                let setup_log = word(&out_path(&format!("{}/{LABWC_SETUP_LOG}", self.scratch)));
                 s.push_str(&nested_headless_script(
                     &self.tag,
                     SESSION_DIR,
                     &word(&out_path(&labwc_dir(&self.scratch))),
-                    (
-                        &labwc_log,
-                        &word(&out_path(&format!("{}/{LABWC_SETUP_LOG}", self.scratch))),
-                    ),
-                    &word(&format!("{dir}/{LABWC_SETUP}")),
+                    (&labwc_log, &setup_log),
+                    &setup,
                     &tar_sh(&display_logs),
                 ));
+                if self.dmabuf_probe {
+                    s.push_str(&dmabuf_probe_sh(
+                        &self.tag,
+                        &setup,
+                        &setup_log,
+                        &tar_sh(&display_logs),
+                    ));
+                }
                 if let Some(port) = self.view {
                     // tar --ignore-failed-read: the log may not exist yet on a failure before wayvnc starts
                     let log = format!("{}/{VIEW_LOG}", self.scratch);
@@ -1362,6 +1400,7 @@ impl RemoteRun {
                 .transpose()?,
             manifest_sha256: self.manifest_sha256.clone(),
             audio: self.audio.clone(),
+            dmabuf_probe: self.dmabuf_probe,
         };
         // the previous run's end record must not stand for this one's
         let end = scratch.join(ATLD_RC);
@@ -1414,6 +1453,10 @@ impl RemoteRun {
             .filter(|l| !l.is_empty())
             .take(3)
             .collect();
+        if end.code() == Some(HOST_LIMIT_EXIT) {
+            let why = cause.first().map_or("no output", |l| l);
+            return HostLimit(format!("{why} (transcript {})", self.log.display())).into();
+        }
         anyhow!(
             "remote run {} ended {end}: {} (transcript {})",
             root.display(),
@@ -1693,6 +1736,8 @@ pub struct Target {
     elf: Vec<String>,
     lib_dirs: Vec<String>,
     stage: PathBuf,
+    /// Whether its runs ask their labwc for a client dmabuf import first ([`dmabuf_probe_sh`]); off under [`Break::TrustDmabuf`].
+    dmabuf_probe: bool,
 }
 
 impl Target {
@@ -1717,6 +1762,7 @@ impl Target {
             elf,
             lib_dirs,
             stage: stage_dir(out, gate, brk),
+            dmabuf_probe: brk != Some(Break::TrustDmabuf),
         })
     }
 
@@ -1812,6 +1858,7 @@ impl Target {
             agent: None,
             audio: None,
             view: None,
+            dmabuf_probe: self.dmabuf_probe,
         }))
     }
 
@@ -3173,6 +3220,7 @@ mod tests {
             limit: Duration::from_secs(1),
             log: log.clone(),
             display: Display::Headless,
+            dmabuf_probe: false,
             view: None,
             agent: None,
             manifest_sha256: TEST_SHA.to_owned(),
@@ -3217,6 +3265,7 @@ mod tests {
 
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "run-apk/x".into(),
             root: "run-apk/x/root".into(),
@@ -3334,6 +3383,7 @@ mod tests {
     fn run_script_is_the_plan_in_order() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
@@ -3419,6 +3469,7 @@ mod tests {
         );
         Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: Some(RunAudio {
                 sink: Some(DROP_SINK.to_owned()),
             }),
@@ -3539,6 +3590,7 @@ mod tests {
     fn session_run_names_the_targets_one_wayland_socket() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "run-apk/app".to_owned(),
             root: "run-apk/root".to_owned(),
@@ -3579,6 +3631,7 @@ mod tests {
     fn nested_run_starts_and_ends_labwc_around_atld() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
@@ -3831,6 +3884,7 @@ esac
     fn agent_run_switches_workspace_and_proxies_atld() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "window".to_owned(),
             root: "window/root".to_owned(),
@@ -3940,6 +3994,7 @@ esac
     fn nested_headless_run_owns_its_compositor() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
@@ -4004,11 +4059,123 @@ esac
         );
     }
 
+    /// The dmabuf probe: asked after the labwc setup is ready and before atld; a refusal line stops the run with [`HOST_LIMIT_EXIT`] and the display's logs, any other line goes on. Under
+    /// [`Break::TrustDmabuf`] (`dmabuf_probe` false) the run never asks. The run's end then reads as [`HostLimit`], not a failure.
+    #[test]
+    fn dmabuf_refusal_is_a_host_limit_before_atld() {
+        let plan = Plan {
+            manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: true,
+            audio: None,
+            tag: "app".to_owned(),
+            root: "app/root".to_owned(),
+            scratch: "app/scratch".to_owned(),
+            env: Vec::new(),
+            session_env: Vec::new(),
+            program: "@BASE@/out/cargo/release/atld".to_owned(),
+            args: Vec::new(),
+            files: Vec::new(),
+            lib_dirs: vec!["lib".to_owned()],
+            limit: 60,
+            display: Display::NestedHeadless,
+            view: None,
+            agent: None,
+        };
+        let s = plan.script("atl-next-run/x");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in\n{s}"))
+        };
+        assert!(
+            at("grep -qx ")
+                < at("\"$BASE/out/cargo/release/atl-labwc-setup\" --dmabuf \"$WL\" >> ")
+                && at(" --dmabuf ") < at(&format!("exit {HOST_LIMIT_EXIT}\n"))
+                && at(&format!("exit {HOST_LIMIT_EXIT}\n")) < at(" setsid timeout "),
+            "{s}"
+        );
+        let trusted = Plan {
+            dmabuf_probe: false,
+            ..plan
+        };
+        assert!(!trusted.script("atl-next-run/x").contains("--dmabuf"));
+
+        let dir = temp("dmabuf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("setup.log");
+        let run = |line: &str| {
+            let setup = dir.join("setup");
+            std::fs::write(&setup, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+            std::fs::set_permissions(&setup, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let _ = std::fs::remove_file(&log);
+            let script = format!(
+                "WL=/x\n{}echo went on\n",
+                dmabuf_probe_sh(
+                    "app",
+                    &sh_quote(&setup.display().to_string()),
+                    &sh_quote(&log.display().to_string()),
+                    "echo logs"
+                )
+            );
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap()
+        };
+        let refused = run("dmabuf: refused 64x64 fourcc 0x34325241 stride 256 modifier 0x0");
+        assert_eq!(refused.status.code(), Some(HOST_LIMIT_EXIT));
+        let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert!(
+            stderr.contains("remote run app: host limit: the compositor imports no client dmabuf (dmabuf: refused 64x64"),
+            "{stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&refused.stdout), "logs\n");
+        for line in [
+            "dmabuf: imported 64x64",
+            "dmabuf: not probed: no render node in /dev/dri",
+        ] {
+            let out = run(line);
+            assert!(out.status.success(), "{line}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "went on\n", "{line}");
+        }
+
+        let transcript = dir.join("app.log");
+        std::fs::write(&transcript, format!("== run app on local:/b\n{stderr}")).unwrap();
+        let remote = RemoteRun {
+            host: Host::Local(PathBuf::from("/b")),
+            base: "/b".to_owned(),
+            lib_dirs: Vec::new(),
+            limit: Duration::from_secs(1),
+            log: transcript,
+            display: Display::NestedHeadless,
+            dmabuf_probe: true,
+            view: None,
+            agent: None,
+            manifest_sha256: TEST_SHA.to_owned(),
+            audio: None,
+        };
+        let end = std::os::unix::process::ExitStatusExt::from_raw(HOST_LIMIT_EXIT << 8);
+        let e = remote.failed(Path::new("/w/out/app/root"), end);
+        let limit = e.downcast_ref::<HostLimit>().expect("a host limit");
+        assert!(
+            limit.0.starts_with("remote run app: host limit: "),
+            "{limit}"
+        );
+        let other = std::os::unix::process::ExitStatusExt::from_raw(5 << 8);
+        assert!(
+            !remote
+                .failed(Path::new("/w/out/app/root"), other)
+                .is::<HostLimit>()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// `--view` serves the run's own labwc on the target's loopback only: wayvnc on its socket after labwc is up and before atld, ended before the labwc it shows and by the EXIT trap on any other exit; its log rides in the tar.
     #[test]
     fn view_serves_the_run_labwc_on_loopback_and_ends_with_it() {
         let plan = |view: Option<u16>| Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
@@ -4249,6 +4416,7 @@ esac
         assert!(display_files(Display::Headless, "app/scratch").is_empty());
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "app".to_owned(),
             root: "app/root".to_owned(),
@@ -4286,6 +4454,7 @@ esac
     fn plain_run_has_no_session_discovery() {
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
@@ -4560,6 +4729,7 @@ esac
             },
             elf: Vec::new(),
             lib_dirs: Vec::new(),
+            dmabuf_probe: false,
             stage: stage_dir(out, "g", brk),
         }
     }
@@ -4879,6 +5049,7 @@ esac
 
         let plan = Plan {
             manifest_sha256: TEST_SHA.to_owned(),
+            dmabuf_probe: false,
             audio: None,
             tag: "gl/run".to_owned(),
             root: "gl/run/root".to_owned(),
@@ -4984,6 +5155,7 @@ esac
             lib_dirs: Vec::new(),
             limit: 120,
             display: Display::Headless,
+            dmabuf_probe: false,
             view: None,
             agent: None,
             manifest_sha256: sha256_hex(a_manifest.as_bytes()),

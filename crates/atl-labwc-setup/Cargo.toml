@@ -7,13 +7,17 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The headless labwc's test setup (outputs, seat pointer and keyboard) over its Wayland socket: the library is the local gates' (xtask-harness nested_wayland.rs) and the binary is the remote test runs' helper on the target.
+# The headless labwc's test setup (outputs, seat pointer and keyboard) over its Wayland socket: the library is the local gates' (xtask-harness nested_wayland.rs) and the binary is the remote test runs' helper on the target, and their dmabuf import probe (`--dmabuf`, gbm).
 # Test-environment only: no product crate depends on it.
 
 [dependencies]
 anyhow.workspace = true
 atl-services-types = { path = "../atl-services-types" }
 atl-wayland-wire = { path = "../atl-wayland-wire" }
+gbm.workspace = true
+
+[dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

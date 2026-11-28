@@ -4,6 +4,8 @@
 //! labwc 0.8 ignores rc.xml for output modes, and a seat with no input devices has no `wl_pointer` or `wl_keyboard`, so a client sends these requests. The devices live as long as the connection: [`setup`] returns the control that keeps it open.
 //! The binary `atl-labwc-setup` is this setup as a process: a remote test run starts it beside its labwc on the target (remote.rs `nested_headless_script`) and waits for [`READY_LINE`].
 
+pub mod dmabuf;
+
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard};

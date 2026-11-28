@@ -454,6 +454,8 @@ dependencies = [
  "anyhow",
  "atl-services-types",
  "atl-wayland-wire",
+ "gbm",
+ "rustix",
 ]
 
 [[package]]
