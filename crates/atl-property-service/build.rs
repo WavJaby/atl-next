@@ -1,112 +1,77 @@
 // SPDX-License-Identifier: MIT
-//! Generates `OUT_DIR/abis.rs`: the `ro.product.cpu.abilist*` values of the host cargo builds for, as AOSP's build makes them (build/make/core/board_config.mk, printed by sysprop.mk / gen_build_prop.py), with arches.toml as the board config:
-//! - classes: CPU ABIs = the host row's `android_abis` (64-bit); 2nd (32-bit) CPU ABIs = none, one 64-bit process per app; native-bridge ABIs = every other guest row's, 64-bit ones as TARGET_NATIVE_BRIDGE_ABI, 32-bit ones as TARGET_NATIVE_BRIDGE_2ND_ABI.
-//! - abilist = CPU 64, CPU 32, bridge 64, bridge 32 ("all CPU_ABIs are preferred over all NATIVE_BRIDGE_ABIs"); abilist64 = CPU 64 + bridge 64; abilist32 = CPU 32 + bridge 32.
-//! - AOSP boards bridge one guest arch per width; with several, rows keep arches.toml's row order (row keys sorted) -- ATL's own rule, no AOSP one exists. Each row's ABIs keep their order (preferred first).
+//! Generates `OUT_DIR/abis.rs`: the `ro.product.cpu.abilist*` values of the host cargo builds for, from arches.toml through src/abilist.rs (AOSP's board_config.mk rule; its citations live there).
+
+#[path = "src/abilist.rs"]
+mod abilist;
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 
-struct Row {
-    key: String,
-    pointer_bits: i64,
-    host: Option<String>,
-    abis: Vec<String>,
-}
-
-fn rows(text: &str) -> Result<Vec<Row>> {
+/// arches.toml's rows, and the key of the host row whose Rust triple is `target`.
+fn rows(text: &str, target: &str) -> Result<(Vec<abilist::Row>, String)> {
     let table: toml::Table = text.parse()?;
     let mut rows = Vec::new();
+    let mut host = None;
+    // toml::Table is ordered by key, which is arches.toml's row order
     for (key, row) in &table {
         let pointer_bits = row
             .get("pointer_bits")
             .and_then(toml::Value::as_integer)
             .with_context(|| format!("{key}: pointer_bits"))?;
-        let host = row
-            .get("host")
+        let host_table = row.get("host");
+        if host_table
             .and_then(|h| h.get("rust"))
-            .and_then(|r| r.as_str())
-            .map(str::to_owned);
-        let abis = match row.get("guest").and_then(|g| g.get("android_abis")) {
-            Some(list) => list
-                .as_array()
-                .with_context(|| format!("{key}: android_abis"))?
-                .iter()
-                .map(|a| a.as_str().map(str::to_owned).context("an ABI string"))
-                .collect::<Result<_>>()?,
-            None => Vec::new(),
-        };
-        rows.push(Row {
+            .and_then(toml::Value::as_str)
+            == Some(target)
+        {
+            host = Some(key.clone());
+        }
+        rows.push(abilist::Row {
             key: key.clone(),
-            pointer_bits,
-            host,
-            abis,
+            pointer_bits: u32::try_from(pointer_bits)
+                .with_context(|| format!("{key}: pointer_bits"))?,
+            host: host_table.is_some(),
+            native_bridge: strings(
+                host_table.and_then(|h| h.get("native_bridge")),
+                key,
+                "native_bridge",
+            )?,
+            abis: strings(
+                row.get("guest").and_then(|g| g.get("android_abis")),
+                key,
+                "android_abis",
+            )?,
         });
     }
-    // toml::Table is ordered by key, which is arches.toml's row order
-    rows.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(rows)
+    let host = host.with_context(|| format!("arches.toml: no host row for {target}"))?;
+    Ok((rows, host))
 }
 
-/// board_config.mk's four ABI classes for the host whose Rust triple is `target`.
-struct Classes {
-    /// TARGET_CPU_ABI(2): the host row's own ABIs.
-    cpu64: Vec<String>,
-    /// TARGET_2ND_CPU_ABI(2): none -- one 64-bit process per app (arches.toml), so no 32-bit ABI runs natively.
-    cpu32: Vec<String>,
-    /// TARGET_NATIVE_BRIDGE_ABI: the other 64-bit guest rows'.
-    bridge64: Vec<String>,
-    /// TARGET_NATIVE_BRIDGE_2ND_ABI: the 32-bit guest rows'.
-    bridge32: Vec<String>,
-}
-
-impl Classes {
-    fn of(rows: &[Row], target: &str) -> Result<Self> {
-        let host = rows
-            .iter()
-            .find(|r| r.host.as_deref() == Some(target))
-            .with_context(|| format!("arches.toml: no host row for {target}"))?;
-        ensure!(host.pointer_bits == 64, "{}: hosts are 64-bit", host.key);
-        let mut c = Classes {
-            cpu64: host.abis.clone(),
-            cpu32: Vec::new(),
-            bridge64: Vec::new(),
-            bridge32: Vec::new(),
-        };
-        for r in rows.iter().filter(|r| r.key != host.key) {
-            match r.pointer_bits {
-                64 => c.bridge64.extend(r.abis.iter().cloned()),
-                32 => c.bridge32.extend(r.abis.iter().cloned()),
-                bits => anyhow::bail!("{}: pointer_bits {bits}", r.key),
-            }
-        }
-        Ok(c)
-    }
-
-    /// (abilist, abilist64, abilist32) as board_config.mk builds TARGET_CPU_ABI_LIST, _64_BIT, _32_BIT.
-    fn lists(&self) -> [String; 3] {
-        let join = |parts: &[&Vec<String>]| {
-            parts
-                .iter()
-                .flat_map(|p| p.iter())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        [
-            join(&[&self.cpu64, &self.cpu32, &self.bridge64, &self.bridge32]),
-            join(&[&self.cpu64, &self.bridge64]),
-            join(&[&self.cpu32, &self.bridge32]),
-        ]
-    }
+/// A TOML array of strings; absent = none.
+fn strings(list: Option<&toml::Value>, key: &str, what: &str) -> Result<Vec<String>> {
+    let Some(list) = list else {
+        return Ok(Vec::new());
+    };
+    list.as_array()
+        .with_context(|| format!("{key}: {what}"))?
+        .iter()
+        .map(|a| {
+            a.as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{key}: {what}: a string"))
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let arches = atl_layout::checkout(&manifest)?.join("arches.toml");
-    let rows = rows(&std::fs::read_to_string(&arches)?)?;
-    let [all, l64, l32] = Classes::of(&rows, &std::env::var("TARGET")?)?.lists();
+    let (rows, host) = rows(
+        &std::fs::read_to_string(&arches)?,
+        &std::env::var("TARGET")?,
+    )?;
+    let [all, l64, l32] = abilist::lists(&abilist::device_abis(&rows, &host)?);
     let code = format!(
         "// generated by build.rs from arches.toml, do not edit\npub const ABILIST: &str = {all:?};\npub const ABILIST64: &str = {l64:?};\npub const ABILIST32: &str = {l32:?};\n"
     );
@@ -115,5 +80,7 @@ fn main() -> Result<()> {
         code,
     )?;
     atl_layout::rerun_if_changed(&arches);
+    // included by #[path]: cargo does not see it as a build input otherwise
+    atl_layout::rerun_if_changed(&manifest.join("src/abilist.rs"));
     Ok(())
 }

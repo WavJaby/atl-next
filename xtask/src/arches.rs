@@ -34,6 +34,9 @@ pub struct Host {
     /// The NativeBridge identity crossing exists for this ISA: gates' NB guest is the host's own; else a foreign guest (QEMU).
     #[serde(default)]
     pub identity: bool,
+    /// Guest rows whose QEMU engine this host's build ships (`native_bridge_problems`): AOSP's TARGET_NATIVE_BRIDGE_ABI / _2ND_ABI of the board.
+    #[serde(default)]
+    pub native_bridge: Vec<String>,
     pub meson_cpu_family: String,
     pub debian: String,
     pub archlinux: Option<String>,
@@ -158,7 +161,8 @@ pub fn tool_side(name: &str, build: &str) -> &'static str {
     if name == build { "host" } else { "build" }
 }
 
-fn parse(text: &str) -> Result<Arches> {
+/// Parses and validates arches.toml text (the harness's hand-written rows too).
+pub fn parse(text: &str) -> Result<Arches> {
     let arches: Arches = toml::from_str(text)?;
     validate(&arches)?;
     Ok(arches)
@@ -569,6 +573,66 @@ pub fn check_qemu_target(layout: &atl_layout::Layout, arches: &Arches) -> Result
     Ok(())
 }
 
+/// The repo file whose `Arch` rows name the QEMU engines: one `isa: "<row key>"` literal per guest ISA the engine runs.
+const ENGINE_FILE: &str = "crates/atl-native-bridge/src/engine/qemu/arch.rs";
+
+/// The guest ISAs the QEMU engine runs: the `isa: "..."` literals of [`ENGINE_FILE`]. Fails on none (the file moved or changed shape).
+pub fn engine_isas(text: &str) -> Result<BTreeSet<String>> {
+    let isas: BTreeSet<String> = text
+        .lines()
+        .filter_map(|l| {
+            let (_, rest) = l.split_once("isa: \"")?;
+            Some(rest.split('"').next()?.to_owned())
+        })
+        .collect();
+    ensure!(
+        !isas.is_empty(),
+        "{ENGINE_FILE}: no `isa: \"..\"` engine row"
+    );
+    Ok(isas)
+}
+
+/// Every host's `native_bridge` lists guest rows other than its own, once each, whose ISA the engine runs (`engines`).
+/// A name without an engine would be advertised in ro.product.cpu.abilist with nothing to run it.
+pub fn native_bridge_problems(arches: &Arches, engines: &BTreeSet<String>) -> Result<()> {
+    for (name, arch) in arches {
+        let Some(host) = &arch.host else {
+            continue;
+        };
+        let mut seen = BTreeSet::new();
+        for guest in &host.native_bridge {
+            ensure!(
+                guest != name,
+                "{FILE}: {name}: native_bridge lists its own row"
+            );
+            ensure!(
+                seen.insert(guest),
+                "{FILE}: {name}: native_bridge lists {guest} twice"
+            );
+            let row = arches
+                .get(guest)
+                .with_context(|| format!("{FILE}: {name}: native_bridge {guest}: no such row"))?;
+            ensure!(
+                row.guest.is_some(),
+                "{FILE}: {name}: native_bridge {guest}: no [{guest}.guest] row"
+            );
+            ensure!(
+                engines.contains(guest),
+                "{FILE}: {name}: native_bridge {guest}: no QEMU engine for ISA {guest} ({ENGINE_FILE})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`native_bridge_problems`] with the engines read from [`ENGINE_FILE`] under `root`.
+pub fn check_native_bridge(root: &Path, arches: &Arches) -> Result<()> {
+    let path = root.join(ENGINE_FILE);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    native_bridge_problems(arches, &engine_isas(&text)?)
+}
+
 /// Every `soong_prebuilt_os` is a value Soong's PrebuiltOS returns on Linux, and `prebuilts/build-tools/<it>/bin` exists in the checkout `layout`
 /// resolves. Which row gets which value (PrebuiltOS keys on Go's GOARCH, a name this table does not carry) is not checked.
 pub fn check_prebuilt_os(layout: &atl_layout::Layout, arches: &Arches) -> Result<()> {
@@ -629,7 +693,8 @@ fn linux_prebuilt_os(config_go: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        host_row, kernel_arch_matches, linux_prebuilt_os, parse, qemu_target, target_arch_of,
+        engine_isas, host_row, kernel_arch_matches, linux_prebuilt_os, native_bridge_problems,
+        parse, qemu_target, target_arch_of,
     };
 
     #[test]
@@ -711,6 +776,7 @@ mod tests {
         let row = |clang: Option<&str>, sysroot: Option<&str>, isa: Option<&str>| super::Host {
             rust: "t".into(),
             identity: false,
+            native_bridge: Vec::new(),
             meson_cpu_family: "m".into(),
             debian: "d".into(),
             archlinux: None,
@@ -810,6 +876,35 @@ mod tests {
         // a host-only row has no QEMU target, an unknown name no row
         assert!(qemu_target(&arches, "b").is_err());
         assert!(qemu_target(&arches, "c").is_err());
+    }
+
+    #[test]
+    fn native_bridge_names_a_guest_row_with_an_engine() {
+        // arch.rs's engine rows as written: one `isa:` literal per Row
+        let engines = engine_isas(
+            "const AARCH64: Row = Row {\n    isa: \"arm64\",\n    pointer_bits: 64,\n};\nconst ARM: Row = Row { isa: \"arm\", pointer_bits: 32 };\n",
+        )
+        .unwrap();
+        assert_eq!(
+            engines.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["arm", "arm64"]
+        );
+        assert!(engine_isas("struct Row { isa: &'static str }").is_err());
+        // riscv64 host with the given native_bridge; guests arm64, x86 (no engine), riscv64 (its own row)
+        let text = |bridge: &str| {
+            parse(&format!(
+                "[arm64]\npointer_bits = 64\n{K}[arm64.guest]\nandroid_abis = [\"arm64-v8a\"]\nclang = \"c\"\nqemu_target = \"aarch64\"\n[x86]\npointer_bits = 32\n{K}[x86.guest]\nandroid_abis = [\"x86\"]\nclang = \"c\"\nqemu_target = \"i386\"\n[riscv64]\npointer_bits = 64\n{K}[riscv64.host]\nrust = \"t\"\nmeson_cpu_family = \"m\"\ndebian = \"d\"\nnative_bridge = [{bridge}]\n[riscv64.guest]\nandroid_abis = [\"riscv64\"]\nclang = \"c\"\nqemu_target = \"riscv64\"\n"
+            ))
+            .unwrap()
+        };
+        native_bridge_problems(&text("\"arm64\""), &engines).unwrap();
+        native_bridge_problems(&text(""), &engines).unwrap();
+        // x86 is a guest row, but no engine runs it
+        assert!(native_bridge_problems(&text("\"x86\""), &engines).is_err());
+        // no such row, its own row, a repeat
+        assert!(native_bridge_problems(&text("\"mips\""), &engines).is_err());
+        assert!(native_bridge_problems(&text("\"riscv64\""), &engines).is_err());
+        assert!(native_bridge_problems(&text("\"arm64\", \"arm64\""), &engines).is_err());
     }
 
     #[test]

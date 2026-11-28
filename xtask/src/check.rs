@@ -419,6 +419,7 @@ fn tables(root: &Path) -> Result<()> {
             arches::check_cross(root, &arches)?;
             arches::check_qemu_target(&layout, &arches)?;
             arches::check_guest_rust(root, &arches)?;
+            arches::check_native_bridge(root, &arches)?;
             crate::isa_tiers::check(root, &arches)?;
             Ok(vec![
                 format!("{} ok ({} arches)", arches::FILE, arches.len()),

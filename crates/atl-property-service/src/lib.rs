@@ -14,6 +14,9 @@ use std::fmt;
 
 use atl_bionic::image::{AddError, Image};
 
+/// The ABI lists' rule (AOSP board_config.mk over arches.toml `native_bridge`); the harness's `device_abis` calls it too.
+pub mod abilist;
+
 mod abis {
     include!(concat!(env!("OUT_DIR"), "/abis.rs"));
 }
@@ -392,28 +395,22 @@ mod tests {
         assert_eq!(mask, (1 << 0x10) | (1 << 0x12) | (1 << 0x13));
     }
 
-    /// board_config.mk over arches.toml on an x86_64 host: CPU ABI x86_64, no 32-bit CPU ABI, bridged 64-bit arm64-v8a then riscv64, bridged 32-bit armeabi-v7a, armeabi, x86 (rows arm, x86).
+    /// arches.toml on an x86_64 host (`native_bridge` arm64, arm): CPU ABI x86_64, bridged 64-bit arm64-v8a, bridged 32-bit armeabi-v7a, armeabi. No riscv64 or x86: no engine runs them.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn abi_lists_on_x86_64() {
-        assert_eq!(
-            abis::ABILIST,
-            "x86_64,arm64-v8a,riscv64,armeabi-v7a,armeabi,x86"
-        );
-        assert_eq!(abis::ABILIST64, "x86_64,arm64-v8a,riscv64");
-        assert_eq!(abis::ABILIST32, "armeabi-v7a,armeabi,x86");
+        assert_eq!(abis::ABILIST, "x86_64,arm64-v8a,armeabi-v7a,armeabi");
+        assert_eq!(abis::ABILIST64, "x86_64,arm64-v8a");
+        assert_eq!(abis::ABILIST32, "armeabi-v7a,armeabi");
     }
 
-    /// Same rules on a riscv64 host: CPU ABI riscv64, bridged 64-bit arm64-v8a then x86_64 (row order arm64 < x86_64), bridged 32-bit unchanged.
+    /// arches.toml on a riscv64 host (`native_bridge` arm64): CPU ABI riscv64, bridged 64-bit arm64-v8a; no 32-bit list (the 32-bit engine is not measured on riscv64).
     #[cfg(target_arch = "riscv64")]
     #[test]
     fn abi_lists_on_riscv64() {
-        assert_eq!(
-            abis::ABILIST,
-            "riscv64,arm64-v8a,x86_64,armeabi-v7a,armeabi,x86"
-        );
-        assert_eq!(abis::ABILIST64, "riscv64,arm64-v8a,x86_64");
-        assert_eq!(abis::ABILIST32, "armeabi-v7a,armeabi,x86");
+        assert_eq!(abis::ABILIST, "riscv64,arm64-v8a");
+        assert_eq!(abis::ABILIST64, "riscv64,arm64-v8a");
+        assert_eq!(abis::ABILIST32, "");
     }
 
     #[test]

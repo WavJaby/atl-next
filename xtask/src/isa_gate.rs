@@ -1205,6 +1205,7 @@ mod tests {
         let host = arches::Host {
             rust: "riscv64gc-unknown-linux-gnu".to_owned(),
             identity: false,
+            native_bridge: Vec::new(),
             meson_cpu_family: "riscv64".to_owned(),
             debian: "riscv64".to_owned(),
             archlinux: None,

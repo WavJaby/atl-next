@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use atl_layout::Layout;
+use atl_property_service::abilist;
 use atl_services_types::display_model::DisplayModel;
 use atl_services_types::native_libs::SupportedAbi;
 use atl_services_types::packages::Library;
@@ -66,31 +67,33 @@ struct Keystore {
 const FRAMEWORK_RES: &str = "device/framework-res/framework-res.apk";
 /// SettingsProvider's install path below a partitions root (`certificate: "platform"`, `privileged: true` in its Android.bp).
 const SETTINGS_PROVIDER: &str = "system/priv-app/SettingsProvider/SettingsProvider.apk";
-/// The device's ABI list (`ro.product.cpu.abilist`'s role), each with its instruction set (arches.toml row key): the host row's `android_abis` first (native), then the other `[guest]` rows' as
-/// translated, 64-bit before 32-bit, rows in key order within each (arches.toml: preference follows host match and pointer_bits). An app whose only native code is foreign thus installs with
-/// that ISA, which the broker passes the launcher; host-native libraries still win when an APK carries both.
+/// The device's ABI list (`ro.product.cpu.abilist`'s role), each with its instruction set (arches.toml row key), preferred first: the host row's `android_abis` (native), then the
+/// rows its `native_bridge` lists (the guests whose engine the host ships), 64-bit before 32-bit. The rule is atl-property-service `abilist::device_abis`, which builds the product's own
+/// `ro.product.cpu.abilist`. An app whose only native code is foreign thus installs with that ISA, which the broker passes the launcher; host-native libraries still win when an APK carries both.
 pub fn device_abis(arches: &crate::arches::Arches, host: &str) -> Result<Vec<SupportedAbi>> {
-    let native = arches
-        .get(host)
-        .and_then(|a| a.guest.as_ref())
-        .with_context(|| format!("{host}: no [guest] row in arches.toml"))?;
-    let mut translated: Vec<(&String, &crate::arches::Arch)> = arches
+    let rows: Vec<abilist::Row> = arches
         .iter()
-        .filter(|(name, a)| name.as_str() != host && a.guest.is_some())
+        .map(|(key, a)| abilist::Row {
+            key: key.clone(),
+            pointer_bits: a.pointer_bits,
+            host: a.host.is_some(),
+            native_bridge: a
+                .host
+                .as_ref()
+                .map(|h| h.native_bridge.clone())
+                .unwrap_or_default(),
+            abis: a
+                .guest
+                .as_ref()
+                .map(|g| g.android_abis.clone())
+                .unwrap_or_default(),
+        })
         .collect();
-    // stable: key order kept within one pointer width
-    translated.sort_by_key(|(_, a)| std::cmp::Reverse(a.pointer_bits));
-    let rows = std::iter::once((host, native)).chain(
-        translated
-            .into_iter()
-            .filter_map(|(name, a)| a.guest.as_ref().map(|g| (name.as_str(), g))),
-    );
-    Ok(rows
-        .flat_map(|(isa, g)| {
-            g.android_abis.iter().map(move |abi| SupportedAbi {
-                abi: abi.clone(),
-                isa: isa.to_owned(),
-            })
+    Ok(abilist::device_abis(&rows, host)?
+        .into_iter()
+        .map(|a| SupportedAbi {
+            abi: a.abi,
+            isa: a.isa,
         })
         .collect())
 }
@@ -2487,6 +2490,28 @@ static RUNTIME_SINKS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// device_abis over hand-written arches rows (the shape arches.toml has): the riscv64 host lists its arm64 engine only, the x86_64 host its arm64 and arm engines; x86 and riscv64 guests have none.
+    #[test]
+    fn device_abis_follows_native_bridge() {
+        let arches = crate::arches::parse(
+            "[arm]\npointer_bits = 32\nkernel_arch = \"arm\"\nuapi_records = [\"pt_regs\"]\n[arm.guest]\nandroid_abis = [\"armeabi-v7a\", \"armeabi\"]\nclang = \"c\"\nqemu_target = \"arm\"\n[arm64]\npointer_bits = 64\nkernel_arch = \"arm64\"\nuapi_records = [\"user_pt_regs\"]\n[arm64.guest]\nandroid_abis = [\"arm64-v8a\"]\nclang = \"c\"\nqemu_target = \"aarch64\"\n[riscv64]\npointer_bits = 64\nkernel_arch = \"riscv\"\nuapi_records = [\"user_regs_struct\"]\n[riscv64.host]\nrust = \"riscv64gc-unknown-linux-gnu\"\nmeson_cpu_family = \"riscv64\"\ndebian = \"riscv64\"\nnative_bridge = [\"arm64\"]\n[riscv64.guest]\nandroid_abis = [\"riscv64\"]\nclang = \"c\"\nqemu_target = \"riscv64\"\n[x86]\npointer_bits = 32\nkernel_arch = \"x86\"\nuapi_records = [\"pt_regs\"]\n[x86.guest]\nandroid_abis = [\"x86\"]\nclang = \"c\"\nqemu_target = \"i386\"\n[x86_64]\npointer_bits = 64\nkernel_arch = \"x86\"\nuapi_records = [\"pt_regs\"]\n[x86_64.host]\nrust = \"x86_64-unknown-linux-gnu\"\nmeson_cpu_family = \"x86_64\"\ndebian = \"amd64\"\nnative_bridge = [\"arm64\", \"arm\"]\n[x86_64.guest]\nandroid_abis = [\"x86_64\"]\nclang = \"c\"\nqemu_target = \"x86_64\"\n",
+        )
+        .unwrap();
+        let line = |host: &str| {
+            device_abis(&arches, host)
+                .unwrap()
+                .iter()
+                .map(|a| format!("{}:{}", a.isa, a.abi))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(line("riscv64"), "riscv64:riscv64 arm64:arm64-v8a");
+        assert_eq!(
+            line("x86_64"),
+            "x86_64:x86_64 arm64:arm64-v8a arm:armeabi-v7a arm:armeabi"
+        );
+    }
 
     /// Only atld's end lines for dead daemons count; the mid-run line and other verdict-like text do not (lines as the red control's atld.log wrote them).
     #[test]

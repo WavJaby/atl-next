@@ -26,6 +26,8 @@
 #                     Checked: cxx sits in cc's install, and `cc -fuse-ld=lld` runs lld's binary.
 #   module_flags      `[[<arch>.host.module_flags]]` rows, cross hosts only: `module` (Android.bp name), `flags`, `reason` (the measurement). The module's compiles and link on this host's product sides take `flags` after Soong's; every other module keeps AOSP's flags. Absent = none.
 #                     Checked: fields non-empty, cc takes the flags for the clang triple under -Werror, the converter fails on a module the tree lacks.
+#   native_bridge     guest rows (`[<guest>.guest]`, not this row) whose QEMU engine this host's build ships: AOSP's TARGET_NATIVE_BRIDGE_ABI / _2ND_ABI (board_config.mk:340-351). Their android_abis join ro.product.cpu.abilist (atl-property-service src/abilist.rs); a guest not listed is in no list. Absent = none.
+#                     Checked: each name is such a row, and its ISA has an engine in atl-native-bridge (engine/qemu/arch.rs `isa:`; xtask arches.rs check_native_bridge).
 # `[<arch>.guest]` present = app native code of this arch runs (natively on a matching host, else via
 # the QEMU bridge):
 #   android_abis      APK `lib/<abi>/` names, preferred first
@@ -33,8 +35,8 @@
 #   qemu_target       QEMU linux-user target (`<qemu_target>-linux-user`)
 #   rust              Rust target triple of our guest code (the engine boot executable, crates/atl-qemu-boot); absent = none for this arch yet. Checked: rustc lists it, and its target_arch (`rustc --print cfg`) is qemu_target.
 #
-# No priority or engine columns: ABI preference (native > translated 64-bit > translated 32-bit) follows
-# from host match and pointer_bits; one translator engine exists.
+# No priority column: ABI preference (native > translated 64-bit > translated 32-bit) follows from host
+# match and pointer_bits. Which guests a host translates: its `native_bridge` list.
 # Later-goal arches get a row when work on them starts.
 
 [arm]
@@ -78,6 +80,8 @@ uapi_records = ["user_regs_struct"]
 rust = "riscv64gc-unknown-linux-gnu"
 meson_cpu_family = "riscv64"
 debian = "riscv64"
+# arm64 engine: measured on this host class (k3, run-apk Temple Run 14.8 fps, 2026-11-26). arm (32-bit) engine: built and booted on x86_64 only (p4-p3-engine-abi4); add "arm" once a riscv64 run boots it.
+native_bridge = ["arm64"]
 # maintainer 2026-11-08: no V, no Zbs (the riscv64 test host has neither; device tree riscv,isa-extensions)
 isa = "rv64gc_zba_zbb"
 # outputs run on the test host (Ubuntu 24.04, glibc 2.39); the sysroot is Debian 13 (glibc 2.41), so no output may need a newer GLIBC_ version
@@ -119,6 +123,8 @@ rust = "x86_64-unknown-linux-gnu"
 identity = true
 meson_cpu_family = "x86_64"
 debian = "amd64"
+# arm64 and arm engines: built and booted on x86_64 (p4-p3-engine-abi4). No engine for x86 or riscv64 guests.
+native_bridge = ["arm64", "arm"]
 archlinux = "x86_64"
 soong_prebuilt_os = "linux-x86"
 sysroot = "x86-64-sysroot"
