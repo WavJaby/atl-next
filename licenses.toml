@@ -139,6 +139,19 @@ reason = "the project's License file: \"SPDX-License-Identifier: BSD-3-Clause OR
 licence = "Apache-2.0"
 reason = "the file's AOSP Apache-2.0 header sits inside the mterp template's `%def header():` block, which the notice scan does not read; art/runtime's Android.bp names two kinds, so the default cannot pick"
 
+# nterp templates with no notice of their own: gen_mterp.py concatenates them into mterp_riscv64.S under main.S's Apache-2.0 header; art/runtime's Android.bp names two kinds, so the default cannot pick. Needed once patches/aosp/art touches them (0007).
+[upstream.aosp.paths."art/runtime/interpreter/mterp/riscv64/array.S"]
+licence = "Apache-2.0"
+reason = "nterp template fragment, no notice; generated into mterp_riscv64.S under main.S's Apache-2.0 header"
+
+[upstream.aosp.paths."art/runtime/interpreter/mterp/riscv64/control_flow.S"]
+licence = "Apache-2.0"
+reason = "nterp template fragment, no notice; generated into mterp_riscv64.S under main.S's Apache-2.0 header"
+
+[upstream.aosp.paths."art/runtime/interpreter/mterp/riscv64/invoke.S"]
+licence = "Apache-2.0"
+reason = "nterp template fragment, no notice; generated into mterp_riscv64.S under main.S's Apache-2.0 header"
+
 [upstream.aosp.paths."external/mksh/src/"]
 licence = "MirOS"
 reason = "mirabilos' notice in each file (\"Provided that these terms and disclaimer and all copyright notices are retained ... permission is granted to deal in this work without restriction\"): the MirOS Licence (SPDX MirOS), which the phrase rules do not read"

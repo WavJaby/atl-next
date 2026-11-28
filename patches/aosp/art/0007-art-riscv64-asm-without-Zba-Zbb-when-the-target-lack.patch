@@ -1,0 +1,691 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: WavJaby <WavJaby@gmail.com>
+Date: Sat, 28 Nov 2026 19:40:35 +0800
+Subject: [PATCH] art: riscv64 asm without Zba/Zbb when the target lacks them
+
+Zba/Zbb instructions in the riscv64 entrypoints and nterp go through
+asm_support_riscv64.S macros (SHADD, SHADD_UW, ZEXT_W, SEXT_B,
+ANDNOT): the single instruction under __riscv_zba / __riscv_zbb, so a
+target with the extensions assembles to the same bytes; a base-ISA
+sequence otherwise. Every nterp handler still fits 128 bytes at
+rv64gc (largest 126, after linker relaxation).
+
+Licence of the patched files: Apache-2.0 (their AOSP headers).
+
+Upstream-Status: Inappropriate [AOSP targets rv64gcv_zba_zbb_zbs]
+Patch-Reason: a second riscv64 host target is plain rv64gc (a board without Zba/Zbb/Zbs), where the assembler rejects these instructions and libart cannot build; the march is the target, and nothing outside the source can replace the instructions
+---
+SPDX-License-Identifier: Apache-2.0
+ runtime/arch/riscv64/asm_support_riscv64.S    | 83 ++++++++++++++++++-
+ .../arch/riscv64/quick_entrypoints_riscv64.S  | 22 ++---
+ runtime/interpreter/mterp/riscv64/array.S     | 20 ++---
+ .../interpreter/mterp/riscv64/control_flow.S  |  4 +-
+ runtime/interpreter/mterp/riscv64/invoke.S    | 64 +++++++-------
+ runtime/interpreter/mterp/riscv64/main.S      | 44 +++++-----
+ 6 files changed, 158 insertions(+), 79 deletions(-)
+
+diff --git a/runtime/arch/riscv64/asm_support_riscv64.S b/runtime/arch/riscv64/asm_support_riscv64.S
+index accdb0510a3bf352ef7fe00f2fadc95bac2c448a..eb6b1691df908b705170f4383a3ba15607433c36 100644
+--- a/runtime/arch/riscv64/asm_support_riscv64.S
++++ b/runtime/arch/riscv64/asm_support_riscv64.S
+@@ -26,6 +26,85 @@
+ #define xSELF s1
+ 
+ 
++// Zba/Zbb operations: the single instruction when the target has the extension (__riscv_zba /
++// __riscv_zbb), a base-ISA (rv64gc) sequence otherwise. \tmp is the expansion's scratch, default
++// \rd; it must differ from \rs2. sh1add with \rd == \rs2 and no \tmp adds \rs1 twice.
++
++// \rd := \rs2 + (\rs1 << \n), n = 1..3
++.macro SHADD n, rd, rs1, rs2, tmp
++#if defined(__riscv_zba)
++    sh\n\()add \rd, \rs1, \rs2
++#else
++  .ifnb \tmp
++    .ifc \tmp, \rs2
++      .error "SHADD: tmp == rs2"
++    .endif
++    slli \tmp, \rs1, \n
++    add \rd, \tmp, \rs2
++  .else
++    .ifc \rd, \rs2
++      .if \n != 1
++        .error "SHADD: rd == rs2 needs tmp"
++      .endif
++      add \rd, \rd, \rs1
++      add \rd, \rd, \rs1
++    .else
++      slli \rd, \rs1, \n
++      add \rd, \rd, \rs2
++    .endif
++  .endif
++#endif
++.endm
++
++// \rd := \rs2 + (zext32(\rs1) << \n), n = 0..3 (0 = add.uw)
++.macro SHADD_UW n, rd, rs1, rs2, tmp
++#if defined(__riscv_zba)
++  .if \n == 0
++    add.uw \rd, \rs1, \rs2
++  .else
++    sh\n\()add.uw \rd, \rs1, \rs2
++  .endif
++#else
++  .ifc \tmp, \rs2
++    .error "SHADD_UW: tmp == rs2"
++  .endif
++    slli \tmp, \rs1, 32
++    srli \tmp, \tmp, 32 - \n
++    add \rd, \tmp, \rs2
++#endif
++.endm
++
++// \rd := zext32(\rs)
++.macro ZEXT_W rd, rs
++#if defined(__riscv_zba)
++    zext.w \rd, \rs
++#else
++    slli \rd, \rs, 32
++    srli \rd, \rd, 32
++#endif
++.endm
++
++// \rd := sext8(\rs)
++.macro SEXT_B rd, rs
++#if defined(__riscv_zbb)
++    sext.b \rd, \rs
++#else
++    slli \rd, \rs, 56
++    srai \rd, \rd, 56
++#endif
++.endm
++
++// \rd := \rs1 & ~\rs2; \tmp may be \rs2 (clobbered)
++.macro ANDNOT rd, rs1, rs2, tmp
++#if defined(__riscv_zbb)
++    andn \rd, \rs1, \rs2
++#else
++    not \tmp, \rs2
++    and \rd, \rs1, \tmp
++#endif
++.endm
++
++
+ .macro ENTRY name
+     .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
+     .global \name
+@@ -94,7 +173,7 @@
+ .macro POISON_HEAP_REF ref
+ #ifdef USE_HEAP_POISONING
+     neg \ref, \ref
+-    zext.w \ref, \ref
++    ZEXT_W \ref, \ref
+ #endif  // USE_HEAP_POISONING
+ .endm
+ 
+@@ -103,7 +182,7 @@
+ .macro UNPOISON_HEAP_REF ref
+ #ifdef USE_HEAP_POISONING
+     neg \ref, \ref
+-    zext.w \ref, \ref
++    ZEXT_W \ref, \ref
+ #endif  // USE_HEAP_POISONING
+ .endm
+ 
+diff --git a/runtime/arch/riscv64/quick_entrypoints_riscv64.S b/runtime/arch/riscv64/quick_entrypoints_riscv64.S
+index e97c786b914a71809c2930f36b77592afc07301d..e505649395242de8dd5729427b95ca2af0d53b7f 100644
+--- a/runtime/arch/riscv64/quick_entrypoints_riscv64.S
++++ b/runtime/arch/riscv64/quick_entrypoints_riscv64.S
+@@ -1332,7 +1332,7 @@ ENTRY art_quick_aput_obj
+     // value's type == array's component type - trivial assignability
+     bne   a3, a4, .Laput_obj_check_assignability
+ .Laput_obj_store:
+-    sh2add a3, a1, a0
++    SHADD 2, a3, a1, a0
+     POISON_HEAP_REF a2
+     sw    a2, MIRROR_OBJECT_ARRAY_DATA_OFFSET(a3)      // Heap reference = 32b.
+     ld    a3, THREAD_CARD_TABLE_OFFSET(xSELF)
+@@ -1342,7 +1342,7 @@ ENTRY art_quick_aput_obj
+     ret
+ 
+ .Laput_obj_null:
+-    sh2add a3, a1, a0
++    SHADD 2, a3, a1, a0
+     sw    a2, MIRROR_OBJECT_ARRAY_DATA_OFFSET(a3)      // Heap reference = 32b.
+     ret
+ 
+@@ -1370,7 +1370,7 @@ ENTRY art_quick_aput_obj
+     RESTORE_GPR ra, 3*8
+     DECREASE_FRAME 32
+ 
+-    sh2add a3, a1, a0
++    SHADD 2, a3, a1, a0
+     POISON_HEAP_REF a2
+     sw    a2, MIRROR_OBJECT_ARRAY_DATA_OFFSET(a3)      // Heap reference = 32b.
+     ld    a3, THREAD_CARD_TABLE_OFFSET(xSELF)
+@@ -1900,7 +1900,7 @@ END \name
+     lwu   \temp0, MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET(\temp0)
+     srli  \temp0, \temp0, PRIMITIVE_TYPE_SIZE_SHIFT_SHIFT   // Component size shift is in high 16
+                                                             // bits.
+-    zext.w \temp1, \count                                   // From \count we use a 32 bit value,
++    ZEXT_W \temp1, \count                                   // From \count we use a 32 bit value,
+                                                             // it can not overflow.
+     sll   \temp1, \temp1, \temp0                            // Calculate data size
+     // Add array data offset and alignment.
+@@ -1919,25 +1919,25 @@ END \name
+ .macro COMPUTE_ARRAY_SIZE_8 class, count, temp0, temp1, temp2
+     // Add array data offset and alignment adjustment to the `\count`.
+     li     \temp1, (MIRROR_INT_ARRAY_DATA_OFFSET + OBJECT_ALIGNMENT_MASK)
+-    add.uw \temp1, \count, \temp1
++    SHADD_UW 0, \temp1, \count, \temp1, \temp0
+ .endm
+ 
+ .macro COMPUTE_ARRAY_SIZE_16 class, count, temp0, temp1, temp2
+     // Add array data offset and alignment adjustment to the shifted `\count`.
+     li     \temp1, (MIRROR_INT_ARRAY_DATA_OFFSET + OBJECT_ALIGNMENT_MASK)
+-    sh1add.uw \temp1, \count, \temp1
++    SHADD_UW 1, \temp1, \count, \temp1, \temp0
+ .endm
+ 
+ .macro COMPUTE_ARRAY_SIZE_32 class, count, temp0, temp1, temp2
+     // Add array data offset and alignment adjustment to the shifted `\count`.
+     li     \temp1, (MIRROR_INT_ARRAY_DATA_OFFSET + OBJECT_ALIGNMENT_MASK)
+-    sh2add.uw \temp1, \count, \temp1
++    SHADD_UW 2, \temp1, \count, \temp1, \temp0
+ .endm
+ 
+ .macro COMPUTE_ARRAY_SIZE_64 class, count, temp0, temp1, temp2
+     // Add array data offset and alignment adjustment to the shifted `\count`.
+     li     \temp1, (MIRROR_WIDE_ARRAY_DATA_OFFSET + OBJECT_ALIGNMENT_MASK)
+-    sh3add.uw \temp1, \count, \temp1
++    SHADD_UW 3, \temp1, \count, \temp1, \temp0
+ .endm
+ 
+ // TODO(ngeoffray): art_quick_alloc_array_resolved_region_tlab is not used for arm64, remove
+@@ -1998,15 +1998,15 @@ ENTRY art_quick_indexof
+ #endif
+     /* Clamp start to [0..count) */
+     sraiw a5, a2, 31
+-    andn  a2, a2, a5
++    ANDNOT a2, a2, a5, a5
+     bge   a2, a3, .Lstring_indexof_nomatch
+ 
+ #if (STRING_COMPRESSION_FEATURE)
+     beqz  a4, .Lstring_indexof_compressed
+ #endif
+     /* Build pointers to start and end of the data to compare */
+-    sh1add a2, a2, a0
+-    sh1add a3, a3, a0
++    SHADD 1, a2, a2, a0
++    SHADD 1, a3, a3, a0
+ 
+     /*
+      * At this point we have:
+diff --git a/runtime/interpreter/mterp/riscv64/array.S b/runtime/interpreter/mterp/riscv64/array.S
+index 769747efa9382a9cf5e423c4bcbc015e2b22660a..0de23b229036aa7be09c1e1a6590f01fcdae228f 100644
+--- a/runtime/interpreter/mterp/riscv64/array.S
++++ b/runtime/interpreter/mterp/riscv64/array.S
+@@ -100,7 +100,7 @@
+                            // t1 := ssssssssBBBBBBBB
+    GET_VREG_OBJECT a1, t0  // a1 := refs[AA] (array ref)
+    // +BBBBBBBB offset is in code units. Multiply by 2 for byte offset against dex PC.
+-   sh1add a0, t1, xPC      // a0 := payload address
++   SHADD 1, a0, t1, xPC      // a0 := payload address
+    call art_quick_handle_fill_data  // args a0, a1
+    FETCH_ADVANCE_INST 3
+    GET_INST_OPCODE t0
+@@ -136,16 +136,16 @@
+      add t0, a0, t0
+      lb t0, MIRROR_BYTE_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 16 and zext:
+-     sh1add t0, a0, t0
++     SHADD 1, t0, a0, t0, a0
+      lhu t0, MIRROR_CHAR_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 16:
+-     sh1add t0, a0, t0
++     SHADD 1, t0, a0, t0, a0
+      lh t0, MIRROR_SHORT_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 32:
+-     sh2add t0, a0, t0
++     SHADD 2, t0, a0, t0, a0
+      lw t0, MIRROR_INT_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 64:
+-     sh3add t0, a0, t0
++     SHADD 3, t0, a0, t0, a0
+      ld t0, MIRROR_WIDE_ARRAY_DATA_OFFSET(t0)
+ %  else:
+ %    assert False, width
+@@ -176,7 +176,7 @@
+ %  array_prelude(array="t0", index="a0", length="a1", null_label=f".L{opcode}_null", oob_label=f".L{opcode}_oob")
+        // t0 := vBB array object, a0 := vCC index, a1 := array length
+ 
+-   sh2add t0, a0, t0
++   SHADD 2, t0, a0, t0, a0
+    lwu a0, MIRROR_OBJECT_ARRAY_DATA_OFFSET(t0)
+        // a0 := *(array obj + data offset + idx * elem_size)
+    UNPOISON_HEAP_REF a0
+@@ -238,16 +238,16 @@
+      add t0, t1, t0
+      sb t2, MIRROR_BYTE_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 16 and zext:
+-     sh1add t0, t1, t0
++     SHADD 1, t0, t1, t0, t1
+      sh t2, MIRROR_CHAR_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 16:
+-     sh1add t0, t1, t0
++     SHADD 1, t0, t1, t0, t1
+      sh t2, MIRROR_SHORT_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 32:
+-     sh2add t0, t1, t0
++     SHADD 2, t0, t1, t0, t1
+      sw t2, MIRROR_INT_ARRAY_DATA_OFFSET(t0)
+ %  elif width == 64:
+-     sh3add t0, t1, t0
++     SHADD 3, t0, t1, t0, t1
+      sd t2, MIRROR_WIDE_ARRAY_DATA_OFFSET(t0)
+ %  else:
+ %    assert False, width
+diff --git a/runtime/interpreter/mterp/riscv64/control_flow.S b/runtime/interpreter/mterp/riscv64/control_flow.S
+index 215439cb4173e1aa09379f0b67f190a9f5e329fc..33532dfd8e0332d3e316a596f2fb30d602e002c1 100644
+--- a/runtime/interpreter/mterp/riscv64/control_flow.S
++++ b/runtime/interpreter/mterp/riscv64/control_flow.S
+@@ -64,7 +64,7 @@
+ // Note: The branch offset must not be 0.
+ %def op_goto():
+    srliw t0, xINST, 8  // t0 := AA (zext)
+-   sext.b t0, t0       // t0 := +AA (sext)
++   SEXT_B t0, t0       // t0 := +AA (sext)
+    BRANCH units=t0
+ 
+ // goto/16 +AAAA
+@@ -91,7 +91,7 @@
+    srliw t0, xINST, 8          // t0 := AA
+    FETCH t1, count=1, signed=1, width=32  // t1 := +BBBBBBBB (sext)
+ %  get_vreg("a1", "t0")        #  a1 := vAA
+-   sh1add a0, t1, xPC          // a0 := +BBBBBBBB * 2 + xPC
++   SHADD 1, a0, t1, xPC          // a0 := +BBBBBBBB * 2 + xPC
+ %  if is_packed:
+      call NterpDoPackedSwitch  // args a0 (switchData), a1 (value)
+ %  else:
+diff --git a/runtime/interpreter/mterp/riscv64/invoke.S b/runtime/interpreter/mterp/riscv64/invoke.S
+index 75229dc79a18f7fe6106d05181554f001af0915d..76f30c7cf2d6ce3d48a69b92474d3c144424fbdb 100644
+--- a/runtime/interpreter/mterp/riscv64/invoke.S
++++ b/runtime/interpreter/mterp/riscv64/invoke.S
+@@ -67,7 +67,7 @@
+                                     // t0 := klass object (32-bit addr)
+    UNPOISON_HEAP_REF t0
+    // Entry address = entry's byte offset in vtable + vtable's byte offset in klass object.
+-   sh3add a0, a0, t0                // a0 := entry's byte offset
++   SHADD 3, a0, a0, t0                // a0 := entry's byte offset
+    ld a0, MIRROR_CLASS_VTABLE_OFFSET_64(a0)
+                                     // a0 := ArtMethod*
+    tail NterpInvokeVirtual${range}  // args a0, a1, s7
+@@ -180,7 +180,7 @@
+ 2:
+    ld t0, MIRROR_CLASS_IMT_PTR_OFFSET_64(t0)
+                           // t0 := base address of imt
+-   sh3add t0, t1, t0      // t0 := entry's address in imt
++   SHADD 3, t0, t1, t0, t1      // t0 := entry's address in imt
+    ld a2, (t0)            // a2 := ArtMethod*
+    tail NterpInvokeInterface${range}  // a0 (hidden arg), a1 (this), a2 (ArtMethod*), s7 (vregs)
+ 3:
+@@ -194,7 +194,7 @@
+ 4:
+    // Interface methods on j.l.Object have a contract with NterpGetMethod.
+    srliw t1, a0, 16       // t3 := method index
+-   sh3add t0, t1, t0      // t0 := entry's byte offset, before vtable offset adjustment
++   SHADD 3, t0, t1, t0, t1      // t0 := entry's byte offset, before vtable offset adjustment
+    ld a0, MIRROR_CLASS_VTABLE_OFFSET_64(t0)
+    tail NterpInvokeDirect${range}  // args a0, a1, s7
+ 5:
+@@ -733,13 +733,13 @@
+    srliw $z0, xINST, 8                 // z0 := AA
+ %  if arg_start == "0":  # static:
+      beqz $z0, .L${uniq}_simple_done   // AA = 0: no further args.
+-     sh2add $z1, $vC, xFP              // z1 := &FP[CCCC]
++     SHADD 2, $z1, $vC, xFP              // z1 := &FP[CCCC]
+      li $z2, 2
+      blt $z0, $z2, .L${uniq}_simple_1  // AA = 1
+ %  else:  # instance:
+      li $z2, 2
+      blt $z0, $z2, .L${uniq}_simple_done  // AA = 1, and a1 already loaded.
+-     sh2add $z1, $vC, xFP               // z1 := &FP[CCCC]
++     SHADD 2, $z1, $vC, xFP               // z1 := &FP[CCCC]
+ %#:
+    // Here: z0, z1, z2 same values for static vs instance.
+    beq $z0, $z2, .L${uniq}_simple_2  // AA = 2
+@@ -754,7 +754,7 @@
+ 
+    // AA >= 8: store in stack. Load/store from FP[CCCC + 7] upwards.
+    slli $z2, $z0, 63                 // z2 := negative if z0 bit #0 is set (odd)
+-   sh2add $z0, $z0, $z1              // z0 := loop guard at top of stack
++   SHADD 2, $z0, $z0, $z1              // z0 := loop guard at top of stack
+    addi $z3, $z1, 7*4                // z3 := &FP[CCCC + 7]
+    addi $z4, sp, __SIZEOF_POINTER__ + 7*4
+                                      // z4 := &OUT[CCCC + 7]
+@@ -828,12 +828,12 @@
+    lb $z0, 1($shorty)      // z0 := first arg
+    li $z1, 'L'             // ref type
+ %  if range == 'Range':
+-     sh2add $z2, $vreg, xFP  // z2 := &fp[CCCC]
++     SHADD 2, $z2, $vreg, xFP  // z2 := &fp[CCCC]
+      lwu a2, 4($z2)        // a2 := fp[CCCC + 1], zext
+ %  else:
+      srliw $z2, $vreg, 4   // z2 := F|E|D
+      andi $z2, $z2, 0xF    // z2 := D
+-     sh2add $z2, $z2, xFP  // z2 := &fp[D]
++     SHADD 2, $z2, $z2, xFP  // z2 := &fp[D]
+      lwu a2, ($z2)         // a2 := fp[D], zext
+ %#:
+    beq $z0, $z1, $call     // ref type: LWU into a2
+@@ -868,10 +868,10 @@
+    lb $z0, 1($shorty)        // z0 := first arg
+    li $z1, 'L'               // ref type
+ %  if range == 'Range':
+-     sh2add $z2, $vreg, xFP  // z2 := &fp[CCCC]
++     SHADD 2, $z2, $vreg, xFP  // z2 := &fp[CCCC]
+ %  else:
+      andi $z2, $vreg, 0xF    // z2 := C
+-     sh2add $z2, $z2, xFP    // z2 := &fp[C]
++     SHADD 2, $z2, $z2, xFP    // z2 := &fp[C]
+ %#:
+    lwu a1, ($z2)             // a1 := fp[C] or (range) fp[CCCC], zext
+    beq $z0, $z1, $call       // ref type: LWU into a1
+@@ -1028,27 +1028,27 @@
+ %  get_vreg("a4", z0)
+    lb $z1, 4($shorty)              // shorty RDEFG
+    bne $z1, $z2, .L${uniq}_slow_4
+-   zext.w a4, a4
++   ZEXT_W a4, a4
+ .L${uniq}_slow_4:
+    srliw $z1, $v_fedc, 12          // z1 := F
+ %  get_vreg("a3", z1)
+    lb $z1, 3($shorty)              // shorty RDEF
+    bne $z1, $z2, .L${uniq}_slow_3
+-   zext.w a3, a3
++   ZEXT_W a3, a3
+ .L${uniq}_slow_3:
+    srliw $z1, $v_fedc, 8           // z1 := F|E
+    andi $z1, $z1, 0xF              // z1 := E
+ %  get_vreg("a2", z1)
+    lb $z1, 2($shorty)              // shorty RDE
+    bne $z1, $z2, .L${uniq}_slow_2
+-   zext.w a2, a2
++   ZEXT_W a2, a2
+ .L${uniq}_slow_2:
+    srliw $z1, $v_fedc, 4           // z1 := F|E|D
+    andi $z1, $z1, 0xF              // z1 := D
+ %  get_vreg("a1", z1)
+    lb $z1, 1($shorty)              // shorty RD
+    bne $z1, $z2, .L${uniq}_slow_1
+-   zext.w a1, a1
++   ZEXT_W a1, a1
+ .L${uniq}_slow_1:
+    // "this" never read in string-init
+ 
+@@ -1096,9 +1096,9 @@
+ .L${uniq}_slow_stack:
+    beqz $z2, .L${uniq}_slow_done  // No stack needed, skip it. Otherwise copy-paste it all with LD/SD.
+    addi $z0, sp, 8            // z0 := base addr of out array
+-   sh2add $z1, $vC, xFP       // z1 := base addr of FP[CCCC]
++   SHADD 2, $z1, $vC, xFP       // z1 := base addr of FP[CCCC]
+    srliw $z2, xINST, 8        // z2 := AA, vreg count
+-   sh2add $z2, $z2, $z1       // z2 := loop guard, addr of one slot past top of xFP array
++   SHADD 2, $z2, $z2, $z1       // z2 := loop guard, addr of one slot past top of xFP array
+ %  copy_vregs_to_out(out=z0, fp=z1, fp_top=z2, z0=z3, uniq=uniq)
+ .L${uniq}_slow_done:
+ 
+@@ -1109,7 +1109,7 @@
+    srliw $z0, xINST, 8             // z0 := AA; possible values 1-5
+    li $z1, 2
+    blt $z0, $z1, .L${uniq}_slow_1  // A = 1
+-   sh2add $z2, $vC, xFP            // z2 := &fp[CCCC]
++   SHADD 2, $z2, $vC, xFP            // z2 := &fp[CCCC]
+    li $z3, 'L'                     // z3 := ref type
+    beq $z0, $z1, .L${uniq}_slow_2  // A = 2
+    li $z1, 4
+@@ -1119,22 +1119,22 @@
+    lw a4, 4*4($z2)
+    lb $z1, 4($shorty)
+    bne $z1, $z3, .L${uniq}_slow_4
+-   zext.w a4, a4
++   ZEXT_W a4, a4
+ .L${uniq}_slow_4:
+    lw a3, 3*4($z2)
+    lb $z1, 3($shorty)
+    bne $z1, $z3, .L${uniq}_slow_3
+-   zext.w a3, a3
++   ZEXT_W a3, a3
+ .L${uniq}_slow_3:
+    lw a2, 2*4($z2)
+    lb $z1, 2($shorty)
+    bne $z1, $z3, .L${uniq}_slow_2
+-   zext.w a2, a2
++   ZEXT_W a2, a2
+ .L${uniq}_slow_2:
+    lw a1, 1*4($z2)
+    lb $z1, 1($shorty)
+    bne $z1, $z3, .L${uniq}_slow_1
+-   zext.w a1, a1
++   ZEXT_W a1, a1
+ .L${uniq}_slow_1:
+    // "this" never read in string-init
+ 
+@@ -1153,7 +1153,7 @@
+    beq $z0, $J, .L${uniq}_gpr_load_8_bytes
+ %  get_vreg(gpr, gpr)        #  gpr := 32-bit load
+    bne $z0, $L, .L${uniq}_gpr_load_common
+-   zext.w $gpr, $gpr
++   ZEXT_W $gpr, $gpr
+ .L${uniq}_gpr_load_common:
+    srliw $vregs, $vregs, 4   // shift out the processed arg, one vreg
+    j .L${uniq}_gpr_set       // and exit
+@@ -1209,7 +1209,7 @@
+    beq $z0, $J, .L${uniq}_gpr_range_load_2_vreg
+ %  get_vreg(gpr, idx)
+    bne $z0, $L, .L${uniq}_gpr_range_load_common
+-   zext.w $gpr, $gpr
++   ZEXT_W $gpr, $gpr
+ .L${uniq}_gpr_range_load_common:
+    addi $idx, $idx, 1
+    j .L${uniq}_gpr_range_done
+@@ -1391,7 +1391,7 @@
+    // - The out array has \z0 slots.
+    // - Each register slot is 4 bytes.
+    // - Additional 24 bytes for 3 fields: saved frame pointer, dex pc, and ArtMethod*.
+-   sh1add $z1, $regs, $z0
++   SHADD 1, $z1, $regs, $z0
+    slli $z1, $z1, 2
+    addi $z1, $z1, 24    // z1 := frame size, without alignment padding
+ 
+@@ -1402,13 +1402,13 @@
+ 
+    // Set \refs to base of reference array. Align to pointer size for the frame pointer and dex pc
+    // pointer, below the reference array.
+-   sh2add $z0, $z0, $z1  // z0 := out array size in bytes
++   SHADD 2, $z0, $z0, $z1  // z0 := out array size in bytes
+    addi $z0, $z0, 28     //     + 24 bytes for 3 fields, plus 4 for alignment slack.
+    andi $refs, $z0, -__SIZEOF_POINTER__
+                          // refs := refs array base
+ 
+    // Set \fp to base of register array, above the reference array. This region is already aligned.
+-   sh2add $fp, $regs, $refs
++   SHADD 2, $fp, $regs, $refs
+                          // fp := fp array base
+ 
+    // Set up the stack pointer.
+@@ -1448,8 +1448,8 @@
+    // A >= 1, decide and branch
+    li $z1, 2
+    sub $z2, $regs, $z0        // z2 := regs - A; vC's index in fp
+-   sh2add $z3, $z2, $fp       // z3 := addr of fp[C]
+-   sh2add $z2, $z2, $refs     // z2 := addr of refs[C]
++   SHADD 2, $z3, $z2, $fp       // z3 := addr of fp[C]
++   SHADD 2, $z2, $z2, $refs     // z2 := addr of refs[C]
+    blt $z0, $z1, .L${uniq}_arg_1
+    beq $z0, $z1, .L${uniq}_arg_2
+    li $z1, 4
+@@ -1509,10 +1509,10 @@
+ %#:
+    // AA >= 1, iterator setup
+    sub $z4, $regs, $z0     // z4 := regs - AA; starting idx in fp and refs
+-   sh2add $z1, $vC, xREFS  // z1 := addr of xREFS[CCCC]
+-   sh2add $z2, $vC, xFP    // z2 := addr of xFP[CCCC]
+-   sh2add $z3, $z4, $refs  // z3 := addr of refs[z4]
+-   sh2add $z4, $z4, $fp    // z4 := addr of fp[z4]
++   SHADD 2, $z1, $vC, xREFS  // z1 := addr of xREFS[CCCC]
++   SHADD 2, $z2, $vC, xFP    // z2 := addr of xFP[CCCC]
++   SHADD 2, $z3, $z4, $refs  // z3 := addr of refs[z4]
++   SHADD 2, $z4, $z4, $fp    // z4 := addr of fp[z4]
+ 
+    BRANCH_IF_BIT_CLEAR $z0, $z0, 0, .L${uniq}_arg_range_copy_wide
+                            // branch if AA is even
+diff --git a/runtime/interpreter/mterp/riscv64/main.S b/runtime/interpreter/mterp/riscv64/main.S
+index c3fec2f9e56f1ea8ce873c6af0b09dd433ec1ce0..7b5a3f37e382919f383b528a42449028c15da7f3 100644
+--- a/runtime/interpreter/mterp/riscv64/main.S
++++ b/runtime/interpreter/mterp/riscv64/main.S
+@@ -238,7 +238,7 @@ END \name
+ #endif
+     andi \z0, xPC, 0xFF << 2
+     addi \z0, \z0, THREAD_INTERPRETER_CACHE_OFFSET >> 2
+-    sh2add \z0, \z0, xSELF  // z0 := entry's address
++    SHADD 2, \z0, \z0, xSELF  // z0 := entry's address
+     ld \z1, (\z0)           // z1 := dex PC
+     bne xPC, \z1, \miss_label
+     ld \reg, 8(\z0)         // value: depends on context; see call site
+@@ -265,7 +265,7 @@ END \name
+ 
+ // Update xPC by \units code units. On back edges, perform hotness and suspend.
+ .macro BRANCH units
+-    sh1add xPC, \units, xPC
++    SHADD 1, xPC, \units, xPC
+     blez \units, 2f  // If branch is <= 0, increase hotness and do a suspend check.
+ 1:
+     FETCH_INST
+@@ -320,16 +320,16 @@ END \name
+ // Clobbers: \reg
+ // Safe if \reg == \vreg.
+ .macro GET_VREG_WIDE reg, vreg
+-    sh2add \reg, \vreg, xFP  // vreg addr in register array
++    SHADD 2, \reg, \vreg, xFP  // vreg addr in register array
+     ld \reg, (\reg)          // reg := fp[vreg](lo) | fp[vreg+1](hi)
+ .endm
+ 
+ // 64 bit write
+ // Clobbers: z0
+ .macro SET_VREG_WIDE reg, vreg, z0
+-    sh2add \z0, \vreg, xFP    // vreg addr in register array
++    SHADD 2, \z0, \vreg, xFP    // vreg addr in register array
+     sd \reg, (\z0)            // fp[vreg] := reg(lo) ; fp[vreg+1] := reg(hi)
+-    sh2add \z0, \vreg, xREFS  // vreg addr in reference array
++    SHADD 2, \z0, \vreg, xREFS  // vreg addr in reference array
+     sd zero, (\z0)            // refs[vreg] := null ; refs[vreg+1] := null
+ .endm
+ 
+@@ -337,32 +337,32 @@ END \name
+ // Clobbers: \reg
+ // Safe if \reg == \vreg.
+ .macro GET_VREG_OBJECT reg, vreg
+-    sh2add \reg, \vreg, xREFS  // vreg addr in reference array
++    SHADD 2, \reg, \vreg, xREFS  // vreg addr in reference array
+     lwu \reg, (\reg)           // reg := refs[vreg]
+ .endm
+ 
+ // Object write
+ // Clobbers: z0
+ .macro SET_VREG_OBJECT reg, vreg, z0
+-    sh2add \z0, \vreg, xFP    // vreg addr in register array
++    SHADD 2, \z0, \vreg, xFP    // vreg addr in register array
+     sw \reg, (\z0)            // fp[vreg] := reg
+-    sh2add \z0, \vreg, xREFS  // vreg addr in reference array
++    SHADD 2, \z0, \vreg, xREFS  // vreg addr in reference array
+     sw \reg, (\z0)            // refs[vreg] := reg
+ .endm
+ 
+ // Floating-point 64 bit read
+ // Clobbers: \reg, \vreg
+ .macro GET_VREG_DOUBLE reg, vreg
+-    sh2add \vreg, \vreg, xFP  // vreg addr in register array
++    SHADD 2, \vreg, \vreg, xFP  // vreg addr in register array
+     fld \reg, (\vreg)         // reg := fp[vreg](lo) | fp[vreg+1](hi)
+ .endm
+ 
+ // Floating-point 64 bit write
+ // Clobbers: \reg, z0
+ .macro SET_VREG_DOUBLE reg, vreg, z0
+-    sh2add \z0, \vreg, xFP    // vreg addr in register array
++    SHADD 2, \z0, \vreg, xFP    // vreg addr in register array
+     fsd \reg, (\z0)           // fp[vreg] := reg(lo) ; fp[vreg+1] := reg(hi)
+-    sh2add \z0, \vreg, xREFS  // vreg addr in reference array
++    SHADD 2, \z0, \vreg, xREFS  // vreg addr in reference array
+     sd zero, (\z0)            // refs[vreg] := null ; refs[vreg+1] := null
+ .endm
+ 
+@@ -376,10 +376,10 @@ END \name
+ %  if is_wide or width == 64:
+      GET_VREG_WIDE $reg, $vreg
+ %  elif is_unsigned:
+-     sh2add $reg, $vreg, xFP  // vreg addr in register array
++     SHADD 2, $reg, $vreg, xFP  // vreg addr in register array
+      lwu $reg, ($reg)         // reg := fp[vreg], zext
+ %  else:
+-     sh2add $reg, $vreg, xFP  // vreg addr in register array
++     SHADD 2, $reg, $vreg, xFP  // vreg addr in register array
+      lw $reg, ($reg)          // reg := fp[vreg]
+ %#:
+ 
+@@ -390,9 +390,9 @@ END \name
+ %  if is_wide or width == 64:
+      SET_VREG_WIDE $reg, $vreg, $z0
+ %  else:
+-     sh2add $z0, $vreg, xFP    // vreg addr in register array
++     SHADD 2, $z0, $vreg, xFP    // vreg addr in register array
+      sw $reg, ($z0)            // fp[vreg] := reg
+-     sh2add $z0, $vreg, xREFS  // vreg addr in reference array
++     SHADD 2, $z0, $vreg, xREFS  // vreg addr in reference array
+      sw zero, ($z0)            // refs[vreg] := null
+ %#:
+ 
+@@ -402,7 +402,7 @@ END \name
+ %  if is_double:
+      GET_VREG_DOUBLE $reg, $vreg
+ %  else:
+-     sh2add $vreg, $vreg, xFP  // vreg addr in register array
++     SHADD 2, $vreg, $vreg, xFP  // vreg addr in register array
+      flw $reg, ($vreg)         // reg := fp[vreg]
+ %#:
+ 
+@@ -412,9 +412,9 @@ END \name
+ %  if is_double:
+      SET_VREG_DOUBLE $reg, $vreg, $z0
+ %  else:
+-     sh2add $z0, $vreg, xFP    // vreg addr in register array
++     SHADD 2, $z0, $vreg, xFP    // vreg addr in register array
+      fsw $reg, ($z0)           // fp[vreg] := reg
+-     sh2add $z0, $vreg, xREFS  // vreg addr in reference array
++     SHADD 2, $z0, $vreg, xREFS  // vreg addr in reference array
+      sw zero, ($z0)            // refs[vreg] := null
+ %#:
+ 
+@@ -479,8 +479,8 @@ OAT_ENTRY ExecuteNterpImpl
+                             // s10 := method flags
+ 
+    // Fast path: all reference args.
+-   sh2add t0, s7, xFP       // t0 := &xFP[a1]
+-   sh2add t1, s7, xREFS     // t1 := &xREFS[a1]
++   SHADD 2, t0, s7, xFP       // t0 := &xFP[a1]
++   SHADD 2, t1, s7, xREFS     // t1 := &xREFS[a1]
+    BRANCH_IF_BIT_CLEAR t2, s10, ART_METHOD_NTERP_ENTRY_POINT_FAST_PATH_FLAG_BIT, .Lentry_a1
+ %  setup_ref_args_and_go(fp="t0", refs="t1", refs_end="xFP", spills_sp="s9", z0="t2", z1="t3", done=".Lentry_go")
+ 
+@@ -503,8 +503,8 @@ OAT_ENTRY ExecuteNterpImpl
+    RESTORE_ALL_ARGUMENTS
+ 
+    // temporaries are trashed, recompute some values
+-   sh2add t0, s7, xFP       // t0 := &xFP[a1]
+-   sh2add t1, s7, xREFS     // t1 := &xREFS[a1]
++   SHADD 2, t0, s7, xFP       // t0 := &xFP[a1]
++   SHADD 2, t1, s7, xREFS     // t1 := &xREFS[a1]
+    addi t2, s11, 1          // t2 := shorty arg (skip return type)
+    xori s10, s10, 1         // s10 := 0 if static, 1 if instance
+    slliw t3, s10, 2         // t3 := (static) 0, (instance) 4: fp/refs/outs byte offset

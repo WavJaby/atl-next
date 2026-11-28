@@ -12,11 +12,13 @@ use crate::spdx::Tree;
 type Rule = (&'static str, fn(&Path, &Tree) -> Result<()>);
 
 /// Report order = the old step order.
-pub const RULES: [Rule; 8] = [
+pub const RULES: [Rule; 9] = [
     // SPDX header on every tracked or new, non-ignored file
     ("spdx", crate::spdx::check),
     // libbinder's driver I/O goes only through BinderDriver.h (patches/aosp/frameworks/native 0002), in the AOSP tree this checkout builds (not the tracked tree)
     ("seam", crate::seam_gate::check),
+    // ART's riscv64 .S files use Zba/Zbb/Zbs only under #if defined(__riscv_<ext>) (patches/aosp/art 0007), in the AOSP tree this checkout builds
+    ("riscv-asm-isa", crate::riscv_asm_isa::check),
     // Android path literals (`/system`, `/data`, ...) only in crate atl-android-paths, others allowed by android-paths.toml with a reason
     ("android-paths", crate::android_paths::check),
     // bwrap flag literals only in atl-bwrap, besides the golden argv tests
