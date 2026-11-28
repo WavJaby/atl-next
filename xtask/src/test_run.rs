@@ -605,6 +605,7 @@ fn attempt(
     let (counts, cut_short) = read(&String::from_utf8_lossy(&output));
     let (status, oom) = match measured {
         Ok(Measured { result: Ok(c) }) => {
+            crate::timing::note_row_cpu(std::time::Duration::from_micros(c.cpu_usec));
             let record = RunRecord {
                 kind: resource_ledger::TEST,
                 name: binary.label.clone(),

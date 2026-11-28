@@ -136,6 +136,10 @@ struct Passthrough {
 /// Parses the command line and runs the subcommand; the binary's whole `main`.
 pub fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // check's CPU is its scope's (timing.rs CpuMeter): the outermost process enters the scope before any re-exec, so the namespaced run is in it too
+    if std::env::var_os(tree::ENV).is_none() && matches!(cli.command, Command::Check(_)) {
+        crate::timing::enter_check_scope();
+    }
     // as cargo's runner: cwd and environment are a test binary's, nothing else of this command line applies
     if let Command::RecordTest(args) = &cli.command {
         return test_run::record(args).map(|()| ExitCode::SUCCESS);

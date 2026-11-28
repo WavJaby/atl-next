@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -482,6 +482,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
     let mut undecided: Vec<String> = Vec::new();
     let mut failures = Vec::new();
     let mut times = Timings::default();
+    eprintln!("check: cpu from {}", timing::cpu_source());
     for (i, step) in steps.iter().enumerate() {
         crate::verdict::step(&format!("check:{}/{}:{}", i + 1, steps.len(), step.name()));
         eprintln!("== check: {}", step.name());
@@ -489,7 +490,10 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
         let pool_before = build_pool::pool_waits_so_far(&ws);
         // a harness step's grants are queued in its own process: its StepDone carries them
         let mut harness_waits = PoolWaits::default();
-        let cpu = timing::cpu_used();
+        // the step's processes are in check's scope; its managed rows are not: their CPU is the rows tally's delta plus the harness's own
+        let mut harness_rows = Duration::ZERO;
+        let meter = timing::CpuMeter::start();
+        let rows_before = timing::row_cpu_so_far();
         // every step ends with one `== check: <step> (<s>) <outcome>` line: the time sits on the line that names the outcome
         let outcome = if let Some(why) = step.skip(&out) {
             skipped.push(step.name());
@@ -514,6 +518,7 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             match run {
                 Ok(done) => {
                     harness_waits = done.pool_waits;
+                    harness_rows = done.row_cpu;
                     let n = done.undecided.len();
                     undecided.extend(done.undecided.iter().map(ToString::to_string));
                     let open = if n == 0 {
@@ -536,7 +541,8 @@ pub fn run(root: &Path, args: &Args) -> Result<ExitCode> {
             }
         };
         let took = started.elapsed();
-        let cpu = timing::cpu_used().saturating_sub(cpu);
+        let rows = timing::row_cpu_so_far().saturating_sub(rows_before) + harness_rows;
+        let cpu = meter.stop(rows);
         let waits = build_pool::pool_waits_so_far(&ws).since(pool_before) + harness_waits;
         times.push_step(step.name(), took, waits, cpu);
         let waited = if waits.total.is_zero() {

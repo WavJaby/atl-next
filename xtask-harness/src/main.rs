@@ -629,6 +629,11 @@ fn check_step(root: &std::path::Path, step: CheckStep, out: &std::path::Path) ->
         "{}",
         xtask::harness::pool_waits_line(xtask::build_pool::pool_waits_so_far(&ws))
     );
+    // the managed rows this process ran: their scopes sit outside check's scope, so check adds this to the step's CPU
+    println!(
+        "{}",
+        xtask::harness::row_cpu_line(xtask::timing::row_cpu_so_far())
+    );
     Ok(ExitCode::SUCCESS)
 }
 

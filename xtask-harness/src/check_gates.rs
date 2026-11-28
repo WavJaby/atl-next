@@ -943,6 +943,8 @@ impl RowRun<'_> {
                 return Ok(errored(row, &e));
             }
         };
+        // the row's scope is outside check's scope: its counters are the step's rows CPU (timing.rs row_cpu_so_far, the harness's `row-cpu:` line)
+        xtask::timing::note_row_cpu(std::time::Duration::from_micros(record.cpu_usec));
         let phases = phases_field(&text);
         // the gate's own record (atl-host-load), its last `host load:` line: the scope's peak and the stall share of its span
         let seen = atl_host_load::Seen::read(&text);

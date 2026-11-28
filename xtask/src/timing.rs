@@ -3,6 +3,9 @@
 //! [`phase`] is the finer clock of one process (the drive-tap step): exclusive time per named phase, the cargo lock waits inside each, and [`report`] of both.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -34,6 +37,135 @@ fn cpu_of_stat(stat: &str, ticks_per_second: u64) -> Duration {
         .filter_map(|f| f.parse::<u64>().ok())
         .sum();
     Duration::from_secs_f64(ticks as f64 / ticks_per_second as f64)
+}
+
+/// Name prefix of the transient scope a check run lives in (`atl-check-<pid>.scope`, [`enter_check_scope`]).
+pub const CHECK_UNIT_PREFIX: &str = "atl-check-";
+
+fn is_check_scope_name(name: &str) -> bool {
+    name.starts_with(CHECK_UNIT_PREFIX) && name.ends_with(".scope")
+}
+
+/// The cgroup v2 path of `/proc/self/cgroup` text (`0::/a/b`); `/` for the root.
+fn cgroup_v2_path(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| l.strip_prefix("0::"))
+}
+
+/// This process's cgroup dir when it is a check scope; None in any other (a job's, the session's, the root).
+fn own_check_scope() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let dir = Path::new("/sys/fs/cgroup").join(cgroup_v2_path(&text)?.trim_start_matches('/'));
+    let name = dir.file_name()?.to_str()?;
+    is_check_scope_name(name).then_some(dir)
+}
+
+/// `usage_usec` (us) of a cgroup's `cpu.stat`: the CPU of everything in it, exited tasks included, since the cgroup was made.
+fn usage_usec_of(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse().ok())
+}
+
+/// `check` runs as the main process of its own transient scope (systemd-run --scope keeps the pid): the scope holds this run's processes and no other job's.
+/// Returns only when it cannot: the note says why, and the run keeps the rusage measure. A probe first, because exec replaces this process.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "systemd-run moves this xtask driver into the check scope and the exec replaces only the driver, which runs no sandboxed app (clippy.toml); the same exception as atl-host-load scope.rs"
+)]
+pub fn enter_check_scope() {
+    use std::os::unix::process::CommandExt as _;
+    if own_check_scope().is_some() {
+        return;
+    }
+    let probe = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .output();
+    if !probe.is_ok_and(|o| o.status.success()) {
+        eprintln!("check: no scope (systemd-run --user --scope failed): cpu from rusage");
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("check: no scope ({e}): cpu from rusage");
+            return;
+        }
+    };
+    let unit = format!("{CHECK_UNIT_PREFIX}{}", std::process::id());
+    let err = Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect"])
+        .arg(format!("--unit={unit}"))
+        .arg("--")
+        .arg(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!("check: no scope ({err}): cpu from rusage");
+}
+
+/// Which counter a step's CPU is read from, for the run's first line.
+pub fn cpu_source() -> String {
+    match own_check_scope() {
+        Some(dir) => format!(
+            "scope {}",
+            dir.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        ),
+        None => "rusage (not in a check scope)".to_owned(),
+    }
+}
+
+/// One reading of a step's CPU counter: the check scope's `usage_usec` (us), or this process's rusage when there is no scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    Scope(u64),
+    Rusage(Duration),
+}
+
+/// A step's CPU between two readings. Scope: its delta, plus `rows` (the managed rows' CPU; their scopes sit outside the check scope).
+/// Rusage: its delta alone, since rusage already holds the rows it reaped. Mismatched readings: zero, a report never a verdict.
+fn cpu_between(start: Reading, end: Reading, rows: Duration) -> Duration {
+    match (start, end) {
+        (Reading::Scope(a), Reading::Scope(b)) => Duration::from_micros(b.saturating_sub(a)) + rows,
+        (Reading::Rusage(a), Reading::Rusage(b)) => b.saturating_sub(a),
+        _ => Duration::ZERO,
+    }
+}
+
+fn read(scope: Option<&Path>) -> Reading {
+    scope
+        .and_then(|dir| std::fs::read_to_string(dir.join("cpu.stat")).ok())
+        .and_then(|stat| usage_usec_of(&stat))
+        .map_or_else(|| Reading::Rusage(cpu_used()), Reading::Scope)
+}
+
+/// A step's CPU: the check scope's counter when this process is in one, else rusage ([`cpu_used`]).
+pub struct CpuMeter {
+    scope: Option<PathBuf>,
+    start: Reading,
+}
+
+impl CpuMeter {
+    pub fn start() -> Self {
+        let scope = own_check_scope();
+        let start = read(scope.as_deref());
+        CpuMeter { scope, start }
+    }
+
+    /// The CPU since [`CpuMeter::start`], with `rows` (the managed rows the step ran) added in scope mode.
+    pub fn stop(&self, rows: Duration) -> Duration {
+        cpu_between(self.start, read(self.scope.as_deref()), rows)
+    }
+}
+
+/// CPU of the managed rows this process ran (a row's workload-leaf counter, `Record.cpu_usec`). Their scopes sit outside the check scope, so a step adds them.
+static ROW_CPU_NANOS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_row_cpu(cpu: Duration) {
+    let nanos = u64::try_from(cpu.as_nanos()).unwrap_or(u64::MAX);
+    ROW_CPU_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+pub fn row_cpu_so_far() -> Duration {
+    Duration::from_nanos(ROW_CPU_NANOS.load(Ordering::Relaxed))
 }
 
 /// Pool grants that queued: how many, and their total queue time (enqueue -> grant, build_pool.rs). Summed per grant, so overlapping grants add up.
@@ -402,6 +534,51 @@ mod tests {
         assert_eq!(
             t.critical(),
             "critical: gates 200.0s (cpu 400.0s, 2.0 cores) wait 7.0s, test 40.0s (cpu 50.0s, 1.2 cores), tables 20.0s (cpu 160.0s, 8.0 cores)"
+        );
+    }
+
+    /// cgroup v2 `cpu.stat` (kernel layout, hand-written): `usage_usec` is the first counter here; the line is read by key.
+    #[test]
+    fn a_cgroup_reads_its_usage_usec() {
+        let stat = "usage_usec 11537\nuser_usec 9000\nsystem_usec 2537\n";
+        assert_eq!(usage_usec_of(stat), Some(11_537));
+        assert_eq!(usage_usec_of("user_usec 9000\n"), None);
+    }
+
+    #[test]
+    fn only_an_atl_check_scope_is_the_check_cgroup() {
+        assert!(is_check_scope_name("atl-check-42.scope"));
+        // the WSL session's cgroup, a job's and a gate's scope are not the run's own
+        assert!(!is_check_scope_name("init.scope"));
+        assert!(!is_check_scope_name("atl-job-cpp.scope"));
+        assert!(!is_check_scope_name("atl-gate-42.scope"));
+        let path =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/atl-check-42.scope\n";
+        assert_eq!(
+            cgroup_v2_path(path),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/atl-check-42.scope")
+        );
+        assert_eq!(cgroup_v2_path("0::/init.scope\n"), Some("/init.scope"));
+    }
+
+    /// Scope readings are microseconds of the scope's counter; a step in scope mode adds its rows, rusage mode does not (rusage holds the rows it reaped).
+    #[test]
+    fn a_step_in_the_check_scope_adds_its_rows_and_rusage_does_not() {
+        let s = Duration::from_secs;
+        // scope: 1.0 s -> 4.5 s of the run's own processes = 3.5 s, plus 2 s of managed rows
+        assert_eq!(
+            cpu_between(Reading::Scope(1_000_000), Reading::Scope(4_500_000), s(2)),
+            Duration::from_millis(5_500)
+        );
+        // rusage: 2 s -> 3 s = 1 s; the 9 s of rows are inside that delta already
+        assert_eq!(
+            cpu_between(Reading::Rusage(s(2)), Reading::Rusage(s(3)), s(9)),
+            s(1)
+        );
+        // readings from different counters never add up
+        assert_eq!(
+            cpu_between(Reading::Scope(5), Reading::Rusage(s(1)), s(1)),
+            Duration::ZERO
         );
     }
 

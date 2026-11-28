@@ -122,12 +122,35 @@ fn pool_waits_of(step: &str, stdout: &str) -> Result<PoolWaits> {
     })
 }
 
-/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail; `pool_waits` = the grants its harness process queued (its own tally: check's is another process's).
+/// The line a harness check step prints after `pool-waits:`: the CPU of the managed rows it ran, nanoseconds ([`row_cpu_of`]).
+pub const ROW_CPU_PREFIX: &str = "row-cpu: ";
+
+/// The harness's `row-cpu:` line for `cpu` (xtask-harness main.rs prints it on every successful check step).
+pub fn row_cpu_line(cpu: Duration) -> String {
+    format!("{ROW_CPU_PREFIX}{}", cpu.as_nanos())
+}
+
+/// The rows' CPU from the last `row-cpu:` line of the harness's stdout. Absent is an error, as for the pool waits: check never sums a step without it.
+fn row_cpu_of(step: &str, stdout: &str) -> Result<Duration> {
+    let body = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(ROW_CPU_PREFIX))
+        .with_context(|| format!("{step}: no `{ROW_CPU_PREFIX}` line on the harness's stdout"))?;
+    let nanos: u64 = body
+        .trim()
+        .parse()
+        .with_context(|| format!("{step}: unreadable row cpu `{body}`"))?;
+    Ok(Duration::from_nanos(nanos))
+}
+
+/// A step that ran without failing: `skipped` = checked only part of its input (why); `undecided` = gates it ran that could not judge on this host, neither pass nor fail; `pool_waits` = the grants its harness process queued (its own tally: check's is another process's); `row_cpu` = the CPU of the managed rows it ran (their scopes sit outside check's scope).
 #[derive(Debug, Default)]
 pub struct StepDone {
     pub skipped: Option<String>,
     pub undecided: Vec<Undecided>,
     pub pool_waits: PoolWaits,
+    pub row_cpu: Duration,
 }
 
 impl From<Option<String>> for StepDone {
@@ -192,6 +215,7 @@ pub fn check_step(root: &Path, step: &str, out: &Path) -> Result<StepDone> {
             })
             .collect::<Result<_>>()?,
         pool_waits: pool_waits_of(step, &stdout)?,
+        row_cpu: row_cpu_of(step, &stdout)?,
     })
 }
 
@@ -458,6 +482,21 @@ mod pool_waits_tests {
     #[test]
     fn a_step_without_its_pool_waits_line_is_an_error() {
         assert!(pool_waits_of("gates", "skip: no native build dir\n").is_err());
+    }
+
+    #[test]
+    fn the_harness_row_cpu_line_is_read_back_exactly() {
+        let stdout = "skip: no native build dir\npool-waits: 0 0\nrow-cpu: 2500000000\n";
+        assert_eq!(
+            row_cpu_of("gates", stdout).expect("a row-cpu line"),
+            Duration::from_millis(2_500)
+        );
+    }
+
+    /// A harness that exited without its row CPU line: check must fail, not count the step's rows as zero.
+    #[test]
+    fn a_step_without_its_row_cpu_line_is_an_error() {
+        assert!(row_cpu_of("gates", "pool-waits: 0 0\n").is_err());
     }
 }
 
