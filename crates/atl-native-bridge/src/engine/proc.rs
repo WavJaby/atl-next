@@ -62,7 +62,7 @@ fn row_address(name: &str) -> Option<usize> {
     GL_LIBS.iter().find_map(|lib| {
         let row = rows.get(&((*lib).to_owned(), name.to_owned()))?;
         let host = row.host.filter(|_| row.exported != 0)?;
-        // deliberate break (`ATL_NB_BREAK=egl_raw`): the host's own address, which the guest would run on its guest FS
+        // deliberate break (`--features break-egl_raw`): the host's own address, which the guest would run on its guest FS
         let answer = if cfg!(atl_nb_egl_raw) {
             host
         } else {

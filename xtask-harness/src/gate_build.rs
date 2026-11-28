@@ -83,7 +83,7 @@ pub enum Group {
     Release,
     /// The gl-dispatch probe: its own workspace (`gl_dispatch::PROBE`), release, `<out>/cargo`; build machine only. Key `gl-dispatch`.
     GlDispatch,
-    /// atl-native-bridge's `sles_recorder` example, debug, cargo's default target dir (`CARGO_TARGET_DIR`, else `<root>/target`), `ATL_NB_BREAK` unset; build machine only. Key `recorder`.
+    /// atl-native-bridge's `sles_recorder` example, debug, cargo's default target dir (`CARGO_TARGET_DIR`, else `<root>/target`), no break feature; build machine only. Key `recorder`.
     Recorder,
     /// The converter packages of the graph (`packages::build`: metadata, clippy, build, cdylib installs). Keys `converter/<package>/<file>`.
     Converter,
@@ -256,7 +256,6 @@ pub fn ensure(root: &Path, out: &Path, groups: &[Group]) -> Result<Products> {
                     "--example",
                     example,
                 ])
-                .env_remove("ATL_NB_BREAK")
                 .current_dir(root),
             "cargo build (sles recorder)",
         )?;
@@ -312,7 +311,7 @@ pub fn property_service(root: &Path, out: &Path) -> Result<PathBuf> {
         .to_owned())
 }
 
-/// The test executable of `cargo test --locked -p <package> --test <test>` (`ATL_NB_BREAK=<brk>` when given): the record's in a row, else built.
+/// The test executable of `cargo test --locked -p <package> --test <test>` (`--features break-<brk>` when given): the record's in a row, else built.
 pub fn test_bin(root: &Path, package: &str, test: &str, brk: Option<&str>) -> Result<PathBuf> {
     match prebuilt::lookup(&test_key(package, test, brk))? {
         Some(path) => Ok(path),
@@ -345,16 +344,16 @@ fn test_builds() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
     all
 }
 
-/// `cargo test --no-run --locked -p <package> --test <test>` (`ATL_NB_BREAK=<brk>` when given, else unset): the executable cargo built.
+/// `cargo test --no-run --locked -p <package> --test <test>` (`--features break-<brk>` when given): the executable cargo built.
 fn test_build(root: &Path, package: &str, test: &str, brk: Option<&str>) -> Result<PathBuf> {
+    let feature = brk.map(|b| format!("break-{b}"));
     let mut cmd = cargo_command();
     cmd.current_dir(root).args([
         "test", "--no-run", "--locked", "-p", package, "--test", test,
     ]);
-    match brk {
-        Some(b) => cmd.env("ATL_NB_BREAK", b),
-        None => cmd.env_remove("ATL_NB_BREAK"),
-    };
+    if let Some(f) = &feature {
+        cmd.args(["--features", f.as_str()]);
+    }
     let run = unit_use::run(&mut cmd, unit_use::Units::Recorded, unit_use::Echo::Nothing)?;
     check!(
         run.status.success(),

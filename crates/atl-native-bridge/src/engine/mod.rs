@@ -154,7 +154,7 @@ pub fn claim(isa: Option<&str>) -> Result<Active, String> {
 /// The engine for ISA `isa` in a process already running `current`: none or the host ISA -> identity (refused in a core without it), a QEMU guest architecture's ISA (qemu/arch.rs) -> QEMU running it, anything else refused; a choice other than `current` is refused.
 fn decide(current: Option<Active>, isa: Option<&str>) -> Result<Active, String> {
     let want = match isa {
-        // deliberate break (`ATL_NB_BREAK=host_qemu`): the host ISA routed to QEMU (unit test `selection`)
+        // deliberate break (`--features break-host_qemu`): the host ISA routed to QEMU (unit test `selection`)
         #[cfg(atl_nb_identity)]
         None | Some(identity::GUEST_ISA) if cfg!(atl_nb_host_qemu) => {
             Active::Qemu(qemu::Arch::Aarch64)
@@ -174,7 +174,7 @@ fn decide(current: Option<Active>, isa: Option<&str>) -> Result<Active, String> 
         },
     };
     match current {
-        // deliberate break (`ATL_NB_BREAK=second_isa`): a second ISA accepted (unit test `selection`)
+        // deliberate break (`--features break-second_isa`): a second ISA accepted (unit test `selection`)
         Some(got) if got != want && !cfg!(atl_nb_second_isa) => Err(format!(
             "ISA {isa:?} needs the {want:?} engine, but this process already runs {got:?}: one engine per process"
         )),
@@ -282,7 +282,7 @@ impl Active {
                     ))
                 }
             }
-            // deliberate break (`ATL_NB_BREAK=qt_keep_windows`): windows are never given back (qemu-thread check c must go red)
+            // deliberate break (`--features break-qt_keep_windows`): windows are never given back (qemu-thread check c must go red)
             Active::Qemu(_) if cfg!(atl_nb_qt_keep_windows) => return,
             Active::Qemu(_) => qemu::CROSSING.unmap_window(at, len),
         };

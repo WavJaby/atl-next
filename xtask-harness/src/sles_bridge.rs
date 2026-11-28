@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test sles-bridge`: OpenSL ES through the identity engine (opensl-es plan slice O1). An NDK x86_64 fixture (`xtask-harness/testdata/sles-bridge/fixture.c`, DT_NEEDED libOpenSLES.so -> the guest proxy) drives a host recorder SL library (atl-native-bridge example `sles_recorder`), which the bridge opens as `/system/lib64/libOpenSLES.so` by absolute path: the run sees a bwrap root whose `/system` is `<out>/sles-bridge/root/system` (qemu_linker.rs `system_wrap`), no product change.
 //! Harness: `cargo test -p atl-native-bridge --test sles_bridge` (harness-less; checks a-h in its header), env as `nb-identity` (nb_identity.rs `identity_env`) with the fixture dir as the test library dir.
-//! Runs: plain (every check ok, exit 0), then each break (`ATL_NB_BREAK`, atl-native-bridge build.rs `BREAKS`) must turn its named check red and exit nonzero: `sles_raw_sink` -> c, `sles_no_dedup` -> e, `sles_var_skip` -> f.
+//! Runs: plain (every check ok, exit 0), then each break (feature `break-<name>`, atl-native-bridge build.rs `BREAKS`) must turn its named check red and exit nonzero: `sles_raw_sink` -> c, `sles_no_dedup` -> e, `sles_var_skip` -> f.
 //! Output: `<out>/sles-bridge/`, one log per run. Default: mutating (builds the fixture, the recorder and the test; a break run rebuilds the package with its cfg).
 
 use std::ffi::OsString;
@@ -127,10 +127,6 @@ fn one(
         .arg(exe)
         .envs(env.iter().map(|(k, v)| (*k, v)))
         .current_dir(root.join("crates").join(PACKAGE));
-    match brk {
-        Some((b, _)) => cmd.env("ATL_NB_BREAK", b),
-        None => cmd.env_remove("ATL_NB_BREAK"),
-    };
     let run = unit_use::run(&mut cmd, Units::Plain, Echo::Nothing)
         .context("running the sles-bridge test")?;
     let log = dir.join(format!("{name}.log"));

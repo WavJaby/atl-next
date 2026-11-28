@@ -8,7 +8,7 @@
 //! d: a name with no row and no host answer answers NULL;
 //! e: two answers for eglQueryDevicesEXT (a prototype the table describes, no row: the dedup path) are equal, and the answer's call returns EGL_TRUE from the recorder.
 //! c (trap run, its own process): eglGetProcAddress("glAtlNoDescriptor") answers a named trap; calling it aborts, naming the function (the harness checks the abort and its stderr line).
-//! Breaks (`ATL_NB_BREAK`, build.rs `BREAKS`): `egl_raw` -> a and f red; `egl_nodedup` -> e red.
+//! Breaks (feature `break-<name>`, build.rs `BREAKS`): `egl_raw` -> a and f red; `egl_nodedup` -> e red.
 //! Output: `egl-bridge: (<c>) ok` per check, `egl-bridge: (<c>) FAIL: <why>` otherwise; exit 0 when all pass.
 #![allow(
     clippy::print_stdout,

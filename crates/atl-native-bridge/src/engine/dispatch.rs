@@ -55,7 +55,7 @@ pub fn on_trap(trap: Trap) -> Answer {
     }
 }
 
-/// Added to a trap's id before its slot is read: 0 in every build; the `qe_id` break (`ATL_NB_BREAK`) makes it 1, so each binding calls its neighbour's host function.
+/// Added to a trap's id before its slot is read: 0 in every build; the `qe_id` break (feature `break-qe_id`) makes it 1, so each binding calls its neighbour's host function.
 #[cfg(not(atl_nb_qe_id))]
 const ID_SKEW: usize = 0;
 #[cfg(atl_nb_qe_id)]

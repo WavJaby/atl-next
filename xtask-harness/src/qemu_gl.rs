@@ -3,7 +3,7 @@
 //!
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`). Fixture: `xtask-harness/testdata/qemu-gl/fixture.c`, static (NDK clang, the NDK's GLES2 headers for the PFN types). No guest linker or NB images: the gate calls the fixture's entries directly, as `qemu-abi` does.
 //! GS2.2 G1 (eglGetProcAddress, checks e, f, g, h, p and the trap run o): the fixture asks the binding of eglGetProcAddress for a name and calls the answer. Rows the gate registers answer the row's guest address; a name with no row goes to the host libEGL at SYSTEM_LIB, which is the recorder of `egl_bridge.rs` (`stage_recorder`) under the same bwrap root (`system_wrap`). The fallback names (p) and the named trap (o, its own run) need that host.
-//! Harness: `tests/qemu_gl.rs` (harness-less; checks s, b, c, u, d, t, a, i, j, k, n, e, f, g, h, p; the trap run o) run through `qemu_linker::harness_in`. Breaks (`ATL_NB_BREAK`, dispatch.rs `call_host`, engine/proc.rs): `v_drop` (fp lanes zeroed: checks c, u, d, t, a), `drop_stack` (stack words one early: checks i, j), `ret_int` (the fp result read from x0: check n), `egl_raw` (eglGetProcAddress answers the host address of a row, not its guest address: checks e, f, g), `egl_nodedup` (a host answer is bound once per call: check p).
+//! Harness: `tests/qemu_gl.rs` (harness-less; checks s, b, c, u, d, t, a, i, j, k, n, e, f, g, h, p; the trap run o) run through `qemu_linker::harness_in`. Breaks (feature `break-<name>`, dispatch.rs `call_host`, engine/proc.rs): `v_drop` (fp lanes zeroed: checks c, u, d, t, a), `drop_stack` (stack words one early: checks i, j), `ret_int` (the fp result read from x0: check n), `egl_raw` (eglGetProcAddress answers the host address of a row, not its guest address: checks e, f, g), `egl_nodedup` (a host answer is bound once per call: check p).
 //! Output: `<out>/qemu/<target>-linux-user-pic/qemu-gl/`, one log per run.
 
 use std::ffi::OsString;
@@ -116,7 +116,6 @@ fn trap_run(root: &Path, dir: &Path, env: &[(&str, &Path)], wrap: &[OsString]) -
     .envs(env.iter().copied())
     .env("ATL_NB_DLLIBS", dir)
     .env("ATL_QEMU_GL_CASE", "trap")
-    .env_remove("ATL_NB_BREAK")
     .current_dir(root);
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;

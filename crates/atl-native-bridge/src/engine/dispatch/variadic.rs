@@ -63,7 +63,7 @@ pub(super) fn call(target: usize, lanes: &AtlLanes, fp: bool, _sig: Sig) -> (u64
     }
 }
 
-/// Break `al_zero` (`ATL_NB_BREAK=al_zero`): [`call`]'s image, called from asm with %al = 0 where the normal call sets 8. A variadic callee saves its xmm arguments only when %al is nonzero (SysV), so a double vararg reads garbage. Returns rax and xmm0. The ten stack words (x6, x7, then s0..s7) are pushed so the callee finds the first at the lowest address.
+/// Break `al_zero` (`--features break-al_zero`): [`call`]'s image, called from asm with %al = 0 where the normal call sets 8. A variadic callee saves its xmm arguments only when %al is nonzero (SysV), so a double vararg reads garbage. Returns rax and xmm0. The ten stack words (x6, x7, then s0..s7) are pushed so the callee finds the first at the lowest address.
 #[cfg(atl_nb_al_zero)]
 fn call_al0(target: usize, x: [u64; 8], v: [f64; 8], s: [u64; 8]) -> (u64, f64) {
     let stack = [x[6], x[7], s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]];

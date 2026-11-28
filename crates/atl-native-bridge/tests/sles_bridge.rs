@@ -10,7 +10,7 @@
 //! f: the guest's `SL_IID_PLAY` is the recorder's `SL_IID_PLAY` value;
 //! g: `GetInterface` of the fixture's unknown IID = SL_RESULT_FEATURE_UNSUPPORTED (0x0C) and the refusal counter `sles.GetInterface.<its 16 bytes in hex>` is 1.
 //! h: the fixture defines `SL_IID_ANDROIDCONFIGURATION` read-only and `SL_IID_ANDROIDEFFECT` writable (an app library interposing the proxy, as WeChat's liboboe.so does): the load survives, both fixture words still point at the fixture's own IIDs, and the proxy's own words (guest dlsym on the proxy handle) equal the recorder's. Expected by the ELF rule: the dlopen root precedes its DT_NEEDED proxy in lookup, so the proxy's GOT binds these names to the fixture; only the proxy's own definitions may be written.
-//! Breaks (`ATL_NB_BREAK`): `sles_raw_sink` -> c red; `sles_no_dedup` -> e red; `sles_var_skip` -> f red.
+//! Breaks (feature `break-<name>`): `sles_raw_sink` -> c red; `sles_no_dedup` -> e red; `sles_var_skip` -> f red.
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,

@@ -132,25 +132,18 @@ fn harness(
     cmd.args(["-s", "KILL"])
         .arg(RUN_TIMEOUT_SECS.to_string())
         .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args([
-        "test",
-        "--locked",
-        "-p",
-        PACKAGE,
-        "--features",
-        FEATURE,
-        "--test",
-        test,
-        "--target-dir",
-    ])
-    .arg(dir.join("cargo"))
-    .args(["--"])
-    .envs(env.iter().copied())
-    .current_dir(root);
-    match brk {
-        Some((b, _)) => cmd.env("ATL_NB_BREAK", b),
-        None => cmd.env_remove("ATL_NB_BREAK"),
+    // a break is a second feature of the same package: one `--features` list
+    let features = match brk {
+        Some((b, _)) => format!("{FEATURE},break-{b}"),
+        None => FEATURE.to_owned(),
     };
+    cmd.args(["test", "--locked", "-p", PACKAGE, "--features"])
+        .arg(features)
+        .args(["--test", test, "--target-dir"])
+        .arg(dir.join("cargo"))
+        .args(["--"])
+        .envs(env.iter().copied())
+        .current_dir(root);
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{name}.log"));

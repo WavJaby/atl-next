@@ -129,7 +129,7 @@ pub(super) const fn variadic_a_slot(id: usize) -> usize {
 }
 
 /// The host env behind guest env `guest` (0 = 0), for the NDK shims (ndk.rs): an NDK function takes a `JNIEnv*` and calls the host library through it.
-/// Deliberate break `ATL_NB_BREAK=ndk_env`: the guest env itself, whose function table is the guest's.
+/// Deliberate break `--features break-ndk_env`: the guest env itself, whose function table is the guest's.
 ///
 /// # Safety
 /// `guest` is 0 or a guest env made by `guest_env`.

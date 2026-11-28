@@ -586,7 +586,7 @@ impl super::Engine for Identity {
             super::Tp::Guest(t) => {
                 // a guest call with no TCB would run on the host TLS; attach and `Guest::start` always install one
                 assert!(t != 0, "guest call with no guest thread pointer");
-                // deliberate break of gate g1 (`ATL_NB_BREAK=swap_tp`): the guest enters on the host thread pointer
+                // deliberate break of gate g1 (`--features break-swap_tp`): the guest enters on the host thread pointer
                 cpu.set_guest_tp(if cfg!(atl_nb_swap_tp) { fs_base() } else { t });
                 false
             }

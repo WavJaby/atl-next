@@ -44,7 +44,7 @@ extern "C" fn intercept_symbol(addr: *mut c_void, library: *const c_char, symbol
     // every stub resolves by (library, name) in the one binding table (bindings.rs), never by the global scope
     let host = super::bindings::target(&lib, &name).and_then(|t| t.callee());
     let host_addr = host.map(|(h, _)| h);
-    // deliberate break of the app gate's glesPbuffer (`ATL_NB_BREAK=gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
+    // deliberate break of the app gate's glesPbuffer (`--features break-gl_direct`): glClear's stub jumps to the host front itself, skipping the crossing -> host code runs on the guest thread pointer
     #[cfg(atl_nb_gl_direct)]
     let bound = if name == "glClear" {
         host.map(|(h, _)| h)
@@ -106,7 +106,7 @@ pub fn bind_linker(linker: &Image) -> Result<(), String> {
         "__dl___native_bridge_get_host_pthread",
         get_host_pthread as *const () as usize,
     )];
-    // the `qe_no_tls` break (`ATL_NB_BREAK`) leaves this placeholder unpatched: the linker's `bl` branches to 0
+    // the `qe_no_tls` break (feature `break-qe_no_tls`) leaves this placeholder unpatched: the linker's `bl` branches to 0
     #[cfg(not(atl_nb_qe_no_tls))]
     hooks.push((
         "__dl___native_bridge_config_static_tls",

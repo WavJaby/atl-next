@@ -64,7 +64,7 @@ fn stack_req(attr: *const libc::pthread_attr_t) -> StackReq {
             libc::pthread_attr_getguardsize(attr, &mut guard);
         }
     }
-    // deliberate break (`ATL_NB_BREAK=qt_attr_size`): the attr's size never reaches attach (qemu-thread gate `g`)
+    // deliberate break (`--features break-qt_attr_size`): the attr's size never reaches attach (qemu-thread gate `g`)
     if cfg!(atl_nb_qt_attr_size) {
         size = 0;
     }
@@ -143,7 +143,7 @@ pub(super) extern "C" fn pthread_create(
     while thread::tid_of(record).is_some_and(|t| t == 0) {
         std::thread::yield_now();
     }
-    // deliberate break (`ATL_NB_BREAK=qt_handle_glibc`): the guest gets glibc's handle, as before tr-first blocker 4 (qemu-thread gate `q`)
+    // deliberate break (`--features break-qt_handle_glibc`): the guest gets glibc's handle, as before tr-first blocker 4 (qemu-thread gate `q`)
     let handle = if cfg!(atl_nb_qt_handle_glibc) {
         glibc
     } else {
@@ -165,7 +165,7 @@ extern "C" fn run(start: *mut c_void) -> *mut c_void {
     thread::adopt_record(record);
     let ht = thread::attach_with(stack);
     ROUTINE.with(|r| r.set(true));
-    // deliberate break (`ATL_NB_BREAK=qt_routine_arg`): the routine gets the wrong argument (qemu-thread gate)
+    // deliberate break (`--features break-qt_routine_arg`): the routine gets the wrong argument (qemu-thread gate)
     let arg = if cfg!(atl_nb_qt_routine_arg) {
         arg + 1
     } else {
@@ -202,7 +202,7 @@ pub(super) extern "C" fn pthread_exit(value: usize) -> usize {
     if !ROUTINE.with(Cell::get) {
         super::unsupported("guest pthread_exit outside a guest thread's start routine");
     }
-    // deliberate break (`ATL_NB_BREAK=qt_exit_resume`): the call is not ended, so the guest resumes after its noreturn pthread_exit (qemu-thread gate `x`)
+    // deliberate break (`--features break-qt_exit_resume`): the call is not ended, so the guest resumes after its noreturn pthread_exit (qemu-thread gate `x`)
     if cfg!(atl_nb_qt_exit_resume) {
         return value;
     }

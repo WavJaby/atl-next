@@ -1060,7 +1060,7 @@ fn ilp32_libc_entry(
 ) -> Result<String> {
     let guest = protos.arches.get("guest").context("no guest view")?;
     let host = protos.arches.get("host").context("no host view")?;
-    // deliberate break (`ATL_NB_BREAK=main_exit_unbound`): native_bridge_exit keeps its stub name, which no header declares
+    // deliberate break (`--features break-main_exit_unbound`): native_bridge_exit keeps its stub name, which no header declares
     let proto = if name == "native_bridge_exit"
         && selected_breaks()?.contains(&"atl_nb_main_exit_unbound")
     {
@@ -2985,9 +2985,7 @@ fn sl_layout_rs(host: &atl_bridgegen::ir::ArchView) -> Result<String> {
     Ok(out)
 }
 
-/// `ATL_NB_BREAK=<name>[,<name>]` selects [`BREAKS`]. Read here, so the cfg reaches this package only; a global RUSTFLAGS cfg reached every crate and failed unrelated builds.
-/// Set it on the run that stages the core (`xtask test app`, atld_run.rs `cdylib::stage`, a plain `cargo build`): cargo rebuilds the core when the value changes, so that run's environment decides the artifact.
-const BREAK_ENV: &str = "ATL_NB_BREAK";
+/// A break is the cargo feature `break-<name>` (Cargo.toml: one per [`BREAKS`] row), enabled on the command line only. Cargo keys the build script and the crate by features, so a break is its own build and a plain build never reruns for one. The cfg reaches this package only; a global RUSTFLAGS cfg reached every crate and failed unrelated builds.
 /// The deliberate breaks: name -> the cfg it turns on. A break is a gate failing on purpose: red with it, green without.
 const BREAKS: &[(&str, &str)] = &[
     // the app gate's `glesPbuffer` (engine/vdso.rs): glClear's stub bound to the front's raw address, no crossing
@@ -3127,29 +3125,15 @@ const DOWN_ATT_CFG: &str = "atl_nb_down_att";
 /// The cfg naming a core built with the identity engine (arches.toml `[<arch>.host] identity`); crate code gates on it, never on an arch name.
 const IDENTITY_CFG: &str = "atl_nb_identity";
 
-/// The cfgs `ATL_NB_BREAK` names, in order; an unknown name fails the build, naming it and the known ones.
+/// The cfgs of the enabled `break-<name>` features, in table order: cargo sets `CARGO_FEATURE_BREAK_<NAME>` for each enabled one. An unknown `--features break-x` fails in cargo; a declared feature without a row is inert (cfg-less), so keep Cargo.toml and BREAKS in step.
 fn selected_breaks() -> Result<Vec<&'static str>> {
-    let Ok(value) = std::env::var(BREAK_ENV) else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(|name| {
-            BREAKS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|&(_, cfg)| cfg)
-                .with_context(|| {
-                    let known: Vec<&str> = BREAKS.iter().map(|&(n, _)| n).collect();
-                    format!(
-                        "{BREAK_ENV}={name}: no such break (known: {})",
-                        known.join(", ")
-                    )
-                })
+    Ok(BREAKS
+        .iter()
+        .filter(|(name, _)| {
+            std::env::var_os(format!("CARGO_FEATURE_BREAK_{}", name.to_ascii_uppercase())).is_some()
         })
-        .collect()
+        .map(|&(_, cfg)| cfg)
+        .collect())
 }
 
 fn main() -> Result<()> {
@@ -3162,7 +3146,6 @@ fn main() -> Result<()> {
     for &(_, cfg) in BREAKS {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
     }
-    println!("cargo::rerun-if-env-changed={BREAK_ENV}");
     for cfg in selected_breaks()? {
         println!("cargo::rustc-cfg={cfg}");
     }

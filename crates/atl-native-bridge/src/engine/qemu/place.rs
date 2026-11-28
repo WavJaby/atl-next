@@ -205,7 +205,7 @@ pub fn is_stub(addr: usize) -> bool {
     read_words(addr) == placed().placeholder
 }
 
-/// Deliberate break of the placeholder shape check (`ATL_NB_BREAK=qe_prefix`): only the first two bytes decide, so a site whose tail differs is taken for a stub.
+/// Deliberate break of the placeholder shape check (`--features break-qe_prefix`): only the first two bytes decide, so a site whose tail differs is taken for a stub.
 #[cfg(atl_nb_qe_prefix)]
 pub fn is_stub(addr: usize) -> bool {
     read_words(addr)[0] & 0xffff == placed().placeholder[0] & 0xffff

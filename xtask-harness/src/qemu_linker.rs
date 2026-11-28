@@ -4,7 +4,7 @@
 //! Library: the engine `.so` (`qemu_spike::engine_so_file`, QEMU bridge plan Q5-1b), which the core dlopens through its C ABI; the rlib route is retired. Fixtures in `xtask-harness/testdata/qemu-linker/`, built by the NDK clang: `fixture.c` (static, Q4-3), `exe.c` (PIE without libc, the main executable the guest linker loads), `dl_exe.c` (PIE with DT_NEEDED on libc.so and libdl.so, the Q4-5 dlopen executable), `libdep.c` and `libfix.c` (the Q4-5 dlopen'd pair: libfix.so's DT_NEEDED is libdep.so). Boot: the engine boot executable (`qemu::boot_exe`, crates/atl-qemu-boot).
 //! Images: `--nb <dir>` is the arm64 NB out dir (`<out>/nb-graph-arm64/nb/arm64`, from `xtask native --host x86_64 --native-bridge arm64 nb:libc nb:native_bridge_guest_linker nb:libnative_bridge_vdso nb:libnative_bridge_guest_libc nb:libdl nb:libm nb:ld-android`): `native_bridge_guest_linker/linker64`, `libnative_bridge_vdso/libnative_bridge_vdso.so`, and the guest library directories `libnative_bridge_guest_libc`, `libdl`, `libm`, `ld-android` that the Q4-5 harness puts on the guest's library path.
 //! Harnesses: `cargo test -p atl-native-bridge --test <name>` (each selects the QEMU engine itself), harness-less; each header lists its env and checks.
-//! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (`ATL_NB_BREAK`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
+//! - `qemu_linker` (Q4-3 placement): checks p, r, t, a, s. Breaks (feature `break-<name>`): `qe_site` (the vdso's placeholder search fails closed on call_guest), `qe_nomap` (no page registered: a fetch from a placed site faults), `qe_id` (a binding trap calls its neighbour's host function).
 //! - `qemu_start` (Q4-4 linker init): checks s (started), e (entry), t (static TLS), h (get_host_pthread), g (GS base). Breaks: `qe_no_tls` (the static-TLS hook unpatched: the linker's `bl` branches to 0). `qe_guest_base` is retired (Q5-1b): the engine's command line is `-B 0` and the C ABI has no base argument, so there is no nonzero-base run to refuse. The AT_RANDOM break (plan Q4-4 (b)) was never wired: it did not abort (Q4-5 log).
 //! - `qemu_dlopen` (Q4-5 guest dlopen): checks s (started), i (the stub libc intercepted stubs), d (dlopen returned a handle), y (dlsym found both functions), c (libfix's constructor saw libdep's relocated value), v (fix_value()). Break: `skip_reloc` (harness-level: the run's libdep.so has DT_ANDROID_RELRSZ zeroed, so its packed RELATIVE relocations are not applied; no product cfg). The AT_RANDOM break was dropped: nothing on this path aborts without AT_RANDOM.
 //! - `qemu_main` (phase4-32bit P4b guest main): `main_exe.c`'s main creates and joins a thread, then one that registers thread-exit destructors (`__cxa_thread_atexit_impl`), a key value and a cleanup handler and ends in `pthread_exit`, then one that pops a handler with execute and returns, registers two on the main thread, returns; the guest's exit ends the process through NBS `native_bridge_exit` -> host `exit`. Checks s (started), c (churn), k (host calls through down shells: `fx_cb(int, int64_t, void*)` gets its arguments, a `Down::Handle` callback sees a scoped handle), n (resolver round in the guest's layout, window count unchanged), e (the host exit ran), v (main's status), d (thread-exit destructors and cleanup handlers once each, bionic's order), r (no host pointer refused). Breaks: `shorty_swap` (the down call's third parameter class flipped: k red), `main_exit_unbound` (the exit stub unprototyped on ILP32, unbound on LP64: the guest's exit traps naming it), `main_tls_dtor_unbound` (no host side for `native_bridge___cxa_thread_atexit_impl`: the worker's registration traps naming it), `dns_keep_list` (freeaddrinfo keeps the list's window block: n red), `exit_skip_cleanup` (thread.rs `run_cleanup` skipped: status 8, v and d red).
@@ -311,7 +311,7 @@ fn skip_relative(so: &Path, out: &Path) -> Result<()> {
 
 /// Harness-level break of `qemu_staged`: the stage leaves the boot executable out.
 const NO_BOOT_EXE: &str = "no_boot_exe";
-/// Breaks that change the run's files, not the product build: never passed as ATL_NB_BREAK.
+/// Breaks that change the run's files, not the product build: never enabled as a `break-<name>` feature.
 const HARNESS_BREAKS: [&str; 2] = [SKIP_RELOC, NO_BOOT_EXE];
 /// The Q6-5 staged boot (module doc).
 const STAGED: Harness = Harness {
@@ -471,28 +471,24 @@ pub(crate) fn harness_in(
         .arg(RUN_TIMEOUT_SECS.to_string())
         .args(wrap)
         .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    cmd.args([
-        "test",
-        "--locked",
-        "-p",
-        PACKAGE,
-        "--test",
-        h.test,
-        "--target-dir",
-    ])
-    .arg(dir.join("cargo"))
-    .args(["--"])
-    .envs(env.iter().copied())
-    .env("ATL_NB_DLLIBS", dllibs)
-    .current_dir(root);
-    match brk {
-        // a harness-level break changes the fixture files, not the product build
+    // a harness-level break changes the fixture files, not the product build; a break the harness does not list (an engine break, run by hand) leaves the native build plain
+    let feature = match brk {
         Some(b) if !HARNESS_BREAKS.contains(&b) && h.breaks.contains(&b) => {
-            cmd.env("ATL_NB_BREAK", b)
+            Some(format!("break-{b}"))
         }
-        // a break the harness does not list is in the caller's env (an engine break): this run is judged as a break, the native build is plain
-        _ => cmd.env_remove("ATL_NB_BREAK"),
+        _ => None,
     };
+    let mut args = vec!["test", "--locked", "-p", PACKAGE];
+    if let Some(f) = &feature {
+        args.extend(["--features", f.as_str()]);
+    }
+    args.extend(["--test", h.test, "--target-dir"]);
+    cmd.args(args)
+        .arg(dir.join("cargo"))
+        .args(["--"])
+        .envs(env.iter().copied())
+        .env("ATL_NB_DLLIBS", dllibs)
+        .current_dir(root);
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{name}.log"));

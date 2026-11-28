@@ -2,8 +2,8 @@
 #![cfg(atl_nb_identity)]
 //! Spike gate g1 (bridge-1 route N): the identity crossing leaves the host thread intact, and the guest linker initialises through it.
 //! Build env: tests/common/mod.rs; stage 2 prints SKIP without a native-bridge build.
-//! Deliberate break: `ATL_NB_BREAK=no_fs_restore` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
-//! Deliberate break: `ATL_NB_BREAK=swap_tp` enters the guest on the host thread pointer (`Identity::call`) -> stage 0's guest FS check fails.
+//! Deliberate break: `--features break-no_fs_restore` drops the crossing's FS restore -> the probes of stage 0 and stage 2 both fail (every stage runs; exit 1).
+//! Deliberate break: `--features break-swap_tp` enters the guest on the host thread pointer (`Identity::call`) -> stage 0's guest FS check fails.
 //!
 //! Stages:
 //! - 0, always: the crossing installs a guest thread pointer for the call and restores the host's after; host probe after it.

@@ -3,7 +3,7 @@
 //! Q5-8b gate (QEMU bridge plan section 5), harness-less: the crossing counter on the identity side (feature `crossing-count`; the counted shells of `atl-bridgegen` `x86::entries_asm`). A stand-in guest loop, run as g4 runs its own (stand-in guest TCB, no TLS), calls the host thunk pool and the JNI stub pool; each call crosses to a host function.
 //! Expected values are the loop counts this file passes, never the counter's: each host function also counts its own calls, so the counter is checked against a record it does not write.
 //! Checks: (s) started (FSGSBASE); (t) thunk crossings per host target exact, two slots bound to one target counted together; (j) JNI stub crossings per target and per JNI slot exact (slots 5 and 9, no other slot; the slot count is the shared `dispatch::count_object` entry, per (table, slot) QEMU's route also takes); (w) 2^16 further crossings dump exactly once; (f) FS on the host after the calls.
-//! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. Break `ATL_NB_BREAK=id_count`: the shells are generated plain, so the counter sees nothing and (t), (j) and (w) must fail.
+//! Output: `crossing: (x) ok` or `crossing: (x) FAIL <why>` per check; exit 0 when all pass. Break `--features break-id_count`: the shells are generated plain, so the counter sees nothing and (t), (j) and (w) must fail.
 #![allow(
     clippy::print_stdout,
     reason = "a harness-less gate: its verdict lines are its output"

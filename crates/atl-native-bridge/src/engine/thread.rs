@@ -369,7 +369,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
                 continue;
             }
             ran = true;
-            // deliberate break (`ATL_NB_BREAK=qt_skip_dtor`): the guest destructor never runs (qemu-thread gate)
+            // deliberate break (`--features break-qt_skip_dtor`): the guest destructor never runs (qemu-thread gate)
             if cfg!(atl_nb_qt_skip_dtor) {
                 continue;
             }
@@ -423,7 +423,7 @@ extern "C" fn detach(value: *mut libc::c_void) {
 /// `ht` is the calling thread's record, its engine CPU attached.
 pub(super) unsafe fn run_cleanup(ht: &mut HostThread) {
     let record = RECORD.with(Cell::get);
-    // deliberate break (`ATL_NB_BREAK=exit_skip_cleanup`): cleanup handlers never run (qemu-linker gate, qemu_main status 8)
+    // deliberate break (`--features break-exit_skip_cleanup`): cleanup handlers never run (qemu-linker gate, qemu_main status 8)
     if record == 0 || cfg!(atl_nb_exit_skip_cleanup) {
         return;
     }

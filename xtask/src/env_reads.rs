@@ -154,12 +154,6 @@ const ALLOWED: &[(&str, &str, Class, &str)] = &[
     ),
     (
         "crates/atl-native-bridge/build.rs",
-        "ATL_NB_BREAK",
-        Class::Pending,
-        "48 deliberate breaks, ~12 harness callers",
-    ),
-    (
-        "crates/atl-native-bridge/build.rs",
         "ATL_NB_GL_GUEST_INCLUDE",
         Class::Pending,
         "identity gate's force-included guest header",

@@ -2,7 +2,7 @@
 //! `xtask test nb-identity`: the identity native-bridge gates g1-g5 (the x86_64 engine, no QEMU), with the env they read taken from this checkout's out dir instead of set by hand.
 //!
 //! Needs `<out>/nb/x86_64` (the x86_64 NB build) and what `xtask test app` stages: `<out>/app/root/system/lib64/x86_64` (the guest's libc++.so) and `<out>/app/jni-fixture/android-21` (the test libraries). A missing dir fails the run by name.
-//! Env per gate: `ATL_NB`, `ATL_NB_LIBCXX`, `ATL_NB_TESTLIB` (the fixture dir, then the NDK sysroot's lib dir with libc++_shared.so, as an APK's `lib/<abi>/` holds them). `ATL_NB_BREAK` in the caller's environment passes through to the gates (names: atl-native-bridge build.rs `BREAKS`).
+//! Env per gate: `ATL_NB`, `ATL_NB_LIBCXX`, `ATL_NB_TESTLIB` (the fixture dir, then the NDK sysroot's lib dir with libc++_shared.so, as an APK's `lib/<abi>/` holds them). A break is the cargo feature `break-<name>` (names: atl-native-bridge build.rs `BREAKS`), never an environment variable.
 //! Pass: every gate's cargo test exits 0. Logs: `<out>/nb-identity/<gate>.log`.
 //! Default: mutating (cargo builds the gate targets, and each run writes its log).
 

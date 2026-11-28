@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! `xtask test egl-bridge`: eglGetProcAddress through the identity engine (GS2.2 G1). An NDK x86_64 fixture (`xtask-harness/testdata/egl-bridge/fixture.c`, DT_NEEDED libEGL.so and libGLESv2.so -> the guest proxies) asks eglGetProcAddress for glVertexAttrib4f, glTexImage2D, glFinish, a host-described name with no row, a name nobody has, and a name with no prototype (the trap run). The host side is the recorder (atl-native-bridge example `egl_recorder`), staged as `/system/lib64/libEGL.so` and `libGLESv2.so` under the bwrap root (qemu_linker.rs `system_wrap`), no product change.
 //! Harness: `cargo test -p atl-native-bridge --test egl_bridge` (harness-less; checks a, f, b, d, e and the trap run c in its header), env as `nb-identity` (nb_identity.rs `identity_env`) with the fixture dir as the test library dir.
-//! Runs: plain (every check ok, exit 0); each break (`ATL_NB_BREAK`, atl-native-bridge build.rs `BREAKS`) turns its check red and exits nonzero: `egl_raw` -> a, `egl_nodedup` -> e; the trap run (`ATL_EGL_CASE=trap`) must abort naming glAtlNoDescriptor (check c).
+//! Runs: plain (every check ok, exit 0); each break (feature `break-<name>`, atl-native-bridge build.rs `BREAKS`) turns its check red and exits nonzero: `egl_raw` -> a, `egl_nodedup` -> e; the trap run (`ATL_EGL_CASE=trap`) must abort naming glAtlNoDescriptor (check c).
 //! Output: `<out>/egl-bridge/`, one log per run. Default: mutating (builds the fixture, the recorder and the test; a break run rebuilds the package with its cfg).
 
 use std::ffi::OsString;
@@ -104,7 +104,6 @@ fn fixture(root: &Path, dir: &Path) -> Result<PathBuf> {
 pub(crate) fn stage_recorder(root: &Path, dir: &Path) -> Result<PathBuf> {
     let mut cmd = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cmd.args(["build", "--locked", "-p", PACKAGE, "--example", RECORDER])
-        .env_remove("ATL_NB_BREAK")
         .current_dir(root);
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("building the recorder")?;
@@ -144,10 +143,10 @@ fn one(
         .args(["test", "--locked", "-p", PACKAGE, "--test", TEST])
         .envs(env.iter().map(|(k, v)| (*k, v)))
         .current_dir(root);
-    match brk {
-        Some((b, _)) => cmd.env("ATL_NB_BREAK", b),
-        None => cmd.env_remove("ATL_NB_BREAK"),
-    };
+    if let Some((b, _)) = brk {
+        let feature = format!("break-{b}");
+        cmd.args(["--features", feature.as_str()]);
+    }
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
     let log = dir.join(format!("{name}.log"));
@@ -197,7 +196,6 @@ fn trap_run(
         .args(["test", "--locked", "-p", PACKAGE, "--test", TEST])
         .envs(env.iter().map(|(k, v)| (*k, v)))
         .env("ATL_EGL_CASE", "trap")
-        .env_remove("ATL_NB_BREAK")
         .current_dir(root);
     let run =
         unit_use::run(&mut cmd, Units::Recorded, Echo::Nothing).context("running cargo test")?;
